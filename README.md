@@ -99,8 +99,8 @@ Zalỏ covers everyday chat (no mini apps or calls):
 
 ### Install
 
-1. Download `zalom3ui-debug-apk` from the latest **CI** run on GitHub. It holds one APK per CPU type; almost every
-   current phone is `arm64-v8a` (check with `adb shell getprop ro.product.cpu.abi`).
+1. Download `zalom3ui-debug-apk` from the latest **CI** run on GitHub. It holds one APK, for `arm64-v8a` phones
+   (almost every current phone; check with `adb shell getprop ro.product.cpu.abi`).
 2. Copy `app-arm64-v8a-debug.apk` to the phone and open it (allow installing from that app when asked), or
    `adb install app-arm64-v8a-debug.apk`.
 3. Open **Zalỏ** and log in (below). Zalỏ has its own app id (`com.zalom3ui.app`), so it installs next to Zalo Lite;

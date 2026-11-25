@@ -44,12 +44,13 @@ android {
         }
     }
 
-    // libnode.so is ~60 MB per CPU type, so build one APK per type instead of a universal one.
+    // arm64 only (every current phone): libnode.so is ~60 MB per CPU type. The split keeps the APK's name
+    // (app-arm64-v8a-debug.apk) and limits the native build to that one type.
     splits {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            include("arm64-v8a")
             isUniversalApk = false
         }
     }
