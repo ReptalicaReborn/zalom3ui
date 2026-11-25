@@ -7,14 +7,22 @@ package com.zalom3ui.app.call
  */
 class OpusFrameCodec(sampleRate: Int = 16000, bitrate: Int = 20_000) : FrameCodec {
     private val encoder = OpusEncoder(sampleRate, 1, bitrate)
-    private val decoder = OpusDecoder(sampleRate, 1)
+    private val decoder: OpusDecoder = try {
+        OpusDecoder(sampleRate, 1)
+    } catch (t: Throwable) {
+        runCatching { encoder.close() }.onFailure { t.addSuppressed(it) }
+        throw t
+    }
 
     override fun encode(pcm: ShortArray): ByteArray = encoder.encode(pcm)
 
     override fun decode(packet: ByteArray?): ShortArray = decoder.decode(packet)
 
     override fun close() {
-        encoder.close()
-        decoder.close()
+        try {
+            encoder.close()
+        } finally {
+            decoder.close()
+        }
     }
 }

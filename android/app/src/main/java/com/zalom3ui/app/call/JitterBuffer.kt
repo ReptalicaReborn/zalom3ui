@@ -8,8 +8,18 @@ package com.zalom3ui.app.call
  * thread, pop from the playback thread.
  */
 class JitterBuffer(private val targetFrames: Int = 3, private val maxFrames: Int = 25) {
+    /** Result of an atomic [popIfPlaying] tick. */
+    sealed class PopResult {
+        /** Buffer is still filling to [targetFrames]; play silence without counting concealment. */
+        data object Buffering : PopResult()
+
+        /** Playout slot is active: [packet] is the Opus payload, or null when missing (conceal). */
+        class Frame(val packet: ByteArray?) : PopResult()
+    }
+
     private val lock = Any()
     private val packets = HashMap<Int, ByteArray>()
+    private val hardResetAhead = (maxFrames * RESET_MULTIPLIER).coerceAtMost(HALF - 1)
 
     private var playing = false
 
@@ -31,10 +41,17 @@ class JitterBuffer(private val targetFrames: Int = 3, private val maxFrames: Int
                     // Older than the playout point. While buffering, it may still be the new oldest (reordering).
                     if (playing) return
                     next = s
-                } else if (playing && ahead > maxFrames) {
-                    // A jump this large is not jitter: the stream restarted or we lost it. Re-buffer from here.
+                    // Prune packets that are now too far ahead of the rewound start so a buffering gap can't hang PLC.
+                    packets.keys.removeAll { ((it - next) and MASK) > maxFrames }
+                } else if (!playing && ahead > maxFrames) {
+                    // While buffering, keep the window bounded to maxFrames behind the newest sequence.
+                    packets.keys.removeAll { ((s - it) and MASK) > maxFrames }
+                    next = packets.keys.maxByOrNull { (s - it) and MASK } ?: s
+                } else if (playing && ahead > hardResetAhead) {
+                    // A jump this large is not jitter or clock drift: the stream restarted or we lost it. Re-buffer from here.
                     packets.clear()
                     playing = false
+                    dryPops = 0
                     next = s
                 }
             }
@@ -47,9 +64,19 @@ class JitterBuffer(private val targetFrames: Int = 3, private val maxFrames: Int
         }
     }
 
+    /** Atomically checks whether playout is active and pops the next slot, avoiding an [isPlaying]/[pop] TOCTOU race. */
+    fun popIfPlaying(): PopResult = synchronized(lock) {
+        if (!playing) return PopResult.Buffering
+        PopResult.Frame(popLocked())
+    }
+
     /** Next frame in order, or null when it is missing or the buffer has not started playing yet. */
     fun pop(): ByteArray? = synchronized(lock) {
         if (!playing) return null
+        popLocked()
+    }
+
+    private fun popLocked(): ByteArray? {
         if (packets.size > maxFrames) skipAhead()
         val out = packets.remove(next)
         next = (next + 1) and MASK
@@ -61,7 +88,7 @@ class JitterBuffer(private val targetFrames: Int = 3, private val maxFrames: Int
         } else {
             dryPops = 0
         }
-        out
+        return out
     }
 
     /** Drops the oldest frames so only [targetFrames] remain, bounding latency after a burst or clock drift. */
@@ -76,5 +103,6 @@ class JitterBuffer(private val targetFrames: Int = 3, private val maxFrames: Int
         const val MASK = 0xFFFF
         const val HALF = 0x8000
         const val DRY_RESET = 50
+        const val RESET_MULTIPLIER = 3
     }
 }

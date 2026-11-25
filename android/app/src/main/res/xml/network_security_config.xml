@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The server is self-hosted and often reached by LAN IP over plain HTTP,
-  so cleartext is allowed. Prefer HTTPS (reverse proxy, Tailscale) whenever
-  the phone talks to it outside your home network.
+  Only loopback (the on-phone server) and the Android emulator host may use cleartext HTTP.
+  Remote self-hosted servers must use HTTPS (reverse proxy, Tailscale, etc.).
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
 </network-security-config>

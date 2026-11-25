@@ -3,6 +3,7 @@ package com.zalom3ui.app.server
 import android.content.Context
 import android.os.Build
 import java.io.File
+import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -14,6 +15,7 @@ import java.util.Locale
  */
 object StartupLog {
     private const val MAX_BYTES = 64 * 1024
+    private const val SERVER_LOG_TAIL_BYTES = 24 * 1024
 
     fun file(context: Context): File = File(File(context.filesDir, "zalo").apply { mkdirs() }, "startup.log")
 
@@ -24,9 +26,24 @@ object StartupLog {
     fun write(context: Context, line: String) {
         runCatching {
             val f = file(context)
-            if (f.length() > MAX_BYTES) f.writeText(f.readText().takeLast(MAX_BYTES / 2))
-            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-            f.appendText("$time [${android.os.Process.myPid()}] $line\n")
+            RandomAccessFile(f, "rw").use { raf ->
+                raf.channel.lock().use {
+                    if (raf.length() > MAX_BYTES) {
+                        val keep = MAX_BYTES / 2
+                        raf.seek(raf.length() - keep)
+                        val tail = ByteArray(keep)
+                        raf.readFully(tail)
+                        val nl = tail.indexOf('\n'.code.toByte())
+                        val start = if (nl in 0 until tail.size - 1) nl + 1 else 0
+                        raf.seek(0)
+                        raf.write(tail, start, tail.size - start)
+                        raf.setLength((tail.size - start).toLong())
+                    }
+                    raf.seek(raf.length())
+                    val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+                    raf.write("$time [${android.os.Process.myPid()}] $line\n".toByteArray(Charsets.UTF_8))
+                }
+            }
         }
     }
 
@@ -42,9 +59,22 @@ object StartupLog {
         appendLine("Local port: ${LocalServer.port(context)}")
         appendLine()
         appendLine("== startup.log")
-        append(runCatching { file(context).readText() }.getOrDefault("(none)\n"))
+        append(runCatching { readTail(file(context), MAX_BYTES) }.getOrDefault("(none)\n"))
         appendLine()
         appendLine("== server.log (last part)")
-        append(runCatching { serverLog(context).readText().takeLast(24 * 1024) }.getOrDefault("(none)\n"))
+        append(runCatching { readTail(serverLog(context), SERVER_LOG_TAIL_BYTES) }.getOrDefault("(none)\n"))
+    }
+
+    private fun readTail(file: File, maxBytes: Int): String {
+        if (!file.isFile) return "(none)\n"
+        RandomAccessFile(file, "r").use { raf ->
+            val len = raf.length()
+            if (len == 0L) return "(none)\n"
+            val toRead = minOf(len, maxBytes.toLong()).toInt()
+            raf.seek(len - toRead)
+            val buf = ByteArray(toRead)
+            raf.readFully(buf)
+            return String(buf, Charsets.UTF_8)
+        }
     }
 }

@@ -129,6 +129,7 @@ const RESUME_RETRY_MAX_MS = 60_000;
 const SESSION_EXPIRED = "Your Zalo session has ended. Log in again with the QR code.";
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp"]);
 const STICKER_SEARCH_LIMIT = 30;
+const MAX_STICKERS_CACHE = 500;
 const MAX_GROUP_NAME = 100;
 /** A client says which chat it shows at least this often; after that the chat counts as closed again. */
 const VIEWING_TTL_MS = 90_000;
@@ -137,7 +138,7 @@ const NOTIFY_MAX_AGE_MS = 10 * 60_000;
 
 export class ZaloSession extends EventEmitter<SessionEvents> {
     private api: API | null = null;
-    private loginInFlight: Promise<void> | null = null;
+    private loginInFlight: { generation: number; promise: Promise<void> } | null = null;
     private abortQR: (() => unknown) | null = null;
     /** Bumped by logout and by a QR login that replaces a resume, so stale attempts drop their result. */
     private generation = 0;
@@ -239,7 +240,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         // Replace a resume that is waiting to retry: the user chose to scan a new code instead.
         if (this.resuming) {
             this.cancelResume();
-            await this.loginInFlight?.catch(() => {});
+            await this.loginInFlight?.promise.catch(() => {});
         }
         const generation = this.generation;
         return this.runLogin(async () => {
@@ -272,13 +273,23 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         this.activeCall?.finish("logout", true);
         this.cancelResume();
         this.abortQR?.();
+        this.abortQR = null;
         this.stopControlPoll();
         this.ctrlPollOff = false;
         this.api?.listener.stop();
         this.api = null;
         this.members.clear();
+        this.friendList.clear();
+        this.ringing.clear();
+        this.handledCallControls.clear();
+        this.viewing = null;
+        this.stickers.clear();
+        this.stickerLookups.clear();
+        this.callTrace.clear();
+        this.store.ownId = null;
         fs.rmSync(this.credentialsFile, { force: true });
         this.store.clear();
+        this.store.flush();
         this.setStatus({
             state: "logged_out",
             qrImage: null,
@@ -288,6 +299,17 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             error: null,
             retrying: false,
         });
+    }
+
+    /** Stops background activity (active call, poller, listener, timers) without deleting saved credentials or messages. */
+    shutdown(): void {
+        this.activeCall?.finish("shutdown", true);
+        this.cancelResume();
+        this.abortQR?.();
+        this.abortQR = null;
+        this.stopControlPoll();
+        this.api?.listener.stop();
+        this.api = null;
     }
 
     /** Reconnect the real-time listener, e.g. after Zalo Web was opened elsewhere and kicked us. */
@@ -535,7 +557,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
      * zca-js drops the realtime "voip" controls that signal calls. Reads them from the same socket: decoded with the
      * session's cipher key, recorded in the call log, and an incoming call is announced.
      */
-    private tapCallEvents(listener: unknown): void {
+    private tapCallEvents(listener: unknown, live: () => boolean = () => true): void {
         const l = listener as { ws?: { on?: (event: string, fn: (data: unknown) => void) => void } | null; cipherKey?: string };
         const ws = l.ws;
         if (!ws || typeof ws.on !== "function" || this.tappedSockets.has(ws)) return;
@@ -543,6 +565,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         // Proves the hook runs: a log with this line and no call events means Zalo sent none to this session.
         this.callTrace.record({ kind: "listening" });
         ws.on("message", (data: unknown) => {
+            if (!live()) return;
             if (!Buffer.isBuffer(data)) return;
             let info: FrameInfo | null;
             try {
@@ -562,7 +585,13 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     async declineCall(callId: string): Promise<void> {
         const api = this.requireApi();
         const call = this.ringing.get(callId);
-        if (!call) throw new HttpError(404, "That call isn't ringing any more");
+        if (!call || Date.now() - call.receivedAt > RINGING_MAX_AGE_MS) {
+            this.ringing.delete(callId);
+            throw new HttpError(404, "That call isn't ringing any more");
+        }
+        if (call.group) throw new HttpError(422, "Group calls can't be declined here");
+        // Claim before awaiting so answerCall cannot race declineCall.
+        this.ringing.delete(callId);
         const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
         const send = voiceCallSender(api);
         try {
@@ -578,7 +607,6 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.callTrace.record({ kind: "decline_failed", callId, error: describeError(err) });
             throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
         }
-        this.ringing.delete(callId);
         this.emit("call", { type: "ended", callId, act: "declined" });
     }
 
@@ -592,7 +620,11 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     async answerCall(callId: string, testSeconds?: number): Promise<CurrentCall> {
         const api = this.requireApi();
         const call = this.ringing.get(callId);
-        if (!call) throw new HttpError(404, "That call isn't ringing any more");
+        if (!call || Date.now() - call.receivedAt > RINGING_MAX_AGE_MS) {
+            this.ringing.delete(callId);
+            throw new HttpError(404, "That call isn't ringing any more");
+        }
+        if (call.group) throw new HttpError(422, "Group calls can't be answered here");
         if (this.activeCall) throw new HttpError(409, "Already in a call");
         const p = mediaParamsOf(call);
         const server = p && parseServer(p.server);
@@ -600,19 +632,56 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.callTrace.record({ kind: "answer_unavailable", callId, reason: "the request has no media server, ids or session" });
             throw new HttpError(422, "This call doesn't carry what's needed to answer it");
         }
+        // Claim before awaiting so declineCall or a second answerCall can't race this one.
+        this.ringing.delete(callId);
         const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
         const send = voiceCallSender(api);
         const callerName =
             this.friendList.get(call.callerId)?.name ?? this.store.getThread("user", call.callerId)?.name ?? call.displayName ?? "Someone";
         const current: CurrentCall = { callId, callerId: call.callerId, callerName, video: call.video, state: "connecting", connectedAt: null };
-        // Claimed before the first await, so a second answer can't race this one.
-        const active: ActiveCall = { info: current, media: null, finish: () => {}, camOn: false, peer: { cameraOn: true, muted: false }, peerHeard: new Set() };
+
+        let done = false;
+        let wantHangUp = false;
+        let accepted = false;
+        let timer: NodeJS.Timeout | undefined;
+        let started = Date.now();
+        const active: ActiveCall = {
+            info: current,
+            media: null,
+            finish: (reason: string, sendHangUp: boolean) => {
+                if (done) return;
+                done = true;
+                wantHangUp = sendHangUp;
+                clearTimeout(timer);
+                const media = active.media;
+                if (media) media.close(sendHangUp && accepted);
+                if (this.activeCall === active) this.activeCall = null;
+                this.callTrace.record({
+                    kind: "call_done",
+                    callId,
+                    reason,
+                    seconds: Math.round((Date.now() - started) / 1000),
+                    ...(media ? { stats: media.stats } : {}),
+                });
+                if (sendHangUp && accepted) {
+                    hangUp(send, call, imei).then(
+                        (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
+                        (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
+                    );
+                }
+                this.emit("call", { type: "ended", callId, act: reason });
+            },
+            camOn: false,
+            peer: { cameraOn: true, muted: false },
+            peerHeard: new Set(),
+        };
         this.activeCall = active;
         try {
             await ringRing(send, call, imei).then(
                 (answer) => this.callTrace.record({ kind: "ringring", callId, answer }),
                 (err) => this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) }),
             );
+            if (done) throw new HttpError(409, "Call ended while connecting");
             const media = new MediaCall({
                 server,
                 userId: p.userId,
@@ -625,9 +694,13 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                 onKeyFrameRequest: () => this.emit("call_key_frame"),
             });
             active.media = media;
-            const started = Date.now();
+            started = Date.now();
             const token = await media.join();
-            this.callTrace.record({ kind: "media_join", callId, server: p.server, token, address: media.natAddress, ms: Date.now() - started });
+            this.callTrace.record({ kind: "media_join", callId, server: p.server, joined: token !== null, ms: Date.now() - started });
+            if (done) {
+                media.close(false);
+                throw new HttpError(409, "Call ended while connecting");
+            }
             if (token === null) {
                 media.close(false);
                 throw new HttpError(502, "Zalo's media server didn't let us join the call");
@@ -640,7 +713,17 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                 this.callTrace.record({ kind: "answer_failed", callId, error: describeError(err) });
                 throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
             }
-            this.ringing.delete(callId);
+            if (done) {
+                media.close(wantHangUp);
+                if (wantHangUp) {
+                    hangUp(send, call, imei).then(
+                        (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
+                        (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
+                    );
+                }
+                throw new HttpError(409, "Call ended while connecting");
+            }
+            accepted = true;
             media.startSilence();
             active.camMic = (state) => {
                 camMicState(send, call, state).then(
@@ -648,30 +731,15 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                     (err) => this.callTrace.record({ kind: "cam_mic_failed", callId, ...state, error: describeError(err) }),
                 );
             };
-            // No camera yet: say so, or the other side of a video call waits for our picture.
-            if (call.video) active.camMic({ camOn: false });
+            // No camera yet (unless already turned on while connecting): say so, or the other side waits for our picture.
+            if (call.video) active.camMic({ camOn: active.camOn });
             current.state = "connected";
             current.connectedAt = Date.now();
-            let done = false;
-            active.finish = (reason: string, sendHangUp: boolean) => {
-                if (done) return;
-                done = true;
-                clearTimeout(timer);
-                media.close(sendHangUp);
-                if (this.activeCall === active) this.activeCall = null;
-                this.callTrace.record({ kind: "call_done", callId, reason, seconds: Math.round((Date.now() - started) / 1000), stats: media.stats });
-                if (sendHangUp) {
-                    hangUp(send, call, imei).then(
-                        (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
-                        (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
-                    );
-                }
-                this.emit("call", { type: "ended", callId, act: reason });
-            };
-            const timer = testSeconds === undefined ? undefined : setTimeout(() => active.finish("time_up", true), testSeconds * 1000);
+            timer = testSeconds === undefined ? undefined : setTimeout(() => active.finish("time_up", true), testSeconds * 1000);
             this.emit("call", { type: "connected", ...current, connectedAt: current.connectedAt });
             return { ...current };
         } catch (err) {
+            active.media?.close(false);
             if (this.activeCall === active) this.activeCall = null;
             throw err;
         }
@@ -824,7 +892,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         } else if (CALL_ENDING_ACTS.has(control.act)) {
             if (callId !== undefined) this.ringing.delete(String(callId));
             // The caller hung up (our own answer comes back as "answer" too: not an end).
-            if (this.activeCall && String(callId) === this.activeCall.info.callId && control.act !== "answer") {
+            if (this.activeCall && String(callId) === this.activeCall.info.callId) {
+                if (control.act === "answer") return;
                 this.activeCall.finish(control.act, false);
                 return;
             }
@@ -904,6 +973,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     // ---- Friends ----
 
     friends(): Person[] {
+        if (!this.api) return [];
         return [...this.friendList.values()].sort((a, b) => a.name.localeCompare(b.name));
     }
 
@@ -1018,7 +1088,12 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         // The same picture received stickers show, so a sent sticker looks like the one picked.
         const url = STICKER_IMAGE_URL + d.id;
         const info = { id: Number(d.id), catId: Number(d.cateId), type: Number(d.type), url };
+        if (this.stickers.has(info.id)) this.stickers.delete(info.id);
         this.stickers.set(info.id, info);
+        while (this.stickers.size > MAX_STICKERS_CACHE) {
+            const oldest = this.stickers.keys().next().value;
+            if (oldest !== undefined) this.stickers.delete(oldest);
+        }
         return info;
     }
 
@@ -1037,8 +1112,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return pending;
     }
 
-    private async loadFriends(api: API): Promise<void> {
+    private async loadFriends(api: API, generation = this.generation): Promise<void> {
         const friends = await api.getAllFriends();
+        if (generation !== this.generation || this.api !== api) return;
         this.friendList.clear();
         for (const f of friends) {
             const person = { id: String(f.userId), name: f.displayName || f.zaloName, avatar: f.avatar ?? "" };
@@ -1070,12 +1146,14 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     private runLogin(fn: () => Promise<void>): Promise<void> {
-        if (this.loginInFlight) return this.loginInFlight;
+        const generation = this.generation;
+        if (this.loginInFlight && this.loginInFlight.generation === generation) {
+            return this.loginInFlight.promise;
+        }
         if (this.status.state === "ready") return Promise.resolve();
 
-        const generation = this.generation;
         this.setStatus({ state: "logging_in", qrImage: null, scannedBy: null, error: null, retrying: false });
-        this.loginInFlight = fn()
+        const promise = fn()
             .catch((err: unknown) => {
                 if (generation !== this.generation) return;
                 this.stopControlPoll();
@@ -1083,10 +1161,13 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                 this.setStatus({ state: "logged_out", qrImage: null, scannedBy: null, error: describeError(err) });
             })
             .finally(() => {
-                this.loginInFlight = null;
-                this.abortQR = null;
+                if (generation === this.generation) {
+                    if (this.loginInFlight?.generation === generation) this.loginInFlight = null;
+                    this.abortQR = null;
+                }
             });
-        return this.loginInFlight;
+        this.loginInFlight = { generation, promise };
+        return promise;
     }
 
     /** Stops a resume that is in flight or waiting to retry; its result, if any, is dropped. */
@@ -1157,10 +1238,11 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         } catch {
             // Not essential.
         }
+        if (generation !== this.generation || this.api !== api) return;
 
         const { listener } = api;
         // Ignore stragglers from a session that was logged out.
-        const live = () => this.api === api;
+        const live = () => generation === this.generation && this.api === api;
         listener.on("message", (msg) => live() && this.ingest(msg));
         listener.on("old_messages", (msgs) => live() && msgs.forEach((m) => this.ingest(m)));
         listener.on("undo", (undo) => live() && this.onUndo(undo));
@@ -1172,11 +1254,12 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         listener.on("group_event", (e) => {
             if (!live() || !e.threadId) return;
             this.members.delete(e.threadId);
-            this.loadGroups(api, [e.threadId]).then(() => this.emit("threads"), () => {});
+            this.loadGroups(api, [e.threadId], generation).then(() => live() && this.emit("threads"), () => {});
         });
         listener.on("connected", () => {
-            this.tapCallEvents(listener);
-            if (live()) this.startControlPoll(api);
+            if (!live()) return;
+            this.tapCallEvents(listener, live);
+            this.startControlPoll(api);
             this.setStatus({ state: "ready", error: null });
             // Ask the server to replay messages and reactions we missed while offline.
             listener.requestOldMessages(ThreadType.User);
@@ -1203,7 +1286,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         this.setStatus({ state: "ready", ownId, ownName, qrImage: null, scannedBy: null, error: null });
         listener.start({ retryOnClose: true });
 
-        this.loadContacts(api).catch((err) => console.warn("Could not load contacts:", err));
+        this.loadContacts(api, generation).catch((err) => console.warn("Could not load contacts:", err));
     }
 
     private ingest(raw: Message): void {
@@ -1243,18 +1326,27 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private onSeen(s: SeenMessage): void {
         const ownId = this.status.ownId;
         if (s.type === ThreadType.Group) {
-            const seenBy = s.data.seenUids.map(String).filter((u) => u !== ownId);
+            const seenBy = (s.data.seenUids ?? []).map(String).filter((u) => u !== ownId);
             this.receipt("group", s.threadId, s.data.msgId, { seenBy });
             // Read on another device: keep our unread count in sync.
             if (s.isSelf) {
                 const msg = this.store.getMessage(String(s.data.msgId));
                 if (msg) {
                     this.store.markRead("group", s.threadId, msg.ts);
+                    this.emit("read", { threadKind: "group", threadId: String(s.threadId) });
                     this.emit("threads");
                 }
             }
         } else {
-            this.receipt("user", s.threadId, s.data.msgId, { seenBy: [s.threadId] });
+            // Read on another device in a 1:1 chat: keep our unread count in sync instead of applying a peer seen receipt.
+            if (Boolean((s as { isSelf?: unknown }).isSelf)) {
+                const msg = this.store.getMessage(String(s.data.msgId));
+                this.store.markRead("user", String(s.threadId), msg ? msg.ts : Date.now());
+                this.emit("read", { threadKind: "user", threadId: String(s.threadId) });
+                this.emit("threads");
+            } else {
+                this.receipt("user", s.threadId, s.data.msgId, { seenBy: [String(s.threadId)] });
+            }
         }
     }
 
@@ -1276,13 +1368,19 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         if (msg) this.emit("message_updated", this.store.toPublic(msg));
     }
 
-    private async loadContacts(api: API): Promise<void> {
-        await this.loadFriends(api);
-        await this.loadGroups(api, Object.keys((await api.getAllGroups()).gridVerMap));
+    private async loadContacts(api: API, generation = this.generation): Promise<void> {
+        const live = () => generation === this.generation && this.api === api;
+        await this.loadFriends(api, generation);
+        if (!live()) return;
+        const allGroups = await api.getAllGroups();
+        if (!live()) return;
+        await this.loadGroups(api, Object.keys(allGroups.gridVerMap), generation);
+        if (!live()) return;
 
         // Pinned and muted conversations are account settings shared with the phone app.
         try {
             const pins = await api.getPinConversations();
+            if (!live()) return;
             this.store.replacePinned(
                 pins.conversations.map((c) => threadKey(c.startsWith("g") ? "group" : "user", c.slice(1))),
             );
@@ -1291,6 +1389,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         }
         try {
             const mute = await api.getMute();
+            if (!live()) return;
             const entries: [string, number][] = [];
             for (const [kind, list] of [
                 ["user", mute.chatEntries],
@@ -1305,12 +1404,14 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         } catch (err) {
             console.warn("Could not load muted chats:", err);
         }
+        if (!live()) return;
         this.emit("threads");
     }
 
-    private async loadGroups(api: API, groupIds: string[]): Promise<void> {
+    private async loadGroups(api: API, groupIds: string[], generation = this.generation): Promise<void> {
         for (let i = 0; i < groupIds.length; i += GROUP_INFO_BATCH) {
             const info = await api.getGroupInfo(groupIds.slice(i, i + GROUP_INFO_BATCH));
+            if (generation !== this.generation || this.api !== api) return;
             for (const [id, g] of Object.entries(info.gridInfoMap)) {
                 this.store.upsertThread({ id, kind: "group", name: g.name, avatar: g.avt });
             }
@@ -1332,7 +1433,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
 
     private writeCredentials(credentials: Credentials): void {
         fs.mkdirSync(path.dirname(this.credentialsFile), { recursive: true, mode: 0o700 });
-        fs.writeFileSync(this.credentialsFile, JSON.stringify(credentials), { mode: 0o600 });
+        const tmp = `${this.credentialsFile}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(credentials), { mode: 0o600 });
+        fs.renameSync(tmp, this.credentialsFile);
     }
 }
 

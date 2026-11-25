@@ -8,6 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -35,7 +38,10 @@ import kotlinx.coroutines.launch
  * Runs in the ":node" process next to the server, so it works while the app is closed.
  */
 class MessageNotifier(private val context: Context) {
-    private val history = HashMap<String, ArrayDeque<Line>>()
+    private val history = object : LinkedHashMap<String, ArrayDeque<Line>>(MAX_THREADS, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArrayDeque<Line>>?): Boolean =
+            size > MAX_THREADS
+    }
 
     private data class Line(val sender: String, val text: String, val ts: Long)
 
@@ -201,7 +207,7 @@ class MessageNotifier(private val context: Context) {
     }
 
     private fun endCall(callId: String) {
-        val tags = if (callId.isEmpty()) ringing.toList() else listOf(CALL_TAG + callId).filter { it in ringing }.ifEmpty { ringing.toList() }
+        val tags = if (callId.isEmpty()) ringing.toList() else listOf(callTag(callId))
         for (tag in tags) {
             ringing -= tag
             NotificationManagerCompat.from(context).cancel(tag, CALL_NOTIFICATION_ID)
@@ -235,6 +241,7 @@ class MessageNotifier(private val context: Context) {
         /** Notifications are tagged with the chat key; this id is shared by all of them. */
         const val NOTIFICATION_ID = 100
         private const val MAX_LINES = 7
+        private const val MAX_THREADS = 50
         private const val RECONNECT_MS = 3_000L
 
         fun ensureChannel(context: Context) {
@@ -335,10 +342,16 @@ class NotificationActionReceiver : BroadcastReceiver() {
                 if (intent.action == ACTION_REPLY && !text.isNullOrEmpty()) api.send(ref.kind, ref.id, text)
                 // Replying reads the chat, as in the official app; the server's "read" event removes the notification.
                 api.markRead(ref.kind, ref.id)
-            } catch (_: Exception) {
-                // Leave the notification so nothing is lost; the reply can be typed in the app.
-            } finally {
                 NotificationManagerCompat.from(context).cancel(ref.key, MessageNotifier.NOTIFICATION_ID)
+            } catch (e: Exception) {
+                // Leave the notification so nothing is lost; the reply can be typed in the app.
+                StartupLog.write(context, "notification action ${intent.action} failed: ${e.message}")
+                if (intent.action == ACTION_REPLY) {
+                    Handler(Looper.getMainLooper()).post {
+                        runCatching { Toast.makeText(context.applicationContext, "Couldn't send reply", Toast.LENGTH_SHORT).show() }
+                    }
+                }
+            } finally {
                 pending.finish()
             }
         }

@@ -6,7 +6,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { WebSocketServer, type WebSocket } from "ws";
 import type { Config } from "./config.js";
 import { HttpError } from "./errors.js";
-import type { MuteOption, UploadFile, ZaloSession } from "./session.js";
+import type { CallEvent, MuteOption, UploadFile, ZaloSession } from "./session.js";
 import { REACTIONS, type MentionInfo, type ThreadKind } from "./store.js";
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
@@ -15,21 +15,64 @@ const MUTE_OPTIONS = new Set<MuteOption>(["1h", "4h", "8am", "forever"]);
 /** Zalo itself takes larger files; this is what a phone comfortably holds in memory while it uploads. */
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_FRIEND_MESSAGE = 150;
+const MAX_FORWARD_TARGETS = 20;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const STATIC_CSP =
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
 export function createServer(config: Config, session: ZaloSession): http.Server {
     const app = express();
     app.disable("x-powered-by");
-    app.use(express.json({ limit: "64kb" }));
+
+    app.use((req, res, next) => {
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader("X-Frame-Options", "DENY");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        if (req.path !== "/api" && !req.path.startsWith("/api/")) {
+            res.setHeader("Content-Security-Policy", STATIC_CSP);
+        }
+        if (!isValidHost(config, req.headers.host)) {
+            res.status(403).json({ error: "Forbidden" });
+            return;
+        }
+        next();
+    });
+
     app.use(express.static(PUBLIC_DIR));
 
     const api = express.Router();
     api.use((req, res, next) => {
+        const isMutation = req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS";
+        if (!isAllowedOrigin(req.headers, isMutation)) {
+            res.status(403).json({ error: "Forbidden" });
+            return;
+        }
         if (!isAuthorized(config, req.headers.authorization, req.query.token)) {
             res.status(401).json({ error: "Unauthorized" });
             return;
         }
         next();
     });
+
+    /**
+     * One photo or file as the raw request body; `name` is its file name (the extension decides photo or file),
+     * `width` / `height` the pixel size of a photo. Mounted before express.json() so .json uploads arrive as Buffers.
+     */
+    api.post(
+        "/threads/:kind/:id/attachments",
+        express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
+        wrap(async (req, res) => {
+            const kind = parseKind(req.params.kind);
+            const name = typeof req.query.name === "string" ? path.basename(req.query.name.trim()) : "";
+            if (!name || !name.includes(".")) throw new HttpError(400, "name must be a file name with an extension");
+            if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new HttpError(400, "The request body is the file");
+            const file: UploadFile = { data: req.body, filename: name, width: positiveInt(req.query.width), height: positiveInt(req.query.height) };
+            const msgIds = await session.sendAttachment(kind, req.params.id, file);
+            res.status(201).json({ msgIds });
+        }),
+    );
+
+    api.use(express.json({ limit: "64kb" }));
 
     api.get("/status", (_req, res) => {
         res.json(session.getStatus());
@@ -70,7 +113,11 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         const kind = parseKind(req.params.kind);
         const { id } = req.params;
         if (kind === "user") {
-            res.json({ lastOnline: await session.lastOnline(id).catch(() => null) });
+            const lastOnline = await session.lastOnline(id).catch((err) => {
+                if (err instanceof HttpError) throw err;
+                return null;
+            });
+            res.json({ lastOnline });
         } else {
             res.json({ members: await session.groupMembers(id) });
         }
@@ -111,10 +158,10 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
-    /** The chat a client shows (or `{}` for none). Clients repeat it while it stays open. */
+    /** The chat a client shows (or `{}` / `{ kind: null, id: null }` for none). Clients repeat it while it stays open. */
     api.put("/presence", (req, res) => {
         const { kind, id } = (req.body ?? {}) as { kind?: unknown; id?: unknown };
-        if (kind === undefined && id === undefined) {
+        if ((kind === undefined || kind === null) && (id === undefined || id === null)) {
             session.setViewing(null, null);
         } else {
             if (typeof id !== "string" || !id) throw new HttpError(400, "id is required");
@@ -128,8 +175,16 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
     api.get("/threads/:kind/:id/messages", wrap(async (req, res) => {
         const kind = parseKind(req.params.kind);
         const { id } = req.params;
-        const before = req.query.before !== undefined ? Number(req.query.before) : undefined;
-        const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+        let before: number | undefined;
+        if (req.query.before !== undefined) {
+            before = typeof req.query.before === "string" && req.query.before.trim() !== "" ? Number(req.query.before) : NaN;
+            if (!Number.isFinite(before)) throw new HttpError(400, "before must be a finite number");
+        }
+        let limit: number | undefined;
+        if (req.query.limit !== undefined) {
+            limit = positiveInt(req.query.limit);
+            if (limit === undefined) throw new HttpError(400, "limit must be a positive integer");
+        }
 
         // Groups have a history endpoint, so fill a thin cache from the server on first open.
         if (kind === "group" && before === undefined && session.store.getMessages(kind, id).length < 20) {
@@ -137,24 +192,6 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         }
         res.json({ thread: session.store.getThread(kind, id) ?? null, messages: session.store.getMessages(kind, id, { before, limit }) });
     }));
-
-    /**
-     * One photo or file as the raw request body; `name` is its file name (the extension decides photo or file),
-     * `width` / `height` the pixel size of a photo.
-     */
-    api.post(
-        "/threads/:kind/:id/attachments",
-        express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
-        wrap(async (req, res) => {
-            const kind = parseKind(req.params.kind);
-            const name = typeof req.query.name === "string" ? path.basename(req.query.name.trim()) : "";
-            if (!name || !name.includes(".")) throw new HttpError(400, "name must be a file name with an extension");
-            if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new HttpError(400, "The request body is the file");
-            const file: UploadFile = { data: req.body, filename: name, width: positiveInt(req.query.width), height: positiveInt(req.query.height) };
-            const msgIds = await session.sendAttachment(kind, req.params.id, file);
-            res.status(201).json({ msgIds });
-        }),
-    );
 
     api.get("/stickers", wrap(async (req, res) => {
         const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
@@ -174,7 +211,8 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
         if (!text) throw new HttpError(400, "text is required");
         if (text.length > MAX_TEXT_LENGTH) throw new HttpError(400, `text is longer than ${MAX_TEXT_LENGTH} characters`);
-        const quoteId = req.body?.quoteId === undefined ? undefined : String(req.body.quoteId);
+        const rawQuoteId = req.body?.quoteId;
+        const quoteId = rawQuoteId === undefined || rawQuoteId === null || rawQuoteId === "" ? undefined : String(rawQuoteId);
         const mentions = parseMentions(req.body?.mentions, text);
 
         const msgId = await session.sendText(kind, req.params.id, text, { quoteId, mentions });
@@ -201,11 +239,20 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
     api.post("/threads/:kind/:id/messages/:msgId/forward", wrap(async (req, res) => {
         const targets = req.body?.to;
         if (!Array.isArray(targets) || targets.length === 0) throw new HttpError(400, "to must be a non-empty array");
-        const parsed = targets.map((t: unknown) => {
+        const seen = new Set<string>();
+        const parsed: { kind: ThreadKind; id: string }[] = [];
+        for (const t of targets) {
             const { kind, id } = (t ?? {}) as { kind?: unknown; id?: unknown };
             if (typeof id !== "string" || !id) throw new HttpError(400, "each target needs an id");
-            return { kind: parseKind(String(kind)), id };
-        });
+            const k = parseKind(String(kind));
+            const key = `${k}:${id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            parsed.push({ kind: k, id });
+            if (parsed.length > MAX_FORWARD_TARGETS) {
+                throw new HttpError(400, `Cannot forward to more than ${MAX_FORWARD_TARGETS} chats at once`);
+            }
+        }
         await session.forward(parseKind(req.params.kind), req.params.id, req.params.msgId, parsed);
         res.status(204).end();
     }));
@@ -341,10 +388,21 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
 
     app.use("/api", api);
     app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-        const status = err instanceof HttpError ? err.status : 500;
-        const message = err instanceof Error ? err.message : String(err);
-        if (status === 500) console.error(err);
-        res.status(status).json({ error: message });
+        if (err instanceof HttpError) {
+            res.status(err.status).json({ error: err.message });
+            return;
+        }
+        const statusCode =
+            typeof err === "object" && err !== null
+                ? Number((err as { status?: unknown; statusCode?: unknown }).status ?? (err as { statusCode?: unknown }).statusCode)
+                : NaN;
+        if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500) {
+            const message = err instanceof Error && err.message ? err.message : "Bad request";
+            res.status(statusCode).json({ error: message });
+            return;
+        }
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
     });
 
     const server = http.createServer(app);
@@ -352,41 +410,79 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
     return server;
 }
 
+const WS_HEARTBEAT_MS = 30_000;
+const MAX_MEDIA_BUFFERED_BYTES = 2 * 1024 * 1024;
+
 /** Pushes session status, message changes, typing and thread-list changes to connected clients. */
 function attachWebSocket(server: http.Server, config: Config, session: ZaloSession): void {
-    const wss = new WebSocketServer({ noServer: true });
+    const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
     /** The call's audio, both ways, as binary messages (docs/call-audio.md §3). */
-    const audioWss = new WebSocketServer({ noServer: true });
+    const audioWss = new WebSocketServer({ noServer: true, maxPayload: MAX_VIDEO_FRAME + 1024 });
+    const alive = new WeakSet<WebSocket>();
 
     server.on("upgrade", (req, socket, head) => {
-        const url = new URL(req.url ?? "/", "http://localhost");
-        const target = url.pathname === "/ws" ? wss : url.pathname === "/ws/call-audio" ? audioWss : null;
-        if (!target || !isAuthorized(config, req.headers.authorization, url.searchParams.get("token"))) {
+        socket.on("error", () => {});
+        let url: URL;
+        try {
+            url = new URL(req.url ?? "/", "http://localhost");
+        } catch {
+            socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+            socket.destroy();
+            return;
+        }
+        if (!isValidHost(config, req.headers.host) || !isAllowedOrigin(req.headers, true)) {
+            socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+            socket.destroy();
+            return;
+        }
+        if (!isAuthorized(config, req.headers.authorization, url.searchParams.get("token"))) {
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+            socket.destroy();
+            return;
+        }
+        const target = url.pathname === "/ws" ? wss : url.pathname === "/ws/call-audio" ? audioWss : null;
+        if (!target) {
+            socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
             socket.destroy();
             return;
         }
         target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
     });
 
-    session.on("call_audio", ({ seq, timestamp, opus }) => {
-        if (audioWss.clients.size === 0) return;
-        const frame = encodeAudioToApp(seq, timestamp, opus);
-        for (const client of audioWss.clients) if (client.readyState === client.OPEN) client.send(frame);
-    });
-    session.on("call", (call) => {
-        if (call.type === "ended") for (const client of audioWss.clients) client.close(1000, "call ended");
-    });
     const sendToApp = (frame: Buffer) => {
         if (audioWss.clients.size === 0) return;
-        for (const client of audioWss.clients) if (client.readyState === client.OPEN) client.send(frame);
+        for (const client of audioWss.clients) {
+            if (client.readyState === client.OPEN && client.bufferedAmount <= MAX_MEDIA_BUFFERED_BYTES) {
+                client.send(frame, () => {});
+            }
+        }
     };
-    session.on("call_video", ({ key, timestamp, data }) => sendToApp(encodeVideoToApp(key, timestamp, data)));
-    session.on("call_key_frame", () => sendToApp(KEY_FRAME_REQUEST));
+
+    const onCallAudio = ({ seq, timestamp, opus }: { seq: number; timestamp: number; opus: Buffer }) => {
+        if (audioWss.clients.size === 0) return;
+        sendToApp(encodeAudioToApp(seq, timestamp, opus));
+    };
+    const onCallAudioClose = (call: CallEvent) => {
+        if (call.type === "ended" && !session.currentCall()) {
+            for (const client of audioWss.clients) client.close(1000, "call ended");
+        }
+    };
+    const onCallVideo = ({ key, timestamp, data }: { key: boolean; timestamp: number; data: Buffer }) =>
+        sendToApp(encodeVideoToApp(key, timestamp, data));
+    const onCallKeyFrame = () => sendToApp(KEY_FRAME_REQUEST);
+
     audioWss.on("connection", (ws: WebSocket) => {
+        ws.on("error", () => {});
+        alive.add(ws);
+        ws.on("pong", () => alive.add(ws));
         if (!session.currentCall()) {
             ws.close(1008, "no call in progress");
             return;
+        }
+        for (const existing of audioWss.clients) {
+            if (existing !== ws && (existing.readyState === existing.OPEN || existing.readyState === existing.CONNECTING)) {
+                existing.close(1000, "replaced");
+            }
         }
         ws.on("message", (data: Buffer, isBinary: boolean) => {
             if (!isBinary) return;
@@ -404,13 +500,13 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     const broadcast = (payload: unknown) => {
         const data = JSON.stringify(payload);
         for (const client of wss.clients) {
-            if (client.readyState === client.OPEN) client.send(data);
+            if (client.readyState === client.OPEN) client.send(data, () => {});
         }
     };
 
-    session.on("status", (status) => broadcast({ type: "status", status }));
+    const onStatus = (status: ReturnType<ZaloSession["getStatus"]>) => broadcast({ type: "status", status });
     // `notify`: whether a phone should show it (not mine, not muted, not the chat that is open, not old history).
-    session.on("message", (message) => {
+    const onMessage = (message: Parameters<ZaloSession["shouldNotify"]>[0]) => {
         const notify = session.shouldNotify(message);
         broadcast({
             type: "message",
@@ -418,16 +514,71 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
             notify,
             ...(notify ? { threadName: session.threadName(message.threadKind, message.threadId) } : {}),
         });
-    });
-    session.on("read", (read) => broadcast({ type: "read", ...read }));
-    session.on("call", (call) => broadcast({ type: "call", call }));
-    session.on("message_updated", (message) => broadcast({ type: "message_updated", message }));
-    session.on("message_deleted", (deleted) => broadcast({ type: "message_deleted", ...deleted }));
-    session.on("typing", (typing) => broadcast({ type: "typing", ...typing }));
-    session.on("threads", () => broadcast({ type: "threads" }));
+    };
+    const onRead = (read: { threadKind: ThreadKind; threadId: string }) => broadcast({ type: "read", ...read });
+    const onCallBroadcast = (call: CallEvent) => broadcast({ type: "call", call });
+    const onMessageUpdated = (message: Parameters<ZaloSession["shouldNotify"]>[0]) => broadcast({ type: "message_updated", message });
+    const onMessageDeleted = (deleted: { threadKind: ThreadKind; threadId: string; id: string }) =>
+        broadcast({ type: "message_deleted", ...deleted });
+    const onTyping = (typing: { threadKind: ThreadKind; threadId: string; uid: string; name: string }) =>
+        broadcast({ type: "typing", ...typing });
+    const onThreads = () => broadcast({ type: "threads" });
+
+    session.on("call_audio", onCallAudio);
+    session.on("call", onCallAudioClose);
+    session.on("call_video", onCallVideo);
+    session.on("call_key_frame", onCallKeyFrame);
+    session.on("status", onStatus);
+    session.on("message", onMessage);
+    session.on("read", onRead);
+    session.on("call", onCallBroadcast);
+    session.on("message_updated", onMessageUpdated);
+    session.on("message_deleted", onMessageDeleted);
+    session.on("typing", onTyping);
+    session.on("threads", onThreads);
 
     wss.on("connection", (ws: WebSocket) => {
-        ws.send(JSON.stringify({ type: "status", status: session.getStatus() }));
+        ws.on("error", () => {});
+        alive.add(ws);
+        ws.on("pong", () => alive.add(ws));
+        ws.send(JSON.stringify({ type: "status", status: session.getStatus() }), () => {});
+    });
+
+    const heartbeat = setInterval(() => {
+        for (const wsServer of [wss, audioWss]) {
+            for (const client of wsServer.clients) {
+                if (client.readyState !== client.OPEN) continue;
+                if (!alive.has(client)) {
+                    client.terminate();
+                    continue;
+                }
+                alive.delete(client);
+                try {
+                    client.ping();
+                } catch {
+                    client.terminate();
+                }
+            }
+        }
+    }, WS_HEARTBEAT_MS);
+    heartbeat.unref();
+
+    server.on("close", () => {
+        clearInterval(heartbeat);
+        session.off("call_audio", onCallAudio);
+        session.off("call", onCallAudioClose);
+        session.off("call_video", onCallVideo);
+        session.off("call_key_frame", onCallKeyFrame);
+        session.off("status", onStatus);
+        session.off("message", onMessage);
+        session.off("read", onRead);
+        session.off("call", onCallBroadcast);
+        session.off("message_updated", onMessageUpdated);
+        session.off("message_deleted", onMessageDeleted);
+        session.off("typing", onTyping);
+        session.off("threads", onThreads);
+        wss.close();
+        audioWss.close();
     });
 }
 
@@ -478,6 +629,43 @@ function wrap(handler: (req: Request, res: Response) => Promise<void>) {
     };
 }
 
+function isValidHost(config: Config, hostHeader: string | undefined): boolean {
+    if (!LOOPBACK_HOSTS.has(config.host)) return true;
+    if (!hostHeader || /[\s/@\\]/.test(hostHeader)) return false;
+    try {
+        const u = new URL(`http://${hostHeader}`);
+        return LOOPBACK_HOSTS.has(u.hostname.toLowerCase());
+    } catch {
+        return false;
+    }
+}
+
+function originMatchesHost(origin: string, hostHeader: string | undefined): boolean {
+    if (!hostHeader || /[\s/@\\]/.test(hostHeader)) return false;
+    try {
+        const originUrl = new URL(origin);
+        if (originUrl.protocol !== "http:" && originUrl.protocol !== "https:") return false;
+        const hostUrl = new URL(`${originUrl.protocol}//${hostHeader}`);
+        return originUrl.host.toLowerCase() === hostUrl.host.toLowerCase();
+    } catch {
+        return false;
+    }
+}
+
+function isAllowedOrigin(headers: http.IncomingHttpHeaders, isMutationOrWs: boolean): boolean {
+    const rawSecFetchSite = headers["sec-fetch-site"];
+    const secFetchSite = typeof rawSecFetchSite === "string" ? rawSecFetchSite.trim().toLowerCase() : "";
+    const rawOrigin = headers.origin;
+    const origin = typeof rawOrigin === "string" ? rawOrigin.trim() : undefined;
+
+    if (secFetchSite === "cross-site") return false;
+    if (origin !== undefined && !originMatchesHost(origin, headers.host)) return false;
+    if (isMutationOrWs && secFetchSite === "same-site" && (!origin || !originMatchesHost(origin, headers.host))) {
+        return false;
+    }
+    return true;
+}
+
 function isAuthorized(config: Config, header: string | undefined, queryToken: unknown): boolean {
     if (!config.accessToken) return true;
     const presented = header?.startsWith("Bearer ") ? header.slice(7) : typeof queryToken === "string" ? queryToken : "";
@@ -487,7 +675,7 @@ function isAuthorized(config: Config, header: string | undefined, queryToken: un
 }
 
 function positiveInt(value: unknown): number | undefined {
-    const n = typeof value === "string" ? Number(value) : NaN;
+    const n = typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
     return Number.isInteger(n) && n > 0 ? n : undefined;
 }
 
@@ -508,7 +696,7 @@ export function parseMentions(input: unknown, text: string): MentionInfo[] | und
     if (!Array.isArray(input)) throw new HttpError(400, "mentions must be an array");
     return input.map((m: unknown) => {
         const { uid, pos, len } = (m ?? {}) as Record<string, unknown>;
-        if (typeof uid !== "string" || !Number.isInteger(pos) || !Number.isInteger(len)) {
+        if (typeof uid !== "string" || uid.length === 0 || !Number.isInteger(pos) || !Number.isInteger(len)) {
             throw new HttpError(400, "each mention needs uid, pos and len");
         }
         const p = pos as number;

@@ -1,7 +1,11 @@
 package com.zalom3ui.app.data
 
 import android.content.Context
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.security.SecureRandom
+import java.util.Properties
 
 data class ServerSettings(
     /** Run the Zalo server inside this app instead of connecting to one elsewhere. */
@@ -29,6 +33,7 @@ data class Appearance(
 /** Server settings, kept in app-private storage shared by the UI and the on-phone server process. */
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val appFilesDir: File = (context.applicationContext ?: context).filesDir
 
     fun load(): ServerSettings {
         val serverUrl = prefs.getString(KEY_URL, "").orEmpty()
@@ -64,30 +69,69 @@ class SettingsStore(context: Context) {
      * Secret shared between the UI and the on-phone server, so other apps on the phone can't use
      * the server's localhost port. Created on first use.
      */
-    fun localToken(): String {
-        prefs.getString(KEY_LOCAL_TOKEN, null)?.let { return it }
-        val bytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
-        val token = bytes.joinToString("") { "%02x".format(it) }
-        // commit, not apply: the server process reads this from disk right after.
-        prefs.edit().putString(KEY_LOCAL_TOKEN, token).commit()
-        return token
-    }
+    fun localToken(): String = readOrInitLocalConfig().token
 
     /**
      * Loopback port of this install's on-phone server, picked at random once. A fixed port would clash with another app
      * that runs the same server (Zalo Lite uses 38123): the UI would then talk to that app's server, which refuses our
      * token, and ours could not start.
      */
-    fun localPort(): Int {
-        prefs.getInt(KEY_LOCAL_PORT, 0).takeIf { it in LOCAL_PORT_RANGE }?.let { return it }
-        val port = LOCAL_PORT_RANGE.first + SecureRandom().nextInt(LOCAL_PORT_RANGE.last - LOCAL_PORT_RANGE.first + 1)
-        // commit, not apply: the server process reads this from disk right after.
-        prefs.edit().putInt(KEY_LOCAL_PORT, port).commit()
-        return port
+    fun localPort(): Int = readOrInitLocalConfig().port
+
+    private data class LocalConfig(val token: String, val port: Int)
+
+    /**
+     * Stores [KEY_LOCAL_TOKEN] and [KEY_LOCAL_PORT] in a private properties file coordinated by both an
+     * intra-process lock and an inter-process [java.nio.channels.FileChannel.lock], avoiding cross-process
+     * SharedPreferences races between the UI and `:node` processes.
+     */
+    private fun readOrInitLocalConfig(): LocalConfig = synchronized(localConfigLock) {
+        appFilesDir.mkdirs()
+        val lockFile = File(appFilesDir, LOCAL_LOCK_FILE)
+        val propsFile = File(appFilesDir, LOCAL_PROPS_FILE)
+        RandomAccessFile(lockFile, "rw").use { raf ->
+            raf.channel.lock().use {
+                val props = Properties()
+                if (propsFile.isFile) {
+                    runCatching { propsFile.inputStream().use { props.load(it) } }
+                }
+                var token = props.getProperty(KEY_LOCAL_TOKEN)?.takeIf { it.isNotBlank() }
+                var port = props.getProperty(KEY_LOCAL_PORT)?.toIntOrNull()?.takeIf { it in LOCAL_PORT_RANGE }
+                var dirty = false
+                if (token == null) {
+                    token = prefs.getString(KEY_LOCAL_TOKEN, null)?.takeIf { it.isNotBlank() }
+                        ?: ByteArray(24).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
+                    props.setProperty(KEY_LOCAL_TOKEN, token)
+                    dirty = true
+                }
+                if (port == null) {
+                    port = prefs.getInt(KEY_LOCAL_PORT, 0).takeIf { it in LOCAL_PORT_RANGE }
+                        ?: (LOCAL_PORT_RANGE.first + SecureRandom().nextInt(LOCAL_PORT_RANGE.last - LOCAL_PORT_RANGE.first + 1))
+                    props.setProperty(KEY_LOCAL_PORT, port.toString())
+                    dirty = true
+                }
+                if (dirty || !propsFile.isFile) {
+                    val tmp = File(appFilesDir, "$LOCAL_PROPS_FILE.tmp")
+                    FileOutputStream(tmp).use { out ->
+                        props.store(out, null)
+                        out.flush()
+                        runCatching { out.fd.sync() }
+                    }
+                    if (!tmp.renameTo(propsFile)) {
+                        tmp.copyTo(propsFile, overwrite = true)
+                        tmp.delete()
+                    }
+                }
+                LocalConfig(token, port)
+            }
+        }
     }
 
     private companion object {
+        val localConfigLock = Any()
         val LOCAL_PORT_RANGE = 40000..59999
+        const val LOCAL_PROPS_FILE = "local-server.properties"
+        const val LOCAL_LOCK_FILE = "local-server.lock"
         const val KEY_LOCAL_PORT = "local_port"
         const val KEY_ON_DEVICE = "on_device"
         const val KEY_URL = "server_url"

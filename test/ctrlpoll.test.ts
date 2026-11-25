@@ -163,3 +163,126 @@ test("an answer that only repeats controls already handed over hands over nothin
     assert.equal(events[1].repeated, 1);
     assert.ok(slept.includes(30_000), "waits before polling again");
 });
+
+test("serverList requires HTTPS and rejects plain HTTP", () => {
+    assert.deepEqual(serverList(["http://insecure.example", "https://secure.example"]), ["https://secure.example"]);
+    assert.deepEqual(serverList("http://insecure.example"), []);
+});
+
+test("readPollAnswer rejects null, array, and primitive decrypted data", () => {
+    for (const payload of ["null", "[1,2,3]", "42", '"hello"', "true", '{"data":null}', '{"data":[1,2]}']) {
+        const res = readPollAnswer(JSON.stringify({ error_code: 0, data: sealCbc(payload) }), KEY);
+        assert.equal(res.kind, "error", `expected error for ${payload}`);
+    }
+    assert.equal(readPollAnswer("null", KEY).kind, "error");
+    assert.equal(readPollAnswer("[1,2]", KEY).kind, "error");
+});
+
+test("controlsIn preserves controlId and actionId on top-level controls for deduplication", async () => {
+    const topLevel = { act_type: "voip", act: "request", controlId: "cid-9", actionId: "aid-9", data: "{}" };
+    const found = controlsIn({ list: [topLevel] });
+    assert.equal(found.length, 1);
+    assert.equal(found[0].controlId, "cid-9");
+    assert.equal(found[0].actionId, "aid-9");
+
+    const body = { status: 200, body: JSON.stringify({ error_code: 0, data: sealCbc(JSON.stringify({ data: { list: [topLevel] } })) }) };
+    const got: unknown[] = [];
+    const events: Record<string, unknown>[] = [];
+    const answers = [body, body];
+    const p = new ControlPoller({
+        servers: ["https://ctrl.example"],
+        secretKey: KEY,
+        apiVersion: 1,
+        apiType: 1,
+        holdSeconds: 30,
+        get: async () => answers.shift()!,
+        onControls: (c) => got.push(...c),
+        onEvent: (e) => events.push(e),
+        sleep: async () => {},
+    });
+    await p.pollOnce();
+    await p.pollOnce();
+    assert.equal(got.length, 1, "top-level control deduplicated across polls");
+    assert.equal(events[1].repeated, 1);
+});
+
+test("stop() cancels active sleep timers and prevents stale in-flight polls from firing after stop/start", async () => {
+    let resolveFirst!: (v: { status: number; body: string }) => void;
+    let calls = 0;
+    const got: unknown[] = [];
+    const events: Record<string, unknown>[] = [];
+    const body = (callId: number) =>
+        JSON.stringify({
+            error_code: 0,
+            data: sealCbc(JSON.stringify({ data: { controls: [{ content: { act_type: "voip", act: "request", data: JSON.stringify({ callId }) } }] } })),
+        });
+
+    const p = new ControlPoller({
+        servers: ["https://ctrl.example"],
+        secretKey: KEY,
+        apiVersion: 1,
+        apiType: 1,
+        holdSeconds: 30,
+        get: async () => {
+            calls++;
+            if (calls === 1) {
+                return await new Promise<{ status: number; body: string }>((r) => {
+                    resolveFirst = r;
+                });
+            }
+            if (calls === 2) return { status: 200, body: body(2) };
+            // Trigger refusal to stop the second run cleanly.
+            return { status: 200, body: '{"error_code":-69}' };
+        },
+        onControls: (c) => got.push(...c),
+        onEvent: (e) => events.push(e),
+    });
+
+    p.start();
+    // Wait a tick for the first poll to be in-flight.
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(calls, 1);
+    p.stop();
+    p.start();
+    // Resolve the stale first poll after restart: it must be ignored completely.
+    resolveFirst({ status: 200, body: body(1) });
+    await new Promise((r) => setTimeout(r, 30));
+    // Stop while the second run is sleeping in MIN_GAP_MS so no timer lingers.
+    p.stop();
+    assert.equal(got.length, 1, "only the restarted run delivered controls");
+    assert.match(String((got[0] as { content: { data: string } }).content.data), /"callId":2/);
+});
+
+test("errors thrown by onControls or onEvent never cause unhandled rejections", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+        const answers = [
+            { status: 200, body: JSON.stringify({ error_code: 0, data: sealCbc(JSON.stringify({ data: { controls: [voipRequest] } })) }) },
+            { status: 200, body: '{"error_code":-69}' },
+        ];
+        const p = new ControlPoller({
+            servers: ["https://ctrl.example"],
+            secretKey: KEY,
+            apiVersion: 1,
+            apiType: 1,
+            holdSeconds: 30,
+            get: async () => answers.shift() ?? { status: 200, body: '{"error_code":-69}' },
+            onControls: () => {
+                throw new Error("boom controls");
+            },
+            onEvent: () => {
+                throw new Error("boom event");
+            },
+            sleep: async () => {},
+        });
+        p.start();
+        await new Promise((r) => setTimeout(r, 30));
+        p.stop();
+        assert.deepEqual(unhandled, []);
+    } finally {
+        process.off("unhandledRejection", onUnhandled);
+    }
+});
+

@@ -2,8 +2,10 @@ package com.zalom3ui.app.call
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CallAudioLinkTest {
@@ -39,12 +41,44 @@ class CallAudioLinkTest {
     }
 
     @Test
-    fun urlUsesWsSchemeAndToken() {
-        assertEquals(
-            "ws://127.0.0.1:41234/ws/call-audio?token=a%2Bb",
-            CallAudioLink.buildUrl("http://127.0.0.1:41234/", "a+b"),
-        )
-        assertEquals("ws://127.0.0.1:1/ws/call-audio", CallAudioLink.buildUrl("http://127.0.0.1:1", null))
+    fun oversizedAudioPayloadIsRejected() {
+        val maxOk = ByteArray(7 + CallAudioLink.MAX_AUDIO_PAYLOAD).apply { this[0] = 1 }
+        val decoded = CallAudioLink.decodeIncoming(maxOk)
+        assertNotNull(decoded)
+        assertEquals(CallAudioLink.MAX_AUDIO_PAYLOAD, decoded!!.opus.size)
+
+        val tooLarge = ByteArray(7 + CallAudioLink.MAX_AUDIO_PAYLOAD + 1).apply { this[0] = 1 }
+        assertNull(CallAudioLink.decodeIncoming(tooLarge))
+    }
+
+    @Test
+    fun requestUsesWsUrlAndBearerAuthorizationHeader() {
+        assertEquals("ws://127.0.0.1:41234/ws/call-audio", CallAudioLink.buildUrl("http://127.0.0.1:41234/"))
+        assertEquals("wss://127.0.0.1:41234/ws/call-audio", CallAudioLink.buildUrl("https://127.0.0.1:41234/"))
+
+        val req = CallAudioLink.buildRequest("http://127.0.0.1:41234/", "a+b")
+        assertEquals("Bearer a+b", req.header("Authorization"))
+        assertEquals("/ws/call-audio", req.url.encodedPath)
+        assertNull(req.url.queryParameter("token"))
+        assertFalse(req.url.toString().contains("a+b"))
+
+        val noToken = CallAudioLink.buildRequest("http://127.0.0.1:1", null)
+        assertNull(noToken.header("Authorization"))
+        assertNull(noToken.url.queryParameter("token"))
+
+        val emptyToken = CallAudioLink.buildRequest("http://127.0.0.1:1", "")
+        assertNull(emptyToken.header("Authorization"))
+        assertNull(emptyToken.url.queryParameter("token"))
+    }
+
+    @Test
+    fun videoBacklogCapsDeltaAndKeyFramesSeparately() {
+        assertTrue(CallAudioLink.shouldSendVideo(key = false, queueSize = CallAudioLink.MAX_VIDEO_BACKLOG))
+        assertFalse(CallAudioLink.shouldSendVideo(key = false, queueSize = CallAudioLink.MAX_VIDEO_BACKLOG + 1))
+
+        assertTrue(CallAudioLink.shouldSendVideo(key = true, queueSize = CallAudioLink.MAX_VIDEO_BACKLOG + 1))
+        assertTrue(CallAudioLink.shouldSendVideo(key = true, queueSize = CallAudioLink.MAX_KEYFRAME_BACKLOG))
+        assertFalse(CallAudioLink.shouldSendVideo(key = true, queueSize = CallAudioLink.MAX_KEYFRAME_BACKLOG + 1))
     }
 
     @Test

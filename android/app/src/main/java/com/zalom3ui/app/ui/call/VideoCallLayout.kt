@@ -35,6 +35,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -177,19 +178,30 @@ private fun SelfView(onSurface: (Surface?) -> Unit) {
 @Composable
 private fun VideoSurface(modifier: Modifier, overlay: Boolean, onSurface: (Surface?) -> Unit) {
     val current by rememberUpdatedState(onSurface)
+    var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
+    val callback = remember {
+        object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) = current(holder.surface)
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) = current(null)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            surfaceView?.holder?.removeCallback(callback)
+            current(null)
+        }
+    }
     AndroidView(
         modifier = modifier,
         factory = { context ->
             SurfaceView(context).apply {
                 // Above the other side's picture, which is a SurfaceView too.
                 if (overlay) setZOrderMediaOverlay(true)
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) = current(holder.surface)
-
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-
-                    override fun surfaceDestroyed(holder: SurfaceHolder) = current(null)
-                })
+                holder.addCallback(callback)
+                surfaceView = this
             }
         },
     )

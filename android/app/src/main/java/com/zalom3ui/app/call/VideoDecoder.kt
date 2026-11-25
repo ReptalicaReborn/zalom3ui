@@ -22,7 +22,9 @@ class VideoDecoder(
     private val lock = Object()
     private val queue = ArrayDeque<Frame>()
     private var surface: Surface? = null
-    private var surfaceChanged = false
+    private var surfaceGen = 0L
+    private var handledGen = 0L
+    private var releasedGen = 0L
     private var waitingForKey = true
     private var running = true
     private var lastAsk = 0L
@@ -32,31 +34,34 @@ class VideoDecoder(
     private var timeBase = 0L
     private var lastTs = -1L
 
-    @Volatile private var codecReleased = true
-
     private val worker = Thread({ run() }, "video-decoder").apply { isDaemon = true; start() }
 
     /** Queues one access unit; called from the socket's thread. Never blocks. */
     fun submit(key: Boolean, timestamp: Long, accessUnit: ByteArray) {
+        var ask = false
         synchronized(lock) {
             if (!running || surface == null) return
             if (waitingForKey && !key) {
-                askForKeyFrame()
-                return
-            }
-            if (key) waitingForKey = false
-            if (queue.size >= MAX_QUEUE) {
-                // Behind: throw the backlog away. Delta frames can't be used without it, so wait for the next key frame.
-                queue.clear()
-                if (!key) {
-                    waitingForKey = true
-                    askForKeyFrame()
-                    return
+                ask = shouldAskForKeyFrameLocked()
+            } else {
+                if (key) waitingForKey = false
+                if (queue.size >= MAX_QUEUE) {
+                    // Behind: throw the backlog away. Delta frames can't be used without it, so wait for the next key frame.
+                    queue.clear()
+                    if (!key) {
+                        waitingForKey = true
+                        ask = shouldAskForKeyFrameLocked()
+                    } else {
+                        queue.addLast(Frame(key, timestamp, accessUnit))
+                        lock.notifyAll()
+                    }
+                } else {
+                    queue.addLast(Frame(key, timestamp, accessUnit))
+                    lock.notifyAll()
                 }
             }
-            queue.addLast(Frame(key, timestamp, accessUnit))
-            lock.notifyAll()
         }
+        if (ask) requestKeyFrame()
     }
 
     /**
@@ -64,24 +69,30 @@ class VideoDecoder(
      * decoder let go of the old surface, so the caller may destroy it.
      */
     fun setSurface(s: Surface?) {
+        var ask = false
         synchronized(lock) {
             surface = s
-            surfaceChanged = true
+            val gen = ++surfaceGen
             queue.clear()
             waitingForKey = true
-            codecReleased = false
             lock.notifyAll()
             if (s == null) {
                 val end = SystemClock.elapsedRealtime() + RELEASE_WAIT_MS
-                while (!codecReleased && running) {
+                while (releasedGen < gen && running) {
                     val left = end - SystemClock.elapsedRealtime()
                     if (left <= 0) break
-                    lock.wait(left)
+                    try {
+                        lock.wait(left)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
                 }
             } else {
-                askForKeyFrame(force = true)
+                ask = shouldAskForKeyFrameLocked(force = true)
             }
         }
+        if (ask) requestKeyFrame()
     }
 
     fun release() {
@@ -89,14 +100,19 @@ class VideoDecoder(
             running = false
             lock.notifyAll()
         }
-        runCatching { worker.join(RELEASE_WAIT_MS) }
+        try {
+            worker.join(RELEASE_WAIT_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
-    private fun askForKeyFrame(force: Boolean = false) {
+    // Caller must hold lock.
+    private fun shouldAskForKeyFrameLocked(force: Boolean = false): Boolean {
         val now = SystemClock.elapsedRealtime()
-        if (!force && now - lastAsk < KEY_FRAME_RETRY_MS) return
+        if (!force && now - lastAsk < KEY_FRAME_RETRY_MS) return false
         lastAsk = now
-        requestKeyFrame()
+        return true
     }
 
     private fun run() {
@@ -104,22 +120,34 @@ class VideoDecoder(
             while (true) {
                 var frame: Frame? = null
                 var newSurface: Surface? = null
-                var swap = false
+                var swapGen = -1L
+                var interrupted = false
                 synchronized(lock) {
                     if (!running) return@synchronized
-                    if (!surfaceChanged && queue.isEmpty()) lock.wait(IDLE_WAIT_MS)
-                    if (surfaceChanged) {
-                        surfaceChanged = false
-                        newSurface = surface
-                        swap = true
+                    if (surfaceGen == handledGen && queue.isEmpty()) {
+                        try {
+                            if (codec == null) lock.wait() else lock.wait(IDLE_WAIT_MS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            interrupted = true
+                            return@synchronized
+                        }
                     }
-                    frame = queue.removeFirstOrNull()
+                    if (!running) return@synchronized
+                    if (surfaceGen != handledGen) {
+                        swapGen = surfaceGen
+                        newSurface = surface
+                    }
+                    if (swapGen < 0 || newSurface != null) {
+                        frame = queue.removeFirstOrNull()
+                    }
                 }
-                if (!running) break
-                if (swap) {
+                if (!running || interrupted) break
+                if (swapGen >= 0) {
                     releaseCodec()
                     synchronized(lock) {
-                        codecReleased = true
+                        handledGen = swapGen
+                        releasedGen = swapGen
                         lock.notifyAll()
                     }
                     if (newSurface == null) continue
@@ -130,7 +158,8 @@ class VideoDecoder(
         } finally {
             releaseCodec()
             synchronized(lock) {
-                codecReleased = true
+                handledGen = surfaceGen
+                releasedGen = surfaceGen
                 lock.notifyAll()
             }
         }
@@ -140,11 +169,27 @@ class VideoDecoder(
         var c = codec
         if (c == null) {
             if (!f.key) return
-            val s = synchronized(lock) { surface } ?: return
+            val targetSurface: Surface
+            val targetGen: Long
+            synchronized(lock) {
+                if (!running || surfaceGen != handledGen) return
+                val s = surface ?: return
+                targetSurface = s
+                targetGen = surfaceGen
+            }
+            if (!targetSurface.isValid) return
             c = try {
-                open(s)
+                open(targetSurface)
             } catch (_: Exception) {
                 failed()
+                return
+            }
+            val stillValid = synchronized(lock) {
+                running && surface === targetSurface && surfaceGen == targetGen
+            }
+            if (!stillValid || !targetSurface.isValid) {
+                runCatching { c.stop() }
+                runCatching { c.release() }
                 return
             }
             codec = c
@@ -155,7 +200,7 @@ class VideoDecoder(
             val i = c.dequeueInputBuffer(INPUT_WAIT_US)
             if (i < 0) {
                 // The decoder is not taking frames: drop this one and resynchronise on a key frame.
-                if (!f.key) failedSoft()
+                failedSoft()
                 return
             }
             val buf = c.getInputBuffer(i) ?: return
@@ -180,21 +225,33 @@ class VideoDecoder(
     }
 
     private fun open(s: Surface): MediaCodec {
-        val c = MediaCodec.createDecoderByType(MIME)
-        try {
-            val format = MediaFormat.createVideoFormat(MIME, 640, 480)
-            // Room for the other side to change resolution without rebuilding the codec.
-            format.setInteger(MediaFormat.KEY_MAX_WIDTH, 1280)
-            format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 720)
-            // Show frames as they arrive (Android 11+ decoders that support it).
-            format.setInteger("low-latency", 1)
-            c.configure(format, s, null, 0)
-            c.start()
-        } catch (e: Exception) {
-            runCatching { c.release() }
-            throw e
+        val formats = listOf(
+            MediaFormat.createVideoFormat(MIME, 640, 480).apply {
+                // Room for the other side to change resolution without rebuilding the codec.
+                setInteger(MediaFormat.KEY_MAX_WIDTH, 1280)
+                setInteger(MediaFormat.KEY_MAX_HEIGHT, 720)
+                // Show frames as they arrive (Android 11+ decoders that support it).
+                setInteger("low-latency", 1)
+            },
+            MediaFormat.createVideoFormat(MIME, 640, 480).apply {
+                setInteger(MediaFormat.KEY_MAX_WIDTH, 1280)
+                setInteger(MediaFormat.KEY_MAX_HEIGHT, 720)
+            },
+            MediaFormat.createVideoFormat(MIME, 640, 480),
+        )
+        var lastError: Exception? = null
+        for (format in formats) {
+            val c = MediaCodec.createDecoderByType(MIME)
+            try {
+                c.configure(format, s, null, 0)
+                c.start()
+                return c
+            } catch (e: Exception) {
+                runCatching { c.release() }
+                lastError = e
+            }
         }
-        return c
+        throw lastError!!
     }
 
     private fun drain() {
@@ -216,9 +273,13 @@ class VideoDecoder(
     private fun reportSize(f: MediaFormat) {
         fun int(k: String) = if (f.containsKey(k)) f.getInteger(k) else -1
         // The decoder's buffer is padded to a block size; the crop says what is really picture.
-        var w = int("crop-right") - int("crop-left") + 1
-        var h = int("crop-bottom") - int("crop-top") + 1
-        if (int("crop-right") < 0 || w <= 0 || h <= 0) {
+        val left = int("crop-left")
+        val top = int("crop-top")
+        val right = int("crop-right")
+        val bottom = int("crop-bottom")
+        var w = right - left + 1
+        var h = bottom - top + 1
+        if (left < 0 || top < 0 || right < 0 || bottom < 0 || w <= 0 || h <= 0) {
             w = int(MediaFormat.KEY_WIDTH)
             h = int(MediaFormat.KEY_HEIGHT)
         }
@@ -232,11 +293,12 @@ class VideoDecoder(
     }
 
     private fun failedSoft() {
-        synchronized(lock) {
+        val ask = synchronized(lock) {
             queue.clear()
             waitingForKey = true
-            askForKeyFrame()
+            shouldAskForKeyFrameLocked()
         }
+        if (ask) requestKeyFrame()
     }
 
     private fun releaseCodec() {

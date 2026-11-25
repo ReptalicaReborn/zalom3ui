@@ -48,6 +48,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -80,8 +81,8 @@ fun SettingsScreen(
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
     var serverUrl by rememberSaveable { mutableStateOf(current.serverUrl) }
-    var token by rememberSaveable { mutableStateOf(current.token) }
-    var showToken by rememberSaveable { mutableStateOf(false) }
+    var token by remember { mutableStateOf(current.token) }
+    var showToken by remember { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
     var pickTheme by rememberSaveable { mutableStateOf(false) }
     val edited = ServerSettings(onDevice, serverUrl.trim(), token.trim())

@@ -1,6 +1,7 @@
 package com.zalom3ui.app.ui.call
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -20,15 +21,21 @@ import androidx.lifecycle.lifecycleScope
 import com.zalom3ui.app.call.CallService
 import com.zalom3ui.app.call.CallState
 import com.zalom3ui.app.data.ApiClient
+import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.server.MessageNotifier
 import com.zalom3ui.app.ui.AppTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Full-screen call UI: ringing (Answer / Decline), connecting, connected (Mute / Speaker / Hang up) and "Call ended".
@@ -64,6 +71,7 @@ class CallActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        answerWithVideo = savedInstanceState?.getBoolean(STATE_ANSWER_WITH_VIDEO, false) ?: false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -98,7 +106,7 @@ class CallActivity : ComponentActivity() {
                         video = if (service is CallState.Ringing) video else videoCall,
                         cameraOn = cameraOn,
                         peerCameraOn = peerCamera,
-                        remoteAspect = remoteSize?.let { (w, h) -> w.toFloat() / h },
+                        remoteAspect = remoteSize?.let { (w, h) -> if (w > 0 && h > 0) w.toFloat() / h else null },
                         notice = notice ?: if (cameraDenied) "Allow the camera in the phone's app settings to send video" else null,
                     ),
                     onAnswer = { answer(false) },
@@ -114,23 +122,85 @@ class CallActivity : ComponentActivity() {
                 )
             }
         }
-        handle(intent)
-        // Close a moment after the call ends, so "Call ended" is readable.
+        handle(intent, isFreshStart = savedInstanceState == null)
+        // Keep the display awake while a call is active, watch for remote hang-ups while ringing,
+        // and close a moment after the call ends so "Call ended" (or an error reason) is readable.
         lifecycleScope.launch {
             CallService.state.collectLatest { s ->
-                if (s is CallState.Ended && error == null) {
-                    delay(CLOSE_DELAY_MS)
-                    CallService.reset()
-                    finish()
+                updateKeepScreenOn(s)
+                when (s) {
+                    is CallState.Ringing -> watchRingingCall(s.callId)
+                    is CallState.Ended -> {
+                        val hasError = error != null || s.reason != "Call ended"
+                        if (s.reason != "Call ended" && error == null) error = s.reason
+                        delay(if (hasError) ERROR_DELAY_MS else CLOSE_DELAY_MS)
+                        CallService.reset()
+                        finish()
+                    }
+                    else -> Unit
                 }
             }
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_ANSWER_WITH_VIDEO, answerWithVideo)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handle(intent)
+        handle(intent, isFreshStart = true)
+    }
+
+    private fun updateKeepScreenOn(state: CallState) {
+        val keepOn = state is CallState.Ringing || state is CallState.Connecting || state is CallState.Connected
+        if (keepOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private suspend fun watchRingingCall(ringingCallId: String) {
+        if (ringingCallId.isEmpty()) return
+        val api = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
+        val ended = withTimeoutOrNull(RINGING_TIMEOUT_MS) {
+            while (isActive) {
+                val current = runCatching { api.currentCall() }.getOrNull()
+                if (current != null && (current.callId != ringingCallId || current.state != "ringing")) {
+                    return@withTimeoutOrNull true
+                }
+                try {
+                    api.events().first { event ->
+                        when (event) {
+                            is ServerEvent.CallEnded -> event.callId.isEmpty() || event.callId == ringingCallId
+                            is ServerEvent.CallConnected -> event.callId.isEmpty() || event.callId == ringingCallId
+                            else -> false
+                        }
+                    }
+                    return@withTimeoutOrNull true
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: NoSuchElementException) {
+                    // Socket closed cleanly; reconnect and re-check currentCall().
+                } catch (_: Exception) {
+                    // Socket dropped; reconnect and re-check currentCall().
+                }
+                delay(RINGING_RECONNECT_MS)
+            }
+            false
+        }
+        if (ended != false) dismissRinging(ringingCallId)
+    }
+
+    private fun dismissRinging(ringingCallId: String) {
+        val current = CallService.state.value
+        if (answering || current !is CallState.Ringing || current.callId != ringingCallId) return
+        NotificationManagerCompat.from(this).cancel(MessageNotifier.callTag(ringingCallId), MessageNotifier.CALL_NOTIFICATION_ID)
+        CallService.reset()
+        finish()
     }
 
     private fun nameOf(s: CallState): String = when (s) {
@@ -154,7 +224,7 @@ class CallActivity : ComponentActivity() {
         else -> CallPhase.Ringing(video)
     }
 
-    private fun handle(intent: Intent) {
+    private fun handle(intent: Intent, isFreshStart: Boolean) {
         val id = intent.getStringExtra(EXTRA_CALL_ID).orEmpty()
         if (id.isEmpty()) {
             finish()
@@ -171,12 +241,37 @@ class CallActivity : ComponentActivity() {
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME).orEmpty()
         avatar = intent.getStringExtra(EXTRA_AVATAR)
         video = intent.getBooleanExtra(EXTRA_VIDEO, false)
-        CallService.showRinging(callId, callerName, avatar)
+        if (isFreshStart || CallService.state.value is CallState.Idle) {
+            CallService.showRinging(callId, callerName, avatar)
+        }
         // The notification's Answer is voice only, even for a video call; "Answer with video" is on the screen.
-        if (intent.action == ACTION_ANSWER) answer(false)
+        if (isFreshStart && intent.action == ACTION_ANSWER) answer(false)
     }
 
     private fun hasPermission(permission: String) = checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+
+    /** Dismisses the lock screen before showing a system permission prompt so the dialog isn't hidden behind it. */
+    private fun runAfterUnlock(action: () -> Unit) {
+        val km = getSystemService(KeyguardManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && km != null && km.isKeyguardLocked) {
+            km.requestDismissKeyguard(
+                this,
+                object : KeyguardManager.KeyguardDismissCallback() {
+                    override fun onDismissSucceeded() {
+                        if (!isFinishing && !isDestroyed) action()
+                    }
+
+                    override fun onDismissCancelled() = Unit
+
+                    override fun onDismissError() {
+                        if (!isFinishing && !isDestroyed) action()
+                    }
+                },
+            )
+        } else {
+            action()
+        }
+    }
 
     /** Camera button: on needs the permission (asked now, the first time), off just stops. */
     private fun toggleCamera(on: Boolean) {
@@ -186,7 +281,7 @@ class CallActivity : ComponentActivity() {
                 cameraDenied = false
                 CallService.setCamera(this, true)
             }
-            else -> cameraPermission.launch(Manifest.permission.CAMERA)
+            else -> runAfterUnlock { cameraPermission.launch(Manifest.permission.CAMERA) }
         }
     }
 
@@ -198,37 +293,44 @@ class CallActivity : ComponentActivity() {
         }
         if (missing.isNotEmpty()) {
             answerWithVideo = withVideo
-            answerPermissions.launch(missing.toTypedArray())
+            runAfterUnlock { answerPermissions.launch(missing.toTypedArray()) }
             return
         }
         val s = CallService.state.value
-        if (s is CallState.Connecting || s is CallState.Connected) return
+        if (s is CallState.Connecting || s is CallState.Connected || s is CallState.Ended) return
         answering = true
         val id = callId
         val name = callerName
+        val appContext = applicationContext
         // The call is answered now, so the ringing notification has done its job.
         NotificationManagerCompat.from(this).cancel(MessageNotifier.callTag(id), MessageNotifier.CALL_NOTIFICATION_ID)
         // A video call starts on the speaker; the camera only if asked for and allowed.
-        CallService.start(this, id, name, avatar, video = video, camera = withVideo && hasPermission(Manifest.permission.CAMERA))
-        lifecycleScope.launch {
+        try {
+            CallService.start(this, id, name, avatar, video = video, camera = withVideo && hasPermission(Manifest.permission.CAMERA))
+        } catch (e: Exception) {
+            answering = false
+            error = e.message ?: "Couldn't answer the call"
+            return
+        }
+        // Outlives Activity rotation so answering completes instead of aborting mid-flight.
+        callActionScope.launch {
             try {
-                ApiClient(LocalServer.url(this@CallActivity), SettingsStore(this@CallActivity).localToken()).answerCall(id)
+                ApiClient(LocalServer.url(appContext), SettingsStore(appContext).localToken()).answerCall(id)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                error = e.message ?: "Couldn't answer the call"
-                CallService.stop(this@CallActivity)
-                delay(ERROR_DELAY_MS)
-                CallService.reset()
-                finish()
+                CallService.stop(appContext, e.message ?: "Couldn't answer the call")
             }
         }
     }
 
     private fun decline() {
         val id = callId
+        val appContext = applicationContext
         NotificationManagerCompat.from(this).cancel(MessageNotifier.callTag(id), MessageNotifier.CALL_NOTIFICATION_ID)
-        val api = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
+        val api = ApiClient(LocalServer.url(appContext), SettingsStore(appContext).localToken())
         // Outlives the screen: the request should finish even though we close right away.
-        CoroutineScope(Dispatchers.IO).launch { runCatching { api.declineCall(id) } }
+        callActionScope.launch { runCatching { api.declineCall(id) } }
         CallService.reset()
         finish()
     }
@@ -241,8 +343,14 @@ class CallActivity : ComponentActivity() {
         const val EXTRA_CALLER_NAME = "callerName"
         const val EXTRA_AVATAR = "avatar"
         const val EXTRA_VIDEO = "video"
+        private const val STATE_ANSWER_WITH_VIDEO = "answerWithVideo"
         private const val CLOSE_DELAY_MS = 1_200L
         private const val ERROR_DELAY_MS = 2_500L
+        private const val RINGING_RECONNECT_MS = 2_000L
+        private const val RINGING_TIMEOUT_MS = 75_000L
+
+        /** Application-scoped coroutine scope so answer/decline requests survive Activity rotation or finish. */
+        private val callActionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
         /** [answerNow]: the Answer button of the notification, so the call is picked up as soon as the screen opens. */
         fun intent(

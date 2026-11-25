@@ -8,8 +8,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -26,6 +26,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
@@ -96,13 +97,16 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -118,7 +122,6 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -136,6 +139,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -147,6 +151,7 @@ import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadSummary
 import kotlin.math.ceil
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /** Everything the chat screen can ask for. */
@@ -194,6 +199,7 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, sti
     var viewing by rememberSaveable { mutableStateOf<String?>(null) }
     var showStickers by rememberSaveable { mutableStateOf(false) }
     val isGroup = chat.kind == "group"
+    DisposableEffect(chat.ref) { onDispose { VoicePlayback.stop() } }
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKED_MEDIA)) {
         if (it.isNotEmpty()) actions.onSendFiles(it)
     }
@@ -279,8 +285,9 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, sti
                 onStartTyping = actions.onStartTyping,
                 onLoadMembers = actions.onLoadMembers,
                 onSend = { text, mentioned, onSent ->
-                    actions.onSend(text, replyTo, mentioned) {
-                        replyTo = null
+                    val quote = replyTo
+                    actions.onSend(text, quote, mentioned) {
+                        if (replyTo?.id == quote?.id) replyTo = null
                         onSent()
                     }
                 },
@@ -480,7 +487,8 @@ private fun MessageList(
     }
     val showJump by remember { derivedStateOf { listState.firstVisibleItemIndex > 2 } }
 
-    Box(Modifier.fillMaxSize()) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val maxBubble = maxWidth * 0.78f
         LazyColumn(
             state = listState,
             reverseLayout = true,
@@ -506,6 +514,7 @@ private fun MessageList(
                         isGroup = isGroup,
                         firstOfRun = firstOfRun,
                         lastOfRun = lastOfRun,
+                        maxBubble = maxBubble,
                         menuOpen = menuFor == msg.id,
                         onLongPress = { onOpenMenu(msg) },
                         onDismissMenu = onDismissMenu,
@@ -571,6 +580,7 @@ private fun MessageRow(
     isGroup: Boolean,
     firstOfRun: Boolean,
     lastOfRun: Boolean,
+    maxBubble: Dp,
     menuOpen: Boolean,
     onLongPress: () -> Unit,
     onDismissMenu: () -> Unit,
@@ -582,13 +592,14 @@ private fun MessageRow(
     val self = msg.isSelf
     val haptics = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
-    val offsetX = remember { Animatable(0f) }
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+    var settleJob by remember { mutableStateOf<Job?>(null) }
     val threshold = with(LocalDensity.current) { 64.dp.toPx() }
-    val maxBubble = (LocalConfiguration.current.screenWidthDp * 0.78f).dp
+    val currentOnSwipeReply by rememberUpdatedState(onSwipeReply)
 
     Box(Modifier.fillMaxWidth().padding(top = if (firstOfRun) 8.dp else 2.dp)) {
         // Revealed while swiping a message to the right to reply to it.
-        if (offsetX.value > 0f) {
+        if (dragOffset > 0f) {
             Icon(
                 Icons.AutoMirrored.Filled.Reply,
                 contentDescription = null,
@@ -597,7 +608,7 @@ private fun MessageRow(
                     .align(Alignment.CenterStart)
                     .padding(start = 8.dp)
                     .graphicsLayer {
-                        val progress = (offsetX.value / threshold).coerceIn(0f, 1f)
+                        val progress = (dragOffset / threshold).coerceIn(0f, 1f)
                         alpha = progress
                         scaleX = 0.6f + 0.4f * progress
                         scaleY = 0.6f + 0.4f * progress
@@ -607,21 +618,39 @@ private fun MessageRow(
         Row(
             Modifier
                 .fillMaxWidth()
-                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .offset { IntOffset(dragOffset.roundToInt(), 0) }
                 .pointerInput(msg.id, msg.recalled) {
-                    if (msg.recalled) return@pointerInput
+                    if (msg.recalled) {
+                        dragOffset = 0f
+                        return@pointerInput
+                    }
                     detectHorizontalDragGestures(
-                        onDragEnd = {
-                            if (offsetX.value >= threshold) onSwipeReply()
-                            scope.launch { offsetX.animateTo(0f) }
+                        onDragStart = {
+                            settleJob?.cancel()
+                            settleJob = null
                         },
-                        onDragCancel = { scope.launch { offsetX.animateTo(0f) } },
+                        onDragEnd = {
+                            if (dragOffset >= threshold) currentOnSwipeReply()
+                            val start = dragOffset
+                            settleJob?.cancel()
+                            settleJob = scope.launch {
+                                animate(initialValue = start, targetValue = 0f) { value, _ -> dragOffset = value }
+                            }
+                        },
+                        onDragCancel = {
+                            val start = dragOffset
+                            settleJob?.cancel()
+                            settleJob = scope.launch {
+                                animate(initialValue = start, targetValue = 0f) { value, _ -> dragOffset = value }
+                            }
+                        },
                         onHorizontalDrag = { change, delta ->
-                            val next = (offsetX.value + delta).coerceIn(0f, threshold * 1.3f)
-                            if (offsetX.value < threshold && next >= threshold) {
+                            val prev = dragOffset
+                            val next = (prev + delta).coerceIn(0f, threshold * 1.3f)
+                            if (prev < threshold && next >= threshold) {
                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                             }
-                            scope.launch { offsetX.snapTo(next) }
+                            dragOffset = next
                             change.consume()
                         },
                     )
@@ -1113,9 +1142,12 @@ private fun Composer(
             ) {
                 FilledIconButton(
                     onClick = {
-                        onSend(value.text, mentioned.toList()) {
-                            value = TextFieldValue("")
-                            mentioned.clear()
+                        val sentText = value.text
+                        onSend(sentText, mentioned.toList()) {
+                            if (value.text == sentText) {
+                                value = TextFieldValue("")
+                                mentioned.clear()
+                            }
                         }
                     },
                     enabled = !sending,

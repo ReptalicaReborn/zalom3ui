@@ -10,7 +10,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.Process
 import android.system.Os
 import android.util.Log
@@ -22,6 +24,7 @@ import com.zalom3ui.app.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -53,12 +56,7 @@ class NodeService : Service() {
     override fun onCreate() {
         super.onCreate()
         StartupLog.write(this, "service: created")
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        if (!promoteToForeground()) return
         runCatching { getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback) }
         // New-message notifications, while the app is closed too.
         MessageNotifier(this).start(scope)
@@ -66,6 +64,9 @@ class NodeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         StartupLog.write(this, "service: start command (already running: $started)")
+        if (!promoteToForeground()) {
+            return START_NOT_STICKY
+        }
         if (!started) {
             started = true
             // Node needs a bigger stack than Android's default thread stack.
@@ -76,9 +77,32 @@ class NodeService : Service() {
 
     override fun onDestroy() {
         StartupLog.write(this, "service: destroyed")
+        scope.cancel()
         runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
         super.onDestroy()
-        Process.killProcess(Process.myPid())
+        // Exit after onDestroy() returns so Android records stopSelf() cleanly instead of treating it as a crash.
+        Handler(Looper.getMainLooper()).post { Process.killProcess(Process.myPid()) }
+    }
+
+    private fun promoteToForeground(): Boolean {
+        return try {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (e: SecurityException) {
+            StartupLog.error(this, "service: startForeground denied", e)
+            stopSelf()
+            false
+        } catch (e: IllegalStateException) {
+            // Includes ForegroundServiceStartNotAllowedException (API 31+, subclass of IllegalStateException).
+            StartupLog.error(this, "service: startForeground not allowed", e)
+            stopSelf()
+            false
+        }
     }
 
     private fun runNode() {
@@ -107,7 +131,6 @@ class NodeService : Service() {
             StartupLog.error(this, "service: could not run Node", e)
         }
         stopSelf()
-        Process.killProcess(Process.myPid())
     }
 
     private fun buildNotification(): Notification {

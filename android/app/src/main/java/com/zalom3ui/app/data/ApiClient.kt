@@ -1,39 +1,42 @@
 package com.zalom3ui.app.data
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.MediaType
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.BufferedSink
-import okio.source
-import java.io.InputStream
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.BufferedSink
+import okio.source
 import java.io.IOException
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class ApiException(message: String, val code: Int = 0) : IOException(message)
 
@@ -61,8 +64,8 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     suspend fun messages(kind: String, id: String, limit: Int, before: Long? = null): ThreadMessages =
         get(
-            "threads/$kind/$id/messages",
-            *listOfNotNull("limit" to limit.toString(), before?.let { "before" to it.toString() }).toTypedArray(),
+            "threads", kind, id, "messages",
+            query = listOfNotNull("limit" to limit.toString(), before?.let { "before" to it.toString() }),
         )
 
     suspend fun send(kind: String, id: String, text: String, quoteId: String? = null, mentions: List<Mention> = emptyList()) {
@@ -81,20 +84,20 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 }
             }
         }
-        post<Unit>("threads/$kind/$id/messages", body.toString())
+        post<Unit>("threads", kind, id, "messages", body = body.toString())
     }
 
     /** [reaction] is a reaction key such as "heart", or null to remove ours. */
     suspend fun react(kind: String, id: String, msgId: String, reaction: String?) {
-        httpPut("threads/$kind/$id/messages/$msgId/reaction", buildJsonObject { put("reaction", reaction) }.toString())
+        httpPut("threads", kind, id, "messages", msgId, "reaction", body = buildJsonObject { put("reaction", reaction) }.toString())
     }
 
     suspend fun recall(kind: String, id: String, msgId: String) {
-        post<Unit>("threads/$kind/$id/messages/$msgId/recall")
+        post<Unit>("threads", kind, id, "messages", msgId, "recall")
     }
 
     suspend fun deleteForMe(kind: String, id: String, msgId: String) {
-        httpDelete("threads/$kind/$id/messages/$msgId")
+        httpDelete("threads", kind, id, "messages", msgId)
     }
 
     suspend fun forward(kind: String, id: String, msgId: String, targets: List<ThreadRef>) {
@@ -108,7 +111,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 }
             }
         }
-        post<Unit>("threads/$kind/$id/messages/$msgId/forward", body.toString())
+        post<Unit>("threads", kind, id, "messages", msgId, "forward", body = body.toString())
     }
 
     /**
@@ -127,13 +130,13 @@ class ApiClient(serverUrl: String, private val token: String?) {
     ) {
         val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
         val body = StreamBody(mimeType?.toMediaTypeOrNull() ?: OCTET_STREAM, length, open)
-        execute<Unit>(Request.Builder().url(url("threads/$kind/$id/attachments", *query.toTypedArray())).post(body), UPLOAD_HTTP)
+        execute<Unit>(Request.Builder().url(url("threads", kind, id, "attachments", query = query)).post(body), UPLOAD_HTTP)
     }
 
-    suspend fun stickers(query: String): List<StickerInfo> = get("stickers", "q" to query)
+    suspend fun stickers(query: String): List<StickerInfo> = get("stickers", query = listOf("q" to query))
 
     suspend fun sendSticker(kind: String, id: String, stickerId: Long) {
-        post<Unit>("threads/$kind/$id/stickers", buildJsonObject { put("id", stickerId) }.toString())
+        post<Unit>("threads", kind, id, "stickers", body = buildJsonObject { put("id", stickerId) }.toString())
     }
 
     /** Tells the server which chat is on screen (null: none), so it doesn't notify about it. */
@@ -144,60 +147,57 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 put("id", ref.id)
             }
         }
-        httpPut("presence", body.toString())
+        httpPut("presence", body = body.toString())
     }
 
     // ---- Call research ----
 
     /** Picks up a ringing call for 30 s without sound, recording the media connection in the call log. */
     suspend fun answerCallTest(callId: String) {
-        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/answer-test")
+        post<Unit>("calls", callId, "answer-test")
     }
 
     /** Declines a call ringing on this account (the caller sees it declined). */
     suspend fun declineCall(callId: String) {
-        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/decline")
+        post<Unit>("calls", callId, "decline")
     }
 
     /** Picks up a ringing call; the server joins the media server and sends a `connected` event. */
     suspend fun answerCall(callId: String) {
-        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/answer")
+        post<Unit>("calls", callId, "answer")
     }
 
     /** Ends the connected call. */
     suspend fun hangUpCall() {
-        post<Unit>("calls/hangup")
+        post<Unit>("calls", "hangup")
     }
 
     /** Tells the other side of the call we muted / unmuted (the microphone itself is silenced by the app). */
     suspend fun setCallMuted(muted: Boolean) {
-        post<Unit>("calls/mute", buildJsonObject { put("muted", muted) }.toString())
+        post<Unit>("calls", "mute", body = buildJsonObject { put("muted", muted) }.toString())
     }
 
     /** Tells the other side our camera is on / off (the app starts or stops sending video itself). */
     suspend fun setCamera(on: Boolean) {
-        post<Unit>("calls/camera", buildJsonObject { put("on", on) }.toString())
+        post<Unit>("calls", "camera", body = buildJsonObject { put("on", on) }.toString())
     }
 
     /** The call being answered or connected on this account, or null when there is none. */
     suspend fun currentCall(): CurrentCall? = try {
-        get<CurrentCall>("calls/current")
+        get<CurrentCall>("calls", "current")
     } catch (e: ApiException) {
         if (e.code == 404) null else throw e
     }
 
     /** The server's call log (JSON lines of the call events Zalo sent). */
-    suspend fun callLog(): String = withContext(Dispatchers.IO) {
-        val builder = Request.Builder().url(url("debug/call-log")).get()
-        token?.let { builder.header("Authorization", "Bearer $it") }
-        http.newCall(builder.build()).execute().use { res ->
-            if (!res.isSuccessful) throw ApiException("HTTP ${res.code}")
-            res.body?.string().orEmpty()
-        }
+    suspend fun callLog(): String {
+        val (code, body) = executeRaw(Request.Builder().url(url("debug", "call-log")).get())
+        if (code !in 200..299) throw ApiException("HTTP $code", code)
+        return body
     }
 
     suspend fun clearCallLog() {
-        httpDelete("debug/call-log")
+        httpDelete("debug", "call-log")
     }
 
     // ---- Friends ----
@@ -207,93 +207,106 @@ class ApiClient(serverUrl: String, private val token: String?) {
     suspend fun friendRequests(): List<FriendRequest> = get("friend-requests")
 
     suspend fun acceptFriend(userId: String) {
-        post<Unit>("friend-requests/$userId/accept")
+        post<Unit>("friend-requests", userId, "accept")
     }
 
     suspend fun rejectFriend(userId: String) {
-        post<Unit>("friend-requests/$userId/reject")
+        post<Unit>("friend-requests", userId, "reject")
     }
 
-    suspend fun findUser(phone: String): FoundUser = get("users/find", "phone" to phone)
+    suspend fun findUser(phone: String): FoundUser = get("users", "find", query = listOf("phone" to phone))
 
     suspend fun sendFriendRequest(userId: String, message: String) {
-        post<Unit>("friend-requests", buildJsonObject {
-            put("userId", userId)
-            put("message", message)
-        }.toString())
+        post<Unit>(
+            "friend-requests",
+            body = buildJsonObject {
+                put("userId", userId)
+                put("message", message)
+            }.toString(),
+        )
     }
 
     suspend fun undoFriendRequest(userId: String) {
-        httpDelete("friend-requests/$userId")
+        httpDelete("friend-requests", userId)
     }
 
     // ---- Groups ----
 
     suspend fun createGroup(name: String, members: List<String>): CreatedGroup =
-        post("groups", buildJsonObject {
-            put("name", name)
-            putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
-        }.toString())
+        post(
+            "groups",
+            body = buildJsonObject {
+                put("name", name)
+                putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
+            }.toString(),
+        )
 
     suspend fun addGroupMembers(groupId: String, members: List<String>): AddMembersResult =
-        post("groups/$groupId/members", buildJsonObject {
-            putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
-        }.toString())
+        post(
+            "groups", groupId, "members",
+            body = buildJsonObject {
+                putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
+            }.toString(),
+        )
 
     suspend fun removeGroupMember(groupId: String, userId: String) {
-        httpDelete("groups/$groupId/members/$userId")
+        httpDelete("groups", groupId, "members", userId)
     }
 
     suspend fun renameGroup(groupId: String, name: String) {
-        httpPut("groups/$groupId/name", buildJsonObject { put("name", name) }.toString())
+        httpPut("groups", groupId, "name", body = buildJsonObject { put("name", name) }.toString())
     }
 
     suspend fun leaveGroup(groupId: String, silent: Boolean) {
-        post<Unit>("groups/$groupId/leave", buildJsonObject { put("silent", silent) }.toString())
+        post<Unit>("groups", groupId, "leave", body = buildJsonObject { put("silent", silent) }.toString())
     }
 
     // ---- Conversations ----
 
-    suspend fun details(kind: String, id: String): ThreadDetails = get("threads/$kind/$id/info")
+    suspend fun details(kind: String, id: String): ThreadDetails = get("threads", kind, id, "info")
 
     suspend fun markRead(kind: String, id: String) {
-        post<Unit>("threads/$kind/$id/read")
+        post<Unit>("threads", kind, id, "read")
     }
 
     suspend fun markUnread(kind: String, id: String) {
-        post<Unit>("threads/$kind/$id/unread")
+        post<Unit>("threads", kind, id, "unread")
     }
 
     suspend fun typing(kind: String, id: String) {
-        post<Unit>("threads/$kind/$id/typing")
+        post<Unit>("threads", kind, id, "typing")
     }
 
     suspend fun setPinned(kind: String, id: String, pinned: Boolean) {
-        httpPut("threads/$kind/$id/pin", buildJsonObject { put("pinned", pinned) }.toString())
+        httpPut("threads", kind, id, "pin", body = buildJsonObject { put("pinned", pinned) }.toString())
     }
 
     /** [option] null unmutes. */
     suspend fun setMuted(kind: String, id: String, option: MuteOption?) {
-        httpPut("threads/$kind/$id/mute", buildJsonObject { put("duration", option?.apiValue) }.toString())
+        httpPut("threads", kind, id, "mute", body = buildJsonObject { put("duration", option?.apiValue) }.toString())
     }
 
     suspend fun deleteConversation(kind: String, id: String) {
-        httpDelete("threads/$kind/$id")
+        httpDelete("threads", kind, id)
+    }
+
+    internal fun eventsRequest(): Request {
+        val wsUrl = baseUrl.newBuilder()
+            .addPathSegment("ws")
+            .build()
+        return Request.Builder()
+            .url(wsUrl.toString().replaceFirst("http", "ws"))
+            .apply { token?.let { header("Authorization", "Bearer $it") } }
+            .build()
     }
 
     /** Live server events. Completes or throws when the socket closes; callers reconnect. */
     fun events(): Flow<ServerEvent> = callbackFlow {
-        val url = baseUrl.newBuilder()
-            .addPathSegment("ws")
-            .apply { token?.let { addQueryParameter("token", it) } }
-            .build()
-        val request = Request.Builder()
-            .url(url.toString().replaceFirst("http", "ws"))
-            .build()
+        val request = eventsRequest()
 
         val socket = http.newWebSocket(request, object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
-                parseEvent(text)?.let { trySend(it) }
+                runCatching { parseEvent(text) }.getOrNull()?.let { trySend(it) }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -301,7 +314,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                close(if (response?.code == 401) ApiException("Wrong access token") else t)
+                close(if (response?.code == 401) ApiException("Wrong access token", 401) else t)
             }
         })
         awaitClose { socket.close(1000, null) }
@@ -346,41 +359,65 @@ class ApiClient(serverUrl: String, private val token: String?) {
         }
     }
 
-    private suspend inline fun <reified T> get(path: String, vararg query: Pair<String, String>): T =
-        execute(Request.Builder().url(url(path, *query)).get())
+    private suspend inline fun <reified T> get(
+        vararg segments: String,
+        query: List<Pair<String, String>> = emptyList(),
+    ): T = execute(Request.Builder().url(url(*segments, query = query)).get())
 
-    private suspend inline fun <reified T> post(path: String, body: String = ""): T =
-        execute(Request.Builder().url(url(path)).post(body.toRequestBody(JSON_MEDIA_TYPE)))
+    private suspend inline fun <reified T> post(
+        vararg segments: String,
+        body: String = "",
+    ): T = execute(Request.Builder().url(url(*segments)).post(body.toRequestBody(JSON_MEDIA_TYPE)))
 
-    private suspend fun httpPut(path: String, body: String) {
-        execute<Unit>(Request.Builder().url(url(path)).put(body.toRequestBody(JSON_MEDIA_TYPE)))
+    private suspend fun httpPut(vararg segments: String, body: String) {
+        execute<Unit>(Request.Builder().url(url(*segments)).put(body.toRequestBody(JSON_MEDIA_TYPE)))
     }
 
-    private suspend fun httpDelete(path: String) {
-        execute<Unit>(Request.Builder().url(url(path)).delete())
+    private suspend fun httpDelete(vararg segments: String) {
+        execute<Unit>(Request.Builder().url(url(*segments)).delete())
     }
 
     private fun JsonObject.string(key: String): String = this[key]?.jsonPrimitive?.content.orEmpty()
 
     private fun JsonObject.threadRef(): ThreadRef = ThreadRef(string("threadKind"), string("threadId"))
 
-    private suspend inline fun <reified T> execute(builder: Request.Builder, client: OkHttpClient = http): T = withContext(Dispatchers.IO) {
-        token?.let { builder.header("Authorization", "Bearer $it") }
-        client.newCall(builder.build()).execute().use { res ->
-            val body = res.body?.string().orEmpty()
-            if (!res.isSuccessful) {
-                val message = runCatching { json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.content }
-                    .getOrNull()
-                throw ApiException(message ?: "HTTP ${res.code}", res.code)
-            }
-            if (T::class == Unit::class) Unit as T else json.decodeFromString<T>(body)
+    private suspend fun executeRaw(builder: Request.Builder, client: OkHttpClient = http): Pair<Int, String> =
+        suspendCancellableCoroutine { cont ->
+            token?.let { builder.header("Authorization", "Bearer $it") }
+            val call = client.newCall(builder.build())
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resumeWithException(e)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { res ->
+                            val body = res.body?.string().orEmpty()
+                            if (cont.isActive) cont.resume(res.code to body)
+                        }
+                    } catch (e: Throwable) {
+                        if (cont.isActive) cont.resumeWithException(e)
+                    }
+                }
+            })
         }
+
+    private suspend inline fun <reified T> execute(builder: Request.Builder, client: OkHttpClient = http): T {
+        val (code, body) = executeRaw(builder, client)
+        if (code !in 200..299) {
+            val message = runCatching { json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.content }
+                .getOrNull()
+            throw ApiException(message ?: "HTTP $code", code)
+        }
+        return if (T::class == Unit::class) Unit as T else json.decodeFromString<T>(body)
     }
 
-    private fun url(path: String, vararg query: Pair<String, String>): HttpUrl =
+    internal fun url(vararg segments: String, query: List<Pair<String, String>> = emptyList()): HttpUrl =
         baseUrl.newBuilder()
             .addPathSegment("api")
-            .apply { path.split('/').forEach { addPathSegment(it) } }
+            .apply { segments.forEach { addPathSegment(it) } }
             .apply { query.forEach { (k, v) -> addQueryParameter(k, v) } }
             .build()
 

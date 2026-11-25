@@ -20,6 +20,7 @@ data class PickedFile(
     val width: Int? = null,
     val height: Int? = null,
     val open: () -> InputStream,
+    val cleanup: () -> Unit = {},
 )
 
 /** Zalo sends these as photos; any other picture is converted to JPEG first. */
@@ -57,8 +58,9 @@ fun needsJpegConversion(name: String, mimeType: String?): Boolean {
 fun orientedSize(width: Int, height: Int, exifOrientation: Int): Pair<Int, Int> =
     if (exifOrientation in 5..8) height to width else width to height
 
-/** Sample size that brings the longest side to at most [max] pixels. */
+/** Largest power-of-two subsampling factor keeping the longest side at least [max] pixels (before exact scaling). */
 fun sampleSizeFor(width: Int, height: Int, max: Int): Int {
+    if (max <= 0) return 1
     var sample = 1
     while (maxOf(width, height) / (sample * 2) >= max) sample *= 2
     return sample
@@ -101,29 +103,45 @@ private fun convertToJpeg(name: String, open: () -> InputStream, cacheDir: File)
     open().use { BitmapFactory.decodeStream(it, null, bounds) }
     if (bounds.outWidth <= 0) throw ApiException("$name is a picture this phone can't read")
     val decoded = open().use {
-        BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_CONVERTED_SIDE) })
+        BitmapFactory.decodeStream(
+            it,
+            null,
+            BitmapFactory.Options().apply { inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_CONVERTED_SIDE) },
+        )
     } ?: throw ApiException("$name is a picture this phone can't read")
-    val orientation = runCatching { open().use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } }.getOrDefault(1)
-    val bitmap = rotate(decoded, orientation)
-    val dir = File(cacheDir, "uploads").apply { mkdirs() }
-    dir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 6 * 3_600_000L }?.forEach { it.delete() }
-    val out = File(dir, name.substringBeforeLast('.') + "-" + System.nanoTime() + ".jpg")
-    out.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
-    val result = PickedFile(
-        name = name.substringBeforeLast('.') + ".jpg",
-        mimeType = "image/jpeg",
-        length = out.length(),
-        width = bitmap.width,
-        height = bitmap.height,
-        open = { out.inputStream() },
-    )
-    if (bitmap !== decoded) decoded.recycle()
-    bitmap.recycle()
-    return result
+    var bitmap: Bitmap? = null
+    try {
+        val orientation = runCatching { open().use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } }.getOrDefault(1)
+        val transformed = transform(decoded, orientation, MAX_CONVERTED_SIDE)
+        bitmap = transformed
+        val dir = File(cacheDir, "uploads").apply { mkdirs() }
+        dir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 6 * 3_600_000L }?.forEach { it.delete() }
+        val out = File(dir, name.substringBeforeLast('.') + "-" + System.nanoTime() + ".jpg")
+        try {
+            out.outputStream().use { transformed.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        } catch (e: Throwable) {
+            out.delete()
+            throw e
+        }
+        return PickedFile(
+            name = name.substringBeforeLast('.') + ".jpg",
+            mimeType = "image/jpeg",
+            length = out.length(),
+            width = transformed.width,
+            height = transformed.height,
+            open = { out.inputStream() },
+            cleanup = { out.delete() },
+        )
+    } finally {
+        val b = bitmap
+        if (b != null && b !== decoded) b.recycle()
+        decoded.recycle()
+    }
 }
 
-private fun rotate(bitmap: Bitmap, orientation: Int): Bitmap {
+private fun transform(bitmap: Bitmap, orientation: Int, maxSide: Int): Bitmap {
     val m = Matrix()
+    var changed = true
     when (orientation) {
         ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
         ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
@@ -132,7 +150,14 @@ private fun rotate(bitmap: Bitmap, orientation: Int): Bitmap {
         ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
         ExifInterface.ORIENTATION_TRANSPOSE -> { m.postRotate(90f); m.postScale(-1f, 1f) }
         ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(270f); m.postScale(-1f, 1f) }
-        else -> return bitmap
+        else -> changed = false
     }
+    val longest = maxOf(bitmap.width, bitmap.height)
+    if (longest > maxSide) {
+        val scale = maxSide.toFloat() / longest.toFloat()
+        m.postScale(scale, scale)
+        changed = true
+    }
+    if (!changed) return bitmap
     return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
 }

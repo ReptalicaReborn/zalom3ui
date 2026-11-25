@@ -23,6 +23,7 @@ import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -38,6 +39,9 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.zalom3ui.app.server.StartupLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private object Routes {
     const val HOME = "home"
@@ -98,6 +102,7 @@ fun App(vm: AppViewModel) {
 private fun AppNav(vm: AppViewModel) {
     val nav = rememberNavController()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     val configuration = LocalConfiguration.current
     // Tablets (not phones turned sideways) show the chat list and the open chat side by side, like Telegram.
@@ -186,7 +191,12 @@ private fun AppNav(vm: AppViewModel) {
                     since = state.startingSince,
                     error = state.startupError,
                     onRestart = vm::restartLocalServer,
-                    onShareLog = { QrActions.shareText(context, "zaloo-startup-log.txt", "Share startup log", StartupLog.report(context)) },
+                    onShareLog = {
+                        scope.launch {
+                            val report = withContext(Dispatchers.IO) { StartupLog.report(context) }
+                            QrActions.shareText(context, "zaloo-startup-log.txt", "Share startup log", report)
+                        }
+                    },
                 )
                 status == null -> LoadingScreen("Connecting…")
                 !status.isLoggedIn -> LoginScreen(
@@ -264,15 +274,12 @@ private fun AppNav(vm: AppViewModel) {
                 onBack = { nav.popBackStack() },
                 onConfirm = { name, ids ->
                     busy = true
-                    vm.createGroup(name, ids) { thread ->
-                        busy = false
+                    vm.createGroup(name, ids, onDone = { busy = false }) { thread ->
                         vm.openChat(thread)
                         goToChat()
                     }
                 },
             )
-            // A failed create shows its error and leaves the picks as they were.
-            LaunchedEffect(state.error) { if (state.error != null) busy = false }
         }
         composable(Routes.FRIEND_REQUESTS) {
             val state by vm.state.collectAsStateWithLifecycle()
@@ -317,7 +324,6 @@ private fun AppNav(vm: AppViewModel) {
             val state by vm.state.collectAsStateWithLifecycle()
             var busy by remember { mutableStateOf(false) }
             LaunchedEffect(Unit) { vm.loadMembers() }
-            LaunchedEffect(state.error) { if (state.error != null) busy = false }
             FriendPickerScreen(
                 title = "Add to ${state.chat?.name.orEmpty()}",
                 confirmLabel = "Add",
@@ -330,8 +336,7 @@ private fun AppNav(vm: AppViewModel) {
                 onBack = { nav.popBackStack() },
                 onConfirm = { _, ids ->
                     busy = true
-                    vm.addMembers(ids) {
-                        busy = false
+                    vm.addMembers(ids, onFinished = { busy = false }) {
                         nav.popBackStack()
                     }
                 },
@@ -399,7 +404,7 @@ private fun AppNav(vm: AppViewModel) {
                     vm.logout()
                     nav.popBackStack(Routes.HOME, inclusive = false)
                 },
-                onShareCallLog = { vm.shareCallLog { log -> QrActions.shareCallLog(context, log) } },
+                onShareCallLog = { vm.shareCallLog { log -> scope.launch { QrActions.shareCallLog(context, log) } } },
                 onClearCallLog = vm::clearCallLog,
             )
         }

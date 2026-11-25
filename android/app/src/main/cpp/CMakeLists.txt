@@ -22,7 +22,7 @@ set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Opus at -O0 is too slow for real-time audio, so keep the C code optimised in debug builds too.
-set(CMAKE_C_FLAGS_DEBUG "-O2 -g")
+string(APPEND CMAKE_C_FLAGS_DEBUG " -O2 -g")
 FetchContent_Declare(opus
     URL https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
     URL_HASH SHA256=65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1)

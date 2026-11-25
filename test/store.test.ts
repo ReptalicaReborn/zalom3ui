@@ -339,8 +339,62 @@ test("muteUntil computes the end of each mute option", () => {
 test("parseMentions validates positions against the text", () => {
     assert.deepEqual(parseMentions([{ uid: "u1", pos: 0, len: 4 }], "@Bob hi"), [{ uid: "u1", pos: 0, len: 4 }]);
     assert.equal(parseMentions(undefined, "x"), undefined);
+    assert.throws(() => parseMentions([{ uid: "", pos: 0, len: 4 }], "@Bob hi"), /uid/);
     assert.throws(() => parseMentions([{ uid: "u1", pos: 5, len: 4 }], "@Bob hi"), /outside/);
     assert.throws(() => parseMentions("nope", "x"), /array/);
+});
+
+test("ChatStore backs up corrupt messages.json instead of silently overwriting it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchhrept-corrupt-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        fs.writeFileSync(file, "{not valid json");
+        const store = new ChatStore(file);
+        assert.deepEqual(store.listThreads(), []);
+        const backups = fs.readdirSync(dir).filter((f) => f.startsWith("messages.json.corrupt."));
+        assert.equal(backups.length, 1);
+        assert.equal(fs.readFileSync(path.join(dir, backups[0]!), "utf8"), "{not valid json");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore.flush catches filesystem errors without crashing", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchhrept-flush-"));
+    const blocker = path.join(dir, "blocker");
+    try {
+        fs.writeFileSync(blocker, "not a directory");
+        const store = new ChatStore(path.join(blocker, "messages.json"));
+        store.addMessage(msg("1", 1000));
+        assert.doesNotThrow(() => store.flush());
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore.addMessage returns false when an older message is immediately evicted", () => {
+    const store = new ChatStore();
+    for (let i = 1; i <= 500; i++) {
+        assert.equal(store.addMessage(msg(String(i), i * 1000)), true);
+    }
+    assert.equal(store.addMessage(msg("old", 500)), false);
+    assert.equal(store.getMessage("old"), undefined);
+});
+
+test("ChatStore.addMessage does not clear markedUnread when replaying an old self message", () => {
+    const store = new ChatStore();
+    store.addMessage(msg("1", 2000));
+    store.markRead("user", "100", 2000);
+    store.markUnread("user", "100");
+    assert.equal(store.listThreads()[0].unread, 1);
+
+    // Replaying an older self message (ts <= readUpTo) must keep markedUnread intact.
+    assert.equal(store.addMessage(msg("self-old", 1500, { isSelf: true })), true);
+    assert.equal(store.listThreads()[0].unread, 1);
+
+    // A newer self message clears markedUnread.
+    assert.equal(store.addMessage(msg("self-new", 3000, { isSelf: true })), true);
+    assert.equal(store.listThreads()[0].unread, 0);
 });
 
 test("loadConfig refuses a public host without a token", () => {

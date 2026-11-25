@@ -95,16 +95,31 @@ fun mediaAspect(width: Int?, height: Int?): Float {
 
 /** Opens a link, file or video in another app (browser, player, downloads). */
 fun openExternally(context: Context, url: String, mimeType: String? = null) {
-    val uri = Uri.parse(url)
-    val typed = Intent(Intent.ACTION_VIEW).apply { if (mimeType != null) setDataAndType(uri, mimeType) else data = uri }
+    val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
+    val scheme = uri?.scheme?.lowercase()
+    val browsable = scheme == "http" || scheme == "https"
+    if (uri == null || scheme !in setOf("http", "https", "geo") || (browsable && uri.host.isNullOrBlank())) {
+        Toast.makeText(context, "Can't open this link", Toast.LENGTH_SHORT).show()
+        return
+    }
+    fun buildIntent(withMime: Boolean) = Intent(Intent.ACTION_VIEW).apply {
+        if (withMime && mimeType != null) setDataAndType(uri, mimeType) else data = uri
+        if (browsable) addCategory(Intent.CATEGORY_BROWSABLE)
+    }
     try {
-        context.startActivity(typed)
+        context.startActivity(buildIntent(withMime = true))
     } catch (_: ActivityNotFoundException) {
-        try {
-            context.startActivity(Intent(Intent.ACTION_VIEW, uri))
-        } catch (_: ActivityNotFoundException) {
-            Toast.makeText(context, "No app can open this", Toast.LENGTH_SHORT).show()
+        if (mimeType != null) {
+            try {
+                context.startActivity(buildIntent(withMime = false))
+                return
+            } catch (_: Exception) {
+                // Fall through to toast.
+            }
         }
+        Toast.makeText(context, "No app can open this", Toast.LENGTH_SHORT).show()
+    } catch (_: Exception) {
+        Toast.makeText(context, "Can't open this link", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -332,6 +347,11 @@ object VoicePlayback {
 
     private fun play(context: Context, url: String) {
         stop()
+        val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
+        val scheme = uri?.scheme?.lowercase()
+        if (uri == null || scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
+            return
+        }
         val p = MediaPlayer()
         player = p
         _playing.value = url
@@ -339,7 +359,7 @@ object VoicePlayback {
             p.setAudioAttributes(
                 AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build(),
             )
-            p.setDataSource(url)
+            p.setDataSource(uri.toString())
             p.setOnPreparedListener { if (player === it) it.start() }
             p.setOnCompletionListener { if (player === it) stop() }
             p.setOnErrorListener { mp, _, _ ->

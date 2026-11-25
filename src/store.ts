@@ -432,10 +432,15 @@ export class ChatStore {
         while (i > 0 && list[i - 1].ts > msg.ts) i--;
         list.splice(i, 0, msg);
         this.index.set(msg.id, key);
+        let evictedSelf = false;
         if (list.length > MAX_MESSAGES_PER_THREAD) {
-            for (const dropped of list.splice(0, list.length - MAX_MESSAGES_PER_THREAD)) this.index.delete(dropped.id);
+            for (const dropped of list.splice(0, list.length - MAX_MESSAGES_PER_THREAD)) {
+                this.index.delete(dropped.id);
+                if (dropped.id === msg.id) evictedSelf = true;
+            }
         }
         this.messages.set(key, list);
+        if (evictedSelf) return false;
 
         if (!this.threads.has(key)) {
             this.threads.set(key, {
@@ -446,9 +451,10 @@ export class ChatStore {
                 avatar: "",
             });
         }
+        const prevReadUpTo = this.readUpTo.get(key) ?? 0;
         if (msg.isSelf) {
-            this.markRead(msg.threadKind, msg.threadId, msg.ts);
-        } else if (msg.ts > (this.readUpTo.get(key) ?? 0)) {
+            if (msg.ts > prevReadUpTo) this.markRead(msg.threadKind, msg.threadId, msg.ts);
+        } else if (msg.ts > prevReadUpTo) {
             // A new incoming message supersedes a manual "mark as unread".
             this.markedUnread.delete(key);
         }
@@ -659,18 +665,22 @@ export class ChatStore {
             this.saveTimer = null;
         }
         if (!this.file) return;
-        const snapshot: Snapshot = {
-            threads: Object.fromEntries(this.threads),
-            messages: Object.fromEntries(this.messages),
-            readUpTo: Object.fromEntries(this.readUpTo),
-            pinned: [...this.pinned],
-            mutedUntil: Object.fromEntries(this.mutedUntil),
-            markedUnread: [...this.markedUnread],
-        };
-        fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-        const tmp = `${this.file}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 });
-        fs.renameSync(tmp, this.file);
+        try {
+            const snapshot: Snapshot = {
+                threads: Object.fromEntries(this.threads),
+                messages: Object.fromEntries(this.messages),
+                readUpTo: Object.fromEntries(this.readUpTo),
+                pinned: [...this.pinned],
+                mutedUntil: Object.fromEntries(this.mutedUntil),
+                markedUnread: [...this.markedUnread],
+            };
+            fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+            const tmp = `${this.file}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 });
+            fs.renameSync(tmp, this.file);
+        } catch (err) {
+            console.warn(`Could not save message cache ${this.file}:`, err);
+        }
     }
 
     private update(msgId: string, fn: (m: StoredMessage) => void): StoredMessage | undefined {
@@ -693,7 +703,20 @@ export class ChatStore {
             this.markedUnread = new Set(snapshot.markedUnread ?? []);
             for (const [key, list] of this.messages) for (const m of list) this.index.set(m.id, key);
         } catch (err) {
-            console.warn(`Ignoring unreadable message cache ${this.file}:`, err);
+            this.threads.clear();
+            this.messages.clear();
+            this.readUpTo.clear();
+            this.pinned.clear();
+            this.mutedUntil.clear();
+            this.markedUnread.clear();
+            this.index.clear();
+            const backup = `${this.file}.corrupt.${Date.now()}`;
+            try {
+                fs.renameSync(this.file, backup);
+                console.warn(`Backed up unreadable message cache ${this.file} to ${backup}:`, err);
+            } catch {
+                console.warn(`Ignoring unreadable message cache ${this.file}:`, err);
+            }
         }
     }
 

@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Surface
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import androidx.core.app.ServiceCompat
@@ -58,14 +59,19 @@ sealed interface CallState {
  * notification, follows the call through the server's events, and owns the [CallMedia] while connected.
  */
 class CallService : Service() {
+    /** Coordinates call lifecycle, media attachment, and companion surface/control updates without lock-ordering cycles. */
+    private val stateLock: Any = mediaLock
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var events: Job? = null
     private var muteSync: Job? = null
     private var media: CallMedia? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private var callId = ""
     private var name = ""
     private var avatar: String? = null
     private var ending = false
+    private var callGen = 0L
+    private var cameraGen = 0L
 
     /** Camera wanted before the media was up (answered with video); started once connected. */
     private var cameraWanted = false
@@ -73,58 +79,148 @@ class CallService : Service() {
 
     private val api: ApiClient get() = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
 
+    override fun onCreate() {
+        super.onCreate()
+        synchronized(stateLock) {
+            activeInstance = this
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> begin(intent)
             ACTION_HANGUP -> hangUp()
-            ACTION_STOP -> finish("Call ended")
+            ACTION_STOP -> finish(intent.getStringExtra(EXTRA_REASON).orEmpty().ifBlank { "Call ended" })
             ACTION_CAMERA -> setCamera(intent.getBooleanExtra(EXTRA_ON, false))
-            else -> if (callId.isEmpty()) stopSelf()
+            else -> {
+                val noActiveCall = synchronized(stateLock) { callId.isEmpty() || ending }
+                if (noActiveCall) satisfyForegroundThenStop()
+            }
         }
         return START_NOT_STICKY
+    }
+
+    /**
+     * Satisfies Android 8+'s startForegroundService() contract before stopping when invoked with an empty/null intent.
+     */
+    private fun satisfyForegroundThenStop() {
+        runCatching { startInForeground(camera = false) }
+        runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
+        stopSelf()
     }
 
     private fun begin(intent: Intent) {
         val newId = intent.getStringExtra(EXTRA_CALL_ID).orEmpty()
         if (newId.isEmpty()) {
-            stopSelf()
+            val noActiveCall = synchronized(stateLock) { callId.isEmpty() || ending }
+            if (noActiveCall) satisfyForegroundThenStop()
             return
         }
-        callId = newId
-        name = intent.getStringExtra(EXTRA_NAME).orEmpty()
-        avatar = intent.getStringExtra(EXTRA_AVATAR)
-        ending = false
+        val newName = intent.getStringExtra(EXTRA_NAME).orEmpty()
+        val newAvatar = intent.getStringExtra(EXTRA_AVATAR)
         // Only ask for the camera type when we may use it: Android 14 refuses the service otherwise.
-        cameraWanted = intent.getBooleanExtra(EXTRA_CAMERA, false) && hasCameraPermission()
-        _state.value = CallState.Connecting(callId, name, avatar)
+        val wantCamera = intent.getBooleanExtra(EXTRA_CAMERA, false) && hasCameraPermission()
+
+        val oldEvents: Job?
+        val oldMuteSync: Job?
+        val oldMedia: CallMedia?
+        val oldWakeLock: PowerManager.WakeLock?
+        val gen: Long
+        synchronized(stateLock) {
+            oldEvents = events
+            events = null
+            oldMuteSync = muteSync
+            muteSync = null
+            oldMedia = media
+            media = null
+            if (activeMedia === oldMedia) activeMedia = null
+            oldWakeLock = wakeLock
+            wakeLock = null
+
+            callGen++
+            cameraGen++
+            gen = callGen
+            callId = newId
+            name = newName
+            avatar = newAvatar
+            ending = false
+            cameraWanted = wantCamera
+            activeInstance = this
+        }
+
+        oldEvents?.cancel()
+        oldMuteSync?.cancel()
+        runCatching { oldMedia?.stop() }
+        releaseWakeLock(oldWakeLock)
+
+        _state.value = CallState.Connecting(newId, newName, newAvatar)
         try {
-            startInForeground(cameraWanted)
+            startInForeground(wantCamera)
         } catch (e: Exception) {
             // Android refused a microphone service (permission revoked, app not visible).
-            finish("Couldn't keep the call running: ${e.message}")
+            finish("Couldn't keep the call running: ${e.message}", expectedGen = gen)
             return
         }
-        events?.cancel()
-        events = scope.launch { follow() }
-        muteSync?.cancel()
+        acquireWakeLock(gen)
+
+        val newEvents = scope.launch { follow(newId, gen) }
         // The other side's app shows when we mute, as with the official apps.
-        muteSync = scope.launch { _muted.drop(1).collect { runCatching { api.setCallMuted(it) } } }
+        val newMuteSync = scope.launch { _muted.drop(1).collect { runCatching { api.setCallMuted(it) } } }
+        val stale = synchronized(stateLock) {
+            if (ending || gen != callGen) {
+                true
+            } else {
+                events = newEvents
+                muteSync = newMuteSync
+                false
+            }
+        }
+        if (stale) {
+            newEvents.cancel()
+            newMuteSync.cancel()
+        }
     }
 
-    private suspend fun follow() {
+    private fun acquireWakeLock(gen: Long) {
+        val wl = runCatching {
+            val pm = getSystemService(PowerManager::class.java)
+            pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zalom3ui:call")?.apply {
+                setReferenceCounted(false)
+                acquire(WAKE_LOCK_TIMEOUT_MS)
+            }
+        }.getOrNull() ?: return
+        val stale = synchronized(stateLock) {
+            if (ending || gen != callGen) {
+                true
+            } else {
+                wakeLock = wl
+                false
+            }
+        }
+        if (stale) releaseWakeLock(wl)
+    }
+
+    private fun releaseWakeLock(wl: PowerManager.WakeLock?) {
+        if (wl == null) return
+        runCatching { if (wl.isHeld) wl.release() }
+    }
+
+    private suspend fun follow(targetCallId: String, gen: Long) {
         // The call may already be connected (service restarted, or the event came before we listened).
         runCatching { api.currentCall() }.getOrNull()?.let {
-            if (it.callId == callId && it.state == "connected") onConnected(it.connectedAt)
+            if (it.callId == targetCallId && it.state == "connected") onConnected(it.connectedAt, gen)
         }
         while (scope.isActive) {
+            if (synchronized(stateLock) { ending || gen != callGen }) return
             try {
                 api.events().collect { event ->
+                    if (synchronized(stateLock) { ending || gen != callGen }) return@collect
                     when (event) {
-                        is ServerEvent.CallConnected -> if (event.callId == callId) onConnected(event.connectedAt)
-                        is ServerEvent.CallPeer -> if (event.callId.isEmpty() || event.callId == callId) _peerCamera.value = event.cameraOn
-                        is ServerEvent.CallEnded -> if (event.callId.isEmpty() || event.callId == callId) finish("Call ended")
+                        is ServerEvent.CallConnected -> if (event.callId == targetCallId) onConnected(event.connectedAt, gen)
+                        is ServerEvent.CallPeer -> if (event.callId.isEmpty() || event.callId == targetCallId) _peerCamera.value = event.cameraOn
+                        is ServerEvent.CallEnded -> if (event.callId.isEmpty() || event.callId == targetCallId) finish("Call ended", expectedGen = gen)
                         else -> Unit
                     }
                 }
@@ -137,8 +233,12 @@ class CallService : Service() {
         }
     }
 
-    private fun onConnected(connectedAt: Long) {
-        if (ending || media != null) return
+    private fun onConnected(connectedAt: Long, gen: Long) {
+        val shouldStart = synchronized(stateLock) {
+            !ending && media == null && gen == callGen
+        }
+        if (!shouldStart) return
+
         val since = if (connectedAt > 0) connectedAt else System.currentTimeMillis()
         val m = CallMediaFactory.create(applicationContext)
         m.muted = _muted.value
@@ -146,30 +246,74 @@ class CallService : Service() {
         try {
             m.start()
         } catch (e: Exception) {
-            m.stop()
+            runCatching { m.stop() }
             // Hang up too: otherwise the other side stays in a silent call until Zalo times it out.
             scope.launch {
-                runCatching { api.hangUpCall() }
-                finish("Couldn't start call audio: ${e.message}")
+                val stillCurrent = synchronized(stateLock) { !ending && gen == callGen }
+                if (stillCurrent) {
+                    runCatching { api.hangUpCall() }
+                    finish("Couldn't start call audio: ${e.message}", expectedGen = gen)
+                }
             }
             return
         }
-        m.setVideoListener(videoListener)
-        remoteSurface?.let { m.setRemoteSurface(it) }
-        previewSurface?.let { m.setPreviewSurface(it) }
-        media = m
-        activeMedia = m
-        _state.value = CallState.Connected(callId, name, since, avatar)
-        if (cameraWanted) main.post { setCamera(true) }
+
+        val listener = createVideoListener(gen)
+        val attachedId: String
+        val attachedName: String
+        val attachedAvatar: String?
+        val wantCam: Boolean
+        val camGenAtAttach: Long
+        val aborted: Boolean
+        synchronized(stateLock) {
+            if (ending || media != null || gen != callGen) {
+                aborted = true
+                attachedId = ""
+                attachedName = ""
+                attachedAvatar = null
+                wantCam = false
+                camGenAtAttach = 0L
+            } else {
+                aborted = false
+                m.muted = _muted.value
+                m.speakerOn = _speaker.value
+                m.setVideoListener(listener)
+                remoteSurface?.let { m.setRemoteSurface(it) }
+                previewSurface?.let { m.setPreviewSurface(it) }
+                media = m
+                activeMedia = m
+                attachedId = callId
+                attachedName = name
+                attachedAvatar = avatar
+                wantCam = cameraWanted
+                camGenAtAttach = cameraGen
+            }
+        }
+        if (aborted) {
+            runCatching { m.stop() }
+            return
+        }
+        _state.value = CallState.Connected(attachedId, attachedName, since, attachedAvatar)
+        if (wantCam) {
+            main.post {
+                val stillWanted = synchronized(stateLock) {
+                    !ending && gen == callGen && camGenAtAttach == cameraGen && cameraWanted
+                }
+                if (stillWanted) setCamera(true, expectedGen = gen)
+            }
+        }
     }
 
-    private val videoListener = object : VideoListener {
+    private fun createVideoListener(gen: Long) = object : VideoListener {
         override fun onRemoteVideoSize(width: Int, height: Int) {
-            _remoteSize.value = width to height
+            if (width <= 0 || height <= 0) return
+            val active = synchronized(stateLock) { !ending && gen == callGen }
+            if (active) _remoteSize.value = width to height
         }
 
         override fun onCameraStopped(message: String) {
-            main.post { cameraFailed(message) }
+            val camGen = synchronized(stateLock) { cameraGen }
+            main.post { cameraFailed(message, expectedCallGen = gen, expectedCameraGen = camGen) }
         }
     }
 
@@ -177,42 +321,64 @@ class CallService : Service() {
         checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     /** Starts or stops sending our camera and tells the other side. Runs on the main thread (the service's). */
-    private fun setCamera(on: Boolean) {
-        if (ending) return
-        if (on) {
-            if (!hasCameraPermission()) {
-                cameraWanted = false
-                _cameraOn.value = false
-                _notice.value = "Allow the camera to send video"
-                return
-            }
-            val m = media
-            if (m == null) {
-                // Not connected yet: connecting starts the camera (cameraWanted).
+    private fun setCamera(on: Boolean, expectedGen: Long? = null) {
+        val m: CallMedia?
+        val gen: Long
+        synchronized(stateLock) {
+            if (ending) return
+            if (expectedGen != null && expectedGen != callGen) return
+            gen = callGen
+            if (on) {
+                if (!hasCameraPermission()) {
+                    cameraWanted = false
+                    cameraGen++
+                    _cameraOn.value = false
+                    _notice.value = "Allow the camera to send video"
+                    return
+                }
+                m = media
+                if (m == null) {
+                    // Not connected yet: connecting starts the camera (cameraWanted).
+                    cameraWanted = true
+                    cameraGen++
+                    _cameraOn.value = true
+                    return
+                }
                 cameraWanted = true
-                _cameraOn.value = true
-                return
+                cameraGen++
+            } else {
+                cameraWanted = false
+                cameraGen++
+                m = media
             }
-            if (!startCamera(m)) return
+        }
+        if (on) {
+            if (m == null || !startCamera(m, gen)) return
         } else {
-            cameraWanted = false
-            media?.setCameraOn(false)
+            runCatching { m?.setCameraOn(false) }
             // Back to a microphone-only service; Android 14 wants the type to match what is running.
             runCatching { startInForeground(false) }
         }
+        val stillActive = synchronized(stateLock) { !ending && gen == callGen }
+        if (!stillActive) return
         _cameraOn.value = on
         scope.launch { runCatching { api.setCamera(on) } }
     }
 
-    private fun startCamera(m: CallMedia): Boolean {
+    private fun startCamera(m: CallMedia, gen: Long): Boolean {
         try {
             // The camera type goes on before the camera opens, and only while we are allowed to use it.
             startInForeground(true)
             m.setCameraOn(true)
         } catch (e: Exception) {
-            m.setCameraOn(false)
+            runCatching { m.setCameraOn(false) }
             runCatching { startInForeground(false) }
-            cameraWanted = false
+            synchronized(stateLock) {
+                if (gen == callGen) {
+                    cameraWanted = false
+                    cameraGen++
+                }
+            }
             _cameraOn.value = false
             _notice.value = "Couldn't start the camera: ${e.message}"
             return false
@@ -221,9 +387,17 @@ class CallService : Service() {
         return true
     }
 
-    private fun cameraFailed(message: String) {
-        if (ending || !_cameraOn.value) return
-        cameraWanted = false
+    private fun cameraFailed(message: String, expectedCallGen: Long, expectedCameraGen: Long) {
+        val shouldHandle = synchronized(stateLock) {
+            if (ending || expectedCallGen != callGen || expectedCameraGen != cameraGen || !_cameraOn.value) {
+                false
+            } else {
+                cameraWanted = false
+                cameraGen++
+                true
+            }
+        }
+        if (!shouldHandle) return
         _cameraOn.value = false
         _notice.value = message
         runCatching { startInForeground(false) }
@@ -231,26 +405,47 @@ class CallService : Service() {
     }
 
     private fun hangUp() {
-        if (ending) return
+        val gen = synchronized(stateLock) {
+            if (ending) return
+            callGen
+        }
         scope.launch {
             // Even if the request fails the user wants out; the server ends the call on its own timeout.
             runCatching { api.hangUpCall() }
-            finish("Call ended")
+            finish("Call ended", expectedGen = gen)
         }
     }
 
-    @Synchronized
-    private fun finish(reason: String) {
-        if (ending) return
-        ending = true
-        events?.cancel()
-        muteSync?.cancel()
-        media?.stop()
-        media = null
-        activeMedia = null
+    private fun finish(reason: String, expectedGen: Long? = null) {
+        val eventsToCancel: Job?
+        val muteSyncToCancel: Job?
+        val mediaToStop: CallMedia?
+        val wakeLockToRelease: PowerManager.WakeLock?
+        synchronized(stateLock) {
+            if (ending) return
+            if (expectedGen != null && expectedGen != callGen) return
+            ending = true
+            callGen++
+            cameraGen++
+            cameraWanted = false
+            eventsToCancel = events
+            events = null
+            muteSyncToCancel = muteSync
+            muteSync = null
+            mediaToStop = media
+            media = null
+            if (activeMedia === mediaToStop || activeInstance === this) activeMedia = null
+            wakeLockToRelease = wakeLock
+            wakeLock = null
+            if (activeInstance === this) activeInstance = null
+        }
+        eventsToCancel?.cancel()
+        muteSyncToCancel?.cancel()
+        runCatching { mediaToStop?.stop() }
+        releaseWakeLock(wakeLockToRelease)
         _cameraOn.value = false
         _state.value = CallState.Ended(reason)
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
         stopSelf()
     }
 
@@ -266,11 +461,19 @@ class CallService : Service() {
     }
 
     private fun buildNotification(): android.app.Notification {
-        val person = Person.Builder().setName(name.ifBlank { "Zalo call" }).setImportant(true).build()
+        val currentId: String
+        val currentName: String
+        val currentAvatar: String?
+        synchronized(stateLock) {
+            currentId = callId
+            currentName = name
+            currentAvatar = avatar
+        }
+        val person = Person.Builder().setName(currentName.ifBlank { "Zalo call" }).setImportant(true).build()
         val open = PendingIntent.getActivity(
             this,
             0,
-            CallActivity.intent(this, callId, "", name, avatar, video = false, answerNow = false),
+            CallActivity.intent(this, currentId, "", currentName, currentAvatar, video = _videoCall.value, answerNow = false),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val hangUp = PendingIntent.getService(
@@ -292,11 +495,35 @@ class CallService : Service() {
 
     override fun onDestroy() {
         // Normally finish() ran already; this covers the system killing the service.
-        media?.stop()
-        media = null
+        val eventsToCancel: Job?
+        val muteSyncToCancel: Job?
+        val mediaToStop: CallMedia?
+        val wakeLockToRelease: PowerManager.WakeLock?
+        val wasEnding: Boolean
+        synchronized(stateLock) {
+            wasEnding = ending
+            ending = true
+            callGen++
+            cameraGen++
+            cameraWanted = false
+            eventsToCancel = events
+            events = null
+            muteSyncToCancel = muteSync
+            muteSync = null
+            mediaToStop = media
+            media = null
+            if (activeMedia === mediaToStop || activeInstance === this) activeMedia = null
+            wakeLockToRelease = wakeLock
+            wakeLock = null
+            if (activeInstance === this) activeInstance = null
+        }
+        eventsToCancel?.cancel()
+        muteSyncToCancel?.cancel()
+        runCatching { mediaToStop?.stop() }
+        releaseWakeLock(wakeLockToRelease)
         scope.cancel()
-        if (!ending && _state.value !is CallState.Idle) _state.value = CallState.Ended("Call ended")
-        activeMedia = null
+        _cameraOn.value = false
+        if (!wasEnding && _state.value !is CallState.Idle) _state.value = CallState.Ended("Call ended")
         super.onDestroy()
     }
 
@@ -311,11 +538,16 @@ class CallService : Service() {
         const val EXTRA_VIDEO = "video"
         const val EXTRA_CAMERA = "camera"
         const val EXTRA_ON = "on"
+        private const val EXTRA_REASON = "reason"
         const val ACTION_CAMERA = "com.zalom3ui.app.action.CALL_CAMERA"
 
         const val CHANNEL_ID = "call_ongoing"
         private const val NOTIFICATION_ID = 201
         private const val RECONNECT_MS = 2_000L
+        private const val WAKE_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1_000L
+
+        /** Shared lock coordinating CallService lifecycle with companion surface/media helpers. */
+        private val mediaLock = Any()
 
         private val _state = MutableStateFlow<CallState>(CallState.Idle)
         val state: StateFlow<CallState> = _state.asStateFlow()
@@ -346,26 +578,27 @@ class CallService : Service() {
         private val _notice = MutableStateFlow<String?>(null)
         val notice: StateFlow<String?> = _notice.asStateFlow()
 
-        @Volatile
+        private var activeInstance: CallService? = null
         private var activeMedia: CallMedia? = null
 
         // The screen's surfaces outlive the media (they exist while connecting), so they are kept here.
-        @Volatile
         private var remoteSurface: Surface? = null
-
-        @Volatile
         private var previewSurface: Surface? = null
 
         /** The surface the other side's video is drawn on; null when it is destroyed. */
         fun setRemoteSurface(surface: Surface?) {
-            remoteSurface = surface
-            activeMedia?.setRemoteSurface(surface)
+            synchronized(mediaLock) {
+                remoteSurface = surface
+                activeMedia?.setRemoteSurface(surface)
+            }
         }
 
         /** The surface of our small self-view; null when it is destroyed. */
         fun setPreviewSurface(surface: Surface?) {
-            previewSurface = surface
-            activeMedia?.setPreviewSurface(surface)
+            synchronized(mediaLock) {
+                previewSurface = surface
+                activeMedia?.setPreviewSurface(surface)
+            }
         }
 
         /**
@@ -374,13 +607,19 @@ class CallService : Service() {
          */
         fun setCamera(context: Context, on: Boolean) {
             _cameraOn.value = on
-            context.startService(
-                Intent(context, CallService::class.java).setAction(ACTION_CAMERA).putExtra(EXTRA_ON, on),
-            )
+            val instance = synchronized(mediaLock) { activeInstance }
+            if (instance != null) {
+                instance.main.post { instance.setCamera(on) }
+                return
+            }
+            val intent = Intent(context, CallService::class.java).setAction(ACTION_CAMERA).putExtra(EXTRA_ON, on)
+            runCatching { context.startService(intent) }
         }
 
         fun switchCamera() {
-            activeMedia?.switchCamera()
+            synchronized(mediaLock) {
+                activeMedia?.switchCamera()
+            }
         }
 
         fun clearNotice() {
@@ -427,27 +666,55 @@ class CallService : Service() {
                 .putExtra(EXTRA_AVATAR, avatar)
                 .putExtra(EXTRA_VIDEO, video)
                 .putExtra(EXTRA_CAMERA, camera)
-            ContextCompat.startForegroundService(context, intent)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: Exception) {
+                _cameraOn.value = false
+                _state.value = CallState.Ended(e.message ?: "Couldn't keep the call running")
+                throw e
+            }
         }
 
         /** Ends the connected call: tells the server, then stops the service. */
         fun hangUp(context: Context) {
-            context.startService(Intent(context, CallService::class.java).setAction(ACTION_HANGUP))
+            val instance = synchronized(mediaLock) { activeInstance }
+            if (instance != null) {
+                instance.main.post { instance.hangUp() }
+                return
+            }
+            runCatching { context.startService(Intent(context, CallService::class.java).setAction(ACTION_HANGUP)) }
         }
 
         /** Drops the service without a hang-up request, for when answering failed. */
-        fun stop(context: Context) {
-            context.startService(Intent(context, CallService::class.java).setAction(ACTION_STOP))
+        fun stop(context: Context, reason: String = "Call ended") {
+            val instance = synchronized(mediaLock) { activeInstance }
+            if (instance != null) {
+                instance.main.post { instance.finish(reason) }
+                return
+            }
+            val intent = Intent(context, CallService::class.java)
+                .setAction(ACTION_STOP)
+                .putExtra(EXTRA_REASON, reason)
+            val started = runCatching { context.startService(intent) }.isSuccess
+            if (!started) {
+                runCatching { context.stopService(Intent(context, CallService::class.java)) }
+                _cameraOn.value = false
+                _state.value = CallState.Ended(reason)
+            }
         }
 
         fun setMuted(on: Boolean) {
-            _muted.value = on
-            activeMedia?.muted = on
+            synchronized(mediaLock) {
+                _muted.value = on
+                activeMedia?.muted = on
+            }
         }
 
         fun setSpeaker(on: Boolean) {
-            _speaker.value = on
-            activeMedia?.speakerOn = on
+            synchronized(mediaLock) {
+                _speaker.value = on
+                activeMedia?.speakerOn = on
+            }
         }
 
         private fun ensureChannel(context: Context) {
