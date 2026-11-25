@@ -13,7 +13,7 @@
 
 namespace {
 
-const char *kTag = "ZaloLiteNode";
+const char *kTag = "ZalooNode";
 int stdoutPipe[2];
 int stderrPipe[2];
 
@@ -47,7 +47,7 @@ void startForwarding(int (&fds)[2], int target, int priority) {
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_watchhrept_app_server_NodeRuntime_startNode(JNIEnv *env, jobject /* this */, jobjectArray arguments) {
+Java_com_zalom3ui_app_server_NodeRuntime_startNode(JNIEnv *env, jobject /* this */, jobjectArray arguments) {
     jsize argc = env->GetArrayLength(arguments);
     std::vector<std::string> args;
     size_t total = 0;

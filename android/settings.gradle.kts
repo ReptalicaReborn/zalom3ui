@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "watchhrept-android"
+rootProject.name = "zalom3ui-android"
 include(":app")

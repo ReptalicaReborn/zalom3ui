@@ -17,11 +17,11 @@ val nodeMobileSha256 = "bd7321eaa1a7602fbe0bb87302df2d79d87835cf4363fbdd17c350db
 val nodeMobileDir = layout.buildDirectory.dir("nodejs-mobile")
 
 android {
-    namespace = "com.watchhrept.app"
+    namespace = "com.zalom3ui.app"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.watchhrept.app"
+        applicationId = "com.zalom3ui.app"
         minSdk = 26 // Android 8.0
         targetSdk = 35
         versionCode = 3

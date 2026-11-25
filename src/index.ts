@@ -10,7 +10,7 @@ const session = new ZaloSession(store, config.dataDir, config.readReceipts);
 const server = createServer(config, session);
 
 server.listen(config.port, config.host, () => {
-    console.log(`watchhrept listening on http://${config.host}:${config.port}`);
+    console.log(`Zalỏ server listening on http://${config.host}:${config.port}`);
 });
 
 void session.resume();
