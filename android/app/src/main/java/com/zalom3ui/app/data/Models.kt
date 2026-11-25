@@ -10,6 +10,7 @@ data class SessionStatus(
     val scannedBy: String? = null,
     val ownId: String? = null,
     val ownName: String? = null,
+    val ownAvatar: String? = null,
     val error: String? = null,
     /** A saved session couldn't reach Zalo and is being retried; a QR login can replace it. */
     val retrying: Boolean = false,

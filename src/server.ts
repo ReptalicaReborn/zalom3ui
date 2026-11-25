@@ -267,6 +267,11 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.json(await session.friendRequests());
     }));
 
+    /** Requests I sent and nobody answered yet (to take back). */
+    api.get("/friend-requests/sent", wrap(async (_req, res) => {
+        res.json(await session.sentFriendRequests());
+    }));
+
     api.post("/friend-requests/:userId/accept", wrap(async (req, res) => {
         await session.acceptFriendRequest(req.params.userId);
         res.status(204).end();

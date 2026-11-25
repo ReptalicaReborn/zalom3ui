@@ -238,6 +238,9 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     suspend fun friendRequests(): List<FriendRequest> = get("friend-requests")
 
+    /** Requests I sent that are still unanswered. */
+    suspend fun sentFriendRequests(): List<FriendRequest> = get("friend-requests", "sent")
+
     suspend fun acceptFriend(userId: String) {
         post<Unit>("friend-requests", userId, "accept")
     }

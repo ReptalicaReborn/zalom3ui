@@ -82,6 +82,8 @@ data class UiState(
     val notice: String? = null,
     val friends: List<Person> = emptyList(),
     val friendRequests: List<FriendRequest>? = null,
+    /** Requests I sent that are still waiting for an answer. */
+    val sentRequests: List<FriendRequest>? = null,
     val stickers: StickerSearch = StickerSearch(),
     /** A chat to open, asked for by a tapped notification. */
     val openRequest: ThreadRef? = null,
@@ -432,6 +434,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun loadFriendRequests() = launchApi { api ->
         val requests = api.friendRequests()
         _state.update { it.copy(friendRequests = requests) }
+        // The list of sent requests is a nicety; don't fail the screen when it can't load.
+        val sent = runCatching { api.sentFriendRequests() }.getOrNull()
+        if (sent != null) _state.update { it.copy(sentRequests = sent) }
+    }
+
+    /** Takes back a request I sent, from the contacts list. */
+    fun cancelSentRequest(request: FriendRequest) = launchApi { api ->
+        api.undoFriendRequest(request.id)
+        _state.update { s -> s.copy(sentRequests = s.sentRequests?.filterNot { it.id == request.id }, notice = "Request to ${request.name} taken back") }
+    }
+
+    /** Opens the 1:1 chat with a friend, whether or not you have talked yet. */
+    fun openFriendChat(person: Person) {
+        val existing = _state.value.threads.firstOrNull { it.kind == "user" && it.id == person.id }
+        openChat(existing ?: ThreadSummary(id = person.id, kind = "user", name = person.name, avatar = person.avatar))
     }
 
     fun acceptFriend(request: FriendRequest) = launchApi { api ->
