@@ -227,6 +227,8 @@ fun SettingsScreen(
                 }
             }
 
+            if (current.onDevice) IncomingCallSettings()
+
             if (current.onDevice || loggedIn) {
                 HorizontalDivider(Modifier.padding(top = 8.dp))
                 SectionHeader("Account")

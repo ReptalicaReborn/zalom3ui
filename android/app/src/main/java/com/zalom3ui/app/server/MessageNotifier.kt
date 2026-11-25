@@ -1,5 +1,6 @@
 package com.zalom3ui.app.server
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -7,6 +8,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -17,6 +20,7 @@ import androidx.core.app.Person
 import androidx.core.app.RemoteInput
 import com.zalom3ui.app.MainActivity
 import com.zalom3ui.app.R
+import com.zalom3ui.app.call.CallPopup
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.IncomingCall
@@ -45,8 +49,11 @@ class MessageNotifier(private val context: Context) {
 
     private data class Line(val sender: String, val text: String, val ts: Long)
 
+    private var scope: CoroutineScope? = null
+
     /** Listens until [scope] ends; reconnects while the server starts or restarts. */
     fun start(scope: CoroutineScope) {
+        this.scope = scope
         ensureChannel(context)
         scope.launch {
             while (isActive) {
@@ -203,8 +210,34 @@ class MessageNotifier(private val context: Context) {
             if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
             else builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
         }
-        if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, builder.build()) }
+        val answerable = call.callId.isNotEmpty() && !call.group
+        // A call Zalỏ can answer rings (ringtone, on repeat) until it is answered, declined or over; the others ring once.
+        val notification = builder.build().apply { if (answerable) flags = flags or Notification.FLAG_INSISTENT }
+        if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, notification) }
+        if (answerable) {
+            popUp(call.callId, CallActivity.intent(context, call.callId, call.callerId, callerName, video = call.video))
+        }
     }
+
+    /**
+     * Opens the ringing call screen over whatever is on screen (CallPopup), unless another call is in progress: that
+     * call's screen stays, and this one only rings in the notification.
+     */
+    private fun popUp(callId: String, ringingScreen: Intent) {
+        val scope = scope ?: return
+        // Once per call: Zalo can repeat a call's request, and a second ringing screen would undo an answer in progress.
+        if (!poppedUp.add(callId)) return
+        while (poppedUp.size > 20) poppedUp.remove(poppedUp.first())
+        scope.launch {
+            val current = runCatching { ApiClient(LocalServer.url(context), SettingsStore(context).localToken()).currentCall() }.getOrNull()
+            // Another call in progress, or this one already answered from the notification.
+            if (current != null && (current.callId != callId || current.state != "ringing")) return@launch
+            if (callTag(callId) !in ringing) return@launch
+            CallPopup.show(context, ringingScreen)
+        }
+    }
+
+    private val poppedUp = LinkedHashSet<String>()
 
     private fun endCall(callId: String) {
         val tags = if (callId.isEmpty()) ringing.toList() else listOf(callTag(callId))
@@ -221,7 +254,9 @@ class MessageNotifier(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "messages"
-        const val CALLS_CHANNEL_ID = "calls"
+        /** Rings with the ringtone. A channel's sound can't change once created, so this replaced the first "calls". */
+        const val CALLS_CHANNEL_ID = "calls_ringing"
+        private const val OLD_CALLS_CHANNEL_ID = "calls"
         private const val CALL_TAG = "call:"
 
         /** Notification tag of the incoming call [callId]; the call screen cancels it when answering. */
@@ -232,9 +267,22 @@ class MessageNotifier(private val context: Context) {
         const val ZALO_PACKAGE = "com.zing.zalo"
 
         fun ensureCallChannel(context: Context) {
-            context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+            val nm = context.getSystemService(NotificationManager::class.java)
+            if (nm.getNotificationChannel(CALLS_CHANNEL_ID) != null) return
+            nm.deleteNotificationChannel(OLD_CALLS_CHANNEL_ID)
+            nm.createNotificationChannel(
                 NotificationChannel(CALLS_CHANNEL_ID, "Incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {
-                    description = "Incoming Zalo calls"
+                    description = "Incoming Zalo calls: rings until you answer or decline"
+                    setSound(
+                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build(),
+                    )
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 1_000, 1_000)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 },
             )
         }
@@ -306,6 +354,7 @@ class CallActionReceiver : BroadcastReceiver() {
             .setContentTitle(title)
             .setContentText(reason ?: "Zalo didn't answer")
             .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setAutoCancel(true)
             .setTimeoutAfter(30_000)
             .build()

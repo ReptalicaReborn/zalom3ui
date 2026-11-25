@@ -120,7 +120,11 @@ app turns its camera on after `connected` with `POST /calls/camera`.
 ## 5. Screens (`com.zalom3ui.app.ui.call`)
 
 - Incoming call: `NotificationCompat.CallStyle.forIncomingCall` with Answer / Decline and a full-screen intent to the
-  call screen (ringing state) when the phone is locked.
+  call screen (ringing state) when the phone is locked. It rings with the ringtone on repeat (`FLAG_INSISTENT`, channel
+  `calls_ringing`) until it is answered, declined or over. The notifier also opens the ringing call screen itself
+  (`CallPopup`), so the call pops up while the device is in use; Android allows that when Zalỏ is visible or may
+  "Display over other apps" (Xiaomi adds its own background pop-up switch). Settings → Incoming calls links to each
+  switch. No pop-up while another call is in progress or once the call was answered from the notification.
 - Call screen (Compose, the app's own theme): avatar, name, "Connecting…" / timer, Mute, Speaker, Hang up.
 - `CallService`: foreground service, type `microphone`, in the main process; owns `CallAudioEngine` +
   `CallAudioLink` while a call is connected; its notification is `CallStyle.forOngoingCall` with Hang up.
