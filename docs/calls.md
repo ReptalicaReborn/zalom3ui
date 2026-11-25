@@ -90,9 +90,11 @@ Byte 0 is the kind:
 | 1 request | client (and server, for forward/echo) | 21-byte control header + body |
 | 2 response | media server | 21-byte control header + body |
 | 3 audio | client | `03`, u32 stream token, SRTP-protected RTP |
-| 4 / 5 audio | server | `04` + RTP, or `05`, u32 token, RTP |
+| 4 audio | server | `04` + SRTP RTP |
+| 5 audio RTCP | both | `05`, u32 token, RTCP (plain: `srtcp: 0`) |
 | 7 audio FEC | both | client: `07` + token + data; server: `07` + data |
-| 13 / 14 / 15 video | client / server / server | like audio |
+| 13 / 14 video | client / server | `0d`, token, SRTP RTP / `0e` + SRTP RTP |
+| 15 video RTCP | both | `0f`, u32 token, RTCP |
 | 0x7f P2P | other phone | `7f`, u8, u8, u32 sender, u16 command, … (binding, echo, direct media) |
 
 Control header: kind (u8), flag (u8: `7e` on init/end call, `01` on the rest), u32, u32, **u32 own zrtc user id**,

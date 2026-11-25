@@ -11,20 +11,20 @@ export const Kind = {
     Request: 1,
     /** Answer from the media server, with the control header. */
     Response: 2,
-    /** Audio from a client: kind, 32-bit stream token, then the (SRTP-protected) RTP packet. */
+    /** Audio RTP from a client: kind, 32-bit stream token, then the (SRTP-protected) RTP packet. */
     Audio: 3,
-    /** Audio from the server without a token. */
+    /** Audio RTP from the server, without a token. */
     AudioIn: 4,
-    /** Audio from the server with a 32-bit token. */
-    AudioInToken: 5,
+    /** Audio RTCP, both ways, with the token (plain RTCP: Zalo calls run with `srtcp: 0`). */
+    AudioRtcp: 5,
     /** Audio FEC from a client (sent with a token); from the server it comes without one. */
     AudioFec: 7,
-    /** Video from a client (sent with a token). */
+    /** Video RTP from a client (sent with a token). */
     Video: 13,
-    /** Video from the server without a token. */
+    /** Video RTP from the server, without a token. */
     VideoIn: 14,
-    /** Video from the server with a token. */
-    VideoInToken: 15,
+    /** Video RTCP, both ways, with the token. */
+    VideoRtcp: 15,
     /** Peer-to-peer packets (binding, echo, media sent directly between the phones). */
     P2P: 0x7f,
 } as const;
@@ -152,6 +152,15 @@ export function endCall(p: { userId: number; callId: number; serverId: number; f
         .done();
 }
 
+/**
+ * RTCP to the media server: kind 5 (audio) or 15 (video), the stream token, the RTCP packet (Zalo PC:
+ * `initZRTPPacketAudio(…, rtcp = true)`).
+ */
+export function rtcp(token: number, packet: Buffer, video = false): Buffer {
+    if (packet.length > MAX_PAYLOAD) throw new Error(`RTCP packet too large (${packet.length} bytes)`);
+    return new Writer().u8(video ? Kind.VideoRtcp : Kind.AudioRtcp).u32(token).bytes(packet).done();
+}
+
 /** One audio packet to the media server: kind 3, the stream token, then the SRTP-protected RTP packet. */
 export function audio(token: number, rtp: Buffer): Buffer {
     if (rtp.length > MAX_PAYLOAD) throw new Error(`Audio packet too large (${rtp.length} bytes)`);
@@ -223,7 +232,7 @@ export function parse(buf: Buffer): Packet {
     if (kind === Kind.AudioIn || kind === Kind.AudioFec || kind === Kind.VideoIn) {
         return { type: "media", kind, payload: limit(r.rest()) };
     }
-    if (kind === Kind.AudioInToken || kind === Kind.VideoInToken) {
+    if (kind === Kind.AudioRtcp || kind === Kind.VideoRtcp) {
         const token = r.u32();
         return { type: "media", kind, token, payload: limit(r.rest()) };
     }

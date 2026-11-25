@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import dgram from "node:dgram";
 import { test } from "node:test";
 import { SrtpContext } from "../src/srtp.js";
+import { parseRtcp } from "../src/rtcp.js";
 import * as zrtc from "../src/zrtc.js";
 import { MediaCall, OPUS_PT, parseServer } from "../src/zrtcclient.js";
 
@@ -22,17 +23,22 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     const port = (server.address() as { port: number }).port;
     const callerSrtp = SrtpContext.fromSession(session);
     const serverSide = SrtpContext.fromSession(session);
-    const seen: { inits: Buffer[]; audio: number; audioOk: number; tokens: Set<number>; ends: number; pings: number } = {
+    const seen: { inits: Buffer[]; audio: number; audioOk: number; tokens: Set<number>; ends: number; pings: number; rtcp: string[] } = {
         inits: [],
         audio: 0,
         audioOk: 0,
         tokens: new Set(),
         ends: 0,
         pings: 0,
+        rtcp: [],
     };
     server.on("message", (msg, from) => {
-        const p = zrtc.parse(msg.subarray(0, 1)[0] === zrtc.Kind.Audio ? Buffer.from([zrtc.Kind.AudioInToken, ...msg.subarray(1)]) : msg);
-        if (msg[0] === zrtc.Kind.Request && p.type === "control") {
+        if (msg[0] === zrtc.Kind.AudioRtcp) {
+            seen.rtcp.push(parseRtcp(msg.subarray(5)).map((r) => r.type).join("+"));
+            return;
+        }
+        const p = msg[0] === zrtc.Kind.Request ? zrtc.parse(msg) : null;
+        if (p && p.type === "control") {
             if (p.cmd === zrtc.Cmd.InitCallCallee) {
                 seen.inits.push(msg);
                 // Response: header, error 0, value38, value18 (the token), our address.
@@ -69,6 +75,7 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
         session,
         log: (e) => logs.push(e),
         pingMs: 30,
+        rtcpMs: 40,
         onAudio: (seq, ts, opus) => heard.push([seq, ts, opus.toString("hex")]),
     });
     assert.equal(await call.join(2000, 100), 12345);
@@ -89,6 +96,8 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     assert.equal(seen.audioOk, seen.audio, "every packet decrypts with the session key");
     assert.deepEqual([...seen.tokens], [12345], "audio carries the server's token");
     assert.ok(seen.pings >= 1);
+    assert.ok(seen.rtcp.length >= 1, "sends RTCP");
+    assert.equal(seen.rtcp.at(-1), "SR+other", "a sender report (with a CNAME) once audio went out");
     assert.equal(seen.ends, 1);
     assert.ok(logs.some((l) => l.kind === "media_init_answer" && l.value18 === 12345));
 });
