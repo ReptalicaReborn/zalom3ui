@@ -10,6 +10,9 @@
     <!-- Voice calls: the microphone, a service that keeps it open, the lock-screen call screen, and speakerphone. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Video calls: the camera, asked for when it is first turned on, and a service type that lets it run. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -17,6 +20,10 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+
+    <!-- Video is optional: voice-only phones and tablets without a camera can still install. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
 
     <!-- To open the official Zalo app for calls (package visibility, Android 11+). -->
     <queries>
@@ -39,11 +46,12 @@
             android:foregroundServiceType="remoteMessaging"
             android:process=":node" />
 
-        <!-- Keeps an answered call alive; main process, because it owns the microphone. -->
+        <!-- Keeps an answered call alive; main process, because it owns the microphone (and the camera on video calls;
+             the camera type is only declared at run time once the permission is granted). -->
         <service
             android:name=".call.CallService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone|camera" />
 
         <!-- "Reply" / "Mark as read" on message notifications; next to the server and its notifier. -->
         <receiver

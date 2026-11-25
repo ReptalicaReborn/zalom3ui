@@ -43,9 +43,22 @@ class CallActivity : ComponentActivity() {
     private var micDenied by mutableStateOf(false)
     private var error by mutableStateOf<String?>(null)
     private var answering = false
+    private var cameraDenied by mutableStateOf(false)
 
-    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) answer() else micDenied = true
+    /** Answering asks for the microphone and, with video, the camera in one go; a refused camera still answers by voice. */
+    private var answerWithVideo = false
+
+    private val answerPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted[Manifest.permission.RECORD_AUDIO] == false || !hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            micDenied = true
+        } else {
+            if (answerWithVideo && !hasPermission(Manifest.permission.CAMERA)) cameraDenied = true
+            answer(answerWithVideo)
+        }
+    }
+
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) CallService.setCamera(this, true) else cameraDenied = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,6 +79,11 @@ class CallActivity : ComponentActivity() {
                 val service by CallService.state.collectAsStateWithLifecycle()
                 val muted by CallService.muted.collectAsStateWithLifecycle()
                 val speaker by CallService.speakerOn.collectAsStateWithLifecycle()
+                val videoCall by CallService.videoCall.collectAsStateWithLifecycle()
+                val cameraOn by CallService.cameraOn.collectAsStateWithLifecycle()
+                val peerCamera by CallService.peerCameraOn.collectAsStateWithLifecycle()
+                val remoteSize by CallService.remoteSize.collectAsStateWithLifecycle()
+                val notice by CallService.notice.collectAsStateWithLifecycle()
                 CallScreen(
                     state = CallScreenState(
                         name = nameOf(service),
@@ -76,8 +94,19 @@ class CallActivity : ComponentActivity() {
                         speakerOn = speaker,
                         micDenied = micDenied,
                         error = error,
+                        // Before the answer the call's own flag decides; afterwards the service's.
+                        video = if (service is CallState.Ringing) video else videoCall,
+                        cameraOn = cameraOn,
+                        peerCameraOn = peerCamera,
+                        remoteAspect = remoteSize?.let { (w, h) -> w.toFloat() / h },
+                        notice = notice ?: if (cameraDenied) "Allow the camera in the phone's app settings to send video" else null,
                     ),
-                    onAnswer = ::answer,
+                    onAnswer = { answer(false) },
+                    onAnswerWithVideo = { answer(true) },
+                    onToggleCamera = { toggleCamera(cameraOn) },
+                    onSwitchCamera = CallService::switchCamera,
+                    onRemoteSurface = CallService::setRemoteSurface,
+                    onPreviewSurface = CallService::setPreviewSurface,
                     onDecline = ::decline,
                     onHangUp = { CallService.hangUp(this@CallActivity) },
                     onToggleMute = { CallService.setMuted(!muted) },
@@ -134,6 +163,7 @@ class CallActivity : ComponentActivity() {
         if (id != callId) {
             answering = false
             micDenied = false
+            cameraDenied = false
             error = null
         }
         callId = id
@@ -142,13 +172,33 @@ class CallActivity : ComponentActivity() {
         avatar = intent.getStringExtra(EXTRA_AVATAR)
         video = intent.getBooleanExtra(EXTRA_VIDEO, false)
         CallService.showRinging(callId, callerName, avatar)
-        if (intent.action == ACTION_ANSWER) answer()
+        // The notification's Answer is voice only, even for a video call; "Answer with video" is on the screen.
+        if (intent.action == ACTION_ANSWER) answer(false)
     }
 
-    private fun answer() {
+    private fun hasPermission(permission: String) = checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+
+    /** Camera button: on needs the permission (asked now, the first time), off just stops. */
+    private fun toggleCamera(on: Boolean) {
+        when {
+            on -> CallService.setCamera(this, false)
+            hasPermission(Manifest.permission.CAMERA) -> {
+                cameraDenied = false
+                CallService.setCamera(this, true)
+            }
+            else -> cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun answer(withVideo: Boolean) {
         if (answering || callId.isEmpty()) return
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        val missing = buildList {
+            if (!hasPermission(Manifest.permission.RECORD_AUDIO)) add(Manifest.permission.RECORD_AUDIO)
+            if (withVideo && !hasPermission(Manifest.permission.CAMERA)) add(Manifest.permission.CAMERA)
+        }
+        if (missing.isNotEmpty()) {
+            answerWithVideo = withVideo
+            answerPermissions.launch(missing.toTypedArray())
             return
         }
         val s = CallService.state.value
@@ -158,7 +208,8 @@ class CallActivity : ComponentActivity() {
         val name = callerName
         // The call is answered now, so the ringing notification has done its job.
         NotificationManagerCompat.from(this).cancel(MessageNotifier.callTag(id), MessageNotifier.CALL_NOTIFICATION_ID)
-        CallService.start(this, id, name, avatar)
+        // A video call starts on the speaker; the camera only if asked for and allowed.
+        CallService.start(this, id, name, avatar, video = video, camera = withVideo && hasPermission(Manifest.permission.CAMERA))
         lifecycleScope.launch {
             try {
                 ApiClient(LocalServer.url(this@CallActivity), SettingsStore(this@CallActivity).localToken()).answerCall(id)
