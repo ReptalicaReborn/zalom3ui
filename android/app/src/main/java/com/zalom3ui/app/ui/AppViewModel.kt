@@ -292,6 +292,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { runCatching { client?.typing(chat.kind, chat.id) } }
     }
 
+    // ---- Call research ----
+
+    /** Shares the server's call log (for docs/calls.md); says so when there is nothing in it yet. */
+    fun shareCallLog(onReady: (String) -> Unit) = launchApi { api ->
+        val log = api.callLog()
+        if (log.isBlank()) {
+            _state.update { it.copy(notice = "The call log is empty: make or receive a call first") }
+        } else {
+            onReady(log)
+        }
+    }
+
+    fun clearCallLog() = launchApi { api ->
+        api.clearCallLog()
+        _state.update { it.copy(notice = "Call log cleared") }
+    }
+
     // ---- Photos, files and stickers ----
 
     /** Sends picked photos / files to the open chat, one by one, in the order picked. */
@@ -540,7 +557,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             is ServerEvent.Typing -> onTyping(event)
             // Notifications are the service's business (MessageNotifier).
-            is ServerEvent.Read -> Unit
+            is ServerEvent.Read, is ServerEvent.CallIncoming, is ServerEvent.CallEnded -> Unit
         }
     }
 

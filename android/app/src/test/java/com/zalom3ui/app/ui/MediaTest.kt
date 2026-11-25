@@ -52,6 +52,17 @@ class MediaTest {
     }
 
     @Test
+    fun incomingCallsDecodeWithLongIds() {
+        val call = json.decodeFromString<com.zalom3ui.app.data.IncomingCall>(
+            """{"callId":"77","callerId":"1234567890123456789","video":true,"group":false,"ts":1700000000000,"callerName":"Bảo","extra":1}""",
+        )
+        assertEquals("1234567890123456789", call.callerId)
+        assertTrue(call.video)
+        assertEquals("Bảo", call.callerName)
+        assertNull(call.groupName)
+    }
+
+    @Test
     fun oldAttachmentsWithoutKindKeepTheirLabel() {
         val a = Attachment(href = "https://x/y.jpg")
         assertFalse(a.isShown())

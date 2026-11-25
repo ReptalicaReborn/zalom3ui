@@ -281,6 +281,18 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    // ---- Call research (docs/calls.md) ----
+
+    /** The call log: one JSON line per call event Zalo sent. Holds call ids and server addresses, no message text. */
+    api.get("/debug/call-log", (_req, res) => {
+        res.type("text/plain").send(session.callLog());
+    });
+
+    api.delete("/debug/call-log", (_req, res) => {
+        session.clearCallLog();
+        res.status(204).end();
+    });
+
     app.use("/api", api);
     app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
         const status = err instanceof HttpError ? err.status : 500;
@@ -327,6 +339,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
         });
     });
     session.on("read", (read) => broadcast({ type: "read", ...read }));
+    session.on("call", (call) => broadcast({ type: "call", call }));
     session.on("message_updated", (message) => broadcast({ type: "message_updated", message }));
     session.on("message_deleted", (deleted) => broadcast({ type: "message_deleted", ...deleted }));
     session.on("typing", (typing) => broadcast({ type: "typing", ...typing }));

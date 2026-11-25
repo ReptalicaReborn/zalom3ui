@@ -225,12 +225,28 @@ enum class MuteOption(val apiValue: String, val label: String) {
     FOREVER("forever", "Until I turn it back on"),
 }
 
+/** Someone is calling (`call` event, type "incoming"); answering happens in the official Zalo app. */
+@Serializable
+data class IncomingCall(
+    val callId: String = "",
+    val callerId: String = "",
+    val video: Boolean = false,
+    val group: Boolean = false,
+    val groupId: String? = null,
+    val ts: Long = 0,
+    val callerName: String = "",
+    val groupName: String? = null,
+)
+
 sealed interface ServerEvent {
     data class Status(val status: SessionStatus) : ServerEvent
     /** [notify]: the server thinks a phone should show it (not mine, not muted, not open, not old). */
     data class Message(val message: ChatMessage, val notify: Boolean = false, val threadName: String = "") : ServerEvent
     /** The chat was read (here or in another client): its notification can go. */
     data class Read(val thread: ThreadRef) : ServerEvent
+    data class CallIncoming(val call: IncomingCall) : ServerEvent
+    /** The call stopped ringing (answered elsewhere, cancelled, ended); [callId] may be empty. */
+    data class CallEnded(val callId: String) : ServerEvent
     data class MessageUpdated(val message: ChatMessage) : ServerEvent
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent

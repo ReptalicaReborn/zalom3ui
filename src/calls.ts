@@ -1,0 +1,183 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import zlib from "node:zlib";
+
+/**
+ * Zalo call events. Calls are signalled with "control" frames on the realtime WebSocket (cmd 601, `act_type: "voip"`:
+ * `request`, `answer`, `cancel`, `endcall`, `group_request`…), which zca-js reads but drops. This module decodes them
+ * from the raw frames, so Zalỏ can say who is calling and record the events for the call research (docs/calls.md).
+ */
+
+export type CallControl = {
+    /** "request" (incoming call), "answer", "cancel", "endcall", "group_request"… */
+    act: string;
+    /** The control's `data`, parsed when it is JSON text. */
+    data: Record<string, unknown>;
+    /** The whole control as Zalo sent it, for the call log. */
+    raw: unknown;
+};
+
+/** Incoming call, as far as the control says. */
+export type IncomingCall = {
+    callId: string;
+    callerId: string;
+    video: boolean;
+    group: boolean;
+    groupId?: string;
+    ts: number;
+};
+
+/** First 4 bytes of a frame: version, command (little-endian u16), sub-command (same layout zca-js reads). */
+export function frameHeader(frame: Buffer): { version: number; cmd: number; subCmd: number } | null {
+    if (frame.length < 4) return null;
+    return { version: frame[0], cmd: frame.readUInt16LE(1), subCmd: frame[3] };
+}
+
+/**
+ * JSON.parse that keeps integers too long for a JS number (Zalo's ids) as text. Only numbers outside strings are
+ * touched: Zalo nests JSON text inside strings, and that text is parsed on its own later.
+ */
+export function parseJsonKeepingBigInts(text: string): unknown {
+    let out = "";
+    let inString = false;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                out += text[i + 1] ?? "";
+                i++;
+            } else if (c === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            continue;
+        }
+        if (c === "-" || (c >= "0" && c <= "9")) {
+            let j = i + 1;
+            while (j < text.length && /[0-9.eE+-]/.test(text[j])) j++;
+            const num = text.slice(i, j);
+            out += /^-?\d{16,}$/.test(num) ? `"${num}"` : num;
+            i = j - 1;
+            continue;
+        }
+        out += c;
+    }
+    return JSON.parse(out);
+}
+
+/**
+ * Decodes an event payload `{ data, encrypt }` like zca-js's `decodeEventData`: 0 plain JSON, 1 base64 + zlib,
+ * 2 URL-encoded base64 of AES-GCM (16-byte IV, 16-byte additional data, tag at the end) + zlib, 3 the same without zlib.
+ */
+export function decodeEventPayload(parsed: { data?: unknown; encrypt?: unknown }, cipherKey: string | undefined): unknown {
+    if (typeof parsed.data !== "string" || typeof parsed.encrypt !== "number") return null;
+    const type = parsed.encrypt;
+    if (type === 0) return parseJsonKeepingBigInts(parsed.data);
+    const buf = Buffer.from(type === 1 ? parsed.data : decodeURIComponent(parsed.data), "base64");
+    let plain = buf;
+    if (type !== 1) {
+        if (!cipherKey || buf.length < 48) return null;
+        const key = Buffer.from(cipherKey, "base64");
+        const algorithm = key.length === 32 ? "aes-256-gcm" : key.length === 24 ? "aes-192-gcm" : "aes-128-gcm";
+        const decipher = crypto.createDecipheriv(algorithm, key, buf.subarray(0, 16));
+        decipher.setAAD(buf.subarray(16, 32));
+        decipher.setAuthTag(buf.subarray(buf.length - 16));
+        plain = Buffer.concat([decipher.update(buf.subarray(32, buf.length - 16)), decipher.final()]);
+    }
+    const text = (type === 3 ? plain : zlib.inflateSync(plain)).toString("utf8");
+    return text ? parseJsonKeepingBigInts(text) : null;
+}
+
+/** The `voip` controls of a raw frame, if it is a control frame (cmd 601). */
+export function callControlsOf(frame: Buffer, cipherKey: string | undefined): CallControl[] {
+    const header = frameHeader(frame);
+    if (!header || header.version !== 1 || header.cmd !== 601 || header.subCmd !== 0) return [];
+    const text = frame.subarray(4).toString("utf8");
+    if (!text) return [];
+    const decoded = decodeEventPayload(JSON.parse(text), cipherKey) as { data?: { controls?: unknown[] } } | null;
+    const controls = decoded?.data?.controls ?? (decoded as { controls?: unknown[] } | null)?.controls ?? [];
+    const out: CallControl[] = [];
+    for (const control of controls) {
+        const content = (control as { content?: Record<string, unknown> })?.content;
+        if (!content || content.act_type !== "voip") continue;
+        let data = content.data;
+        if (typeof data === "string") {
+            try {
+                data = parseJsonKeepingBigInts(data);
+            } catch {
+                data = { text: data };
+            }
+        }
+        out.push({ act: String(content.act ?? ""), data: (data ?? {}) as Record<string, unknown>, raw: control });
+    }
+    return out;
+}
+
+/** Reads an incoming call from a `request` / `group_request` control. Field names vary, so several are tried. */
+export function incomingCallOf(control: CallControl, now = Date.now()): IncomingCall | null {
+    if (control.act !== "request" && control.act !== "group_request") return null;
+    const d = control.data;
+    const text = (...keys: string[]) => {
+        for (const k of keys) {
+            const v = d[k];
+            if ((typeof v === "string" && v) || typeof v === "number") return String(v);
+        }
+        return "";
+    };
+    const callerId = text("callerId", "uidN", "fromUid", "uidFrom", "uid", "hostCall", "srcId");
+    if (!callerId) return null;
+    const ts = Number(text("ts")) || now;
+    const type = Number(text("callType", "type", "calltype"));
+    return {
+        callId: text("callId", "call_id"),
+        callerId,
+        video: type === 1 || text("isVideo") === "1" || d.isVideo === true,
+        group: control.act === "group_request",
+        groupId: text("groupId", "gid") || undefined,
+        ts,
+    };
+}
+
+/** Acts after which a ringing call is over (answered elsewhere, cancelled, ended). */
+export const CALL_ENDING_ACTS = new Set(["answer", "cancel", "endcall", "group_answer", "group_cancel", "group_endcall", "group_finish"]);
+
+const TRACE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The call log: one JSON line per call event, kept in the data folder so it can be shared for the call research.
+ * It holds call ids, user ids and Zalo server addresses, never message text. Rotates at 2 MB.
+ */
+export class CallTrace {
+    private readonly file: string;
+
+    constructor(dataDir: string) {
+        this.file = path.join(dataDir, "call-trace.jsonl");
+    }
+
+    record(entry: Record<string, unknown>): void {
+        try {
+            fs.mkdirSync(path.dirname(this.file), { recursive: true });
+            if (fs.existsSync(this.file) && fs.statSync(this.file).size > TRACE_MAX_BYTES) {
+                fs.renameSync(this.file, this.file + ".1");
+            }
+            fs.appendFileSync(this.file, JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+        } catch (err) {
+            console.warn("Call log:", err);
+        }
+    }
+
+    read(): string {
+        const parts = [this.file + ".1", this.file].filter((f) => fs.existsSync(f)).map((f) => fs.readFileSync(f, "utf8"));
+        return parts.join("");
+    }
+
+    clear(): void {
+        for (const f of [this.file, this.file + ".1"]) fs.rmSync(f, { force: true });
+    }
+}

@@ -23,6 +23,8 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.RestartAlt
+import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -73,6 +75,8 @@ fun SettingsScreen(
     onAppearance: (Appearance) -> Unit,
     onRestartServer: () -> Unit,
     onLogout: () -> Unit,
+    onShareCallLog: () -> Unit = {},
+    onClearCallLog: () -> Unit = {},
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
     var serverUrl by rememberSaveable { mutableStateOf(current.serverUrl) }
@@ -217,6 +221,21 @@ fun SettingsScreen(
                     leadingContent = { Icon(Icons.Outlined.RestartAlt, null) },
                     headlineContent = { Text("Restart Zalo service") },
                     supportingContent = { Text("If messages stop arriving") },
+                )
+            }
+            if (current.onDevice && loggedIn) {
+                HorizontalDivider(Modifier.padding(top = 8.dp))
+                SectionHeader("Call research")
+                ListItem(
+                    modifier = Modifier.clickable(onClick = onShareCallLog),
+                    leadingContent = { Icon(Icons.Outlined.Share, null) },
+                    headlineContent = { Text("Share call log") },
+                    supportingContent = { Text("Call events Zalo sent (call ids, server addresses; no messages), to help add calls") },
+                )
+                ListItem(
+                    modifier = Modifier.clickable(onClick = onClearCallLog),
+                    leadingContent = { Icon(Icons.Outlined.DeleteSweep, null) },
+                    headlineContent = { Text("Clear call log") },
                 )
             }
             if (loggedIn) {

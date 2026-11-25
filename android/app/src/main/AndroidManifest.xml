@@ -13,6 +13,11 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- To open the official Zalo app for calls (package visibility, Android 11+). -->
+    <queries>
+        <package android:name="com.zing.zalo" />
+    </queries>
+
     <application
         android:name=".ZalooApp"
         android:allowBackup="false"

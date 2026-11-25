@@ -21,6 +21,7 @@ import {
     type Undo,
     ZaloApiLoginQRAborted,
 } from "zca-js";
+import { CALL_ENDING_ACTS, CallTrace, callControlsOf, incomingCallOf, type CallControl, type IncomingCall } from "./calls.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -63,10 +64,15 @@ export type UploadFile = { data: Buffer; filename: string; width?: number; heigh
 export type MuteOption = "1h" | "4h" | "8am" | "forever";
 
 export type ReadEvent = { threadKind: ThreadKind; threadId: string };
+/** Someone is calling (answer it in the official app), or that call stopped ringing. */
+export type CallEvent =
+    | { type: "incoming"; call: IncomingCall & { callerName: string; groupName?: string } }
+    | { type: "ended"; callId: string; act: string };
 
 type SessionEvents = {
     status: [SessionStatus];
     read: [ReadEvent];
+    call: [CallEvent];
     message: [ChatMessage];
     message_updated: [ChatMessage];
     message_deleted: [DeletedEvent];
@@ -102,6 +108,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private stickers = new Map<number, StickerInfo>();
     private stickerLookups = new Map<number, Promise<StickerInfo | null>>();
     private viewing: { key: string; until: number } | null = null;
+    private readonly callTrace: CallTrace;
+    /** Sockets already tapped for call events (zca-js opens a new one on each reconnect). */
+    private tappedSockets = new WeakSet<object>();
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -121,6 +130,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     ) {
         super();
         this.credentialsFile = path.join(dataDir, "credentials.json");
+        this.callTrace = new CallTrace(dataDir);
     }
 
     getStatus(): SessionStatus {
@@ -456,6 +466,53 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return this.store.getThread(kind, threadId)?.name ?? threadId;
     }
 
+    // ---- Calls (research: docs/calls.md) ----
+
+    /** The call log (JSON lines) for sharing; empty until a call event arrives. */
+    callLog(): string {
+        return this.callTrace.read();
+    }
+
+    clearCallLog(): void {
+        this.callTrace.clear();
+    }
+
+    /**
+     * zca-js drops the realtime "voip" controls that signal calls. Reads them from the same socket: decoded with the
+     * session's cipher key, recorded in the call log, and an incoming call is announced.
+     */
+    private tapCallEvents(listener: unknown): void {
+        const l = listener as { ws?: { on?: (event: string, fn: (data: unknown) => void) => void } | null; cipherKey?: string };
+        const ws = l.ws;
+        if (!ws || typeof ws.on !== "function" || this.tappedSockets.has(ws)) return;
+        this.tappedSockets.add(ws);
+        ws.on("message", (data: unknown) => {
+            if (!Buffer.isBuffer(data)) return;
+            let controls: CallControl[];
+            try {
+                controls = callControlsOf(data, l.cipherKey);
+            } catch (err) {
+                this.callTrace.record({ kind: "decode_error", error: err instanceof Error ? err.message : String(err) });
+                return;
+            }
+            for (const control of controls) this.onCallControl(control);
+        });
+    }
+
+    /** Public for tests: one decoded voip control. */
+    onCallControl(control: CallControl): void {
+        this.callTrace.record({ kind: "control", act: control.act, control: control.raw });
+        const incoming = incomingCallOf(control);
+        if (incoming) {
+            const caller = this.friendList.get(incoming.callerId)?.name ?? this.store.getThread("user", incoming.callerId)?.name ?? "";
+            const groupName = incoming.groupId ? this.store.getThread("group", incoming.groupId)?.name : undefined;
+            this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
+        } else if (CALL_ENDING_ACTS.has(control.act)) {
+            const callId = control.data.callId ?? control.data.call_id;
+            this.emit("call", { type: "ended", callId: callId === undefined ? "" : String(callId), act: control.act });
+        }
+    }
+
     // ---- Photos, files and stickers ----
 
     /**
@@ -780,6 +837,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.loadGroups(api, [e.threadId]).then(() => this.emit("threads"), () => {});
         });
         listener.on("connected", () => {
+            this.tapCallEvents(listener);
             this.setStatus({ state: "ready", error: null });
             // Ask the server to replay messages and reactions we missed while offline.
             listener.requestOldMessages(ThreadType.User);

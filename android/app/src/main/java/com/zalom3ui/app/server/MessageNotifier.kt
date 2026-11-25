@@ -16,6 +16,7 @@ import com.zalom3ui.app.MainActivity
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ChatMessage
+import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
@@ -59,6 +60,8 @@ class MessageNotifier(private val context: Context) {
         when (event) {
             is ServerEvent.Message -> if (event.notify) show(event.message, event.threadName)
             is ServerEvent.Read -> cancel(event.thread)
+            is ServerEvent.CallIncoming -> showCall(event.call)
+            is ServerEvent.CallEnded -> endCall(event.callId)
             else -> Unit
         }
     }
@@ -132,6 +135,53 @@ class MessageNotifier(private val context: Context) {
         }
     }
 
+    private val ringing = LinkedHashSet<String>()
+
+    /** "Bảo is calling": Zalỏ can't answer calls, so it says who is calling and opens the official app. */
+    private fun showCall(call: IncomingCall) {
+        ensureCallChannel(context)
+        val tag = CALL_TAG + call.callId.ifEmpty { call.callerId }
+        ringing += tag
+        val zalo = context.packageManager.getLaunchIntentForPackage(ZALO_PACKAGE)
+        val openZalo = zalo?.let {
+            PendingIntent.getActivity(context, tag.hashCode(), it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        }
+        val ref = if (call.group && call.groupId != null) ThreadRef("group", call.groupId) else ThreadRef("user", call.callerId)
+        val openChat = PendingIntent.getActivity(
+            context,
+            tag.hashCode() + 1,
+            MainActivity.openChatIntent(context, ref),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val what = if (call.video) "Video call" else "Voice call"
+        val title = buildString {
+            append(call.callerName.ifBlank { "Someone" })
+            append(" is calling")
+            call.groupName?.let { append(" in ").append(it) }
+        }
+        val builder = NotificationCompat.Builder(context, CALLS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("📞 $title")
+            .setContentText(if (zalo != null) "$what · answer it in the Zalo app" else "$what · Zalỏ can't answer calls yet")
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setContentIntent(openZalo ?: openChat)
+            .setAutoCancel(true)
+            // Zalo rings for about a minute; a call that never said it ended disappears on its own.
+            .setTimeoutAfter(CALL_TIMEOUT_MS)
+        if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
+        builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
+        if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, builder.build()) }
+    }
+
+    private fun endCall(callId: String) {
+        val tags = if (callId.isEmpty()) ringing.toList() else listOf(CALL_TAG + callId).filter { it in ringing }.ifEmpty { ringing.toList() }
+        for (tag in tags) {
+            ringing -= tag
+            NotificationManagerCompat.from(context).cancel(tag, CALL_NOTIFICATION_ID)
+        }
+    }
+
     private fun cancel(ref: ThreadRef) {
         history.remove(ref.key)
         NotificationManagerCompat.from(context).cancel(ref.key, NOTIFICATION_ID)
@@ -139,6 +189,20 @@ class MessageNotifier(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "messages"
+        const val CALLS_CHANNEL_ID = "calls"
+        private const val CALL_TAG = "call:"
+        private const val CALL_NOTIFICATION_ID = 200
+        private const val CALL_TIMEOUT_MS = 75_000L
+        /** The official Zalo app, which answers the calls. */
+        const val ZALO_PACKAGE = "com.zing.zalo"
+
+        fun ensureCallChannel(context: Context) {
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CALLS_CHANNEL_ID, "Incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {
+                    description = "Who is calling (calls are answered in the Zalo app)"
+                },
+            )
+        }
         /** Notifications are tagged with the chat key; this id is shared by all of them. */
         const val NOTIFICATION_ID = 100
         private const val MAX_LINES = 7

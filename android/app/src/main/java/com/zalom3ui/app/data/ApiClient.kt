@@ -146,6 +146,22 @@ class ApiClient(serverUrl: String, private val token: String?) {
         httpPut("presence", body.toString())
     }
 
+    // ---- Call research ----
+
+    /** The server's call log (JSON lines of the call events Zalo sent). */
+    suspend fun callLog(): String = withContext(Dispatchers.IO) {
+        val builder = Request.Builder().url(url("debug/call-log")).get()
+        token?.let { builder.header("Authorization", "Bearer $it") }
+        http.newCall(builder.build()).execute().use { res ->
+            if (!res.isSuccessful) throw ApiException("HTTP ${res.code}")
+            res.body?.string().orEmpty()
+        }
+    }
+
+    suspend fun clearCallLog() {
+        httpDelete("debug/call-log")
+    }
+
     // ---- Friends ----
 
     suspend fun friends(): List<Person> = get("friends")
@@ -263,6 +279,14 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 threadName = obj.string("threadName"),
             )
             "read" -> ServerEvent.Read(obj.threadRef())
+            "call" -> {
+                val call = obj["call"]?.jsonObject ?: return null
+                when (call.string("type")) {
+                    "incoming" -> ServerEvent.CallIncoming(json.decodeFromJsonElement(IncomingCall.serializer(), call.getValue("call")))
+                    "ended" -> ServerEvent.CallEnded(call.string("callId"))
+                    else -> null
+                }
+            }
             "message_updated" ->
                 ServerEvent.MessageUpdated(json.decodeFromJsonElement(ChatMessage.serializer(), obj.getValue("message")))
             "message_deleted" -> ServerEvent.MessageDeleted(obj.threadRef(), obj.string("id"))

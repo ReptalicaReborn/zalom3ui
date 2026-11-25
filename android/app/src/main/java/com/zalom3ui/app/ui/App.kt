@@ -357,6 +357,8 @@ private fun AppNav(vm: AppViewModel) {
                     vm.logout()
                     nav.popBackStack(Routes.HOME, inclusive = false)
                 },
+                onShareCallLog = { vm.shareCallLog { log -> QrActions.shareCallLog(context, log) } },
+                onClearCallLog = vm::clearCallLog,
             )
         }
     }
