@@ -289,6 +289,12 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    /** Picks up a ringing call for 30 s without sound, to record the media connection in the call log. */
+    api.post("/calls/:callId/answer-test", wrap(async (req, res) => {
+        await session.answerCallTest(req.params.callId);
+        res.status(204).end();
+    }));
+
     // ---- Call research (docs/calls.md) ----
 
     /** The call log: one JSON line per call event Zalo sent. Holds call ids and server addresses, no message text. */

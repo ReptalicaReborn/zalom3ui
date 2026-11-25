@@ -163,6 +163,15 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   control with status 3. Two earlier tries used `/api/voicecall/cancel` (the caller giving up): Zalo accepted it but
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
+- **Answer (test):** the call notification's second button picks up the way Zalo PC does, without sound yet:
+  `ringring`, join the call's media server over UDP (init call, command 12, with the request's `uidTo` / `uidFrom` /
+  `callId` / `session`; the reply's second number is the **token** every audio packet carries and the server id pings
+  carry), then `/api/voicecall/answer` with status 0, codec Opus 16 kHz mono (payload 112), that media server, our
+  `extendData` and `subCommand: 3`. It then receives the caller's audio (SRTP, key = the session's first 30
+  characters; `src/srtp.ts`, checked against libsrtp), sends Opus silence every 20 ms, pings every 2 s, and after 30 s
+  hangs up (`/api/voicecall/endcall` and the zrtc end call). The call log records the media server's replies and an
+  `answer_test_done` line with what arrived: packet counts per kind, how many audio packets decrypted, RTP payload
+  types, timestamp steps (the clock) and the first byte of the first few Opus frames — never the audio.
 - **Control poll:** only when the account's settings say Zalo PC would long-poll (`enable_ctrl_socket` off or
   `disable_lp` off). On an account with both set the chat socket carried every call, and the poll answers kept
   repeating the same backlog; repeats now make the poll wait 30 s. An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;

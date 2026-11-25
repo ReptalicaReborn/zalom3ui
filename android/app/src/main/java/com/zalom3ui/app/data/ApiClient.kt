@@ -148,6 +148,11 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     // ---- Call research ----
 
+    /** Picks up a ringing call for 30 s without sound, recording the media connection in the call log. */
+    suspend fun answerCallTest(callId: String) {
+        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/answer-test")
+    }
+
     /** Declines a call ringing on this account (the caller sees it declined). */
     suspend fun declineCall(callId: String) {
         post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/decline")

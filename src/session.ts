@@ -33,7 +33,8 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
-import { declineCall, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
+import { acceptCall, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
+import { MediaCall, parseServer } from "./zrtcclient.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -132,6 +133,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private handledCallControls = new Map<string, number>();
     /** Calls ringing on this account now, by call id. */
     private ringing = new Map<string, RingingCall>();
+    /** The call picked up by "Answer (test)", while it runs. */
+    private testCall: { callId: string; finish: (reason: string, hangUp: boolean) => void } | null = null;
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -239,6 +242,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     async logout(): Promise<void> {
+        this.testCall?.finish("logout", true);
         this.cancelResume();
         this.abortQR?.();
         this.stopControlPoll();
@@ -552,6 +556,67 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     /**
+     * "Answer (test)": picks up a ringing call the way Zalo PC does (ringring, join the call's media server, answer with
+     * status 0), receives the caller's audio and sends silence for [seconds], then hangs up. No sound yet: the point is
+     * the call log, which gets the media server's replies and what the audio looked like (counts, RTP fields, whether
+     * it decrypted with the session key).
+     */
+    async answerCallTest(callId: string, seconds = 30): Promise<void> {
+        const api = this.requireApi();
+        const call = this.ringing.get(callId);
+        if (!call) throw new HttpError(404, "That call isn't ringing any more");
+        if (this.testCall) throw new HttpError(409, "A test call is already running");
+        const p = mediaParamsOf(call);
+        const server = p && parseServer(p.server);
+        if (!p || !server) {
+            this.callTrace.record({ kind: "answer_test_unavailable", callId, reason: "the request has no media server, ids or session" });
+            throw new HttpError(422, "This call doesn't carry what's needed to answer it");
+        }
+        const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
+        const send = voiceCallSender(api);
+        await ringRing(send, call, imei).then(
+            (answer) => this.callTrace.record({ kind: "ringring", callId, answer }),
+            (err) => this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) }),
+        );
+        const media = new MediaCall({ server, userId: p.userId, partnerId: p.partnerId, callId: p.callId, session: p.session, log: (e) => this.callTrace.record({ callId, ...e }) });
+        const started = Date.now();
+        const token = await media.join();
+        this.callTrace.record({ kind: "media_join", callId, server: p.server, token, address: media.natAddress, ms: Date.now() - started });
+        if (token === null) {
+            media.close(false);
+            throw new HttpError(502, "Zalo's media server didn't let us join the call");
+        }
+        try {
+            const answer = await acceptCall(send, call, p.server);
+            this.callTrace.record({ kind: "answered", callId, answer });
+        } catch (err) {
+            media.close();
+            this.callTrace.record({ kind: "answer_failed", callId, error: describeError(err) });
+            throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
+        }
+        this.ringing.delete(callId);
+        this.emit("call", { type: "ended", callId, act: "answered_test" });
+        media.startSilence();
+        let done = false;
+        const finish = (reason: string, sendHangUp: boolean) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            media.close(sendHangUp);
+            this.testCall = null;
+            this.callTrace.record({ kind: "answer_test_done", callId, reason, seconds: Math.round((Date.now() - started) / 1000), stats: media.stats });
+            if (sendHangUp) {
+                hangUp(send, call, imei).then(
+                    (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
+                    (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
+                );
+            }
+        };
+        const timer = setTimeout(() => finish("time_up", true), seconds * 1000);
+        this.testCall = { callId, finish };
+    }
+
+    /**
      * Polls Zalo's control servers the way Zalo PC does (src/ctrlpoll.ts), for the call events the chat socket never
      * carries. Notes in the call log what the login offered (field names, server hosts, socket flags), so a log shows
      * why it could not run.
@@ -642,6 +707,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
         } else if (CALL_ENDING_ACTS.has(control.act)) {
             if (callId !== undefined) this.ringing.delete(String(callId));
+            // The caller hung up on the test call (our own answer comes back as "answer" too: not an end).
+            if (this.testCall && String(callId) === this.testCall.callId && control.act !== "answer") this.testCall.finish(`partner_${control.act}`, false);
             this.emit("call", { type: "ended", callId: callId === undefined ? "" : String(callId), act: control.act });
         }
     }

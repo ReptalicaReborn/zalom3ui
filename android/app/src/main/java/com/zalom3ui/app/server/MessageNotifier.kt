@@ -177,9 +177,18 @@ class MessageNotifier(private val context: Context) {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
             builder.addAction(R.drawable.ic_launcher_foreground, "Decline", decline)
+            val answerTest = PendingIntent.getBroadcast(
+                context,
+                tag.hashCode() + 3,
+                CallActionReceiver.answerTestIntent(context, call.callId, tag),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            // Picks up without sound for 30 s and records the media connection (Settings → Call research).
+            builder.addAction(R.drawable.ic_launcher_foreground, "Answer (test)", answerTest)
         }
+        // Android shows three buttons at most.
         if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
-        builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
+        else builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
         if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, builder.build()) }
     }
 
@@ -249,32 +258,34 @@ class MessageNotifier(private val context: Context) {
     }
 }
 
-/** "Decline" on an incoming call notification: tells Zalo, then removes the notification. */
+/** "Decline" and "Answer (test)" on an incoming call notification: tells Zalo, then removes the notification. */
 class CallActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val callId = intent.getStringExtra(EXTRA_CALL_ID) ?: return
         val tag = intent.getStringExtra(EXTRA_TAG) ?: return
+        val answering = intent.action == ACTION_ANSWER_TEST
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                ApiClient(LocalServer.url(context), SettingsStore(context).localToken()).declineCall(callId)
+                val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
+                if (answering) api.answerCallTest(callId) else api.declineCall(callId)
                 NotificationManagerCompat.from(context).cancel(tag, MessageNotifier.CALL_NOTIFICATION_ID)
             } catch (e: Exception) {
                 // Say so on the notification instead of leaving the caller wondering whether it worked.
-                StartupLog.write(context, "Decline failed: ${e.message}")
-                showDeclineFailed(context, tag, e.message)
+                StartupLog.write(context, "${if (answering) "Answer test" else "Decline"} failed: ${e.message}")
+                showFailed(context, tag, if (answering) "Couldn't answer the call" else "Couldn't decline the call", e.message)
             } finally {
                 pending.finish()
             }
         }
     }
 
-    private fun showDeclineFailed(context: Context, tag: String, reason: String?) {
+    private fun showFailed(context: Context, tag: String, title: String, reason: String?) {
         if (!MessageNotifier.canNotify(context)) return
         MessageNotifier.ensureCallChannel(context)
         val n = NotificationCompat.Builder(context, MessageNotifier.CALLS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Couldn't decline the call")
+            .setContentTitle(title)
             .setContentText(reason ?: "Zalo didn't answer")
             .setOnlyAlertOnce(true)
             .setAutoCancel(true)
@@ -285,12 +296,17 @@ class CallActionReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_DECLINE = "com.zalom3ui.app.action.DECLINE_CALL"
+        const val ACTION_ANSWER_TEST = "com.zalom3ui.app.action.ANSWER_CALL_TEST"
         private const val EXTRA_CALL_ID = "callId"
         private const val EXTRA_TAG = "tag"
 
-        fun declineIntent(context: Context, callId: String, tag: String): Intent =
+        fun declineIntent(context: Context, callId: String, tag: String): Intent = intent(context, ACTION_DECLINE, callId, tag)
+
+        fun answerTestIntent(context: Context, callId: String, tag: String): Intent = intent(context, ACTION_ANSWER_TEST, callId, tag)
+
+        private fun intent(context: Context, action: String, callId: String, tag: String): Intent =
             Intent(context, CallActionReceiver::class.java)
-                .setAction(ACTION_DECLINE)
+                .setAction(action)
                 .putExtra(EXTRA_CALL_ID, callId)
                 .putExtra(EXTRA_TAG, tag)
     }

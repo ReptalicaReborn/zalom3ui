@@ -72,6 +72,47 @@ export function declineCall(send: VoiceCallSender, call: RingingCall): Promise<u
     });
 }
 
+/** The codec Zalỏ answers with: Opus 16 kHz mono, payload type 112, 20 ms frames (one of the caller's offers). */
+export const ANSWER_CODEC = '[{"dynamicFptime":0,"frmPtime":20,"name":"opus/16000/1","payload":112}]';
+
+/**
+ * Picks up (signal 402, status 0, Zalo PC's `ZCallInfo::_trySendAcceptSignal`): sent once the media server accepted us,
+ * with the codec we'll send, that media server and our extendData.
+ */
+export function acceptCall(send: VoiceCallSender, call: RingingCall, server: string): Promise<unknown> {
+    const d = call.data;
+    const params = jsonObject(d.params);
+    return send("answer", {
+        callerId: call.callerId,
+        callId: call.rawCallId,
+        status: AnswerStatus.Accept,
+        codec: ANSWER_CODEC,
+        rtcpAddress: server,
+        rtpAddress: server,
+        session_id: text(d.session) || text(params?.sessId),
+        extendData: JSON.stringify(ourExtendData(call)),
+        subCommand: 3,
+    });
+}
+
+/** Hangs up a call that was picked up (signal 409, `/api/voicecall/endcall`). */
+export function hangUp(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
+    return send("endcall", { uidTo: call.callerId, callId: call.rawCallId, status: 3, imei });
+}
+
+/** What joining the call's media server needs, from the request: 32-bit zrtc ids, call id, session and server. */
+export function mediaParamsOf(call: RingingCall): { server: string; userId: number; partnerId: number; callId: number; session: string } | null {
+    const d = call.data;
+    const params = jsonObject(d.params);
+    const server = text(d.rtpAddress) || text(params?.rtpIP);
+    const userId = Number(params?.userId ?? d.uidTo);
+    const partnerId = Number(d.uidFrom);
+    const callId = Number(call.rawCallId);
+    const session = text(d.session) || text(params?.sessId);
+    if (!server || !session || ![userId, partnerId, callId].every((n) => Number.isInteger(n) && n > 0 && n <= 0xffffffff)) return null;
+    return { server, userId, partnerId, callId, session };
+}
+
 /** Zalo PC's call platform (`zrtc::Utility::getPlatform`); phones send 1. */
 export const ZRTC_PLATFORM_PC = 2;
 
