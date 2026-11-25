@@ -26,7 +26,7 @@ class CallEventsTest {
     @Test
     fun ended_andIncoming_stillParse() {
         assertEquals(
-            ServerEvent.CallEnded("c1"),
+            ServerEvent.CallEnded("c1", "hangup"),
             api.parseEvent("""{"type":"call","call":{"type":"ended","callId":"c1","act":"hangup"}}"""),
         )
         val incoming = api.parseEvent(
@@ -37,7 +37,21 @@ class CallEventsTest {
 
     @Test
     fun unknownCallType_isIgnored() {
-        assertNull(api.parseEvent("""{"type":"call","call":{"type":"ringing"}}"""))
+        assertNull(api.parseEvent("""{"type":"call","call":{"type":"mystery"}}"""))
+    }
+
+    @Test
+    fun ringing_andOutgoingEndReason_areParsed() {
+        assertEquals(
+            ServerEvent.CallRinging("c3"),
+            api.parseEvent("""{"type":"call","call":{"type":"ringing","callId":"c3","state":"ringing","outgoing":true}}"""),
+        )
+        assertEquals(
+            ServerEvent.CallEnded("c3", "declined"),
+            api.parseEvent("""{"type":"call","call":{"type":"ended","callId":"c3","act":"declined"}}"""),
+        )
+        val current = json.decodeFromString(CurrentCall.serializer(), """{"callId":"c3","callerId":"u1","state":"calling","outgoing":true}""")
+        assertEquals(true, current.outgoing)
     }
 
     @Test

@@ -34,7 +34,24 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
-import { acceptCall, camMicState, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
+import {
+    acceptCall,
+    answerAck,
+    camMicState,
+    cancelCall,
+    declineCall,
+    hangUp,
+    mediaParamsOf,
+    newCallId,
+    outgoingCallOf,
+    outgoingMediaOf,
+    requestCall,
+    ringRing,
+    ringingCallOf,
+    sendCallRequest,
+    voiceCallSender,
+    type RingingCall,
+} from "./voicecall.js";
 import { MediaCall, parseServer } from "./zrtcclient.js";
 import { HttpError } from "./errors.js";
 import { buildPollView, pollIdOfGroupEvent, type CreatePollInput, type PollView } from "./polls.js";
@@ -81,7 +98,17 @@ export type MuteOption = "1h" | "4h" | "8am" | "forever";
 export type ReadEvent = { threadKind: ThreadKind; threadId: string };
 /** Someone is calling (answer it in the official app), or that call stopped ringing. */
 /** A call that was picked up here. */
-export type CurrentCall = { callId: string; callerId: string; callerName: string; video: boolean; state: "connecting" | "connected"; connectedAt: number | null };
+export type CurrentCall = {
+    callId: string;
+    /** The other person (for a call we placed, the person called). */
+    callerId: string;
+    callerName: string;
+    video: boolean;
+    /** "calling" / "ringing" only for calls we placed (`outgoing`). */
+    state: "connecting" | "calling" | "ringing" | "connected";
+    connectedAt: number | null;
+    outgoing?: true;
+};
 type ActiveCall = {
     info: CurrentCall;
     media: MediaCall | null;
@@ -94,11 +121,17 @@ type ActiveCall = {
     peer: { cameraOn: boolean; muted: boolean };
     /** Which peer controls have arrived at least once. */
     peerHeard: Set<string>;
+    /** Calls we placed: handles that call's controls (ring_ring, answer, busy...). */
+    onControl?: (control: CallControl) => void;
+    /** The media server we joined (calls we placed), to compare with the one the callee says it used. */
+    serverAddress?: string;
 };
 
 export type CallEvent =
     | { type: "incoming"; call: IncomingCall & { callerName: string; groupName?: string } }
     | ({ type: "connected" } & CurrentCall)
+    | ({ type: "outgoing" } & CurrentCall)
+    | ({ type: "ringing" } & CurrentCall)
     | { type: "ended"; callId: string; act: string }
     | { type: "peer"; callId: string; cameraOn: boolean; muted: boolean };
 
@@ -845,6 +878,203 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return this.answerCall(callId, seconds);
     }
 
+    /**
+     * Places a 1:1 call, the way Zalo PC does (the Zalos project's engine, caller path): `requestcall` (Zalo answers with
+     * media servers, the session and our 32-bit ids), join a media server as the caller, `request` naming that server,
+     * then wait: `ring_ring` = ringing, `answer` status 0 = connected (we send `answerack`), status 3 / `reject` / `busy` /
+     * `cancel` / a timeout = ended. Returns once the request is out (state "calling"); the rest arrives as call events.
+     * The call then uses the same audio / video link as an answered one. The call log gets the answer's field names.
+     */
+    async startCall(userId: string, video: boolean, timeouts: { setupMs?: number; ringMs?: number } = {}): Promise<CurrentCall> {
+        const api = this.requireApi();
+        if (!/^\d{1,20}$/.test(userId)) throw new HttpError(400, "That isn't a person Zalo can call");
+        if (userId === this.status.ownId) throw new HttpError(400, "You can't call yourself");
+        if (this.activeCall) throw new HttpError(409, "Already in a call");
+        const callNumber = newCallId();
+        const callId = String(callNumber);
+        const call = outgoingCallOf(userId, callNumber, video);
+        const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
+        const send = voiceCallSender(api);
+        const peerName = this.friendList.get(userId)?.name ?? this.store.getThread("user", userId)?.name ?? "Someone";
+        const current: CurrentCall = { callId, callerId: userId, callerName: peerName, video, state: "calling", connectedAt: null, outgoing: true };
+        const setupMs = timeouts.setupMs ?? 20_000;
+        const ringMs = timeouts.ringMs ?? 60_000;
+
+        let done = false;
+        let requested = false;
+        let timer: NodeJS.Timeout | undefined;
+        const started = Date.now();
+        const connected = () => current.state === "connected";
+        const active: ActiveCall = {
+            info: current,
+            media: null,
+            finish: (reason: string, sendEnd: boolean) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                const wasConnected = connected();
+                const media = active.media;
+                if (media) media.close(sendEnd && wasConnected);
+                if (this.activeCall === active) this.activeCall = null;
+                // Our own hang up before the other side picked up is a cancel.
+                const act = reason === "hangup" && !wasConnected ? "cancel" : reason;
+                this.callTrace.record({
+                    kind: "call_done",
+                    callId,
+                    reason: act,
+                    outgoing: true,
+                    seconds: Math.round((Date.now() - started) / 1000),
+                    ...(media ? { stats: media.stats } : {}),
+                });
+                if (sendEnd && (wasConnected || requested)) {
+                    (wasConnected ? hangUp(send, call, imei) : cancelCall(send, call, imei)).then(
+                        (answer) => this.callTrace.record({ kind: wasConnected ? "hung_up" : "cancelled", callId, answer }),
+                        (err) => this.callTrace.record({ kind: wasConnected ? "hang_up_failed" : "cancel_failed", callId, error: describeError(err) }),
+                    );
+                }
+                this.emit("call", { type: "ended", callId, act });
+            },
+            camOn: false,
+            peer: { cameraOn: true, muted: false },
+            peerHeard: new Set(),
+        };
+        const arm = (ms: number, reason: string) => {
+            clearTimeout(timer);
+            timer = setTimeout(() => active.finish(reason, true), ms);
+        };
+        const connect = () => {
+            const media = active.media;
+            if (done || !media || connected()) return;
+            clearTimeout(timer);
+            media.startSilence();
+            active.camMic = (state) => {
+                camMicState(send, call, state).then(
+                    (answer) => this.callTrace.record({ kind: "cam_mic", callId, ...state, answer }),
+                    (err) => this.callTrace.record({ kind: "cam_mic_failed", callId, ...state, error: describeError(err) }),
+                );
+            };
+            answerAck(send, call, imei).then(
+                (answer) => this.callTrace.record({ kind: "answerack", callId, answer }),
+                (err) => this.callTrace.record({ kind: "answerack_failed", callId, error: describeError(err) }),
+            );
+            // No camera yet (unless turned on already): say so, or the other side waits for our picture.
+            if (video) active.camMic({ camOn: active.camOn });
+            current.state = "connected";
+            current.connectedAt = Date.now();
+            this.emit("call", { type: "connected", ...current });
+        };
+        active.onControl = (control) => {
+            if (done) return;
+            const params = jsonObject(control.data.params);
+            switch (control.act) {
+                case "ring_ring":
+                    if (current.state !== "calling") return;
+                    current.state = "ringing";
+                    arm(ringMs, "no_answer");
+                    this.emit("call", { type: "ringing", ...current });
+                    return;
+                case "answer": {
+                    if (connected()) return;
+                    const status = Number(control.data.status ?? params?.status ?? 0) || 0;
+                    if (status === 0) {
+                        const wanted = typeof params?.rtpSerIp === "string" ? params.rtpSerIp : "";
+                        if (wanted) this.callTrace.record({ kind: "peer_server", callId, sameAsOurs: wanted === active.serverAddress });
+                        connect();
+                    } else {
+                        // 3 = declined, 1 = busy, anything else: couldn't reach them.
+                        active.finish(status === 3 ? "declined" : status === 1 ? "busy" : "unreachable", false);
+                    }
+                    return;
+                }
+                case "reject":
+                    if (!connected()) active.finish("declined", false);
+                    else active.finish(control.act, false);
+                    return;
+                case "busy":
+                    active.finish("busy", false);
+                    return;
+                case "cancel":
+                case "endcall":
+                case "end_call":
+                    active.finish(control.act, false);
+                    return;
+                default:
+            }
+        };
+        this.activeCall = active;
+        this.emit("call", { type: "outgoing", ...current });
+        const fail = (status: number, message: string, reason: string): never => {
+            active.finish(reason, false);
+            throw new HttpError(status, message);
+        };
+        try {
+            arm(setupMs, "unreachable");
+            let answer: unknown;
+            try {
+                answer = await requestCall(send, call, imei);
+            } catch (err) {
+                this.callTrace.record({ kind: "request_call_failed", callId, error: describeError(err) });
+                return fail(502, `Zalo refused the call: ${describeError(err)}`, "failed");
+            }
+            requested = true;
+            const read = outgoingMediaOf(answer, callNumber);
+            const servers = "media" in read ? read.media.servers.length : 0;
+            this.callTrace.record({ kind: "request_call", callId, video, fields: read.shape, servers, ...("error" in read ? { problem: read.error } : {}) });
+            if (done) throw new HttpError(409, "Call ended while connecting");
+            if (!("media" in read)) return fail(502, `Zalo didn't set the call up: ${read.error}`, "failed");
+            const { media: offered } = read;
+
+            // The first of the offered servers that accepts us (a few tries; the callee joins the one we name).
+            let chosen: (typeof offered.servers)[number] | null = null;
+            for (const candidate of offered.servers.slice(0, 3)) {
+                const server = parseServer(candidate.rtp);
+                if (!server) continue;
+                const media = new MediaCall({
+                    server,
+                    userId: offered.userId,
+                    partnerId: offered.partnerId,
+                    callId: callNumber,
+                    session: offered.session,
+                    isCaller: true,
+                    log: (e) => this.callTrace.record({ callId, ...e }),
+                    onAudio: (seq, ts, opus) => this.emit("call_audio", { seq, timestamp: ts, opus }),
+                    onVideo: (frame) => this.emit("call_video", frame),
+                    onKeyFrameRequest: () => this.emit("call_key_frame"),
+                });
+                active.media = media;
+                const t0 = Date.now();
+                const token = await media.join();
+                this.callTrace.record({ kind: "media_join", callId, server: candidate.rtp, joined: token !== null, ms: Date.now() - t0 });
+                if (done) {
+                    media.close(false);
+                    throw new HttpError(409, "Call ended while connecting");
+                }
+                if (token !== null) {
+                    chosen = candidate;
+                    break;
+                }
+                media.close(false);
+                active.media = null;
+            }
+            if (!chosen) return fail(502, "Zalo's media server didn't let us join the call", "failed");
+            active.serverAddress = chosen.rtp;
+
+            try {
+                const reply = await sendCallRequest(send, call, offered, chosen, imei);
+                this.callTrace.record({ kind: "call_requested", callId, video, answer: reply });
+            } catch (err) {
+                this.callTrace.record({ kind: "request_failed", callId, error: describeError(err) });
+                return fail(502, `Zalo refused the call: ${describeError(err)}`, "failed");
+            }
+            if (done) throw new HttpError(409, "Call ended while connecting");
+            return { ...current };
+        } catch (err) {
+            // Anything unexpected: leave no half-open call behind.
+            active.finish("failed", requested);
+            throw err;
+        }
+    }
+
     /** Hangs up the connected call. */
     hangUpCall(): void {
         if (!this.activeCall) throw new HttpError(404, "No call in progress");
@@ -959,6 +1189,14 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         this.callTrace.record({ kind: "control", source, act: control.act, control: control.raw });
         const callId = control.data.callId ?? control.data.call_id;
         if (callId !== undefined && callId !== "") {
+            const placed = this.activeCall;
+            if (placed?.onControl && String(callId) === placed.info.callId && !PEER_ACTS.has(control.act)) {
+                const key = `${control.act}:${String(callId)}`;
+                if (this.handledCallControls.has(key)) return;
+                this.handledCallControls.set(key, now);
+                placed.onControl(control);
+                return;
+            }
             // Camera / microphone toggles repeat legitimately (off, on, off…): they are told apart by state in
             // onPeerControl, not by this once-per-call check.
             if (PEER_ACTS.has(control.act)) {

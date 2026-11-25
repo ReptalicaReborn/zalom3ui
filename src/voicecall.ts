@@ -154,7 +154,7 @@ export const ZRTC_PLATFORM_PC = 2;
  * modes, only the SRTP mode we actually implement (`srtpMode: 1`, `srtcp: 0`), no P2P candidates, the call's media
  * server, and the video codec list.
  */
-export function ourExtendData(call: RingingCall): Record<string, unknown> {
+export function ourExtendData(call: RingingCall, serverAddr?: Record<string, unknown>[]): Record<string, unknown> {
     const params = jsonObject(call.data.params);
     const theirs = jsonObject(params?.extendData) ?? {};
     const num = (k: string, fallback: number) => (typeof theirs[k] === "number" ? (theirs[k] as number) : fallback);
@@ -180,7 +180,7 @@ export function ourExtendData(call: RingingCall): Record<string, unknown> {
         tpType: 0,
         supportCallBusy: 1,
         supportHevcDecode: 0,
-        serverAddr: servers,
+        serverAddr: serverAddr ?? servers,
         // Both official apps always list their video codec, voice calls included. Answering a video call without it
         // crashed the caller's Android app; H.264 only (no HEVC), like supportHevcDecode says.
         video: { codec: [{ name: "h264", payload: 97 }] },
@@ -197,6 +197,108 @@ function text(v: unknown): string {
  */
 export function ringRing(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
     return send("ringring", { callerId: call.callerId, callId: call.rawCallId, status: 0, imei });
+}
+
+// ---- Outgoing calls (mirrors the Zalos project's engine, caller path) ----
+
+/** `requestcall`'s codec: the engine sends an empty list; the real codec goes in the later `request`. */
+const REQUEST_CALL_CODEC = "[]\n";
+
+/** A fresh call id like the engine's (1e9 up to 2^31 - 1: fits Zalo's 32-bit ids). */
+export function newCallId(random: () => number = Math.random): number {
+    return 1_000_000_000 + Math.floor(random() * (2_147_483_647 - 1_000_000_000));
+}
+
+/** The call as the person calling sees it, shaped like a ringing one so the shared helpers (hang up, camera) apply. */
+export function outgoingCallOf(peerId: string, callId: number, video: boolean, now = Date.now()): RingingCall {
+    return {
+        callId: String(callId),
+        callerId: peerId,
+        video,
+        group: false,
+        ts: now,
+        rawCallId: callId,
+        callType: video ? 3 : 1,
+        data: {},
+        receivedAt: now,
+    };
+}
+
+/** Signal 401: asks Zalo to set the call up. Voice is type 1, video 3 (`typeRequest`). */
+export function requestCall(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
+    return send("requestcall", {
+        calleeId: call.callerId,
+        callId: call.rawCallId,
+        codec: REQUEST_CALL_CODEC,
+        typeRequest: call.callType,
+        imei,
+    });
+}
+
+/** One media server of the `requestcall` answer. */
+export type OfferedServer = { rtp: string; rtcp: string };
+
+/** What the `requestcall` answer (signal 401's reply) hands the caller: media servers, session and the 32-bit ids. */
+export type OutgoingMedia = { servers: OfferedServer[]; session: string; userId: number; partnerId: number };
+
+/**
+ * Reads the `requestcall` answer. `error` says what was missing; `shape` lists the answer's field names (never values)
+ * for the call log.
+ */
+export function outgoingMediaOf(answer: unknown, callId: number): { media: OutgoingMedia; shape: string[] } | { error: string; shape: string[] } {
+    const d = jsonObject(answer) ?? {};
+    const shape = Object.keys(d).sort();
+    const servers: OfferedServer[] = [];
+    if (Array.isArray(d.servers)) {
+        for (const s of d.servers) {
+            const o = jsonObject(s);
+            const rtp = text(o?.rtpaddr) || text(o?.rtpAddress);
+            if (rtp) servers.push({ rtp, rtcp: text(o?.rtcpaddr) || text(o?.rtcpAddress) || rtp });
+        }
+    }
+    const zrtcConfig = jsonObject(d.zrtc_config);
+    const session = text(d.sessId) || text(zrtcConfig?.srtpKey);
+    const userId = Number(d.fromId);
+    const partnerId = Number(d.toId);
+    const replyId = d.id === undefined || d.id === null ? callId : Number(d.id);
+    if (d.status !== undefined && d.status !== null && Number(d.status) !== 0) {
+        return { error: `Zalo answered status ${text(d.status)} ${text(d.msg)}`.trim(), shape };
+    }
+    if (replyId !== callId) return { error: "the answer is about another call", shape };
+    if (servers.length === 0) return { error: "the answer names no media server", shape };
+    if (Buffer.from(session, "utf8").length < MIN_SRTP_SESSION_BYTES || Buffer.from(session, "latin1").length < MIN_SRTP_SESSION_BYTES) {
+        return { error: "the answer has no usable session", shape };
+    }
+    if (![userId, partnerId].every((n) => Number.isInteger(n) && n > 0 && n <= 0xffffffff)) return { error: "the answer has no zrtc ids", shape };
+    return { media: { servers, session, userId, partnerId }, shape };
+}
+
+/**
+ * Signal 416: tells the callee which media server we joined, our codec (Opus, [ANSWER_CODEC]), the session, and our
+ * extendData. Zalo rings the callee's phones after this.
+ */
+export function sendCallRequest(send: VoiceCallSender, call: RingingCall, media: OutgoingMedia, server: OfferedServer, imei: string): Promise<unknown> {
+    return send("request", {
+        calleeId: call.callerId,
+        rtcpAddress: server.rtcp,
+        rtpAddress: server.rtp,
+        codec: ANSWER_CODEC,
+        session: media.session,
+        callId: call.rawCallId,
+        imei,
+        extendData: JSON.stringify(ourExtendData(call, [{ rtcp: server.rtcp, rtp: server.rtp, tpType: 0 }])),
+        subCommand: 3,
+    });
+}
+
+/** Signal 405: gives up on a call that hasn't been answered. */
+export function cancelCall(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
+    return send("cancel", { callerId: call.callerId, callId: call.rawCallId, callType: call.video ? 1 : 0, status: 0, imei });
+}
+
+/** Signal 408: the callee's answer arrived and we're connected. */
+export function answerAck(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
+    return send("answerack", { calleeId: call.callerId, callId: call.rawCallId, status: 0, imei });
 }
 
 /** A [VoiceCallSender] on a logged-in zca-js session. */

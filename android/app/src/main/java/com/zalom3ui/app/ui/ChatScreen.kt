@@ -63,6 +63,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.AddCircleOutline
 import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Poll
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Edit
@@ -70,6 +71,7 @@ import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.Mood
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -150,6 +152,7 @@ import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.QUICK_REACTIONS
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadSummary
+import com.zalom3ui.app.ui.call.CallActivity
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
@@ -256,6 +259,14 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, sti
                     }
                 },
                 actions = {
+                    if (!isGroup) {
+                        IconButton(onClick = { context.startActivity(CallActivity.outgoingIntent(context, chat.id, chat.name, thread?.avatar, video = false)) }) {
+                            Icon(Icons.Outlined.Call, contentDescription = "Voice call")
+                        }
+                        IconButton(onClick = { context.startActivity(CallActivity.outgoingIntent(context, chat.id, chat.name, thread?.avatar, video = true)) }) {
+                            Icon(Icons.Outlined.Videocam, contentDescription = "Video call")
+                        }
+                    }
                     ChatMenu(
                         thread = thread,
                         isGroup = isGroup,

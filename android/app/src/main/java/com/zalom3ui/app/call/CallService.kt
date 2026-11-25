@@ -45,6 +45,9 @@ sealed interface CallState {
 
     data class Ringing(val callId: String, val name: String, val avatar: String? = null) : CallState
 
+    /** A call we placed, before the other side picks up. [ringing]: their phone rings (else we're still setting it up). */
+    data class Calling(val callId: String, val name: String, val avatar: String? = null, val ringing: Boolean = false) : CallState
+
     /** Answered on our side; waiting for the server to say the media is up. */
     data class Connecting(val callId: String, val name: String, val avatar: String? = null) : CallState
 
@@ -70,6 +73,9 @@ class CallService : Service() {
     private var name = ""
     private var avatar: String? = null
     private var ending = false
+
+    /** The call was placed from here (so the server's reasons for ending it are worth showing). */
+    private var outgoing = false
     private var callGen = 0L
     private var cameraGen = 0L
 
@@ -112,7 +118,10 @@ class CallService : Service() {
     }
 
     private fun begin(intent: Intent) {
-        val newId = intent.getStringExtra(EXTRA_CALL_ID).orEmpty()
+        val peerId = intent.getStringExtra(EXTRA_PEER_ID).orEmpty()
+        val placing = peerId.isNotEmpty()
+        // A call we place has no id until the server answers `calls/start`.
+        val newId = if (placing) PENDING_CALL_ID else intent.getStringExtra(EXTRA_CALL_ID).orEmpty()
         if (newId.isEmpty()) {
             val noActiveCall = synchronized(stateLock) { callId.isEmpty() || ending }
             if (noActiveCall) satisfyForegroundThenStop()
@@ -143,6 +152,7 @@ class CallService : Service() {
             cameraGen++
             gen = callGen
             callId = newId
+            outgoing = placing
             name = newName
             avatar = newAvatar
             ending = false
@@ -155,7 +165,7 @@ class CallService : Service() {
         runCatching { oldMedia?.stop() }
         releaseWakeLock(oldWakeLock)
 
-        _state.value = CallState.Connecting(newId, newName, newAvatar)
+        _state.value = if (placing) CallState.Calling(newId, newName, newAvatar) else CallState.Connecting(newId, newName, newAvatar)
         try {
             startInForeground(wantCamera)
         } catch (e: Exception) {
@@ -165,7 +175,8 @@ class CallService : Service() {
         }
         acquireWakeLock(gen)
 
-        val newEvents = scope.launch { follow(newId, gen) }
+        val wantVideo = intent.getBooleanExtra(EXTRA_VIDEO, false)
+        val newEvents = scope.launch { if (placing) placeCall(peerId, wantVideo, gen) else follow(newId, gen) }
         // The other side's app shows when we mute, as with the official apps.
         val newMuteSync = scope.launch { _muted.drop(1).collect { runCatching { api.setCallMuted(it) } } }
         val stale = synchronized(stateLock) {
@@ -207,10 +218,52 @@ class CallService : Service() {
         runCatching { if (wl.isHeld) wl.release() }
     }
 
-    private suspend fun follow(targetCallId: String, gen: Long) {
+    /** Posts `calls/start`, then follows the call the server made. */
+    private suspend fun placeCall(peerId: String, video: Boolean, gen: Long) {
+        val started = try {
+            api.startCall(peerId, video)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            finish(e.message ?: "Couldn't place the call", expectedGen = gen)
+            return
+        }
+        val adopted = synchronized(stateLock) {
+            if (ending || gen != callGen) {
+                false
+            } else {
+                callId = started.callId
+                true
+            }
+        }
+        if (!adopted) {
+            // Cancelled while the request was in flight: don't leave the call ringing.
+            runCatching { api.hangUpCall() }
+            return
+        }
+        follow(started.callId, gen, placed = true)
+    }
+
+    /** Shows "Ringing…" once the other phone rings. */
+    private fun onRinging(gen: Long) {
+        val (id, n, a) = synchronized(stateLock) {
+            if (ending || gen != callGen) return
+            Triple(callId, name, avatar)
+        }
+        if (_state.value is CallState.Calling) _state.value = CallState.Calling(id, n, a, ringing = true)
+    }
+
+    private suspend fun follow(targetCallId: String, gen: Long, placed: Boolean = false) {
         // The call may already be connected (service restarted, or the event came before we listened).
-        runCatching { api.currentCall() }.getOrNull()?.let {
+        val snapshot = runCatching { api.currentCall() }
+        snapshot.getOrNull()?.let {
             if (it.callId == targetCallId && it.state == "connected") onConnected(it.connectedAt, gen)
+            if (it.callId == targetCallId && it.state == "ringing") onRinging(gen)
+        }
+        // A call we placed that is already gone (ended before we listened).
+        if (placed && snapshot.isSuccess && snapshot.getOrNull() == null) {
+            finish("Call ended", expectedGen = gen)
+            return
         }
         while (scope.isActive) {
             if (synchronized(stateLock) { ending || gen != callGen }) return
@@ -219,8 +272,12 @@ class CallService : Service() {
                     if (synchronized(stateLock) { ending || gen != callGen }) return@collect
                     when (event) {
                         is ServerEvent.CallConnected -> if (event.callId == targetCallId) onConnected(event.connectedAt, gen)
+                        is ServerEvent.CallRinging -> if (event.callId == targetCallId) onRinging(gen)
                         is ServerEvent.CallPeer -> if (event.callId.isEmpty() || event.callId == targetCallId) _peerCamera.value = event.cameraOn
-                        is ServerEvent.CallEnded -> if (event.callId.isEmpty() || event.callId == targetCallId) finish("Call ended", expectedGen = gen)
+                        is ServerEvent.CallEnded -> if (event.callId.isEmpty() || event.callId == targetCallId) {
+                            val placedHere = synchronized(stateLock) { outgoing }
+                            finish(if (placedHere) endReason(event.act) else "Call ended", expectedGen = gen)
+                        }
                         else -> Unit
                     }
                 }
@@ -533,6 +590,10 @@ class CallService : Service() {
         /** Stops the service without telling the server (the answer request itself failed). */
         const val ACTION_STOP = "com.zalom3ui.app.action.CALL_STOP"
         const val EXTRA_CALL_ID = "callId"
+        /** The person to call (a call we place). */
+        const val EXTRA_PEER_ID = "peerId"
+        /** Stands in for the call id until the server has made the call. */
+        private const val PENDING_CALL_ID = "outgoing"
         const val EXTRA_NAME = "callerName"
         const val EXTRA_AVATAR = "avatar"
         const val EXTRA_VIDEO = "video"
@@ -626,9 +687,20 @@ class CallService : Service() {
             _notice.value = null
         }
 
-        /** The call screen is showing an incoming call. Does not overwrite a call already being answered. */
+        /** What the screen says when a call we placed ends: the server's `act`. */
+        fun endReason(act: String): String = when (act) {
+            "declined" -> "Declined"
+            "busy" -> "Busy"
+            "no_answer" -> "No answer"
+            "unreachable" -> "Couldn't reach them"
+            "failed" -> "Call failed"
+            else -> "Call ended"
+        }
+
+        /** The call screen is showing an incoming call. Does not overwrite a call already being answered or placed. */
         fun showRinging(callId: String, name: String, avatar: String?) {
             val s = _state.value
+            if (s is CallState.Calling) return
             val sameCall = (s is CallState.Connecting && s.callId == callId) || (s is CallState.Connected && s.callId == callId)
             if (!sameCall) _state.value = CallState.Ringing(callId, name, avatar)
         }
@@ -675,7 +747,44 @@ class CallService : Service() {
             }
         }
 
-        /** Ends the connected call: tells the server, then stops the service. */
+        /**
+         * Places a call to [peerId]: starts the foreground service, which asks the server to call and follows it.
+         * Needs RECORD_AUDIO and the app in the foreground. [camera]: a video call that starts with our camera on
+         * (CAMERA already granted), once the other side picks up.
+         */
+        fun startOutgoing(
+            context: Context,
+            peerId: String,
+            name: String,
+            avatar: String? = null,
+            video: Boolean = false,
+            camera: Boolean = false,
+        ) {
+            _muted.value = false
+            _speaker.value = video
+            _videoCall.value = video
+            _cameraOn.value = camera
+            _peerCamera.value = video
+            _remoteSize.value = null
+            _notice.value = null
+            _state.value = CallState.Calling(PENDING_CALL_ID, name, avatar)
+            val intent = Intent(context, CallService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_PEER_ID, peerId)
+                .putExtra(EXTRA_NAME, name)
+                .putExtra(EXTRA_AVATAR, avatar)
+                .putExtra(EXTRA_VIDEO, video)
+                .putExtra(EXTRA_CAMERA, camera)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: Exception) {
+                _cameraOn.value = false
+                _state.value = CallState.Ended(e.message ?: "Couldn't place the call")
+                throw e
+            }
+        }
+
+        /** Ends the call in progress: hangs up when connected, cancels while it rings; tells the server, then stops the service. */
         fun hangUp(context: Context) {
             val instance = synchronized(mediaLock) { activeInstance }
             if (instance != null) {

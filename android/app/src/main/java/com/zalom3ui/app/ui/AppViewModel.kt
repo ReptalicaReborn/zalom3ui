@@ -640,7 +640,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             is ServerEvent.Typing -> onTyping(event)
             is ServerEvent.PollChanged -> _pollEvents.tryEmit(event.pollId)
             // Notifications are the service's business (MessageNotifier).
-            is ServerEvent.Read, is ServerEvent.CallIncoming, is ServerEvent.CallConnected, is ServerEvent.CallPeer, is ServerEvent.CallEnded -> Unit
+            is ServerEvent.Read, is ServerEvent.CallIncoming, is ServerEvent.CallConnected, is ServerEvent.CallPeer, is ServerEvent.CallEnded, is ServerEvent.CallRinging -> Unit
         }
     }
 

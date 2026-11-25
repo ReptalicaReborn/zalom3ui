@@ -192,7 +192,14 @@ class ApiClient(serverUrl: String, private val token: String?) {
         post<Unit>("calls", callId, "answer")
     }
 
-    /** Ends the connected call. */
+    /** Places a 1:1 call; progress comes as `ringing` / `connected` / `ended` events. */
+    suspend fun startCall(userId: String, video: Boolean): CurrentCall =
+        post("calls", "start", body = buildJsonObject {
+            put("userId", userId)
+            put("video", video)
+        }.toString())
+
+    /** Ends the call in progress: hangs up when connected, cancels while it rings. */
     suspend fun hangUpCall() {
         post<Unit>("calls", "hangup")
     }
@@ -359,7 +366,8 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 val call = obj["call"]?.jsonObject ?: return null
                 when (call.string("type")) {
                     "incoming" -> ServerEvent.CallIncoming(json.decodeFromJsonElement(IncomingCall.serializer(), call.getValue("call")))
-                    "ended" -> ServerEvent.CallEnded(call.string("callId"))
+                    "ended" -> ServerEvent.CallEnded(call.string("callId"), call.string("act"))
+                    "ringing" -> ServerEvent.CallRinging(call.string("callId"))
                     "connected" -> ServerEvent.CallConnected(
                         callId = call.string("callId"),
                         callerId = call.string("callerId"),

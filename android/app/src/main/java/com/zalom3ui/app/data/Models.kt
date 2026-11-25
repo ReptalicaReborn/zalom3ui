@@ -319,9 +319,11 @@ data class CurrentCall(
     val callerId: String = "",
     val callerName: String = "",
     val video: Boolean = false,
-    /** "connecting" or "connected". */
+    /** "connecting", "calling" / "ringing" (a call we placed) or "connected". */
     val state: String = "",
     val connectedAt: Long = 0,
+    /** A call we placed; [callerId] / [callerName] are then the person called. */
+    val outgoing: Boolean = false,
 )
 
 sealed interface ServerEvent {
@@ -331,8 +333,10 @@ sealed interface ServerEvent {
     /** The chat was read (here or in another client): its notification can go. */
     data class Read(val thread: ThreadRef) : ServerEvent
     data class CallIncoming(val call: IncomingCall) : ServerEvent
-    /** The call stopped ringing (answered elsewhere, cancelled, ended); [callId] may be empty. */
-    data class CallEnded(val callId: String) : ServerEvent
+    /** The call stopped ringing (answered elsewhere, cancelled, ended); [callId] may be empty. [act] says why ("declined", "busy", "no_answer"...). */
+    data class CallEnded(val callId: String, val act: String = "") : ServerEvent
+    /** A call we placed: the other phone is ringing. */
+    data class CallRinging(val callId: String) : ServerEvent
     /** The call was answered and its media is up; [connectedAt] is epoch millis. */
     data class CallConnected(
         val callId: String,
