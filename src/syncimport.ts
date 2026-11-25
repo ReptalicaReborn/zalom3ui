@@ -192,6 +192,8 @@ export type BackupRow = {
     msgType: number;
     ts: number;
     senderId: string;
+    /** Set when the row has a column that says outright whether this account sent it (true = sent by us). */
+    outgoing?: boolean;
     text: string;
     ttl: number;
     bin: BinNet;
@@ -203,6 +205,8 @@ export type BackupConversation = {
     rows: BackupRow[];
     /** Rows in the table before filtering. */
     sourceRows: number;
+    /** Column names of the `ChatContent` table (for the sync log: the phone's schema is only partly known). */
+    columns?: string[];
 };
 
 function str(v: SqlValue | undefined): string {
@@ -215,6 +219,19 @@ function num(v: SqlValue | undefined): number {
     if (typeof v === "bigint") return Number(v);
     const n = Number(str(v));
     return Number.isFinite(n) ? n : 0;
+}
+
+/** Columns that, when present, tell directly whether this account sent the row (boolean-like). */
+const OUTGOING_COLUMNS = ["IsSend", "IsSent", "IsOutgoing", "IsMine", "IsSelf", "FromMe", "IsFromMe", "Outgoing"];
+
+function outgoingFlag(row: Record<string, SqlValue>): boolean | undefined {
+    for (const name of OUTGOING_COLUMNS) {
+        const v = row[name];
+        if (v === null || v === undefined) continue;
+        const n = typeof v === "number" ? v : typeof v === "bigint" ? Number(v) : Number(str(v));
+        if (Number.isFinite(n)) return n !== 0;
+    }
+    return undefined;
 }
 
 function first(row: Record<string, SqlValue>, names: string[]): SqlValue | undefined {
@@ -251,6 +268,7 @@ export function readConversation(db: Buffer, id: string, isGroup: boolean): Back
             msgType: num(r.MsgType),
             ts: toMillis(num(first(r, ["TimeStamp", "Ts"]))),
             senderId: str(first(r, ["SenderId", "FromId", "FromUid"])),
+            outgoing: outgoingFlag(r),
             text: str(first(r, ["MsgContent", "Message"])),
             ttl: num(r.TTL),
             bin: parseBinNet(Buffer.isBuffer(bin) ? bin : null),
@@ -258,7 +276,7 @@ export function readConversation(db: Buffer, id: string, isGroup: boolean): Back
     }
     // Stable sort: rows with equal timestamps keep the phone's order.
     rows.sort((a, b) => a.ts - b.ts);
-    return { id, isGroup, rows, sourceRows };
+    return { id, isGroup, rows, sourceRows, columns: table.columns };
 }
 
 // ---- Rows -> messages ----
@@ -325,6 +343,19 @@ function pickId(o: Record<string, unknown>, keys: string[]): string {
     return "";
 }
 
+/**
+ * Whether this account sent the row. The sender column is "0" or our id for messages we sent on most phones, but the
+ * phone's schema is only partly known, so: an explicit direction column wins; in a 1:1 chat anyone other than the
+ * other person is us (whatever form our own id takes), and a row with no sender at all is theirs.
+ */
+export function isOutgoing(row: BackupRow, conv: { id: string; isGroup: boolean }, ownId: string): boolean {
+    if (row.outgoing !== undefined) return row.outgoing;
+    const sender = row.senderId;
+    if (sender === "0" || (ownId !== "" && sender === ownId)) return true;
+    if (!conv.isGroup && sender !== "" && sender !== conv.id) return true;
+    return false;
+}
+
 export type ConvertResult = {
     messages: RawMessage[];
     /** Ids of messages the backup says were recalled. */
@@ -350,7 +381,7 @@ export function convertConversation(conv: BackupConversation, ownId: string, nam
             continue;
         }
         const rowId = row.globalMsgId && row.globalMsgId !== "0" ? row.globalMsgId : row.cliMsgId;
-        const mine = row.senderId === "0" || (ownId !== "" && row.senderId === ownId);
+        const mine = isOutgoing(row, conv, ownId);
         const bin = row.bin;
 
         if (row.msgType === 36) {
@@ -408,7 +439,15 @@ export function convertConversation(conv: BackupConversation, ownId: string, nam
             ttl: row.ttl,
         };
         if (bin.quote && (bin.quote.globalMsgId !== "0" || bin.quote.cliMsgId !== "0" || bin.quote.msg)) {
-            data.quote = { ownerId: bin.quote.ownerId, globalMsgId: bin.quote.globalMsgId, fromD: bin.quote.fromD, msg: bin.quote.msg, attach: bin.quote.attach };
+            const quoteOwner = bin.quote.ownerId;
+            const quoteMine = quoteOwner === "0" || (ownId !== "" && quoteOwner === ownId);
+            data.quote = {
+                ownerId: bin.quote.ownerId,
+                globalMsgId: bin.quote.globalMsgId,
+                fromD: bin.quote.fromD || (quoteMine ? "" : nameOf(quoteOwner) || (conv.isGroup ? "" : nameOf(conv.id))),
+                msg: bin.quote.msg,
+                attach: bin.quote.attach,
+            };
         }
         const mentions = bin.mentions
             .map((m) => ({ uid: m.uid.startsWith("-") ? "-1" : m.uid, pos: m.pos, len: m.len, type: m.type }))

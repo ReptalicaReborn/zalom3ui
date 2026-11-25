@@ -238,14 +238,22 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             download: async (url, onProgress, signal) => backupDownloader(this.requireApi())(url, onProgress, signal),
             sink: this.store,
             nameOf: (id) => {
-                const name = this.store.getThread("user", id)?.name ?? "";
+                const name = this.friendList.get(id)?.name || this.store.getThread("user", id)?.name || this.memberName(id);
                 return name === id ? "" : name;
+            },
+            // Group senders who aren't friends are only named by the group's member list.
+            prepare: async (id, isGroup) => {
+                if (isGroup) await this.groupMembers(id);
             },
         });
         this.historySync.on("change", (status) => {
             this.emit("history_sync", status);
             // Imported chats and last messages: clients reload their list.
-            if (status.state === "done") this.emit("threads");
+            if (status.state === "done") {
+                this.emit("threads");
+                // The import may have created chats with no known name: look them up, then refresh the list again.
+                void this.resolveUnnamedThreads().then((changed) => changed && this.emit("threads"), () => {});
+            }
         });
     }
 
@@ -692,6 +700,15 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         if (this.store.isMuted(msg.threadKind, msg.threadId, now)) return false;
         const key = threadKey(msg.threadKind, msg.threadId);
         return !(this.viewing && this.viewing.key === key && this.viewing.until > now);
+    }
+
+    /** A group member's name from any cached member list, or "". */
+    private memberName(userId: string): string {
+        for (const { list } of this.members.values()) {
+            const m = list.find((x) => x.id === userId);
+            if (m?.name) return m.name;
+        }
+        return "";
     }
 
     threadName(kind: ThreadKind, threadId: string): string {
@@ -1773,6 +1790,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         if (!live()) return;
         await this.loadGroups(api, Object.keys(allGroups.gridVerMap), generation);
         if (!live()) return;
+        // Chats imported earlier (history sync) or opened by strangers may still carry only an id as their name.
+        await this.resolveUnnamedThreads().catch(() => {});
+        if (!live()) return;
 
         // Pinned and muted conversations are account settings shared with the phone app.
         try {
@@ -1803,6 +1823,47 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         }
         if (!live()) return;
         this.emit("threads");
+    }
+
+    /** Looks up the real name and picture of chats that are still shown by their id. True if any changed. */
+    async resolveUnnamedThreads(): Promise<boolean> {
+        const api = this.api;
+        if (!api) return false;
+        const generation = this.generation;
+        const unnamed = this.store.unnamedThreads();
+        let changed = false;
+        const users = unnamed.filter((t) => t.kind === "user").map((t) => t.id);
+        for (let i = 0; i < users.length; i += GROUP_INFO_BATCH) {
+            const batch = users.slice(i, i + GROUP_INFO_BATCH);
+            try {
+                const res = await api.getUserInfo(batch);
+                if (generation !== this.generation || this.api !== api) return changed;
+                for (const [id, p] of Object.entries(res.changed_profiles ?? {})) {
+                    const name = p.displayName || p.zaloName;
+                    if (!name) continue;
+                    this.store.upsertThread({ id: String(id).split("_")[0], kind: "user", name, avatar: p.avatar ?? "" });
+                    changed = true;
+                }
+            } catch {
+                // Someone who can't be looked up keeps their id; the rest still get names.
+            }
+        }
+        const groups = unnamed.filter((t) => t.kind === "group").map((t) => t.id);
+        for (let i = 0; i < groups.length; i += GROUP_INFO_BATCH) {
+            const batch = groups.slice(i, i + GROUP_INFO_BATCH);
+            try {
+                const info = await api.getGroupInfo(batch);
+                if (generation !== this.generation || this.api !== api) return changed;
+                for (const [id, g] of Object.entries(info.gridInfoMap ?? {})) {
+                    if (!g.name) continue;
+                    this.store.upsertThread({ id, kind: "group", name: g.name, avatar: g.avt });
+                    changed = true;
+                }
+            } catch {
+                // Groups we have left can't be looked up.
+            }
+        }
+        return changed;
     }
 
     private async loadGroups(api: API, groupIds: string[], generation = this.generation): Promise<void> {

@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import type { API } from "zca-js";
 import { decodeEventPayload, frameHeader, jsonObject } from "./calls.js";
 import { HttpError } from "./errors.js";
-import { importConversation, readConversation, type ImportCounts, type ImportSink } from "./syncimport.js";
+import { importConversation, isOutgoing, readConversation, type BackupConversation, type ImportCounts, type ImportSink } from "./syncimport.js";
 import { BackupError, backupKeyText, conversationFiles, generateSyncKeyPair, rsaDecryptPkcs1, unpackBackup, type SyncKeyPair } from "./zdb.js";
 import { HISTORY_MESSAGES_PER_THREAD } from "./store.js";
 
@@ -129,6 +129,8 @@ export type HistorySyncDeps = {
     sink: ImportSink & { allowMessages(cap: number): void };
     /** A name for a user id (used for the sender of imported messages), or "". */
     nameOf?(userId: string): string;
+    /** Called before a conversation is imported, so [nameOf] can know the names of its senders (best effort). */
+    prepare?(conversationId: string, isGroup: boolean): Promise<void>;
     keyPair?: () => SyncKeyPair;
     /** Waits between download attempts; tests pass a fake. */
     sleep?: (ms: number) => Promise<void>;
@@ -361,6 +363,10 @@ export class HistorySync extends EventEmitter<Events> {
                 continue;
             }
             if (conv && conv.rows.length) {
+                if (done === 0 && conv.columns) this.log(`schema columns=${conv.columns.join(",")}`);
+                if (done < 3) this.log(`senders ${describeSenders(conv, ownId)}`);
+                await this.deps.prepare?.(conv.id, conv.isGroup).catch(() => {});
+                if (gen !== this.generation) return;
                 const c = importConversation(conv, ownId, this.deps.sink, this.deps.nameOf);
                 total.imported += c.imported;
                 total.duplicates += c.duplicates;
@@ -607,4 +613,23 @@ export function backupDownloader(api: API): HistorySyncDeps["download"] {
     }
     const get = (api as unknown as Record<string, (p: { url: string; signal: AbortSignal; onProgress: (got: number, total: number) => void }) => Promise<Buffer>>)[name];
     return (url, onProgress, signal) => get({ url, signal, onProgress });
+}
+
+/** Counts of how a conversation's rows were classified, with no ids (for the sync log). */
+function describeSenders(conv: BackupConversation, ownId: string): string {
+    let zero = 0;
+    let empty = 0;
+    let peer = 0;
+    let own = 0;
+    let other = 0;
+    let sent = 0;
+    for (const r of conv.rows) {
+        if (r.senderId === "0") zero++;
+        else if (r.senderId === "") empty++;
+        else if (r.senderId === conv.id) peer++;
+        else if (ownId !== "" && r.senderId === ownId) own++;
+        else other++;
+        if (isOutgoing(r, conv, ownId)) sent++;
+    }
+    return `${conv.isGroup ? "group" : "chat"} rows=${conv.rows.length} sender0=${zero} empty=${empty} peer=${peer} own=${own} other=${other} direction=${conv.rows.some((r) => r.outgoing !== undefined)} sent=${sent}`;
 }

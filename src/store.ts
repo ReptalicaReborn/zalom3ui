@@ -287,8 +287,13 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
         msg.text = `[Poll] ${attachment.title}`;
         return msg;
     }
-    const label =
-        attachment?.kind === "contact" ? "[Contact]" : (MSG_TYPE_LABELS[data.msgType] ?? "[Unsupported message]");
+    const known = attachment?.kind === "contact" ? "[Contact]" : MSG_TYPE_LABELS[data.msgType];
+    // Notices and cards of a type we don't model (login alerts, group events): show their own text, not a placeholder.
+    if (!known && attachment?.title) {
+        msg.text = attachment.title;
+        return msg;
+    }
+    const label = known ?? "[Unsupported message]";
     // Photos and stickers have no useful title; files, links and cards are named by theirs.
     const named = attachment?.title && attachment.kind !== "photo" && attachment.kind !== "gif";
     msg.text = named ? `${label} ${attachment.title}` : label;
@@ -442,6 +447,11 @@ export class ChatStore {
 
     getThread(kind: ThreadKind, id: string): ThreadInfo | undefined {
         return this.threads.get(threadKey(kind, id));
+    }
+
+    /** Threads still named by their raw id (e.g. created by a history import for someone who is not a friend). */
+    unnamedThreads(): ThreadInfo[] {
+        return [...this.threads.values()].filter((t) => !t.name || t.name === t.id);
     }
 
     /** Lets chats keep up to `cap` messages (saved with the cache), for imported history. Never lowers the limit. */
