@@ -289,11 +289,31 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    /** Picks up a ringing call; its audio then flows over the /ws/call-audio socket. */
+    api.post("/calls/:callId/answer", wrap(async (req, res) => {
+        await session.answerCall(req.params.callId);
+        res.status(204).end();
+    }));
+
     /** Picks up a ringing call for 30 s without sound, to record the media connection in the call log. */
     api.post("/calls/:callId/answer-test", wrap(async (req, res) => {
         await session.answerCallTest(req.params.callId);
         res.status(204).end();
     }));
+
+    api.post("/calls/hangup", (_req, res) => {
+        session.hangUpCall();
+        res.status(204).end();
+    });
+
+    api.get("/calls/current", (_req, res) => {
+        const call = session.currentCall();
+        if (!call) {
+            res.status(404).json({ error: "No call in progress" });
+            return;
+        }
+        res.json(call);
+    });
 
     // ---- Call research (docs/calls.md) ----
 
@@ -323,15 +343,37 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
 /** Pushes session status, message changes, typing and thread-list changes to connected clients. */
 function attachWebSocket(server: http.Server, config: Config, session: ZaloSession): void {
     const wss = new WebSocketServer({ noServer: true });
+    /** The call's audio, both ways, as binary messages (docs/call-audio.md §3). */
+    const audioWss = new WebSocketServer({ noServer: true });
 
     server.on("upgrade", (req, socket, head) => {
         const url = new URL(req.url ?? "/", "http://localhost");
-        if (url.pathname !== "/ws" || !isAuthorized(config, req.headers.authorization, url.searchParams.get("token"))) {
+        const target = url.pathname === "/ws" ? wss : url.pathname === "/ws/call-audio" ? audioWss : null;
+        if (!target || !isAuthorized(config, req.headers.authorization, url.searchParams.get("token"))) {
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
             return;
         }
-        wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+        target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
+    });
+
+    session.on("call_audio", ({ seq, timestamp, opus }) => {
+        if (audioWss.clients.size === 0) return;
+        const frame = encodeAudioToApp(seq, timestamp, opus);
+        for (const client of audioWss.clients) if (client.readyState === client.OPEN) client.send(frame);
+    });
+    session.on("call", (call) => {
+        if (call.type === "ended") for (const client of audioWss.clients) client.close(1000, "call ended");
+    });
+    audioWss.on("connection", (ws: WebSocket) => {
+        if (!session.currentCall()) {
+            ws.close(1008, "no call in progress");
+            return;
+        }
+        ws.on("message", (data: Buffer, isBinary: boolean) => {
+            const opus = isBinary ? decodeAudioFromApp(data) : null;
+            if (opus) session.sendCallAudio(opus);
+        });
     });
 
     const broadcast = (payload: unknown) => {
@@ -362,6 +404,20 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     wss.on("connection", (ws: WebSocket) => {
         ws.send(JSON.stringify({ type: "status", status: session.getStatus() }));
     });
+}
+
+/** Server → app audio message: `01`, u16 RTP sequence, u32 RTP timestamp (big-endian), Opus packet. */
+export function encodeAudioToApp(seq: number, timestamp: number, opus: Buffer): Buffer {
+    const head = Buffer.alloc(7);
+    head[0] = 1;
+    head.writeUInt16BE(seq & 0xffff, 1);
+    head.writeUInt32BE(timestamp >>> 0, 3);
+    return Buffer.concat([head, opus]);
+}
+
+/** App → server audio message: `02` + one Opus frame; anything else is ignored. */
+export function decodeAudioFromApp(data: Buffer): Buffer | null {
+    return data.length > 1 && data.length <= 1276 && data[0] === 2 ? data.subarray(1) : null;
 }
 
 /** Express 4 does not forward rejected promises to the error handler on its own. */

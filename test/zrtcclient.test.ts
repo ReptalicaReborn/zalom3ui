@@ -60,7 +60,17 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     });
 
     const logs: Record<string, unknown>[] = [];
-    const call = new MediaCall({ server: { host: "127.0.0.1", port }, userId: 438000002, partnerId: 465000001, callId: 321000003, session, log: (e) => logs.push(e), pingMs: 30 });
+    const heard: [number, number, string][] = [];
+    const call = new MediaCall({
+        server: { host: "127.0.0.1", port },
+        userId: 438000002,
+        partnerId: 465000001,
+        callId: 321000003,
+        session,
+        log: (e) => logs.push(e),
+        pingMs: 30,
+        onAudio: (seq, ts, opus) => heard.push([seq, ts, opus.toString("hex")]),
+    });
     assert.equal(await call.join(2000, 100), 12345);
     call.startSilence();
     await new Promise((r) => setTimeout(r, 150));
@@ -74,6 +84,7 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     assert.equal(call.stats.audio.decrypted, 3);
     assert.deepEqual(call.stats.audio.timestampSteps, [320, 320]);
     assert.deepEqual(call.stats.audio.opusToc, ["78", "78", "78"]);
+    assert.deepEqual(heard, [[100, 1000, "78010203"], [101, 1320, "78010203"], [102, 1640, "78010203"]], "decrypted Opus handed over");
     assert.ok(seen.audio >= 3, "sent audio every 20 ms");
     assert.equal(seen.audioOk, seen.audio, "every packet decrypts with the session key");
     assert.deepEqual([...seen.tokens], [12345], "audio carries the server's token");

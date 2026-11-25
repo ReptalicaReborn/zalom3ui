@@ -78,14 +78,21 @@ export type MuteOption = "1h" | "4h" | "8am" | "forever";
 
 export type ReadEvent = { threadKind: ThreadKind; threadId: string };
 /** Someone is calling (answer it in the official app), or that call stopped ringing. */
+/** A call that was picked up here. */
+export type CurrentCall = { callId: string; callerId: string; callerName: string; video: boolean; state: "connecting" | "connected"; connectedAt: number | null };
+type ActiveCall = { info: CurrentCall; media: MediaCall | null; finish: (reason: string, hangUp: boolean) => void };
+
 export type CallEvent =
     | { type: "incoming"; call: IncomingCall & { callerName: string; groupName?: string } }
+    | ({ type: "connected" } & CurrentCall)
     | { type: "ended"; callId: string; act: string };
 
 type SessionEvents = {
     status: [SessionStatus];
     read: [ReadEvent];
     call: [CallEvent];
+    /** The other side's audio in a call picked up here: decrypted Opus frames for the app. */
+    call_audio: [{ seq: number; timestamp: number; opus: Buffer }];
     message: [ChatMessage];
     message_updated: [ChatMessage];
     message_deleted: [DeletedEvent];
@@ -133,8 +140,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private handledCallControls = new Map<string, number>();
     /** Calls ringing on this account now, by call id. */
     private ringing = new Map<string, RingingCall>();
-    /** The call picked up by "Answer (test)", while it runs. */
-    private testCall: { callId: string; finish: (reason: string, hangUp: boolean) => void } | null = null;
+    /** The call that was picked up, while it runs. */
+    private activeCall: ActiveCall | null = null;
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -242,7 +249,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     async logout(): Promise<void> {
-        this.testCall?.finish("logout", true);
+        this.activeCall?.finish("logout", true);
         this.cancelResume();
         this.abortQR?.();
         this.stopControlPoll();
@@ -556,64 +563,109 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     /**
-     * "Answer (test)": picks up a ringing call the way Zalo PC does (ringring, join the call's media server, answer with
-     * status 0), receives the caller's audio and sends silence for [seconds], then hangs up. No sound yet: the point is
-     * the call log, which gets the media server's replies and what the audio looked like (counts, RTP fields, whether
-     * it decrypted with the session key).
+     * Picks up a ringing call the way Zalo PC does: ringring, join the call's media server, answer with status 0. The
+     * other side's audio then goes to [onCallAudio] listeners (the app's audio link) and the app's frames go out with
+     * [sendCallAudio]; silence fills in until they come. "Answer (test)" passes [testSeconds]: no app audio, hang up
+     * after that long. The call log gets the media server's replies and, at the end, what the audio looked like (counts,
+     * RTP fields, whether it decrypted), never the audio itself.
      */
-    async answerCallTest(callId: string, seconds = 30): Promise<void> {
+    async answerCall(callId: string, testSeconds?: number): Promise<CurrentCall> {
         const api = this.requireApi();
         const call = this.ringing.get(callId);
         if (!call) throw new HttpError(404, "That call isn't ringing any more");
-        if (this.testCall) throw new HttpError(409, "A test call is already running");
+        if (this.activeCall) throw new HttpError(409, "Already in a call");
         const p = mediaParamsOf(call);
         const server = p && parseServer(p.server);
         if (!p || !server) {
-            this.callTrace.record({ kind: "answer_test_unavailable", callId, reason: "the request has no media server, ids or session" });
+            this.callTrace.record({ kind: "answer_unavailable", callId, reason: "the request has no media server, ids or session" });
             throw new HttpError(422, "This call doesn't carry what's needed to answer it");
         }
         const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
         const send = voiceCallSender(api);
-        await ringRing(send, call, imei).then(
-            (answer) => this.callTrace.record({ kind: "ringring", callId, answer }),
-            (err) => this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) }),
-        );
-        const media = new MediaCall({ server, userId: p.userId, partnerId: p.partnerId, callId: p.callId, session: p.session, log: (e) => this.callTrace.record({ callId, ...e }) });
-        const started = Date.now();
-        const token = await media.join();
-        this.callTrace.record({ kind: "media_join", callId, server: p.server, token, address: media.natAddress, ms: Date.now() - started });
-        if (token === null) {
-            media.close(false);
-            throw new HttpError(502, "Zalo's media server didn't let us join the call");
-        }
+        const callerName =
+            this.friendList.get(call.callerId)?.name ?? this.store.getThread("user", call.callerId)?.name ?? call.displayName ?? "Someone";
+        const current: CurrentCall = { callId, callerId: call.callerId, callerName, video: call.video, state: "connecting", connectedAt: null };
+        // Claimed before the first await, so a second answer can't race this one.
+        const active: ActiveCall = { info: current, media: null, finish: () => {} };
+        this.activeCall = active;
         try {
-            const answer = await acceptCall(send, call, p.server);
-            this.callTrace.record({ kind: "answered", callId, answer });
-        } catch (err) {
-            media.close();
-            this.callTrace.record({ kind: "answer_failed", callId, error: describeError(err) });
-            throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
-        }
-        this.ringing.delete(callId);
-        this.emit("call", { type: "ended", callId, act: "answered_test" });
-        media.startSilence();
-        let done = false;
-        const finish = (reason: string, sendHangUp: boolean) => {
-            if (done) return;
-            done = true;
-            clearTimeout(timer);
-            media.close(sendHangUp);
-            this.testCall = null;
-            this.callTrace.record({ kind: "answer_test_done", callId, reason, seconds: Math.round((Date.now() - started) / 1000), stats: media.stats });
-            if (sendHangUp) {
-                hangUp(send, call, imei).then(
-                    (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
-                    (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
-                );
+            await ringRing(send, call, imei).then(
+                (answer) => this.callTrace.record({ kind: "ringring", callId, answer }),
+                (err) => this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) }),
+            );
+            const media = new MediaCall({
+                server,
+                userId: p.userId,
+                partnerId: p.partnerId,
+                callId: p.callId,
+                session: p.session,
+                log: (e) => this.callTrace.record({ callId, ...e }),
+                onAudio: (seq, ts, opus) => this.emit("call_audio", { seq, timestamp: ts, opus }),
+            });
+            active.media = media;
+            const started = Date.now();
+            const token = await media.join();
+            this.callTrace.record({ kind: "media_join", callId, server: p.server, token, address: media.natAddress, ms: Date.now() - started });
+            if (token === null) {
+                media.close(false);
+                throw new HttpError(502, "Zalo's media server didn't let us join the call");
             }
-        };
-        const timer = setTimeout(() => finish("time_up", true), seconds * 1000);
-        this.testCall = { callId, finish };
+            try {
+                const answer = await acceptCall(send, call, p.server);
+                this.callTrace.record({ kind: "answered", callId, answer, test: testSeconds !== undefined });
+            } catch (err) {
+                media.close();
+                this.callTrace.record({ kind: "answer_failed", callId, error: describeError(err) });
+                throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
+            }
+            this.ringing.delete(callId);
+            media.startSilence();
+            current.state = "connected";
+            current.connectedAt = Date.now();
+            let done = false;
+            active.finish = (reason: string, sendHangUp: boolean) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                media.close(sendHangUp);
+                if (this.activeCall === active) this.activeCall = null;
+                this.callTrace.record({ kind: "call_done", callId, reason, seconds: Math.round((Date.now() - started) / 1000), stats: media.stats });
+                if (sendHangUp) {
+                    hangUp(send, call, imei).then(
+                        (answer) => this.callTrace.record({ kind: "hung_up", callId, answer }),
+                        (err) => this.callTrace.record({ kind: "hang_up_failed", callId, error: describeError(err) }),
+                    );
+                }
+                this.emit("call", { type: "ended", callId, act: reason });
+            };
+            const timer = testSeconds === undefined ? undefined : setTimeout(() => active.finish("time_up", true), testSeconds * 1000);
+            this.emit("call", { type: "connected", ...current, connectedAt: current.connectedAt });
+            return { ...current };
+        } catch (err) {
+            if (this.activeCall === active) this.activeCall = null;
+            throw err;
+        }
+    }
+
+    /** "Answer (test)": picks up without app audio and hangs up after [seconds]. */
+    answerCallTest(callId: string, seconds = 30): Promise<CurrentCall> {
+        return this.answerCall(callId, seconds);
+    }
+
+    /** Hangs up the connected call. */
+    hangUpCall(): void {
+        if (!this.activeCall) throw new HttpError(404, "No call in progress");
+        this.activeCall.finish("hangup", true);
+    }
+
+    /** The call in progress, if any. */
+    currentCall(): CurrentCall | null {
+        return this.activeCall ? { ...this.activeCall.info } : null;
+    }
+
+    /** One 20 ms Opus frame from the app's microphone, for the call in progress. */
+    sendCallAudio(opus: Buffer): void {
+        if (this.activeCall?.info.state === "connected") this.activeCall.media?.sendAudioFrame(opus);
     }
 
     /**
@@ -707,8 +759,11 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
         } else if (CALL_ENDING_ACTS.has(control.act)) {
             if (callId !== undefined) this.ringing.delete(String(callId));
-            // The caller hung up on the test call (our own answer comes back as "answer" too: not an end).
-            if (this.testCall && String(callId) === this.testCall.callId && control.act !== "answer") this.testCall.finish(`partner_${control.act}`, false);
+            // The caller hung up (our own answer comes back as "answer" too: not an end).
+            if (this.activeCall && String(callId) === this.activeCall.info.callId && control.act !== "answer") {
+                this.activeCall.finish(control.act, false);
+                return;
+            }
             this.emit("call", { type: "ended", callId: callId === undefined ? "" : String(callId), act: control.act });
         }
     }

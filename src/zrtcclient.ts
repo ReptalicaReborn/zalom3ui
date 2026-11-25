@@ -38,6 +38,8 @@ export type MediaCallOptions = {
     /** For tests. */
     createSocket?: () => dgram.Socket;
     pingMs?: number;
+    /** The other side's audio, decrypted: RTP sequence number, RTP timestamp and the Opus payload. */
+    onAudio?: (seq: number, timestamp: number, opus: Buffer) => void;
 };
 
 export type MediaStats = {
@@ -81,6 +83,8 @@ export class MediaCall {
     private readonly ssrc = crypto.randomInt(1, 0x7fffffff);
     private firstAudio = true;
     private loggedUnknown = 0;
+    /** When the app last sent a frame: silence fills in only while it doesn't. */
+    private lastFrameAt = 0;
 
     constructor(private readonly o: MediaCallOptions) {
         this.srtp = SrtpContext.fromSession(o.session);
@@ -127,13 +131,26 @@ export class MediaCall {
         return this.token;
     }
 
-    /** Sends one 20 ms frame of silence every 20 ms, so the other side gets a live stream. */
+    /**
+     * Keeps the stream alive with 20 ms frames of silence whenever no real audio is being sent (before the app's
+     * microphone starts, or if it stalls), so the other side never sees the call go quiet.
+     */
     startSilence(): void {
-        this.timers.push(setInterval(() => this.sendAudioFrame(OPUS_SILENCE), FRAME_MS));
+        this.timers.push(
+            setInterval(() => {
+                if (Date.now() - this.lastFrameAt > 3 * FRAME_MS) this.sendFrame(OPUS_SILENCE);
+            }, FRAME_MS),
+        );
+    }
+
+    /** One encoded 20 ms Opus frame from the app's microphone. */
+    sendAudioFrame(opus: Buffer): void {
+        this.lastFrameAt = Date.now();
+        this.sendFrame(opus);
     }
 
     /** Wraps one encoded Opus frame in RTP, protects it and sends it. */
-    sendAudioFrame(opus: Buffer): void {
+    private sendFrame(opus: Buffer): void {
         if (this.token === null) return;
         const rtp = Buffer.alloc(12);
         rtp[0] = 0x80;
@@ -222,5 +239,6 @@ export class MediaCall {
         }
         a.decrypted++;
         if (a.opusToc.length < 5 && rtp.length > h.headerLength) a.opusToc.push(rtp[h.headerLength].toString(16).padStart(2, "0"));
+        if (rtp.length > h.headerLength) this.o.onAudio?.(h.seq, h.timestamp, rtp.subarray(h.headerLength));
     }
 }
