@@ -1,0 +1,98 @@
+# Call audio on Android — contracts between the pieces
+
+Zalỏ's server (Node, in the `:node` process) owns the call: Zalo's signalling, the UDP connection to Zalo's media
+server (zrtc), SRTP. It hands **Opus frames** to the app and takes Opus frames from it. The app (Kotlin) owns the
+microphone, the speaker, the Opus codec and the call screen. See `docs/calls.md` for the protocol itself.
+
+```
+ mic ─► AudioRecord ─► OpusEncoder ─► CallAudioLink ──ws──► server ─► SRTP ─► zrtc UDP ─► Zalo
+ speaker ◄─ AudioTrack ◄─ OpusDecoder ◄─ JitterBuffer ◄─ CallAudioLink ◄──ws── server ◄─ … ◄─ Zalo
+```
+
+Audio format everywhere: **Opus, 16 kHz, mono, 20 ms frames (320 samples), ~20 kbit/s**, RTP payload type 112.
+
+## 1. Opus codec (`com.zalom3ui.app.call`, file `Opus.kt`, native `libzaloopus.so`)
+
+libopus built from source with CMake (FetchContent of the official release tarball, pinned by SHA-256), wrapped
+with JNI.
+
+```kotlin
+class OpusEncoder(sampleRate: Int = 16000, channels: Int = 1, bitrate: Int = 20_000) : AutoCloseable {
+    /** One 20 ms frame: sampleRate / 50 * channels samples. Returns the Opus packet. */
+    fun encode(pcm: ShortArray): ByteArray
+}
+
+class OpusDecoder(sampleRate: Int = 16000, channels: Int = 1) : AutoCloseable {
+    /** Decodes one packet into one 20 ms frame; null = the packet was lost (packet-loss concealment). */
+    fun decode(packet: ByteArray?): ShortArray
+}
+```
+
+Encoder: `OPUS_APPLICATION_VOIP`, in-band FEC on, expected packet loss 10 %, DTX off, complexity 5.
+
+## 2. Audio engine (`com.zalom3ui.app.call`)
+
+```kotlin
+interface FrameCodec : AutoCloseable {
+    fun encode(pcm: ShortArray): ByteArray
+    fun decode(packet: ByteArray?): ShortArray
+}
+
+class JitterBuffer(targetFrames: Int = 3, maxFrames: Int = 25) {
+    fun push(seq: Int, packet: ByteArray)   // seq: RTP sequence number, 16-bit, wraps
+    fun pop(): ByteArray?                   // next frame in order, or null (lost / not arrived yet) once playing
+}
+
+class CallAudioEngine(context: Context, codec: FrameCodec, send: (ByteArray) -> Unit) {
+    fun start()
+    fun stop()
+    fun onPacket(seq: Int, timestamp: Long, opus: ByteArray)  // from the network
+    var muted: Boolean
+    var speakerOn: Boolean
+}
+```
+
+- Capture: `AudioRecord(VOICE_COMMUNICATION, 16000, mono, PCM16)`, platform `AcousticEchoCanceler`,
+  `NoiseSuppressor`, `AutomaticGainControl` when available; 320-sample reads → encode → `send` (silence frames
+  while muted).
+- Playback: every 20 ms pop the jitter buffer → decode (null → concealment) → `AudioTrack(USAGE_VOICE_COMMUNICATION,
+  CONTENT_TYPE_SPEECH)`. `AudioManager.MODE_IN_COMMUNICATION` and audio focus while running; speaker via
+  `setCommunicationDevice` (API 31+) or `isSpeakerphoneOn`.
+
+## 3. Link to the server (`CallAudioLink`)
+
+WebSocket `ws://127.0.0.1:<port>/ws/call-audio?token=<local token>` (same port and token as the event socket,
+`LocalServer.url(context)` / `SettingsStore(context).localToken()`). Binary messages only:
+
+| Direction | Bytes |
+|---|---|
+| server → app | `01`, u16 RTP sequence (big-endian), u32 RTP timestamp (big-endian), Opus packet |
+| app → server | `02`, Opus packet (one 20 ms frame) |
+
+The server sends the other side's audio already decrypted (just the Opus payload). The socket is open only while a
+call is connected; the server closes it when the call ends.
+
+## 4. Call API (server, under `/api`)
+
+| Request | Does |
+|---|---|
+| `POST /calls/:callId/answer` | Picks up a ringing call: joins the media server, answers. 204, or 4xx/5xx `{error}` |
+| `POST /calls/:callId/decline` | Declines (exists) |
+| `POST /calls/hangup` | Ends the connected call. 204 |
+| `GET /calls/current` | `{callId, callerId, callerName, video, state: "connecting" \| "connected", connectedAt}` or 404 |
+
+Events on the existing `/ws` socket, `{"type":"call","call":{…}}`:
+
+- `{"type":"incoming","call":{callId, callerId, callerName, video, group, groupId?, ts}}` (exists)
+- `{"type":"connected","callId","callerId","callerName","video","connectedAt"}` (new)
+- `{"type":"ended","callId","act"}` (exists; `act` says why: `"endcall"`, `"cancel"`, `"declined"`, `"hangup"`…)
+
+## 5. Screens (`com.zalom3ui.app.ui.call`)
+
+- Incoming call: `NotificationCompat.CallStyle.forIncomingCall` with Answer / Decline and a full-screen intent to the
+  call screen (ringing state) when the phone is locked.
+- Call screen (Compose, the app's own theme): avatar, name, "Connecting…" / timer, Mute, Speaker, Hang up.
+- `CallService`: foreground service, type `microphone`, in the main process; owns `CallAudioEngine` +
+  `CallAudioLink` while a call is connected; its notification is `CallStyle.forOngoingCall` with Hang up.
+- Permissions: `RECORD_AUDIO` (asked when answering), `FOREGROUND_SERVICE_MICROPHONE`, `USE_FULL_SCREEN_INTENT`,
+  `MODIFY_AUDIO_SETTINGS`.
