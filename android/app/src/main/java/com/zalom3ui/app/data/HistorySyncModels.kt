@@ -26,6 +26,8 @@ data class HistorySyncStatus(
     val detail: String = "",
     val expectedMessages: Int? = null,
     val counts: HistorySyncCounts? = null,
+    /** What happened, step by step (`GET /api/history-sync/status` only): event and field names, sizes, no content or keys. */
+    val log: List<String> = emptyList(),
 ) {
     val isActive: Boolean get() = state == "waiting_for_phone" || state == "downloading" || state == "importing"
     val isFinished: Boolean get() = state == "done" || state == "failed"

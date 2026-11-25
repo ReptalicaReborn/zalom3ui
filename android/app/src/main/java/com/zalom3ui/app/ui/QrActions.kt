@@ -106,6 +106,9 @@ object QrActions {
     /** Opens the share sheet with the call log as a text file (to send it for the call research). */
     suspend fun shareCallLog(context: Context, log: String) = shareText(context, "zaloo-call-log.txt", "Share call log", log)
 
+    /** The same for the log of "Sync messages from phone". */
+    suspend fun shareSyncLog(context: Context, log: String) = shareText(context, "zaloo-sync-log.txt", "Share sync log", log)
+
     /** Opens the share sheet with [text] as a file named [fileName]. */
     suspend fun shareText(context: Context, fileName: String, title: String, text: String) {
         val uri = withContext(Dispatchers.IO) {

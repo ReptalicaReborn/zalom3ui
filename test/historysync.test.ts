@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import {
     DownloadError,
     HistorySync,
+    backupDownloader,
+    isZaloCookieHost,
     classifyTransferError,
     downloadRetryDelayMs,
     syncControlOf,
@@ -18,6 +20,7 @@ import {
     type HistorySyncDeps,
     type HistorySyncStatus,
 } from "../src/historysync.js";
+import { CookieJar } from "tough-cookie";
 import { createServer } from "../src/server.js";
 import { ZaloSession } from "../src/session.js";
 import { ChatStore, HISTORY_MESSAGES_PER_THREAD, type StoredMessage } from "../src/store.js";
@@ -710,4 +713,60 @@ test("route: starting while logged out is a 409", async () => {
     } finally {
         await close();
     }
+});
+
+test("backup download: chat.zalo.me cookies on another Zalo host, no form content type, safe redirects", async () => {
+    assert.ok(isZaloCookieHost("zfile-sync.zadn.vn"));
+    assert.ok(isZaloCookieHost("tt-files-wpa.chat.zalo.me"));
+    assert.ok(!isZaloCookieHost("evil-zalo.me"));
+    assert.ok(!isZaloCookieHost("zalo.me.example.com"));
+
+    const jar = new CookieJar();
+    await jar.setCookie("zpw_sek=SEK; Domain=chat.zalo.me; Path=/; Secure", "https://chat.zalo.me/");
+    await jar.setCookie("zpsid=SID; Domain=.zalo.me; Path=/; Secure", "https://chat.zalo.me/");
+    const seen: { url: string; headers: Record<string, string> }[] = [];
+    const replies: Response[] = [
+        new Response(null, { status: 302, headers: { location: "https://b.zadn.vn/file.zdb" } }),
+        new Response(null, { status: 302, headers: { location: "https://cdn.example.com/file.zdb" } }),
+        new Response(Buffer.from("BACKUP"), { status: 200, headers: { "content-length": "6" } }),
+    ];
+    const fake: Record<string, unknown> = {
+        custom(name: string, fn: (a: { ctx: unknown; utils: unknown; props: unknown }) => Promise<unknown>) {
+            const ctx = {
+                uid: "4459",
+                userAgent: "UA/1",
+                cookie: jar,
+                options: {
+                    polyfill: async (url: string, init: { headers: Record<string, string>; redirect: string }) => {
+                        assert.equal(init.redirect, "manual");
+                        seen.push({ url, headers: init.headers });
+                        return replies.shift()!;
+                    },
+                },
+            };
+            fake[name] = (props: unknown) => fn({ ctx, utils: {}, props });
+        },
+    };
+    const download = backupDownloader(fake as never);
+    const got = await download("https://a.zadn.vn/pull?k=1", () => {}, new AbortController().signal);
+    assert.equal(got.toString(), "BACKUP");
+    assert.deepEqual(seen.map((s) => s.url), ["https://a.zadn.vn/pull?k=1", "https://b.zadn.vn/file.zdb", "https://cdn.example.com/file.zdb"]);
+    const first = seen[0].headers;
+    assert.equal(first.Cookie, "zpw_sek=SEK; zpsid=SID; zpw_uin=4459");
+    assert.equal(first.Origin, "https://chat.zalo.me");
+    assert.equal(first.Referer, "https://chat.zalo.me/");
+    assert.equal(first["User-Agent"], "UA/1");
+    assert.equal(first.Accept, "*/*");
+    assert.ok(!Object.keys(first).some((k) => k.toLowerCase() === "content-type"));
+    assert.equal(seen[1].headers.Cookie, first.Cookie);
+    assert.equal(seen[2].headers.Cookie, undefined, "no Zalo cookies to other hosts");
+
+    // An error answer is kept, shortened, for the log.
+    replies.push(new Response('{"error_code":-1,"error_message":"bad request"}', { status: 400 }));
+    await assert.rejects(download("https://a.zadn.vn/pull", () => {}, new AbortController().signal), (err: unknown) => {
+        assert.ok(err instanceof DownloadError);
+        assert.equal(err.status, 400);
+        assert.equal(err.answer, '{"error_code":-1,"error_message":"bad request"}');
+        return true;
+    });
 });

@@ -82,4 +82,15 @@ class CallEventsTest {
             api.parseEvent("""{"type":"call","call":{"type":"peer","callId":"c1","muted":true}}"""),
         )
     }
+
+    @Test
+    fun outgoingCallBeforeConnectingDecodes() {
+        // What POST /calls/start and GET /calls/current answer while the other phone hasn't picked up.
+        val call = AppJson.decodeFromString<CurrentCall>(
+            """{"callId":"1027272057","callerId":"4459003195326355900","callerName":"Thatreppy","video":false,"state":"calling","connectedAt":null,"outgoing":true}""",
+        )
+        org.junit.Assert.assertEquals(0L, call.connectedAt)
+        org.junit.Assert.assertEquals("calling", call.state)
+        org.junit.Assert.assertTrue(call.outgoing)
+    }
 }

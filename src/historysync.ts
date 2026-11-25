@@ -109,6 +109,8 @@ export class DownloadError extends Error {
         /** The HTTP status, or 0 for a network failure. */
         readonly status: number,
         readonly retryAfter?: string,
+        /** What the server said, shortened (its error text; never the backup). */
+        readonly answer?: string,
     ) {
         super(message);
     }
@@ -314,7 +316,7 @@ export class HistorySync extends EventEmitter<Events> {
         const url = typeof data.url === "string" ? data.url : "";
         const encryptedKey = typeof data.encrypted_key === "string" ? data.encrypted_key : "";
         this.log(
-            `backup info: format=${format} msgs=${expected} hasUrl=${Boolean(url)} host=${hostOf(url)} hasKey=${Boolean(encryptedKey)} ` +
+            `backup info: format=${format} msgs=${expected} hasUrl=${Boolean(url)} host=${hostOf(url)} urlParams=[${paramNamesOf(url)}] hasKey=${Boolean(encryptedKey)} ` +
                 `size=${Number(data.file_size ?? 0)} dataKeys=[${Object.keys(data).sort().join(",")}] infoKeys=[${Object.keys(info).sort().join(",")}]`,
         );
         if (Object.keys(info).length === 0) throw new BackupError("the backup description is missing");
@@ -399,7 +401,8 @@ export class HistorySync extends EventEmitter<Events> {
                 if (gen !== this.generation) throw err;
                 const status = err instanceof DownloadError ? err.status : 0;
                 const wait = controller.signal.aborted ? -1 : downloadRetryDelayMs(status, attempt, err instanceof DownloadError ? err.retryAfter : undefined, (this.deps.now ?? Date.now)());
-                this.log(`download attempt=${attempt} status=${status} retryIn=${wait}`);
+                const answer = err instanceof DownloadError && err.answer ? ` answer=${JSON.stringify(err.answer)}` : "";
+                this.log(`download attempt=${attempt} status=${status} retryIn=${wait}${answer}`);
                 if (wait < 0) {
                     throw new BackupError(controller.signal.aborted ? "the download stalled" : status ? `the download failed (HTTP ${status})` : "the download failed (network error)");
                 }
@@ -470,6 +473,39 @@ function hostOf(url: string): string {
     }
 }
 
+/** The names of a URL's query parameters (not their values, which can be keys). */
+function paramNamesOf(url: string): string {
+    try {
+        return [...new URL(url).searchParams.keys()].join(",");
+    } catch {
+        return "";
+    }
+}
+
+/** Hosts that get the Zalo session cookies, as in Zalo PC and the Zalos project. */
+export function isZaloCookieHost(host: string): boolean {
+    return /(^|\.)(zalo\.me|zaloapp\.com|zdn\.vn|zadn\.vn|zalo\.vn|dlmd\.me)$/i.test(host);
+}
+
+/**
+ * The cookie header for a backup download: the session's chat.zalo.me cookies (the backup sits on another Zalo host,
+ * whose own cookies would be none), plus zpw_uin when the jar lacks it, the way the Zalos project downloads it.
+ */
+export function backupCookieHeader(chatCookies: { key: string; value: string }[], hostCookies: { key: string; value: string }[], uid: string): string {
+    const parts = new Map<string, string>();
+    for (const c of [...chatCookies, ...hostCookies]) {
+        if (!c.value && (c.key === "zpw_uin" || c.key === "zpw_sek")) continue;
+        if (!parts.has(c.key)) parts.set(c.key, c.value);
+    }
+    if (!parts.has("zpw_uin") && uid) parts.set("zpw_uin", uid);
+    return [...parts].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+/** A short, single-line excerpt of an error answer for the log. */
+export function answerExcerpt(text: string): string {
+    return text.replace(/[^\x20-\x7e\u00a0-\uffff]+/g, " ").trim().slice(0, 200);
+}
+
 // ---- Real network pieces on a logged-in zca-js session ----
 
 const FILE_SERVICE_FALLBACK = "https://tt-files-wpa.chat.zalo.me";
@@ -496,19 +532,57 @@ export function fileServiceCaller(api: API): HistorySyncDeps["call"] {
     return (endpoint, params) => call({ endpoint, params });
 }
 
-/** Downloads a backup with the session's cookies (the file hosts want them), into memory, with a size cap. */
+/**
+ * Downloads a backup into memory, with a size cap. The request is the one the Zalos project sends: a plain GET with the
+ * chat.zalo.me session cookies (only to Zalo hosts), chat.zalo.me as Origin and Referer, no form content type, and
+ * redirects followed by hand so cookies never leave Zalo's hosts.
+ */
 export function backupDownloader(api: API): HistorySyncDeps["download"] {
     const name = "zalooBackupGet";
     if (!(name in api)) {
-        api.custom<Buffer, { url: string; signal: AbortSignal; onProgress: (got: number, total: number) => void }>(name, async ({ utils, props }) => {
-            let response: Response;
+        api.custom<Buffer, { url: string; signal: AbortSignal; onProgress: (got: number, total: number) => void }>(name, async ({ ctx, props }) => {
+            const fetcher: typeof fetch = ctx.options?.polyfill ?? fetch;
+            const headersFor = async (target: URL): Promise<Record<string, string>> => {
+                const headers: Record<string, string> = {
+                    "User-Agent": ctx.userAgent,
+                    Accept: "*/*",
+                    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                };
+                if (isZaloCookieHost(target.hostname)) {
+                    const jar = ctx.cookie;
+                    const chat = jar ? await jar.getCookies("https://chat.zalo.me/") : [];
+                    const own = jar ? await jar.getCookies(target.href) : [];
+                    const cookie = backupCookieHeader(chat, own, String(ctx.uid ?? ""));
+                    if (cookie) headers.Cookie = cookie;
+                    headers.Referer = "https://chat.zalo.me/";
+                    headers.Origin = "https://chat.zalo.me";
+                }
+                return headers;
+            };
+            let response: Response | null = null;
+            let target = new URL(props.url);
             try {
-                response = (await utils.request(props.url, { method: "GET", signal: props.signal })) as Response;
-            } catch {
+                for (let hop = 0; hop < 5; hop++) {
+                    const init = { method: "GET", headers: await headersFor(target), signal: props.signal, redirect: "manual" as const };
+                    response = await fetcher(target.href, Object.assign(init, ctx.options?.agent ? { agent: ctx.options.agent } : {}));
+                    const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+                    if (!location) break;
+                    await response.body?.cancel().catch(() => undefined);
+                    target = new URL(location, target);
+                    if (target.protocol !== "https:") throw new DownloadError("redirected off https", 0);
+                }
+            } catch (err) {
+                if (err instanceof DownloadError) throw err;
                 throw new DownloadError("network error", 0);
             }
-            if (!response.ok) throw new DownloadError(`HTTP ${response.status}`, response.status, response.headers.get("retry-after") ?? undefined);
-            const total = Number(response.headers.get("content-length") ?? 0);
+            if (!response) throw new DownloadError("network error", 0);
+            if (!response.ok) {
+                const answer = await response.text().then(answerExcerpt, () => "");
+                throw new DownloadError(`HTTP ${response.status}`, response.status, response.headers.get("retry-after") ?? undefined, answer);
+            }
+            // fetch undoes a content encoding but leaves the encoded length in content-length.
+            const encoded = Boolean(response.headers.get("content-encoding")) && response.headers.get("content-encoding") !== "identity";
+            const total = encoded ? 0 : Number(response.headers.get("content-length") ?? 0);
             if (total > MAX_BACKUP_BYTES) throw new DownloadError("too large", 413);
             if (!response.body) return Buffer.from(await response.arrayBuffer());
             const chunks: Buffer[] = [];

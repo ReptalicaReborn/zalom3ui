@@ -41,12 +41,21 @@ import kotlin.coroutines.resumeWithException
 
 class ApiException(message: String, val code: Int = 0) : IOException(message)
 
+/**
+ * How the app reads the server's JSON. A `null` for a field that has a default takes the default (the server sends
+ * `connectedAt: null` before a call connects, for example) instead of failing the whole answer.
+ */
+internal val AppJson = Json {
+    ignoreUnknownKeys = true
+    coerceInputValues = true
+}
+
 /** Talks to the Zalỏ server's REST API and WebSocket. */
 class ApiClient(serverUrl: String, private val token: String?) {
     private val baseUrl: HttpUrl = normalizeServerUrl(serverUrl)
         ?: throw IllegalArgumentException("Invalid server URL: $serverUrl")
 
-    private val json = Json { ignoreUnknownKeys = true }
+    private val json = AppJson
 
     suspend fun status(): SessionStatus = get("status")
 

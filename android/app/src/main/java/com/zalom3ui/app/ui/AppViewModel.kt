@@ -380,6 +380,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(historySyncShown = false) }
     }
 
+    /** Hands the server's sync log to [onReady], to share when a sync fails. */
+    fun shareHistorySyncLog(onReady: (String) -> Unit) = launchApi { api ->
+        val status = api.historySyncStatus()
+        val lines = listOf("state=${status.state} error=${status.error.orEmpty()}") + status.log
+        onReady(lines.joinToString("\n"))
+    }
+
     // ---- Call research ----
 
     /** Shares the server's call log (for docs/calls.md); says so when there is nothing in it yet. */

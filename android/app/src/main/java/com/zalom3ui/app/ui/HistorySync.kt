@@ -2,6 +2,7 @@ package com.zalom3ui.app.ui
 
 import android.content.Context
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -15,6 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -23,6 +25,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zalom3ui.app.data.HistorySyncStatus
 import com.zalom3ui.app.data.ThreadSummary
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * "Sync messages from phone": the offer after sign-in, and the progress dialog. The server does the work
@@ -68,6 +71,7 @@ fun HistorySyncHost(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val prefs = remember { HistorySyncPrefs(context) }
+    val scope = rememberCoroutineScope()
     val ownId = state.status?.ownId
     var dismissed by remember(ownId) { mutableStateOf(prefs.isOfferDismissed(ownId)) }
     val candidate = !dismissed && shouldOfferHistorySync(state.status?.isLoggedIn == true, state.threads, state.historySync)
@@ -123,6 +127,7 @@ fun HistorySyncHost(vm: AppViewModel) {
             onCancel = vm::cancelHistorySync,
             onHide = vm::hideHistorySync,
             onRetry = vm::startHistorySync,
+            onShareLog = { vm.shareHistorySyncLog { log -> scope.launch { QrActions.shareSyncLog(context, log) } } },
         )
     }
 }
@@ -133,6 +138,7 @@ fun HistorySyncDialog(
     onCancel: () -> Unit,
     onHide: () -> Unit,
     onRetry: () -> Unit,
+    onShareLog: () -> Unit = {},
 ) {
     val waiting = status.state == "waiting_for_phone"
     AlertDialog(
@@ -180,7 +186,10 @@ fun HistorySyncDialog(
         },
         dismissButton = {
             when {
-                status.state == "failed" -> TextButton(onClick = onHide) { Text("Close") }
+                status.state == "failed" -> Row {
+                    TextButton(onClick = onShareLog) { Text("Share log") }
+                    TextButton(onClick = onHide) { Text("Close") }
+                }
                 status.isActive -> TextButton(onClick = onCancel) { Text("Cancel sync") }
             }
         },
