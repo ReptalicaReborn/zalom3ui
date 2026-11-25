@@ -1,5 +1,5 @@
 import type { API } from "zca-js";
-import type { CallControl, IncomingCall } from "./calls.js";
+import { jsonObject, type CallControl, type IncomingCall } from "./calls.js";
 
 /**
  * Zalo's call signalling: GET requests to the voice call service, `/api/voicecall/<endpoint>?params=<AES(json)>`, the
@@ -43,18 +43,38 @@ export function ringingCallOf(incoming: IncomingCall, control: CallControl, now 
     };
 }
 
+/** Status of an `answer` (Zalo PC's call program, `ZCallInfo`): picked up, busy, declined. */
+export const AnswerStatus = { Accept: 0, Busy: 1, Decline: 3 } as const;
+
 /**
- * Declines a ringing call. Zalo PC has no separate "decline" request: its call program sends signal 405
- * (`ZCallInfo::_processCancleCallJob`: the caller's noised id `uidN`, the call id as a number, the call type, status 0),
- * which the renderer turns into `/api/voicecall/cancel`; the same request a caller sends to give up.
+ * Declines a ringing call. Zalo PC's call program sends signal 402 with status 3 when the incoming call is declined or
+ * its window closed (`ZCallInfo::UiAnswerCallEvent` / `UiCloseEvent`), which the renderer turns into
+ * `/api/voicecall/answer`: the caller's noised id, the call id as a number, the status, the codec list, the media
+ * server and the session. (`cancel` is the caller giving up; sent by the person called, Zalo accepts it but the caller
+ * keeps ringing.) The other devices then get the `answer` control with status 3, as when declining in the official app.
  */
-export function declineCall(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
-    return send("cancel", { callerId: call.callerId, callId: call.rawCallId, callType: call.callType, status: 0, imei });
+export function declineCall(send: VoiceCallSender, call: RingingCall): Promise<unknown> {
+    const d = call.data;
+    const params = jsonObject(d.params);
+    const server = text(d.rtpAddress) || text(params?.rtpIP);
+    return send("answer", {
+        callerId: call.callerId,
+        callId: call.rawCallId,
+        status: AnswerStatus.Decline,
+        codec: text(d.codec),
+        rtcpAddress: text(d.rtcpAddress) || text(params?.rtcpIP) || server,
+        rtpAddress: server,
+        session_id: text(d.session) || text(params?.sessId),
+    });
+}
+
+function text(v: unknown): string {
+    return typeof v === "string" ? v : typeof v === "number" ? String(v) : "";
 }
 
 /**
  * Tells the caller this device is ringing (signal 407, `/api/voicecall/ringring`). Zalo PC's call program sends it as
- * soon as a call arrives; Zalo may only take a decline from a device that rang.
+ * soon as a call arrives.
  */
 export function ringRing(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
     return send("ringring", { callerId: call.callerId, callId: call.rawCallId, status: 0, imei });

@@ -541,7 +541,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) });
         }
         try {
-            const answer = await declineCall(send, call, imei);
+            const answer = await declineCall(send, call);
             this.callTrace.record({ kind: "declined", callId, answer });
         } catch (err) {
             this.callTrace.record({ kind: "decline_failed", callId, error: describeError(err) });

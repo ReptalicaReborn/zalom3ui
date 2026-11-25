@@ -151,13 +151,14 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
 
   Each control is announced once even if both channels carry it, and a call request over 2 minutes old is not
   announced (replayed history).
-- **Decline:** the call notification has **Decline**. Zalo PC has no separate decline request: its call program sends
-  signal 405 (`ZCallInfo::_processCancleCallJob`), which becomes `/api/voicecall/cancel` with the caller's noised id
-  (`uidN`) as `callerId`, the call id **as a number**, the call type (1 voice, 3 video: `extendData.callType` 0 or 1)
-  and `status: 0`; the same request a caller sends to give up. The first try sent the id as text and type 0: Zalo
-  answered but the caller kept ringing. Zalỏ now also sends `ringring` (signal 407, which Zalo PC sends as soon as a
-  call arrives) right before. The call log records `ringring`, then `declined` with Zalo's answer, or
-  `decline_failed`.
+- **Decline:** the call notification has **Decline**. Zalo PC's call program declines (or closes the incoming call
+  window) with signal 402 and **status 3** (`ZCallInfo::UiAnswerCallEvent`, `UiCloseEvent`); accepting is status 0
+  (`_trySendAcceptSignal`), busy status 1. The renderer sends it as `/api/voicecall/answer`: the caller's noised id
+  (`uidN`) as `callerId`, the call id as a number, the status, the codec list, `rtcpAddress` / `rtpAddress` (the call's
+  media server) and `session_id`. Declining in the official app gives the same: the other devices get an `answer`
+  control with status 3. Two earlier tries used `/api/voicecall/cancel` (the caller giving up): Zalo accepted it but
+  the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
+  `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
 - **Control poll:** only when the account's settings say Zalo PC would long-poll (`enable_ctrl_socket` off or
   `disable_lp` off). On an account with both set the chat socket carried every call, and the poll answers kept
   repeating the same backlog; repeats now make the poll wait 30 s. An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;

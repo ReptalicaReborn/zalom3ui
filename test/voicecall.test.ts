@@ -15,8 +15,9 @@ test("the voice call service comes from the login's service map, with Zalo PC's 
     assert.equal(voiceCallDomain(undefined), DEFAULT_VOICE_CALL_DOMAIN);
 });
 
-test("declining sends what Zalo PC's call program sends: noised caller id, numeric call id, call type 1/3", async () => {
+test("declining is an answer with status 3, as Zalo PC's call program sends it", async () => {
     // The shape of a real 1:1 request (values made up): 32-bit zrtc ids, the noised user id, ids as text.
+    const codec = '[{"frmPtime":20,"payload":112,"name":"opus/16000/1","dynamicFptime":0}]';
     const request = (callType: number) =>
         parseJsonKeepingBigInts(
             JSON.stringify({
@@ -26,6 +27,10 @@ test("declining sends what Zalo PC's call program sends: noised caller id, numer
                 callId: "321000003",
                 status: "0",
                 ts: "1795617640181",
+                codec,
+                session: "SESSION-made-up",
+                rtpAddress: "192.0.2.10:4200",
+                rtcpAddress: "192.0.2.10:4200",
                 params: JSON.stringify({ id: 321000003, Dname: "Bảo", extendData: JSON.stringify({ callType }) }),
             }),
         ) as Record<string, unknown>;
@@ -35,14 +40,26 @@ test("declining sends what Zalo PC's call program sends: noised caller id, numer
         assert.equal(incoming.callerId, "4459000000000000001");
         assert.equal(incoming.video, callType === 1);
         assert.equal(incoming.displayName, "Bảo");
+        const call = ringingCallOf(incoming, control, 1795617640181);
+        assert.equal(call.callType, expected);
         const sent: [string, Record<string, unknown>][] = [];
-        await declineCall(async (endpoint, params) => {
-            sent.push([endpoint, params]);
-            return {};
-        }, ringingCallOf(incoming, control, 1795617640181), "imei-1");
-        assert.deepEqual(sent, [["cancel", { callerId: "4459000000000000001", callId: 321000003, callType: expected, status: 0, imei: "imei-1" }]]);
+        await declineCall(async (endpoint, params) => void sent.push([endpoint, params]), call);
+        assert.deepEqual(sent, [
+            [
+                "answer",
+                {
+                    callerId: "4459000000000000001",
+                    callId: 321000003,
+                    status: 3,
+                    codec,
+                    rtcpAddress: "192.0.2.10:4200",
+                    rtpAddress: "192.0.2.10:4200",
+                    session_id: "SESSION-made-up",
+                },
+            ],
+        ]);
         sent.length = 0;
-        await ringRing(async (endpoint, params) => void sent.push([endpoint, params]), ringingCallOf(incoming, control, 1795617640181), "imei-1");
+        await ringRing(async (endpoint, params) => void sent.push([endpoint, params]), call, "imei-1");
         assert.deepEqual(sent, [["ringring", { callerId: "4459000000000000001", callId: 321000003, status: 0, imei: "imei-1" }]]);
     }
 });
