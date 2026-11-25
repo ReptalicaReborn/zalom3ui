@@ -90,8 +90,25 @@ export function decodeEventPayload(parsed: { data?: unknown; encrypt?: unknown }
         decipher.setAuthTag(buf.subarray(buf.length - 16));
         plain = Buffer.concat([decipher.update(buf.subarray(32, buf.length - 16)), decipher.final()]);
     }
-    const text = (type === 3 ? plain : zlib.inflateSync(plain)).toString("utf8");
+    const text = (type === 3 ? plain : inflateAny(plain)).toString("utf8");
     return text ? parseJsonKeepingBigInts(text) : null;
+}
+
+/**
+ * Decompresses like pako.inflate, which zca-js uses: it detects a zlib or a gzip header (call controls come gzipped);
+ * raw deflate as a last resort. A failure names the first bytes, so the call log shows what arrived.
+ */
+export function inflateAny(buf: Buffer): Buffer {
+    try {
+        return zlib.unzipSync(buf);
+    } catch (first) {
+        try {
+            return zlib.inflateRawSync(buf);
+        } catch {
+            const head = buf.subarray(0, 8).toString("hex").replace(/(..)/g, "$1 ").trim();
+            throw new Error(`${first instanceof Error ? first.message : String(first)} (${buf.length} bytes, starting ${head})`);
+        }
+    }
 }
 
 /** Frame commands zca-js handles (zca-js 2.2.0 `listen.js`); anything else is worth noting in the call log. */

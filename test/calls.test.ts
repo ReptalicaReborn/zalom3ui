@@ -16,13 +16,13 @@ function controlFrame(controls: unknown[], cmd = 601): Buffer {
     return eventFrame({ data: { controls } }, cmd);
 }
 
-function eventFrame(body: unknown, cmd: number): Buffer {
+function eventFrame(body: unknown, cmd: number, compress: (b: Buffer) => Buffer = zlib.deflateSync): Buffer {
     const json = Buffer.from(JSON.stringify(body));
     const iv = crypto.randomBytes(16);
     const aad = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(KEY, "base64"), iv);
     cipher.setAAD(aad);
-    const sealed = Buffer.concat([cipher.update(zlib.deflateSync(json)), cipher.final(), cipher.getAuthTag()]);
+    const sealed = Buffer.concat([cipher.update(compress(json)), cipher.final(), cipher.getAuthTag()]);
     const payload = JSON.stringify({ data: encodeURIComponent(Buffer.concat([iv, aad, sealed]).toString("base64")), encrypt: 2 });
     const header = Buffer.alloc(4);
     header[0] = 1;
@@ -124,4 +124,17 @@ test("the call log notes every control's type and unknown frames' field names, n
     assert.ok(!JSON.stringify(unknown).includes("v=0"), "values are not recorded");
 
     assert.equal(inspectFrame(eventFrame({ data: { msgs: [] } }, 501), KEY), null, "message frames are none of the log's business");
+});
+
+test("gzipped and raw-deflated payloads decode too (call controls from a real phone came gzipped)", () => {
+    const body = { data: { controls: [requestControl] } };
+    for (const compress of [zlib.gzipSync, zlib.deflateRawSync, zlib.deflateSync]) {
+        const controls = callControlsOf(eventFrame(body, 601, compress), KEY);
+        assert.equal(controls.length, 1, compress.name);
+        assert.equal(controls[0].data.callerId, "1234567890123456789");
+    }
+});
+
+test("a payload that isn't compressed at all says what it starts with", () => {
+    assert.throws(() => callControlsOf(eventFrame({ data: {} }, 601, (b) => Buffer.concat([Buffer.from([9, 9, 9, 9]), b])), KEY), /starting 09 09 09 09/);
 });
