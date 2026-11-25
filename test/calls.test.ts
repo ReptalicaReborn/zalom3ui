@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import zlib from "node:zlib";
-import { CallTrace, callControlsOf, decodeEventPayload, frameHeader, incomingCallOf, parseJsonKeepingBigInts } from "../src/calls.js";
+import { CallTrace, callControlsOf, decodeEventPayload, frameHeader, incomingCallOf, inspectFrame, parseJsonKeepingBigInts } from "../src/calls.js";
 import { ZaloSession, type CallEvent } from "../src/session.js";
 import { ChatStore } from "../src/store.js";
 
@@ -13,7 +13,11 @@ const KEY = crypto.randomBytes(32).toString("base64");
 
 /** A control frame the way Zalo sends it: header + {data, encrypt: 2} with AES-GCM over zlib'd JSON. */
 function controlFrame(controls: unknown[], cmd = 601): Buffer {
-    const json = Buffer.from(JSON.stringify({ data: { controls } }));
+    return eventFrame({ data: { controls } }, cmd);
+}
+
+function eventFrame(body: unknown, cmd: number): Buffer {
+    const json = Buffer.from(JSON.stringify(body));
     const iv = crypto.randomBytes(16);
     const aad = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(KEY, "base64"), iv);
@@ -108,4 +112,16 @@ test("the call log rotates instead of growing without end", () => {
     for (let i = 0; i < 9; i++) trace.record({ i, big });
     assert.ok(fs.existsSync(path.join(dir, "call-trace.jsonl.1")));
     assert.ok(trace.read().length < 5 * 1024 * 1024);
+});
+
+test("the call log notes every control's type and unknown frames' field names, never their content", () => {
+    const info = inspectFrame(controlFrame([requestControl, { content: { act_type: "fr", act: "add", data: { secret: "x" } } }]), KEY);
+    assert.deepEqual(info?.controlTypes, ["voip/request", "fr/add"]);
+    assert.equal(info?.calls.length, 1);
+
+    const unknown = inspectFrame(eventFrame({ data: { callSignal: { sdp: "v=0" }, n: 1 } }, 777), KEY);
+    assert.deepEqual(unknown?.unknown, { version: 1, cmd: 777, subCmd: 0, bytes: unknown?.unknown?.bytes, keys: ["data", "data.callSignal", "data.n"] });
+    assert.ok(!JSON.stringify(unknown).includes("v=0"), "values are not recorded");
+
+    assert.equal(inspectFrame(eventFrame({ data: { msgs: [] } }, 501), KEY), null, "message frames are none of the log's business");
 });

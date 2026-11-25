@@ -21,7 +21,7 @@ import {
     type Undo,
     ZaloApiLoginQRAborted,
 } from "zca-js";
-import { CALL_ENDING_ACTS, CallTrace, callControlsOf, incomingCallOf, type CallControl, type IncomingCall } from "./calls.js";
+import { CALL_ENDING_ACTS, CallTrace, incomingCallOf, inspectFrame, type CallControl, type FrameInfo, type IncomingCall } from "./calls.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -486,16 +486,21 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         const ws = l.ws;
         if (!ws || typeof ws.on !== "function" || this.tappedSockets.has(ws)) return;
         this.tappedSockets.add(ws);
+        // Proves the hook runs: a log with this line and no call events means Zalo sent none to this session.
+        this.callTrace.record({ kind: "listening" });
         ws.on("message", (data: unknown) => {
             if (!Buffer.isBuffer(data)) return;
-            let controls: CallControl[];
+            let info: FrameInfo | null;
             try {
-                controls = callControlsOf(data, l.cipherKey);
+                info = inspectFrame(data, l.cipherKey);
             } catch (err) {
                 this.callTrace.record({ kind: "decode_error", error: err instanceof Error ? err.message : String(err) });
                 return;
             }
-            for (const control of controls) this.onCallControl(control);
+            if (!info) return;
+            if (info.controlTypes.length) this.callTrace.record({ kind: "controls", types: info.controlTypes });
+            if (info.unknown) this.callTrace.record({ kind: "frame", ...info.unknown });
+            for (const control of info.calls) this.onCallControl(control);
         });
     }
 

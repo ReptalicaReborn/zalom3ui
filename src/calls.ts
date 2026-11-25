@@ -94,16 +94,81 @@ export function decodeEventPayload(parsed: { data?: unknown; encrypt?: unknown }
     return text ? parseJsonKeepingBigInts(text) : null;
 }
 
+/** Frame commands zca-js handles (zca-js 2.2.0 `listen.js`); anything else is worth noting in the call log. */
+export const KNOWN_FRAME_CMDS = new Set([1, 2, 3000, 501, 502, 510, 511, 521, 522, 601, 602, 610, 611, 612]);
+
+/** What a frame says, for the call log: never message content, only types and field names. */
+export type FrameInfo = {
+    /** `voip` controls (calls), in full. */
+    calls: CallControl[];
+    /** "act_type/act" of every control in a control frame (cmd 601). */
+    controlTypes: string[];
+    /** A frame zca-js doesn't handle: its command and the names of its fields. */
+    unknown?: { cmd: number; subCmd: number; bytes: number; keys: string[] };
+};
+
+/** Field names of a decoded payload, one level deep ("data.controls", "data.msgs"…), without values. */
+function shapeOf(value: unknown): string[] {
+    if (!value || typeof value !== "object") return [];
+    const keys: string[] = [];
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        keys.push(k);
+        if (v && typeof v === "object" && !Array.isArray(v)) for (const inner of Object.keys(v)) keys.push(`${k}.${inner}`);
+    }
+    return keys.slice(0, 40);
+}
+
+/** Reads a raw frame for the call log and the call announcements. */
+export function inspectFrame(frame: Buffer, cipherKey: string | undefined): FrameInfo | null {
+    const header = frameHeader(frame);
+    if (!header || header.version !== 1) return null;
+    const known = KNOWN_FRAME_CMDS.has(header.cmd);
+    if (known && header.cmd !== 601) return null;
+    const text = frame.subarray(4).toString("utf8");
+    if (!text) return null;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        return known ? null : { calls: [], controlTypes: [], unknown: { ...header, bytes: frame.length, keys: [] } };
+    }
+    let decoded: unknown = null;
+    try {
+        decoded = decodeEventPayload(parsed as { data?: unknown; encrypt?: unknown }, cipherKey);
+    } catch {
+        // Not an event payload (or not ours to read): keep the outer shape only.
+    }
+    if (!known) {
+        return { calls: [], controlTypes: [], unknown: { ...header, bytes: frame.length, keys: shapeOf(decoded ?? parsed) } };
+    }
+    if (header.subCmd !== 0) return null;
+    return { calls: controlsOf(decoded), controlTypes: controlTypesOf(decoded) };
+}
+
+function controlList(decoded: unknown): unknown[] {
+    const d = decoded as { data?: { controls?: unknown[] }; controls?: unknown[] } | null;
+    return d?.data?.controls ?? d?.controls ?? [];
+}
+
+function controlTypesOf(decoded: unknown): string[] {
+    return controlList(decoded).map((control) => {
+        const content = (control as { content?: Record<string, unknown> })?.content ?? {};
+        return `${String(content.act_type ?? "?")}/${String(content.act ?? "?")}`;
+    });
+}
+
 /** The `voip` controls of a raw frame, if it is a control frame (cmd 601). */
 export function callControlsOf(frame: Buffer, cipherKey: string | undefined): CallControl[] {
     const header = frameHeader(frame);
     if (!header || header.version !== 1 || header.cmd !== 601 || header.subCmd !== 0) return [];
     const text = frame.subarray(4).toString("utf8");
     if (!text) return [];
-    const decoded = decodeEventPayload(JSON.parse(text), cipherKey) as { data?: { controls?: unknown[] } } | null;
-    const controls = decoded?.data?.controls ?? (decoded as { controls?: unknown[] } | null)?.controls ?? [];
+    return controlsOf(decodeEventPayload(JSON.parse(text), cipherKey));
+}
+
+function controlsOf(decoded: unknown): CallControl[] {
     const out: CallControl[] = [];
-    for (const control of controls) {
+    for (const control of controlList(decoded)) {
         const content = (control as { content?: Record<string, unknown> })?.content;
         if (!content || content.act_type !== "voip") continue;
         let data = content.data;
