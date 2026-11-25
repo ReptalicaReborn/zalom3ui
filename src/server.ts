@@ -306,6 +306,12 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     });
 
+    /** `{ "muted": true | false }`: tells the other side (the app silences the microphone itself). */
+    api.post("/calls/mute", (req, res) => {
+        session.setCallMuted(req.body?.muted === true);
+        res.status(204).end();
+    });
+
     api.get("/calls/current", (_req, res) => {
         const call = session.currentCall();
         if (!call) {

@@ -29,6 +29,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -54,6 +55,7 @@ sealed interface CallState {
 class CallService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var events: Job? = null
+    private var muteSync: Job? = null
     private var media: CallMedia? = null
     private var callId = ""
     private var name = ""
@@ -94,6 +96,9 @@ class CallService : Service() {
         }
         events?.cancel()
         events = scope.launch { follow() }
+        muteSync?.cancel()
+        // The other side's app shows when we mute, as with the official apps.
+        muteSync = scope.launch { _muted.drop(1).collect { runCatching { api.setCallMuted(it) } } }
     }
 
     private suspend fun follow() {
@@ -155,6 +160,7 @@ class CallService : Service() {
         if (ending) return
         ending = true
         events?.cancel()
+        muteSync?.cancel()
         media?.stop()
         media = null
         activeMedia = null

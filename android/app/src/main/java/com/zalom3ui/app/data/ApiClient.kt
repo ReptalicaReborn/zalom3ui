@@ -169,6 +169,11 @@ class ApiClient(serverUrl: String, private val token: String?) {
         post<Unit>("calls/hangup")
     }
 
+    /** Tells the other side of the call we muted / unmuted (the microphone itself is silenced by the app). */
+    suspend fun setCallMuted(muted: Boolean) {
+        post<Unit>("calls/mute", buildJsonObject { put("muted", muted) }.toString())
+    }
+
     /** The call being answered or connected on this account, or null when there is none. */
     suspend fun currentCall(): CurrentCall? = try {
         get<CurrentCall>("calls/current")

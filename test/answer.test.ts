@@ -84,7 +84,7 @@ test("answering joins the media server, answers, carries audio both ways, and en
     const call = await session.answerCall("321000003");
     assert.equal(call.state, "connected");
     assert.equal(call.callerName, "Bảo");
-    assert.deepEqual(sent.map(([e]) => e), ["ringring", "answer"]);
+    assert.deepEqual(sent.map(([e]) => e), ["ringring", "answer"], "a voice call: no camera state to announce");
     assert.equal(sent[1][1].status, 0);
     assert.equal(events.at(-1)?.type, "connected");
     await assert.rejects(session.answerCall("321000003"), /isn't ringing/);
@@ -95,6 +95,10 @@ test("answering joins the media server, answers, carries audio both ways, and en
     assert.ok(media.got.audio.some((a) => a.toString() === "my-voice"), "our frame reached the media server, decryptable");
     assert.ok(media.got.audio.some((a) => a.toString("hex") === "f8fffe"), "silence fills in between frames");
     assert.equal(session.currentCall()?.callId, "321000003");
+
+    session.setCallMuted(true);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(sent.at(-1), ["conf", { calleeId: "4459000000000000001", callId: 321000003, isOnCam: -1, isOnMic: 1, data: "" }]);
 
     session.onCallControl({ act: "endcall", data: { callId: "321000003" }, raw: {} });
     assert.equal(session.currentCall(), null);
@@ -114,5 +118,29 @@ test("hanging up sends Zalo's end call and the media server's", async () => {
     assert.deepEqual(sent.at(-1), ["endcall", { uidTo: "4459000000000000001", callId: 321000004, status: 3, imei: "imei-1" }]);
     assert.deepEqual(events.at(-1), { type: "ended", callId: "321000004", act: "hangup" });
     assert.throws(() => session.hangUpCall(), /No call/);
+    media.close();
+});
+
+test("answering a video call without a camera says the camera is off", async () => {
+    const media = await fakeMediaServer();
+    const { session, sent } = sessionWithFakeZalo();
+    session.onCallControl({
+        act: "request",
+        data: {
+            uidFrom: "465000001",
+            uidN: "4459000000000000001",
+            uidTo: "438000002",
+            callId: "321000005",
+            session: SESSION,
+            rtpAddress: `127.0.0.1:${media.port}`,
+            params: JSON.stringify({ userId: 438000002, extendData: JSON.stringify({ callType: 1 }) }),
+        },
+        raw: {},
+    });
+    await session.answerCall("321000005");
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(JSON.parse(sent[1][1].extendData as string).callType, 1, "still a video call");
+    assert.deepEqual(sent[2], ["conf", { calleeId: "4459000000000000001", callId: 321000005, isOnCam: 0, isOnMic: -1, data: "" }]);
+    session.hangUpCall();
     media.close();
 });

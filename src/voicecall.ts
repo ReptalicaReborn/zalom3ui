@@ -95,6 +95,20 @@ export function acceptCall(send: VoiceCallSender, call: RingingCall, server: str
     });
 }
 
+/**
+ * Tells the other side our camera / microphone state (signal 12006, `/api/voicecall/conf`; the Zalos project's engine
+ * does the same): `isOnCam` 1 on / 0 off, `isOnMic` 1 muted / 0 unmuted, -1 for "unchanged".
+ */
+export function camMicState(send: VoiceCallSender, call: RingingCall, state: { camOn?: boolean; muted?: boolean }): Promise<unknown> {
+    return send("conf", {
+        calleeId: call.callerId,
+        callId: call.rawCallId,
+        isOnCam: state.camOn === undefined ? -1 : state.camOn ? 1 : 0,
+        isOnMic: state.muted === undefined ? -1 : state.muted ? 1 : 0,
+        data: "",
+    });
+}
+
 /** Hangs up a call that was picked up (signal 409, `/api/voicecall/endcall`). */
 export function hangUp(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
     return send("endcall", { uidTo: call.callerId, callId: call.rawCallId, status: 3, imei });
@@ -129,18 +143,22 @@ export function ourExtendData(call: RingingCall): Record<string, unknown> {
     return {
         p2p: [],
         callType: call.video ? 1 : 0,
-        newZrtc: 1,
-        platform: ZRTC_PLATFORM_PC,
-        packetMode: num("packetMode", 2),
-        gccMode: num("gccMode", 1),
-        srtpMode: num("srtpMode", 1),
-        sP2P: 0,
-        srtcp: num("srtcp", 0),
+        fecTP: 0,
         gccAudio: num("gccAudio", 1),
+        gccEarlyCall: 0,
+        gccMode: num("gccMode", 1),
         gccSVLR: num("gccSVLR", 1),
-        tpType: 0,
-        spTcp: 0,
         maxFT: num("maxFT", 60),
+        newZrtc: 1,
+        numServers: 0,
+        packetMode: num("packetMode", 2),
+        platform: ZRTC_PLATFORM_PC,
+        sP2P: 0,
+        select2side: 1,
+        spTcp: 1,
+        srtcp: num("srtcp", 0),
+        srtpMode: num("srtpMode", 1),
+        tpType: 0,
         supportCallBusy: 1,
         supportHevcDecode: 0,
         serverAddr: servers,

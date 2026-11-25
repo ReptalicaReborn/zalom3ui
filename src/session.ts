@@ -33,7 +33,7 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
-import { acceptCall, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
+import { acceptCall, camMicState, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
 import { MediaCall, parseServer } from "./zrtcclient.js";
 import { HttpError } from "./errors.js";
 import {
@@ -80,7 +80,13 @@ export type ReadEvent = { threadKind: ThreadKind; threadId: string };
 /** Someone is calling (answer it in the official app), or that call stopped ringing. */
 /** A call that was picked up here. */
 export type CurrentCall = { callId: string; callerId: string; callerName: string; video: boolean; state: "connecting" | "connected"; connectedAt: number | null };
-type ActiveCall = { info: CurrentCall; media: MediaCall | null; finish: (reason: string, hangUp: boolean) => void };
+type ActiveCall = {
+    info: CurrentCall;
+    media: MediaCall | null;
+    finish: (reason: string, hangUp: boolean) => void;
+    /** Tells the other side our camera / microphone state. */
+    camMic?: (state: { camOn?: boolean; muted?: boolean }) => void;
+};
 
 export type CallEvent =
     | { type: "incoming"; call: IncomingCall & { callerName: string; groupName?: string } }
@@ -620,6 +626,14 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             }
             this.ringing.delete(callId);
             media.startSilence();
+            active.camMic = (state) => {
+                camMicState(send, call, state).then(
+                    (answer) => this.callTrace.record({ kind: "cam_mic", callId, ...state, answer }),
+                    (err) => this.callTrace.record({ kind: "cam_mic_failed", callId, ...state, error: describeError(err) }),
+                );
+            };
+            // No camera yet: say so, or the other side of a video call waits for our picture.
+            if (call.video) active.camMic({ camOn: false });
             current.state = "connected";
             current.connectedAt = Date.now();
             let done = false;
@@ -656,6 +670,12 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     hangUpCall(): void {
         if (!this.activeCall) throw new HttpError(404, "No call in progress");
         this.activeCall.finish("hangup", true);
+    }
+
+    /** Mutes or unmutes us in the call in progress, as the other side's app shows it. (The app stops the audio itself.) */
+    setCallMuted(muted: boolean): void {
+        if (!this.activeCall) throw new HttpError(404, "No call in progress");
+        this.activeCall.camMic?.({ muted });
     }
 
     /** The call in progress, if any. */
