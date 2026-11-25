@@ -188,5 +188,6 @@ The Android app uses this API; other clients can too.
 ## Not yet supported
 
 Recording and sending voice messages; sending GIFs (zca-js needs a file-path metadata reader for them); calls; mini
-apps; polls and reminders; editing your profile; searching inside a conversation. Notifications only work when Zalo runs
+apps; polls and reminders; editing your profile; searching inside a conversation. Calls are being researched: see
+[docs/calls.md](docs/calls.md). Notifications only work when Zalo runs
 on the phone (*Settings → Zalo runs on → This phone*), since the service that holds the connection posts them.
