@@ -65,7 +65,44 @@ export function declineCall(send: VoiceCallSender, call: RingingCall): Promise<u
         rtcpAddress: text(d.rtcpAddress) || text(params?.rtcpIP) || server,
         rtpAddress: server,
         session_id: text(d.session) || text(params?.sessId),
+        // Zalo PC's renderer adds these whenever the call program hands it extendData, which it always does here; without
+        // them Zalo ends the call but never tells the caller or the other devices.
+        extendData: JSON.stringify(ourExtendData(call)),
+        subCommand: 3,
     });
+}
+
+/** Zalo PC's call platform (`zrtc::Utility::getPlatform`); phones send 1. */
+export const ZRTC_PLATFORM_PC = 2;
+
+/**
+ * Our side's `extendData`, with the fields Zalo PC's `CallController::getExtendData` writes: the call type, platform,
+ * packet / SRTP / congestion-control modes (as the caller asked), no P2P candidates, and the call's media server.
+ */
+export function ourExtendData(call: RingingCall): Record<string, unknown> {
+    const params = jsonObject(call.data.params);
+    const theirs = jsonObject(params?.extendData) ?? {};
+    const num = (k: string, fallback: number) => (typeof theirs[k] === "number" ? (theirs[k] as number) : fallback);
+    const servers = Array.isArray(theirs.serverAddr) ? theirs.serverAddr.slice(0, 1) : [];
+    return {
+        p2p: [],
+        callType: call.video ? 1 : 0,
+        newZrtc: 1,
+        platform: ZRTC_PLATFORM_PC,
+        packetMode: num("packetMode", 2),
+        gccMode: num("gccMode", 1),
+        srtpMode: num("srtpMode", 1),
+        sP2P: 0,
+        srtcp: num("srtcp", 0),
+        gccAudio: num("gccAudio", 1),
+        gccSVLR: num("gccSVLR", 1),
+        tpType: 0,
+        spTcp: 0,
+        maxFT: num("maxFT", 60),
+        supportCallBusy: 1,
+        supportHevcDecode: 0,
+        serverAddr: servers,
+    };
 }
 
 function text(v: unknown): string {

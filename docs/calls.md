@@ -155,7 +155,10 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   window) with signal 402 and **status 3** (`ZCallInfo::UiAnswerCallEvent`, `UiCloseEvent`); accepting is status 0
   (`_trySendAcceptSignal`), busy status 1. The renderer sends it as `/api/voicecall/answer`: the caller's noised id
   (`uidN`) as `callerId`, the call id as a number, the status, the codec list, `rtcpAddress` / `rtpAddress` (the call's
-  media server) and `session_id`. Declining in the official app gives the same: the other devices get an `answer`
+  media server), `session_id`, and, because the call program always hands over its `extendData`
+  (`CallController::getExtendData`: call type, platform 2 for PC, packet/SRTP/congestion modes, P2P candidates, media
+  servers), `extendData` with `subCommand: 3`. Without those two, Zalo ended the call (accepting it on the phone
+  afterwards said "call ended") but neither the caller nor the other devices heard about it. Declining in the official app gives the same: the other devices get an `answer`
   control with status 3. Two earlier tries used `/api/voicecall/cancel` (the caller giving up): Zalo accepted it but
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.

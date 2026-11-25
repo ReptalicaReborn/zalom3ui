@@ -31,7 +31,11 @@ test("declining is an answer with status 3, as Zalo PC's call program sends it",
                 session: "SESSION-made-up",
                 rtpAddress: "192.0.2.10:4200",
                 rtcpAddress: "192.0.2.10:4200",
-                params: JSON.stringify({ id: 321000003, Dname: "Bảo", extendData: JSON.stringify({ callType }) }),
+                params: JSON.stringify({
+                    id: 321000003,
+                    Dname: "Bảo",
+                    extendData: JSON.stringify({ callType, packetMode: 2, srtpMode: 1, serverAddr: [{ rtp: "192.0.2.10:4200", rtcp: "192.0.2.10:4200" }], p2p: [{ ip: "198.51.100.7", port: 1 }] }),
+                }),
             }),
         ) as Record<string, unknown>;
     for (const [callType, expected] of [[0, 1], [1, 3]]) {
@@ -55,9 +59,16 @@ test("declining is an answer with status 3, as Zalo PC's call program sends it",
                     rtcpAddress: "192.0.2.10:4200",
                     rtpAddress: "192.0.2.10:4200",
                     session_id: "SESSION-made-up",
+                    extendData: sent[0][1].extendData,
+                    subCommand: 3,
                 },
             ],
         ]);
+        const ours = JSON.parse(sent[0][1].extendData as string);
+        assert.equal(ours.callType, callType);
+        assert.equal(ours.platform, 2, "Zalo PC's platform");
+        assert.deepEqual(ours.p2p, [], "never the caller's own addresses");
+        assert.deepEqual(ours.serverAddr, [{ rtp: "192.0.2.10:4200", rtcp: "192.0.2.10:4200" }]);
         sent.length = 0;
         await ringRing(async (endpoint, params) => void sent.push([endpoint, params]), call, "imei-1");
         assert.deepEqual(sent, [["ringring", { callerId: "4459000000000000001", callId: 321000003, status: 0, imei: "imei-1" }]]);
