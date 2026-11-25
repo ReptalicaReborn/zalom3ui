@@ -27,7 +27,11 @@ async function api(method, path, body) {
     });
     if (res.status === 204) return null;
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+        const err = new Error(data.error || `HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
     return data;
 }
 
@@ -62,10 +66,11 @@ function renderStatus() {
 }
 
 function avatarEl(thread) {
-    if (thread.avatar) {
+    const avatarUrl = safeUrl(thread.avatar);
+    if (avatarUrl) {
         const img = document.createElement("img");
         img.className = "avatar";
-        img.src = thread.avatar;
+        img.src = avatarUrl;
         img.alt = "";
         img.loading = "lazy";
         img.referrerPolicy = "no-referrer";
@@ -75,6 +80,15 @@ function avatarEl(thread) {
     div.className = "avatar";
     div.textContent = (thread.name || "?").trim().charAt(0).toUpperCase();
     return div;
+}
+
+function sortThreads() {
+    state.threads.sort(
+        (a, b) =>
+            Number(!!b.pinned) - Number(!!a.pinned) ||
+            (b.lastMessage?.ts ?? 0) - (a.lastMessage?.ts ?? 0) ||
+            a.name.localeCompare(b.name),
+    );
 }
 
 function renderThreads() {
@@ -111,7 +125,9 @@ function renderThreads() {
         }
         li.append(preview);
 
-        li.addEventListener("click", () => openThread(t.kind, t.id));
+        li.addEventListener("click", () => {
+            openThread(t.kind, t.id).catch((err) => alert(err.message));
+        });
         list.append(li);
     }
 }
@@ -145,9 +161,10 @@ function messageEl(m) {
     li.classList.toggle("mentions-me", !!m.mentionsMe);
 
     const href = safeUrl(m.attachment?.href);
-    if (m.msgType === "chat.photo" && (m.attachment?.thumb || href)) {
+    const photoSrc = safeUrl(m.attachment?.thumb) || href;
+    if (m.msgType === "chat.photo" && photoSrc) {
         const img = document.createElement("img");
-        img.src = safeUrl(m.attachment.thumb) || href;
+        img.src = photoSrc;
         img.alt = "Photo";
         img.loading = "lazy";
         img.referrerPolicy = "no-referrer";
@@ -178,6 +195,7 @@ function messageEl(m) {
 }
 
 function safeUrl(url) {
+    if (typeof url !== "string" || !url) return null;
     try {
         const u = new URL(url);
         return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
@@ -190,6 +208,15 @@ function safeUrl(url) {
 
 const currentKey = () => (state.current ? `${state.current.kind}:${state.current.id}` : "");
 const isCurrent = (kind, id) => state.current?.kind === kind && state.current?.id === id;
+let openSeq = 0;
+
+function mergeMessages(fetched) {
+    const byId = new Map(fetched.map((m) => [m.id, m]));
+    for (const m of state.messages) {
+        if (!byId.has(m.id)) byId.set(m.id, m);
+    }
+    return [...byId.values()].sort((a, b) => a.ts - b.ts);
+}
 
 async function loadThreads() {
     state.threads = await api("GET", "/threads");
@@ -197,6 +224,7 @@ async function loadThreads() {
 }
 
 async function openThread(kind, id) {
+    const seq = ++openSeq;
     state.current = { kind, id };
     state.messages = [];
     $("app").classList.add("chat-open");
@@ -206,12 +234,23 @@ async function openThread(kind, id) {
     renderMessages();
 
     const data = await api("GET", `/threads/${kind}/${encodeURIComponent(id)}/messages?limit=200`);
-    if (!isCurrent(kind, id)) return;
-    state.messages = data.messages;
+    if (seq !== openSeq || !isCurrent(kind, id)) return;
+    state.messages = mergeMessages(data.messages);
     if (data.thread) $("chat-title").textContent = data.thread.name;
     renderMessages();
-    await markRead();
+    await markRead().catch(() => {});
     $("text").focus();
+}
+
+async function refreshCurrentThread() {
+    if (!state.current) return;
+    const { kind, id } = state.current;
+    const seq = openSeq;
+    const data = await api("GET", `/threads/${kind}/${encodeURIComponent(id)}/messages?limit=200`);
+    if (seq !== openSeq || !isCurrent(kind, id)) return;
+    state.messages = mergeMessages(data.messages);
+    if (data.thread) $("chat-title").textContent = data.thread.name;
+    renderMessages();
 }
 
 async function markRead() {
@@ -223,15 +262,15 @@ async function markRead() {
     renderThreads();
 }
 
-function onIncoming(m) {
+function onIncoming(m, notify, threadName) {
     let t = state.threads.find((t) => t.kind === m.threadKind && t.id === m.threadId);
     if (!t) {
         // A thread we have not seen yet: refresh to get its name.
-        void loadThreads();
+        void loadThreads().catch(() => {});
     } else if (!t.lastMessage || m.ts >= t.lastMessage.ts) {
         t.lastMessage = m;
         if (!m.isSelf && !(isCurrent(m.threadKind, m.threadId) && document.hasFocus())) t.unread++;
-        state.threads.sort((a, b) => (b.lastMessage?.ts ?? 0) - (a.lastMessage?.ts ?? 0));
+        sortThreads();
         renderThreads();
     }
 
@@ -239,9 +278,9 @@ function onIncoming(m) {
         state.messages.push(m);
         state.messages.sort((a, b) => a.ts - b.ts);
         renderMessages();
-        if (document.hasFocus()) void markRead();
-    } else if (!m.isSelf && document.hidden && "Notification" in window && Notification.permission === "granted") {
-        new Notification(m.fromName || "Zalo", { body: m.text, tag: `${m.threadKind}:${m.threadId}` });
+        if (document.hasFocus()) void markRead().catch(() => {});
+    } else if (notify && !m.isSelf && document.hidden && "Notification" in window && Notification.permission === "granted") {
+        new Notification(threadName || m.fromName || "Zalo", { body: m.text, tag: `${m.threadKind}:${m.threadId}` });
     }
 }
 
@@ -259,18 +298,69 @@ function onUpdated(m) {
 
 // ---- Live updates ----
 
+const WS_BACKOFF_MIN_MS = 1000;
+const WS_BACKOFF_MAX_MS = 30000;
+let wsBackoffMs = WS_BACKOFF_MIN_MS;
+let wsTimer = null;
+let activeWs = null;
+let authStopped = false;
+let hasConnectedOnce = false;
+
+function showUnauthorized(message) {
+    $("login").hidden = false;
+    $("app").hidden = true;
+    $("login-btn").hidden = true;
+    $("login-error").textContent = message || "Open this page with ?token=YOUR_ACCESS_TOKEN";
+}
+
+function scheduleReconnect() {
+    if (authStopped || wsTimer) return;
+    const delay = wsBackoffMs;
+    wsBackoffMs = Math.min(wsBackoffMs * 2, WS_BACKOFF_MAX_MS);
+    wsTimer = setTimeout(() => {
+        wsTimer = null;
+        connect();
+    }, delay);
+}
+
 function connect() {
+    if (authStopped) return;
+    if (activeWs && (activeWs.readyState === WebSocket.OPEN || activeWs.readyState === WebSocket.CONNECTING)) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+    activeWs = ws;
+    let opened = false;
+
+    ws.addEventListener("open", () => {
+        opened = true;
+        wsBackoffMs = WS_BACKOFF_MIN_MS;
+        if (hasConnectedOnce && state.status && ["ready", "disconnected"].includes(state.status.state)) {
+            void loadThreads().catch(() => {});
+            void refreshCurrentThread().catch(() => {});
+        }
+        hasConnectedOnce = true;
+    });
+
     ws.addEventListener("message", (ev) => {
-        const event = JSON.parse(ev.data);
+        let event;
+        try {
+            event = JSON.parse(ev.data);
+        } catch {
+            return;
+        }
         if (event.type === "status") {
             const wasLoggedIn = state.status && ["ready", "disconnected"].includes(state.status.state);
             state.status = event.status;
             renderStatus();
-            if (event.status.state === "ready" && !wasLoggedIn) void loadThreads();
+            if (event.status.state === "ready" && !wasLoggedIn) void loadThreads().catch(() => {});
         } else if (event.type === "message") {
-            onIncoming(event.message);
+            onIncoming(event.message, event.notify, event.threadName);
+        } else if (event.type === "read") {
+            const t = state.threads.find((t) => t.kind === event.threadKind && t.id === event.threadId);
+            if (t && t.unread !== 0) {
+                t.unread = 0;
+                renderThreads();
+            }
         } else if (event.type === "message_updated") {
             onUpdated(event.message);
         } else if (event.type === "message_deleted") {
@@ -278,12 +368,34 @@ function connect() {
                 state.messages = state.messages.filter((m) => m.id !== event.id);
                 renderMessages();
             }
-            void loadThreads();
+            void loadThreads().catch(() => {});
         } else if (event.type === "threads") {
-            void loadThreads();
+            void loadThreads().catch(() => {});
         }
     });
-    ws.addEventListener("close", () => setTimeout(connect, 2000));
+
+    ws.addEventListener("close", () => {
+        if (activeWs === ws) activeWs = null;
+        if (authStopped) return;
+        if (!opened) {
+            api("GET", "/status")
+                .then((s) => {
+                    state.status = s;
+                    renderStatus();
+                    scheduleReconnect();
+                })
+                .catch((err) => {
+                    if (err.status === 401) {
+                        authStopped = true;
+                        showUnauthorized();
+                    } else {
+                        scheduleReconnect();
+                    }
+                });
+            return;
+        }
+        scheduleReconnect();
+    });
 }
 
 // ---- Wiring ----
@@ -292,7 +404,9 @@ $("login-btn").addEventListener("click", async () => {
     $("login-error").textContent = "";
     try {
         state.status = await api("POST", "/login");
+        authStopped = false;
         renderStatus();
+        connect();
         if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
     } catch (err) {
         $("login-error").textContent = err.message;
@@ -301,16 +415,21 @@ $("login-btn").addEventListener("click", async () => {
 
 $("logout-btn").addEventListener("click", async () => {
     if (!confirm("Log out and delete the saved session and message cache on the server?")) return;
-    state.status = await api("POST", "/logout");
-    state.threads = [];
-    state.current = null;
-    state.messages = [];
-    renderStatus();
+    try {
+        state.status = await api("POST", "/logout");
+        state.threads = [];
+        state.current = null;
+        state.messages = [];
+        renderStatus();
+    } catch (err) {
+        alert(err.message);
+    }
 });
 
 $("reconnect-btn").addEventListener("click", () => api("POST", "/reconnect").catch((err) => alert(err.message)));
 
 $("back-btn").addEventListener("click", () => {
+    openSeq++;
     state.current = null;
     $("app").classList.remove("chat-open");
     renderThreads();
@@ -327,7 +446,7 @@ $("composer").addEventListener("submit", async (ev) => {
     try {
         await api("POST", `/threads/${kind}/${encodeURIComponent(id)}/messages`, { text });
     } catch (err) {
-        $("text").value = text;
+        if (!$("text").value) $("text").value = text;
         alert(`Could not send: ${err.message}`);
     }
 });
@@ -345,12 +464,15 @@ api("GET", "/status")
     .then((s) => {
         state.status = s;
         renderStatus();
-        if (s.state === "ready" || s.state === "disconnected") void loadThreads();
+        if (s.state === "ready" || s.state === "disconnected") void loadThreads().catch(() => {});
+        connect();
     })
     .catch((err) => {
-        $("login").hidden = false;
-        $("login-btn").hidden = true;
-        $("login-error").textContent =
-            err.message === "Unauthorized" ? "Open this page with ?token=YOUR_ACCESS_TOKEN" : err.message;
+        if (err.status === 401 || err.message === "Unauthorized") {
+            authStopped = true;
+            showUnauthorized();
+        } else {
+            showUnauthorized(err.message);
+            scheduleReconnect();
+        }
     });
-connect();

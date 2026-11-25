@@ -300,3 +300,102 @@ test("video both ways against a fake media server, with PLI each way", async () 
     await new Promise((r) => setTimeout(r, 100));
     server.close();
 });
+
+test("packetizeFrame throws RangeError on non-positive maxChunk", () => {
+    assert.throws(() => packetizeFrame(keyFrame(), 0), RangeError);
+    assert.throws(() => packetizeFrame(keyFrame(), -10), RangeError);
+    assert.throws(() => packetizeFrame(keyFrame(), Number.NaN), RangeError);
+});
+
+test("assembler: drops pending frame exceeding part count or byte cap", () => {
+    const { a, out } = assembler();
+    // Push 513 parts of one frame (exceeds MAX_FRAME_PARTS = 512).
+    for (let i = 0; i < 513; i++) {
+        a.push({ seq: i, timestamp: 1000, payloadType: 98, marker: false, payload: Buffer.from([0x1c, i === 0 ? 0x80 : 0x00, 1, 2]) });
+    }
+    assert.equal(out.length, 0);
+    assert.equal(a.stats.dropped, 1);
+
+    // Push packets exceeding MAX_FRAME_BYTES (512 * 1024).
+    const { a: a2, out: out2 } = assembler();
+    const bigChunk = Buffer.alloc(64 * 1024, 0xaa);
+    for (let i = 0; i < 9; i++) {
+        a2.push({ seq: i, timestamp: 2000, payloadType: 98, marker: false, payload: bigChunk });
+    }
+    assert.equal(out2.length, 0);
+    assert.equal(a2.stats.dropped, 1);
+});
+
+test("assembler: startup wraparound near seq 0 handles pre-wrap straggler without jumping maxIdx", () => {
+    const { a, out } = assembler();
+    // First packet arrives at seq 2 (keyframe).
+    for (const p of packets(keyFrame(), true, 2, 1000)) a.push(p);
+    // Pre-wrap straggler at seq 65535 arrives — must be treated as before seq 2, not jumping maxIdx to 65535.
+    for (const p of packets(slice(), false, 65535, 500)) a.push(p);
+    // Next frames at seq 3 and 4 continue seamlessly with zero gaps.
+    for (const p of packets(slice(), false, 3, 4000)) a.push(p);
+    for (const p of packets(slice(), false, 4, 7000)) a.push(p);
+    assert.deepEqual(out.map((f) => f.timestamp), [1000, 4000, 7000]);
+    assert.equal(a.stats.gaps, 0);
+
+    // Out-of-order startup keyframe straddling 65534, 65535, 0 where seq 0 arrives first.
+    const { a: a2, out: out2 } = assembler();
+    const kf = packets(Buffer.concat([keyFrame(), Buffer.alloc(2200, 5)]), true, 65534, 500);
+    assert.deepEqual(kf.map((p) => p.seq), [65534, 65535, 0]);
+    a2.push(kf[2]);
+    a2.push(kf[0]);
+    a2.push(kf[1]);
+    assert.equal(out2.length, 1);
+    assert.equal(out2[0].key, true);
+});
+
+test("assembler: extra packet with idx > f.end does not wedge frame completion", () => {
+    const { a, out } = assembler();
+    const kf = packets(Buffer.concat([keyFrame(), Buffer.alloc(1500, 9)]), true, 10, 1000);
+    assert.equal(kf.length, 2); // seq 10, 11 (marker)
+    // Marker arrives first (seq 11), then bogus packet at seq 12 with same timestamp, then seq 10.
+    a.push(kf[1]);
+    a.push({ seq: 12, timestamp: 1000, payloadType: 98, marker: false, payload: Buffer.from([0x1c, 0x00, 0xff]) });
+    a.push(kf[0]);
+    assert.equal(out.length, 1, "frame completes despite bogus packet after marker");
+});
+
+test("assembler: startup delta waits for in-flight keyframe within reorder window, drops after timeout", () => {
+    const { a, out, clock } = assembler();
+    const kf = packets(Buffer.concat([keyFrame(), Buffer.alloc(1500, 4)]), true, 10, 1000);
+    assert.equal(kf.length, 2); // seq 10, 11
+    // First packet of keyframe arrives (in flight).
+    a.push(kf[0]);
+    // Following delta frame at seq 12 arrives early.
+    for (const p of packets(slice(), false, 12, 4000)) a.push(p);
+    assert.equal(a.stats.dropped, 0, "delta waits while earlier keyframe is in flight");
+    assert.equal(out.length, 0);
+    // Remaining packet of keyframe arrives within reorder window.
+    a.push(kf[1]);
+    assert.deepEqual(out.map((f) => [f.key, f.timestamp]), [[true, 1000], [false, 4000]]);
+    assert.equal(a.stats.dropped, 0);
+    assert.equal(a.stats.gaps, 0);
+
+    // If the in-flight keyframe never finishes, timeout drops the waiting delta.
+    const { a: a2, out: out2, asks: asks2, clock: clock2 } = assembler();
+    a2.push(kf[0]);
+    for (const p of packets(slice(), false, 12, 4000)) a2.push(p);
+    assert.equal(a2.stats.dropped, 0);
+    clock2.now += 250;
+    a2.tick();
+    assert.equal(out2.length, 0);
+    assert.equal(a2.stats.dropped, 1);
+    assert.ok(asks2.includes("no_key"));
+});
+
+test("assembler: cached SPS/PPS are copied and do not pin the full keyframe buffer", () => {
+    const { a, out } = assembler();
+    const hugeKey = Buffer.concat([SC, SPS, SC, PPS, SC, Buffer.from([0x65]), Buffer.alloc(20_000, 0x55)]);
+    for (const p of packets(hugeKey, true, 1, 1000)) a.push(p);
+    const sps = (a as unknown as { sps: Buffer }).sps;
+    const pps = (a as unknown as { pps: Buffer }).pps;
+    assert.notEqual(sps.buffer, out[0].data.buffer, "SPS is copied off the keyframe buffer");
+    assert.notEqual(pps.buffer, out[0].data.buffer, "PPS is copied off the keyframe buffer");
+    assert.ok(sps.buffer.byteLength < 20_000, "SPS does not retain 20 KB keyframe slab");
+    assert.ok(pps.buffer.byteLength < 20_000, "PPS does not retain 20 KB keyframe slab");
+});

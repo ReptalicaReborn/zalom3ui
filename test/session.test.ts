@@ -272,3 +272,124 @@ test("normalizeMessage output for a self message from another device", () => {
     const m = normalizeMessage(incoming("1", 1000, { uidFrom: "me" }));
     assert.equal(m.isSelf, true);
 });
+
+test("onSeen guards missing seenUids in groups and handles isSelf in 1:1 chats", () => {
+    const { session, store, events, ingest } = setup();
+    ingest(incoming("g1m", 1000, { uidFrom: "me" }, true));
+    const internals = session as unknown as { onSeen(s: unknown): void };
+    assert.doesNotThrow(() =>
+        internals.onSeen({ type: ThreadType.Group, threadId: "g1", isSelf: false, data: { msgId: "g1m" } }),
+    );
+
+    // 1:1 chat: self seen from another device clears unread instead of marking our own msg as seen by peer.
+    ingest(incoming("u1", 1000));
+    ingest(incoming("u2", 2000, { uidFrom: "me" }));
+    ingest(incoming("u3", 3000));
+    assert.equal(store.listThreads().find((t) => t.id === "100")?.unread, 1);
+    internals.onSeen({ type: ThreadType.User, threadId: "100", isSelf: true, data: { msgId: "u3" } });
+    assert.equal(store.listThreads().find((t) => t.id === "100")?.unread, 0);
+    assert.equal(store.getMessages("user", "100").find((m) => m.id === "u2")?.status, "sent");
+    assert.ok(events.some((e) => e.name === "threads"));
+});
+
+test("logout clears all in-memory caches, call trace, ownId and flushes store", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchhrept-logout-"));
+    const storeFile = path.join(dir, "messages.json");
+    try {
+        const store = new ChatStore(storeFile);
+        const session = new ZaloSession(store, dir);
+        const api = { listener: { stop() {} } };
+        const internals = session as unknown as {
+            api: unknown;
+            status: { state: string; ownId: string | null };
+            friendList: Map<string, { id: string; name: string; avatar: string }>;
+            stickers: Map<number, { id: number; catId: number; type: number; url: string }>;
+            ringing: Map<string, unknown>;
+            handledCallControls: Map<string, number>;
+        };
+        internals.api = api;
+        internals.status.state = "ready";
+        internals.status.ownId = "me";
+        store.ownId = "me";
+        internals.friendList.set("100", { id: "100", name: "Alice", avatar: "" });
+        internals.stickers.set(1, { id: 1, catId: 1, type: 1, url: "https://x" });
+        internals.ringing.set("c1", {});
+        internals.handledCallControls.set("request:c1", Date.now());
+        session.setViewing("user", "100");
+        session.onCallControl({ act: "cancel", data: { callId: "c1" }, raw: {} });
+        store.addMessage(normalizeMessage(incoming("1", 1000)));
+        store.flush();
+        assert.ok(session.callLog().length > 0);
+        assert.equal(session.friends().length, 1);
+
+        await session.logout();
+        assert.equal(session.friends().length, 0);
+        assert.equal(session.callLog(), "");
+        assert.equal(store.ownId, null);
+        assert.equal(internals.friendList.size, 0);
+        assert.equal(internals.ringing.size, 0);
+        assert.equal(internals.handledCallControls.size, 0);
+        assert.equal(internals.stickers.size, 0);
+        assert.deepEqual(store.listThreads(), []);
+        // Flushed synchronously to disk as empty.
+        const reloaded = new ChatStore(storeFile);
+        assert.deepEqual(reloaded.listThreads(), []);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("sticker cache is capped at 500 entries and evicts oldest", () => {
+    const { session } = setup();
+    const internals = session as unknown as {
+        rememberSticker(d: { id: number; cateId: number; type: number }): unknown;
+        stickers: Map<number, unknown>;
+    };
+    for (let i = 1; i <= 510; i++) internals.rememberSticker({ id: i, cateId: 1, type: 1 });
+    assert.equal(internals.stickers.size, 500);
+    assert.equal(internals.stickers.has(1), false);
+    assert.equal(internals.stickers.has(10), false);
+    assert.equal(internals.stickers.has(11), true);
+    assert.equal(internals.stickers.has(510), true);
+});
+
+test("stale onLoggedIn and loadFriends drop results after logout", async () => {
+    const { EventEmitter } = await import("node:events");
+    const store = new ChatStore();
+    const session = new ZaloSession(store, os.tmpdir());
+    let resolveAccount!: (v: unknown) => void;
+    let started = false;
+    const listener = Object.assign(new EventEmitter(), {
+        start() {
+            started = true;
+        },
+        stop() {},
+        requestOldMessages() {},
+        requestOldReactions() {},
+    });
+    const fakeApi = {
+        getOwnId: () => "me",
+        fetchAccountInfo: () => new Promise((r) => (resolveAccount = r)),
+        listener,
+        getAllFriends: async () => [{ userId: "100", displayName: "Alice", zaloName: "Alice", avatar: "" }],
+        getAllGroups: async () => ({ gridVerMap: {} }),
+        getPinConversations: async () => ({ conversations: [] }),
+        getMute: async () => ({ chatEntries: [], groupChatEntries: [] }),
+    };
+
+    const internals = session as unknown as {
+        generation: number;
+        onLoggedIn(api: unknown, generation: number): Promise<void>;
+    };
+    const gen = internals.generation;
+    const loginPromise = internals.onLoggedIn(fakeApi, gen);
+    await session.logout();
+    resolveAccount({ profile: { displayName: "Me" } });
+    await loginPromise;
+
+    assert.equal(started, false);
+    assert.equal(session.getStatus().state, "logged_out");
+    assert.deepEqual(store.listThreads(), []);
+});

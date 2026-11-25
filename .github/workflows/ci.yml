@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -28,8 +31,19 @@ jobs:
           cd /tmp/bundle
           node --version
           PORT=3999 ACCESS_TOKEN=t DATA_DIR=/tmp/bundle/data node server.bundle.mjs > server.log 2>&1 &
-          sleep 3
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          ready=0
+          for i in $(seq 1 40); do
+            if curl -fsS -H "Authorization: Bearer t" localhost:3999/api/status >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+          done
           cat server.log
+          test "$ready" = 1
           curl -fsS -H "Authorization: Bearer t" localhost:3999/api/status
           test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/api/status)" = 401
 
@@ -56,11 +70,11 @@ jobs:
         with:
           path: android/.nodejs-mobile
           key: nodejs-mobile-${{ hashFiles('android/app/build.gradle.kts') }}
-      - run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - run: ./gradlew --no-daemon testDebugUnitTest assembleDebug assembleRelease
       # A missing runtime or bundle would only show up as a crash on the phone.
       - name: Check APKs contain Node.js and the server
         run: |
-          for apk in app/build/outputs/apk/debug/*.apk; do
+          for apk in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
             echo "$apk: $(du -h "$apk" | cut -f1)"
             unzip -l "$apk" | grep -E "libnode\.so|libnodebridge\.so|libc\+\+_shared\.so|libzaloopus\.so|assets/server/server\.mjs"
             # libnode.so needs libc++_shared.so; without it Node fails to load on the phone. libzaloopus.so is the

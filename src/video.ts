@@ -17,12 +17,18 @@ const REORDER_FRAMES = 3;
 const REORDER_MS = 200;
 /** Frames being assembled at once; the oldest is given up beyond this. */
 const MAX_PENDING = 30;
+/** Per-frame limits to bound memory from incomplete or oversized frames. */
+const MAX_FRAME_PARTS = 512;
+const MAX_FRAME_BYTES = 512 * 1024;
 
 export type VideoFrame = { key: boolean; timestamp: number; data: Buffer };
 export type VideoPacket = { seq: number; timestamp: number; payloadType: number; marker: boolean; payload: Buffer };
 
 /** Splits a frame into the payloads of its RTP packets. */
 export function packetizeFrame(annexB: Buffer, maxChunk = MAX_CHUNK): Buffer[] {
+    if (!Number.isInteger(maxChunk) || maxChunk <= 0) {
+        throw new RangeError(`maxChunk must be a positive integer (got ${maxChunk})`);
+    }
     if (annexB.length <= maxChunk) return [annexB];
     const out: Buffer[] = [];
     for (let at = 0; at < annexB.length; at += maxChunk) {
@@ -56,7 +62,7 @@ function isFragment(p: Buffer): boolean {
     return p.length >= 2 && p[0] === 0x1c && (p[1] & 0x3f) === 0;
 }
 
-type Pending = { parts: Map<number, Buffer>; key: boolean; end: number | null };
+type Pending = { parts: Map<number, Buffer>; bytes: number; maxIdx: number; key: boolean; end: number | null };
 type Ready = { key: boolean; data: Buffer; timestamp: number; last: number; since: number };
 
 export type AssemblerStats = { frames: number; keys: number; gaps: number; dropped: number };
@@ -66,8 +72,8 @@ export class VideoAssembler {
     private pending = new Map<number, Pending>();
     /** Complete frames waiting their turn, by the extended sequence number of their first packet. */
     private ready = new Map<number, Ready>();
-    private lastIdx = -1;
-    private maxIdx = -1;
+    private lastIdx: number | null = null;
+    private maxIdx: number | null = null;
     private started = false;
     private needKey = false;
     private sps: Buffer | null = null;
@@ -87,12 +93,12 @@ export class VideoAssembler {
 
     /** The 16-bit sequence number as a running index, picking the rollover count nearest the newest packet. */
     private extend(seq: number): number {
-        if (this.maxIdx < 0) return seq;
+        if (this.maxIdx === null) return seq;
         const cycle = Math.floor(this.maxIdx / 0x10000);
         let best = cycle * 0x10000 + seq;
         for (const c of [cycle - 1, cycle + 1]) {
             const cand = c * 0x10000 + seq;
-            if (cand >= 0 && Math.abs(cand - this.maxIdx) < Math.abs(best - this.maxIdx)) best = cand;
+            if (Math.abs(cand - this.maxIdx) < Math.abs(best - this.maxIdx)) best = cand;
         }
         return best;
     }
@@ -100,19 +106,38 @@ export class VideoAssembler {
     push(pkt: VideoPacket): void {
         if ((pkt.payloadType !== VIDEO_KEY_PT && pkt.payloadType !== VIDEO_DELTA_PT) || pkt.payload.length === 0) return;
         const idx = this.extend(pkt.seq);
-        this.maxIdx = Math.max(this.maxIdx, idx);
-        if (idx <= this.lastIdx) return;
+        this.maxIdx = this.maxIdx === null ? idx : Math.max(this.maxIdx, idx);
+        if (this.lastIdx !== null && idx <= this.lastIdx) return;
         let f = this.pending.get(pkt.timestamp);
         if (!f) {
-            this.pending.set(pkt.timestamp, (f = { parts: new Map(), key: false, end: null }));
+            this.pending.set(pkt.timestamp, (f = { parts: new Map(), bytes: 0, maxIdx: -Infinity, key: false, end: null }));
             if (this.pending.size > MAX_PENDING) {
                 this.pending.delete(this.pending.keys().next().value as number);
                 this.stats.dropped++;
             }
         }
-        f.parts.set(idx, pkt.payload);
+        if (f.end !== null && idx > f.end) return;
+        if (!f.parts.has(idx)) {
+            if (f.parts.size + 1 > MAX_FRAME_PARTS || f.bytes + pkt.payload.length > MAX_FRAME_BYTES) {
+                this.pending.delete(pkt.timestamp);
+                this.stats.dropped++;
+                return;
+            }
+            f.parts.set(idx, pkt.payload);
+            f.bytes += pkt.payload.length;
+            if (idx > f.maxIdx) f.maxIdx = idx;
+        }
         if (pkt.payloadType === VIDEO_KEY_PT) f.key = true;
-        if (pkt.marker) f.end = idx;
+        if (pkt.marker) {
+            f.end = idx;
+            for (const [k, buf] of f.parts) {
+                if (k > f.end) {
+                    f.parts.delete(k);
+                    f.bytes -= buf.length;
+                }
+            }
+            if (f.maxIdx > f.end) f.maxIdx = f.end;
+        }
         if (f.end !== null) this.complete(pkt.timestamp, f);
         this.flush();
     }
@@ -124,6 +149,7 @@ export class VideoAssembler {
 
     private complete(timestamp: number, f: Pending): void {
         const idxs = [...f.parts.keys()].sort((a, b) => a - b);
+        if (idxs.length === 0) return;
         const first = f.parts.get(idxs[0])!;
         if (isFragment(first) && first[1] !== 0x80) return;
         for (let i = 1; i < idxs.length; i++) if (idxs[i] !== idxs[i - 1] + 1) return;
@@ -134,8 +160,8 @@ export class VideoAssembler {
         const types = new Set(units.map((u) => u[0] & 0x1f));
         for (const u of units) {
             const t = u[0] & 0x1f;
-            if (t === 7) this.sps = u;
-            else if (t === 8) this.pps = u;
+            if (t === 7) this.sps = Buffer.from(u);
+            else if (t === 8) this.pps = Buffer.from(u);
         }
         const key = f.key || types.has(5) || types.has(7);
         // A key frame the decoder can start from carries its parameter sets; some senders only send them once.
@@ -148,25 +174,38 @@ export class VideoAssembler {
         this.ready.set(idxs[0], { key, data, timestamp, last: f.end!, since: this.now() });
     }
 
+    private hasEarlierPending(beforeIdx: number): boolean {
+        for (const p of this.pending.values()) {
+            if (p.parts.size > 0 && p.maxIdx < beforeIdx) return true;
+        }
+        return false;
+    }
+
     private flush(): void {
         for (;;) {
             if (this.ready.size === 0) return;
-            const next = this.ready.get(this.lastIdx + 1);
-            if (next && this.lastIdx >= 0) {
-                this.emit(this.lastIdx + 1, next);
-                continue;
+            if (this.lastIdx !== null) {
+                const next = this.ready.get(this.lastIdx + 1);
+                if (next) {
+                    this.emit(this.lastIdx + 1, next);
+                    continue;
+                }
             }
-            const firstIdx = Math.min(...this.ready.keys());
+            let firstIdx = Infinity;
+            for (const k of this.ready.keys()) {
+                if (k < firstIdx) firstIdx = k;
+            }
             const oldest = this.ready.get(firstIdx)!;
-            // Something before it may still arrive: wait a little.
-            if (this.lastIdx >= 0 && this.ready.size <= REORDER_FRAMES && this.now() - oldest.since < REORDER_MS) return;
+            // Something before it may still arrive: wait a little (including when an earlier frame is still in flight at startup).
+            const shouldWait = this.lastIdx !== null || (!oldest.key && this.hasEarlierPending(firstIdx));
+            if (shouldWait && this.ready.size <= REORDER_FRAMES && this.now() - oldest.since < REORDER_MS) return;
             if (!this.started && !oldest.key) {
                 this.ready.delete(firstIdx);
                 this.stats.dropped++;
                 this.onKeyNeeded("no_key");
                 continue;
             }
-            if (this.lastIdx >= 0) {
+            if (this.lastIdx !== null) {
                 this.stats.gaps++;
                 this.needKey = true;
                 this.onKeyNeeded("gap");
@@ -190,7 +229,7 @@ export class VideoAssembler {
             this.onFrame({ key: fr.key, timestamp: fr.timestamp, data: fr.data });
         }
         for (const [ts, p] of this.pending) {
-            if (p.parts.size > 0 && Math.max(...p.parts.keys()) <= this.lastIdx) {
+            if (p.parts.size > 0 && p.maxIdx <= this.lastIdx) {
                 this.pending.delete(ts);
                 this.stats.dropped++;
             }

@@ -84,19 +84,23 @@ export function parseJsonKeepingBigInts(text: string): unknown {
     return JSON.parse(out);
 }
 
+const MAX_INFLATE_BYTES = 2 * 1024 * 1024;
+
 /**
  * Decodes an event payload `{ data, encrypt }` like zca-js's `decodeEventData`: 0 plain JSON, 1 base64 + zlib,
  * 2 URL-encoded base64 of AES-GCM (16-byte IV, 16-byte additional data, tag at the end) + zlib, 3 the same without zlib.
  */
 export function decodeEventPayload(parsed: { data?: unknown; encrypt?: unknown }, cipherKey: string | undefined): unknown {
-    if (typeof parsed.data !== "string" || typeof parsed.encrypt !== "number") return null;
+    if (!parsed || typeof parsed !== "object" || typeof parsed.data !== "string" || typeof parsed.encrypt !== "number") return null;
     const type = parsed.encrypt;
+    if (type !== 0 && type !== 1 && type !== 2 && type !== 3) return null;
     if (type === 0) return parseJsonKeepingBigInts(parsed.data);
     const buf = Buffer.from(type === 1 ? parsed.data : decodeURIComponent(parsed.data), "base64");
     let plain = buf;
     if (type !== 1) {
         if (!cipherKey || buf.length < 48) return null;
         const key = Buffer.from(cipherKey, "base64");
+        if (key.length !== 16 && key.length !== 24 && key.length !== 32) return null;
         const algorithm = key.length === 32 ? "aes-256-gcm" : key.length === 24 ? "aes-192-gcm" : "aes-128-gcm";
         const decipher = crypto.createDecipheriv(algorithm, key, buf.subarray(0, 16));
         decipher.setAAD(buf.subarray(16, 32));
@@ -113,11 +117,13 @@ export function decodeEventPayload(parsed: { data?: unknown; encrypt?: unknown }
  */
 export function inflateAny(buf: Buffer): Buffer {
     try {
-        return zlib.unzipSync(buf);
+        return zlib.unzipSync(buf, { maxOutputLength: MAX_INFLATE_BYTES });
     } catch (first) {
+        if ((first as NodeJS.ErrnoException)?.code === "ERR_BUFFER_TOO_LARGE") throw first;
         try {
-            return zlib.inflateRawSync(buf);
-        } catch {
+            return zlib.inflateRawSync(buf, { maxOutputLength: MAX_INFLATE_BYTES });
+        } catch (second) {
+            if ((second as NodeJS.ErrnoException)?.code === "ERR_BUFFER_TOO_LARGE") throw second;
             const head = buf.subarray(0, 8).toString("hex").replace(/(..)/g, "$1 ").trim();
             throw new Error(`${first instanceof Error ? first.message : String(first)} (${buf.length} bytes, starting ${head})`);
         }
@@ -231,7 +237,8 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
         return "";
     };
     const callerId = text("callerId", "uidN", "fromUid", "uidFrom", "uid", "hostCall", "srcId");
-    if (!callerId) return null;
+    const callId = text("callId", "call_id").trim();
+    if (!callerId || !callId) return null;
     const raw = Number(text("ts", "time", "timestamp"));
     // Seconds or milliseconds.
     const ts = raw ? (raw < 1e12 ? raw * 1000 : raw) : now;
@@ -241,7 +248,7 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
     const extend = jsonObject(params?.extendData);
     const displayName = typeof params?.Dname === "string" && params.Dname ? params.Dname : undefined;
     return {
-        callId: text("callId", "call_id"),
+        callId,
         callerId,
         video: type === 1 || Number(extend?.callType) === 1 || text("isVideo") === "1" || d.isVideo === true,
         group: control.act === "group_request",
@@ -271,6 +278,85 @@ export const CALL_ENDING_ACTS = new Set([
 
 const TRACE_MAX_BYTES = 2 * 1024 * 1024;
 
+/** Sensitive fields stripped from `call-trace.jsonl` (keys matched case-insensitively). */
+const TRACE_SENSITIVE_KEYS = new Set([
+    "session",
+    "sessid",
+    "session_id",
+    "srtpkey",
+    "srtp_key",
+    "token",
+    "p2p",
+    "nataddress",
+    "address",
+    "displayname",
+    "callername",
+    "dname",
+    "avatar",
+    "calleravatar",
+]);
+
+function redactWalk(value: unknown, depth: number, seen: WeakSet<object>): { value: unknown; changed: boolean } {
+    if (depth > 16 || value === null || value === undefined) return { value, changed: false };
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+            try {
+                const parsed = parseJsonKeepingBigInts(value);
+                if (parsed && typeof parsed === "object") {
+                    const inner = redactWalk(parsed, depth + 1, seen);
+                    if (inner.changed) return { value: JSON.stringify(inner.value), changed: true };
+                }
+            } catch {
+                // Not valid JSON; leave plain text untouched.
+            }
+        }
+        return { value, changed: false };
+    }
+    if (typeof value !== "object") return { value, changed: false };
+    if (value instanceof Date || Buffer.isBuffer(value)) return { value, changed: false };
+    if (seen.has(value)) return { value: "[circular]", changed: true };
+    seen.add(value);
+    try {
+        if (Array.isArray(value)) {
+            let changed = false;
+            const out = value.map((item) => {
+                const r = redactWalk(item, depth + 1, seen);
+                if (r.changed) changed = true;
+                return r.value;
+            });
+            return { value: out, changed };
+        }
+        let changed = false;
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+            if (TRACE_SENSITIVE_KEYS.has(k.toLowerCase())) {
+                if (v === null || v === undefined) {
+                    out[k] = v;
+                } else {
+                    out[k] = "[redacted]";
+                    changed = true;
+                }
+                continue;
+            }
+            const r = redactWalk(v, depth + 1, seen);
+            if (r.changed) changed = true;
+            out[k] = r.value;
+        }
+        return { value: out, changed };
+    } finally {
+        seen.delete(value);
+    }
+}
+
+/**
+ * Recursively redacts sensitive secrets and PII (session/SRTP keys, media tokens, P2P/NAT addresses, caller names and
+ * avatars) from a call-trace entry while keeping call IDs, action names, user IDs, server host/ports and stats.
+ */
+export function redactForTrace(value: unknown): unknown {
+    return redactWalk(value, 0, new WeakSet()).value;
+}
+
 /**
  * The call log: one JSON line per call event, kept in the data folder so it can be shared for the call research.
  * It holds call ids, user ids and Zalo server addresses, never message text. Rotates at 2 MB.
@@ -284,11 +370,12 @@ export class CallTrace {
 
     record(entry: Record<string, unknown>): void {
         try {
-            fs.mkdirSync(path.dirname(this.file), { recursive: true });
+            fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
             if (fs.existsSync(this.file) && fs.statSync(this.file).size > TRACE_MAX_BYTES) {
                 fs.renameSync(this.file, this.file + ".1");
             }
-            fs.appendFileSync(this.file, JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+            const safe = redactForTrace(entry) as Record<string, unknown>;
+            fs.appendFileSync(this.file, JSON.stringify({ at: new Date().toISOString(), ...safe }) + "\n", { mode: 0o600 });
         } catch (err) {
             console.warn("Call log:", err);
         }

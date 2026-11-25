@@ -30,10 +30,16 @@ fun formatTime(ts: Long): String =
 fun formatClock(ts: Long): String = DateFormat.getTimeInstance(DateFormat.SHORT).format(ts)
 
 /** Header shown between messages from different days. */
-fun formatDay(ts: Long, now: Long = System.currentTimeMillis()): String = when {
-    DateUtils.isToday(ts) -> "Today"
-    DateUtils.isToday(ts + DateUtils.DAY_IN_MILLIS) -> "Yesterday"
-    else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(ts)
+fun formatDay(ts: Long, now: Long = System.currentTimeMillis()): String {
+    val yesterday = Calendar.getInstance().apply {
+        timeInMillis = now
+        add(Calendar.DAY_OF_YEAR, -1)
+    }.timeInMillis
+    return when {
+        sameDay(ts, now) -> "Today"
+        sameDay(ts, yesterday) -> "Yesterday"
+        else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(ts)
+    }
 }
 
 fun sameDay(a: Long, b: Long): Boolean {

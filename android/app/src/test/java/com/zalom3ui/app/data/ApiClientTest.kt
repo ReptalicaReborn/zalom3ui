@@ -26,4 +26,23 @@ class ApiClientTest {
         assertFalse(ServerSettings(onDevice = false, serverUrl = "", token = "").isConfigured)
         assertTrue(ServerSettings(onDevice = false, serverUrl = "192.168.1.5:3000", token = "").isConfigured)
     }
+
+    @Test
+    fun eventsRequest_usesAuthorizationHeaderInsteadOfQueryParam() {
+        val withToken = ApiClient("https://zalo.example.com", "secret-123").eventsRequest()
+        assertEquals("Bearer secret-123", withToken.header("Authorization"))
+        assertNull(withToken.url.queryParameter("token"))
+        assertEquals("/ws", withToken.url.encodedPath)
+
+        val withoutToken = ApiClient("http://127.0.0.1:45000", null).eventsRequest()
+        assertNull(withoutToken.header("Authorization"))
+        assertNull(withoutToken.url.queryParameter("token"))
+    }
+
+    @Test
+    fun url_encodesEachSegmentWithoutSplittingOrDoubleEncoding() {
+        val api = ApiClient("http://127.0.0.1:45000", "tok")
+        val built = api.url("calls", "a/b c%20d", "answer")
+        assertEquals("http://127.0.0.1:45000/api/calls/a%2Fb%20c%2520d/answer", built.toString())
+    }
 }

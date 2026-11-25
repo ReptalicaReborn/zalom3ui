@@ -206,7 +206,7 @@ test("video in a call: the other side's frames and key-frame requests reach the 
     assert.equal(h.marker, true);
 
     // The caller asks for a key frame (PLI aimed at our video SSRC): the app is told.
-    media.push(zrtc.rtcp(12345, pli(0x7777, h.ssrc), true));
+    media.push(zrtc.rtcp(7, pli(0x7777, h.ssrc), true));
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(keyRequests, 1);
 
@@ -245,4 +245,138 @@ test("the other side's camera and microphone controls become peer events, and do
     assert.ok(!events.some((e) => e.type === "ended"));
     session.hangUpCall();
     media.close();
+});
+
+test("our own answer echo does not emit an ended event, and media_join trace omits raw token and natAddress", async () => {
+    const media = await fakeMediaServer();
+    const { session, events } = sessionWithFakeZalo();
+    try {
+        ring(session, media.port, "321000008");
+        await session.answerCall("321000008");
+
+        const before = events.length;
+        session.onCallControl({ act: "answer", data: { callId: "321000008" }, raw: {} });
+        assert.equal(events.length, before, "our own answer echo must not emit ended");
+        assert.equal(session.currentCall()?.callId, "321000008");
+
+        const lines = session.callLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+        const joinEntry = lines.find((e) => e.kind === "media_join");
+        assert.ok(joinEntry);
+        assert.equal(joinEntry.joined, true);
+        assert.equal("token" in joinEntry, false);
+        assert.equal("address" in joinEntry, false);
+    } finally {
+        if (session.currentCall()) session.hangUpCall();
+        media.close();
+    }
+});
+
+test("answerCall and declineCall reject expired ringing calls and group calls", async () => {
+    const media = await fakeMediaServer();
+    const { session } = sessionWithFakeZalo();
+    try {
+        // Expired ringing call (receivedAt > 2 minutes ago)
+        const oldNow = Date.now() - 3 * 60_000;
+        session.onCallControl(
+            {
+                act: "request",
+                data: {
+                    uidFrom: "465000001",
+                    uidN: "4459000000000000001",
+                    uidTo: "438000002",
+                    callId: "321000009",
+                    session: SESSION,
+                    rtpAddress: `127.0.0.1:${media.port}`,
+                    params: JSON.stringify({ userId: 438000002, extendData: JSON.stringify({ callType: 0 }) }),
+                },
+                raw: {},
+            },
+            "socket",
+            oldNow,
+        );
+        await assert.rejects(session.answerCall("321000009"), /isn't ringing/);
+
+        // Group call cannot be answered or declined here
+        session.onCallControl({
+            act: "group_request",
+            data: {
+                uidFrom: "465000001",
+                callId: "321000010",
+                groupId: "g99",
+            },
+            raw: {},
+        });
+        await assert.rejects(session.answerCall("321000010"), /Group calls/);
+        await assert.rejects(session.declineCall("321000010"), /Group calls/);
+    } finally {
+        media.close();
+    }
+});
+
+test("hanging up or toggling camera during connecting phase behaves cleanly", async () => {
+    const media = await fakeMediaServer();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-answer-race-"));
+    try {
+        // Case 1: hangUpCall while ringring is in flight aborts cleanly before joining media or accepting.
+        let releaseRingRing!: () => void;
+        const sent1: string[] = [];
+        const session1 = new ZaloSession(new ChatStore(), dir);
+        const api1: Record<string, unknown> = {
+            getContext: () => ({ imei: "imei-1" }),
+            custom(name: string) {
+                api1[name] = async ({ endpoint }: { endpoint: string }) => {
+                    sent1.push(endpoint);
+                    if (endpoint === "ringring") {
+                        await new Promise<void>((r) => (releaseRingRing = r));
+                    }
+                    return {};
+                };
+            },
+        };
+        Object.assign(session1 as unknown as { api: unknown; status: { state: string } }, { api: api1, status: { state: "ready" } });
+        const events1: CallEvent[] = [];
+        session1.on("call", (e) => events1.push(e));
+        ring(session1, media.port, "321000011");
+
+        const answering = session1.answerCall("321000011");
+        // declineCall cannot race answerCall because ringing entry was already claimed
+        await assert.rejects(session1.declineCall("321000011"), /isn't ringing/);
+        session1.hangUpCall();
+        assert.equal(session1.currentCall(), null);
+        assert.deepEqual(events1.at(-1), { type: "ended", callId: "321000011", act: "hangup" });
+        releaseRingRing();
+        await assert.rejects(answering, /Call ended while connecting/);
+        assert.deepEqual(sent1, ["ringring"]);
+
+        // Case 2: setCallCamera(true) during connecting sends isOnCam: 1 instead of hardcoded 0.
+        let releaseRingRing2!: () => void;
+        const sent2: [string, Record<string, unknown>][] = [];
+        const session2 = new ZaloSession(new ChatStore(), dir);
+        const api2: Record<string, unknown> = {
+            getContext: () => ({ imei: "imei-1" }),
+            custom(name: string) {
+                api2[name] = async ({ endpoint, params }: { endpoint: string; params: Record<string, unknown> }) => {
+                    sent2.push([endpoint, params]);
+                    if (endpoint === "ringring") {
+                        await new Promise<void>((r) => (releaseRingRing2 = r));
+                    }
+                    return {};
+                };
+            },
+        };
+        Object.assign(session2 as unknown as { api: unknown; status: { state: string } }, { api: api2, status: { state: "ready" } });
+        ringVideo(session2, media.port, "321000012");
+        const answering2 = session2.answerCall("321000012");
+        session2.setCallCamera(true);
+        releaseRingRing2();
+        await answering2;
+        await new Promise((r) => setTimeout(r, 15));
+        const conf = sent2.find(([e]) => e === "conf");
+        assert.ok(conf);
+        assert.equal(conf[1].isOnCam, 1);
+        session2.hangUpCall();
+    } finally {
+        media.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });

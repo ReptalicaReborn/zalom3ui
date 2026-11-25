@@ -10,21 +10,23 @@ import com.zalom3ui.app.server.LocalServer
  * from the on-phone server over [CallAudioLink], which carries them to Zalo's media server. A new one per call.
  */
 class EngineCallMedia(private val context: Context) : CallMedia {
-    private var engine: CallAudioEngine? = null
-    private var link: CallAudioLink? = null
-    private var decoder: VideoDecoder? = null
-    private var sender: CameraVideoSender? = null
-    private var listener: VideoListener? = null
+    @Volatile private var engine: CallAudioEngine? = null
+    @Volatile private var link: CallAudioLink? = null
+    @Volatile private var decoder: VideoDecoder? = null
+    @Volatile private var sender: CameraVideoSender? = null
+    @Volatile private var listener: VideoListener? = null
     private var remoteSurface: Surface? = null
     private var previewSurface: Surface? = null
     private var frontCamera = true
 
+    @Volatile
     override var muted: Boolean = false
         set(value) {
             field = value
             engine?.muted = value
         }
 
+    @Volatile
     override var speakerOn: Boolean = false
         set(value) {
             field = value

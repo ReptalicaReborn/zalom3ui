@@ -128,3 +128,86 @@ test("logging out during a QR login leaves no error behind", async () => {
     assert.equal(s.state, "logged_out");
     assert.equal(s.error, null);
 });
+
+test("logout followed immediately by startQRLogin starts a fresh login and is not clobbered by old finally", async () => {
+    let rejectFirst!: (err: Error) => void;
+    let secondAbortCalled = false;
+    const { session } = setup(
+        [
+            {
+                loginQR: (_o, cb) =>
+                    new Promise((_r, reject) => {
+                        rejectFirst = reject;
+                        cb({
+                            type: LoginQRCallbackEventType.QRCodeGenerated,
+                            data: { image: "FIRST" },
+                            actions: { abort() {}, retry() {} },
+                        });
+                    }),
+            },
+            {
+                loginQR: (_o, cb) =>
+                    new Promise(() => {
+                        cb({
+                            type: LoginQRCallbackEventType.QRCodeGenerated,
+                            data: { image: "SECOND" },
+                            actions: {
+                                abort() {
+                                    secondAbortCalled = true;
+                                },
+                                retry() {},
+                            },
+                        });
+                    }),
+            },
+        ],
+        false,
+    );
+
+    const first = session.startQRLogin();
+    await tick();
+    assert.equal(session.getStatus().qrImage, "data:image/png;base64,FIRST");
+
+    await session.logout();
+    // Immediately start a second QR login while the first promise is still unsettled.
+    void session.startQRLogin();
+    await tick();
+    assert.equal(session.getStatus().qrImage, "data:image/png;base64,SECOND");
+
+    // Now the first promise finishes rejecting; its finally() must not clear the second login's abortQR or state.
+    rejectFirst(new ZaloApiLoginQRAborted());
+    await first;
+    await tick();
+    assert.equal(session.getStatus().state, "awaiting_qr_scan");
+    assert.equal(session.getStatus().qrImage, "data:image/png;base64,SECOND");
+
+    await session.logout();
+    assert.equal(secondAbortCalled, true);
+});
+
+test("GotLoginInfo writes credentials atomically with mode 0600", async () => {
+    const { session, dir } = setup(
+        [
+            {
+                loginQR: async (_o, cb) => {
+                    cb({
+                        type: LoginQRCallbackEventType.GotLoginInfo,
+                        data: { imei: "im", cookie: [], userAgent: "ua" },
+                        actions: { abort() {}, retry() {} },
+                    });
+                    throw new ZaloApiLoginQRAborted();
+                },
+            },
+        ],
+        false,
+    );
+    try {
+        await session.startQRLogin();
+        const credPath = path.join(dir, "credentials.json");
+        assert.equal(fs.existsSync(credPath), true);
+        assert.equal(fs.existsSync(credPath + ".tmp"), false);
+        assert.equal(fs.statSync(credPath).mode & 0o777, 0o600);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});

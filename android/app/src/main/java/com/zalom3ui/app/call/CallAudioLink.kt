@@ -8,6 +8,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** One audio packet from the server: RTP sequence, RTP timestamp and the Opus payload. */
 class IncomingAudio(val seq: Int, val timestamp: Long, val opus: ByteArray)
@@ -28,21 +29,27 @@ class CallAudioLink(
     token: String?,
     private val onAudio: (seq: Int, timestamp: Long, opus: ByteArray) -> Unit,
     private val onClosed: (reason: String?) -> Unit,
-    client: OkHttpClient = OkHttpClient(),
+    client: OkHttpClient = sharedClient,
     private val onVideo: (key: Boolean, timestamp: Long, accessUnit: ByteArray) -> Unit = { _, _, _ -> },
     private val onKeyFrameWanted: () -> Unit = {},
 ) {
-    private val url = buildUrl(baseUrl, token)
+    private val request = buildRequest(baseUrl, token)
 
     // No read timeout: the socket is silent whenever the other side is.
-    private val http = client.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+    private val http: OkHttpClient = if (client === sharedClient) {
+        sharedClient
+    } else {
+        client.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+    }
 
     @Volatile private var socket: WebSocket? = null
-    @Volatile private var finished = false
+    private val closed = AtomicBoolean(false)
+    private val finished = AtomicBoolean(false)
 
+    @Synchronized
     fun connect() {
-        if (socket != null) return
-        socket = http.newWebSocket(Request.Builder().url(url).build(), Listener())
+        if (socket != null || closed.get()) return
+        socket = http.newWebSocket(request, Listener())
     }
 
     /** Sends one 20 ms Opus frame; false if the socket is not open or its queue is full. */
@@ -50,11 +57,12 @@ class CallAudioLink(
 
     /**
      * Sends one encoded camera frame. A delta frame is dropped (false) when the socket is already backed up, so a slow
-     * link makes the picture stutter instead of lagging further and further behind.
+     * link makes the picture stutter instead of lagging further and further behind. Key frames are also capped well
+     * below OkHttp's 16 MiB disconnect threshold.
      */
     fun sendVideo(key: Boolean, accessUnit: ByteArray): Boolean {
         val s = socket ?: return false
-        if (!key && s.queueSize() > MAX_VIDEO_BACKLOG) return false
+        if (!shouldSendVideo(key, s.queueSize())) return false
         return s.send(encodeVideoOut(key, accessUnit).toByteString())
     }
 
@@ -62,13 +70,19 @@ class CallAudioLink(
     fun sendKeyFrameNeeded(): Boolean = socket?.send(encodeKeyFrameNeeded().toByteString()) ?: false
 
     fun close() {
-        socket?.close(1000, null)
-        socket = null
+        closed.set(true)
+        val s = synchronized(this) {
+            val current = socket
+            socket = null
+            current
+        }
+        if (s != null && !s.close(1000, null)) {
+            s.cancel()
+        }
     }
 
     private fun finish(reason: String?) {
-        if (finished) return
-        finished = true
+        if (!finished.compareAndSet(false, true)) return
         socket = null
         onClosed(reason)
     }
@@ -102,20 +116,41 @@ class CallAudioLink(
         const val TYPE_VIDEO_OUT = 0x04
         const val TYPE_KEY_WANTED = 0x05
         const val TYPE_KEY_NEEDED = 0x06
+        internal const val MAX_AUDIO_PAYLOAD = 4096
         private const val HEADER_IN = 7
         private const val HEADER_VIDEO_IN = 6
         private const val FLAG_KEY = 1
 
         /** Bytes the socket may hold unsent before delta frames are dropped (about a second at our bitrate). */
-        private const val MAX_VIDEO_BACKLOG = 96 * 1024L
+        internal const val MAX_VIDEO_BACKLOG = 96 * 1024L
 
-        fun buildUrl(baseUrl: String, token: String?): String {
+        /** Upper cap on queued bytes for key frames too, well below OkHttp's 16 MiB disconnect limit. */
+        internal const val MAX_KEYFRAME_BACKLOG = 4 * 1024 * 1024L
+
+        private val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .pingInterval(20, TimeUnit.SECONDS)
+                .build()
+        }
+
+        internal fun shouldSendVideo(key: Boolean, queueSize: Long): Boolean =
+            if (key) queueSize <= MAX_KEYFRAME_BACKLOG else queueSize <= MAX_VIDEO_BACKLOG
+
+        fun buildUrl(baseUrl: String): String {
             val ws = baseUrl.trimEnd('/')
                 .replaceFirst("https://", "wss://")
                 .replaceFirst("http://", "ws://")
-            val q = if (token.isNullOrEmpty()) "" else "?token=" + java.net.URLEncoder.encode(token, "UTF-8")
-            return "$ws/ws/call-audio$q"
+            return "$ws/ws/call-audio"
         }
+
+        fun buildRequest(baseUrl: String, token: String?): Request =
+            Request.Builder()
+                .url(buildUrl(baseUrl))
+                .apply {
+                    if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token")
+                }
+                .build()
 
         fun encodeOutgoing(opus: ByteArray): ByteArray {
             val out = ByteArray(opus.size + 1)
@@ -124,9 +159,10 @@ class CallAudioLink(
             return out
         }
 
-        /** Parses a server message; null for unknown types or messages too short to hold a header and payload. */
+        /** Parses a server message; null for unknown types, oversized payloads, or messages too short to hold a header and payload. */
         fun decodeIncoming(msg: ByteArray): IncomingAudio? {
             if (msg.size <= HEADER_IN || msg[0].toInt() != TYPE_AUDIO_IN) return null
+            if (msg.size - HEADER_IN > MAX_AUDIO_PAYLOAD) return null
             fun u(i: Int) = msg[i].toLong() and 0xFF
             val seq = ((u(1) shl 8) or u(2)).toInt()
             val ts = (u(3) shl 24) or (u(4) shl 16) or (u(5) shl 8) or u(6)

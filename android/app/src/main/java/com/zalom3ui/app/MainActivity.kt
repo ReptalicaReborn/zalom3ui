@@ -19,6 +19,7 @@ import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
 import com.zalom3ui.app.ui.AppViewModel
+import com.zalom3ui.app.ui.VoicePlayback
 import com.zalom3ui.app.ui.isAppInDarkTheme
 
 class MainActivity : ComponentActivity() {
@@ -77,6 +78,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        VoicePlayback.stop()
         viewModel.stopLiveUpdates()
         super.onStop()
     }

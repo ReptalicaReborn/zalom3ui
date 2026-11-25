@@ -99,3 +99,8 @@ test("media from the server, with and without a token", () => {
     assert.deepEqual(p2p, { type: "p2p", cmd: 7, from: 0x12345678, flag1: 0, flag2: 1, payload: Buffer.from("P2PMEDIA"), rest: Buffer.alloc(0) });
     assert.throws(() => parse(Buffer.from([2, 0x7e, 1])), /cut short/);
 });
+
+test("Writer.str16 throws RangeError when string exceeds 65535 bytes", () => {
+    assert.throws(() => ping({ userId: A, serverId: B, session: "a".repeat(0x10000) }), RangeError);
+    assert.doesNotThrow(() => ping({ userId: A, serverId: B, session: "a".repeat(0xffff) }));
+});

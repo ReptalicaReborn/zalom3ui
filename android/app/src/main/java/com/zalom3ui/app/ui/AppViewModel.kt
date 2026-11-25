@@ -13,6 +13,7 @@ import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.Mention
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.Person
+import com.zalom3ui.app.data.PickedFile
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.data.ServerEvent
@@ -100,6 +101,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var client: ApiClient? = null
     private var liveJob: Job? = null
     private var presenceJob: Job? = null
+    private var refreshThreadsJob: Job? = null
+    private var refreshThreadsPending = false
+    private var restartJob: Job? = null
     private var visible = false
     private var lastTypingSent = 0L
     /** When the live loop last (re)started the on-phone server; errors are expected while it boots. */
@@ -116,8 +120,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun saveSettings(settings: ServerSettings) {
         val wasOnWatch = _state.value.settings.onDevice
+        restartJob?.cancel()
+        restartJob = null
         settingsStore.save(settings)
         if (wasOnWatch && !settings.onDevice) LocalServer.stop(getApplication())
+        localStartedAt = 0L
         _state.value = UiState(settings = settingsStore.load(), appearance = _state.value.appearance)
         rebuildClient()
         if (visible) startLiveUpdates()
@@ -126,38 +133,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Restarts the on-phone server, e.g. if it got stuck. */
     fun restartLocalServer() {
         if (!_state.value.settings.onDevice) return
+        liveJob?.cancel()
+        liveJob = null
+        presenceJob?.cancel()
+        presenceJob = null
+        refreshThreadsJob?.cancel()
+        refreshThreadsJob = null
+        refreshThreadsPending = false
+        localStartedAt = 0L
         LocalServer.stop(getApplication())
-        _state.update { it.copy(status = null, connectionError = null) }
-        viewModelScope.launch {
+        _state.update { it.copy(status = null, connectionError = null, startingSince = 0L, startupError = null) }
+        restartJob?.cancel()
+        restartJob = viewModelScope.launch {
             // Let the old process exit before starting a new one.
             delay(1_500)
             if (visible) startLiveUpdates()
         }
     }
 
-    fun logout() = launchApi { api ->
-        val status = api.logout()
-        _state.update { it.copy(status = status, threads = emptyList(), chat = null) }
+    fun logout() {
+        VoicePlayback.stop()
+        launchApi { api ->
+            val status = api.logout()
+            _state.update { it.copy(status = status, threads = emptyList(), chat = null) }
+        }
     }
 
     /** Hold the WebSocket only while the app is visible, to save battery. */
     fun startLiveUpdates() {
         visible = true
         liveJob?.cancel()
+        liveJob = null
+        presenceJob?.cancel()
+        presenceJob = null
+        refreshThreadsJob?.cancel()
+        refreshThreadsJob = null
+        refreshThreadsPending = false
         val api = client ?: return
         val onDevice = _state.value.settings.onDevice
         if (onDevice) {
             val refused = LocalServer.start(getApplication())
-            localStartedAt = System.currentTimeMillis()
+            if (localStartedAt == 0L) localStartedAt = System.currentTimeMillis()
             _state.update {
                 it.copy(
-                    startingSince = if (it.status == null) localStartedAt else it.startingSince,
+                    startingSince = if (it.status == null && it.startingSince == 0L) localStartedAt else it.startingSince,
                     startupError = refused?.let { e -> "Android didn't start the Zalo service: ${e.message ?: e.javaClass.simpleName}" },
                 )
             }
         }
         // Repeated while visible: the server forgets a chat nobody confirms is still open.
-        presenceJob?.cancel()
         presenceJob = viewModelScope.launch {
             while (true) {
                 runCatching { api.setPresence(_state.value.chat?.ref) }
@@ -189,6 +213,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         liveJob = null
         presenceJob?.cancel()
         presenceJob = null
+        refreshThreadsJob?.cancel()
+        refreshThreadsJob = null
+        refreshThreadsPending = false
         // Out of sight: messages of the open chat notify again.
         val api = client ?: return
         viewModelScope.launch { withContext(NonCancellable) { runCatching { api.setPresence(null) } } }
@@ -224,10 +251,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun consumeOpenRequest(): ThreadSummary? {
-        val ref = _state.value.openRequest ?: return null
-        val thread = _state.value.threads.firstOrNull { it.ref == ref } ?: return null
+        val current = _state.value
+        val ref = current.openRequest ?: return null
+        if (current.threads.isEmpty()) return null
         _state.update { it.copy(openRequest = null) }
-        return thread
+        return current.threads.firstOrNull { it.ref == ref }
     }
 
     // ---- Chat ----
@@ -235,7 +263,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(thread: ThreadSummary) {
         _state.update { it.copy(chat = ChatState(thread.kind, thread.id, thread.name)) }
         if (visible) viewModelScope.launch { runCatching { client?.setPresence(thread.ref) } }
-        launchApi { api ->
+        launchApi(onDone = { updateChat(thread.ref) { it.copy(loading = false) } }) { api ->
             val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
             val unread = _state.value.threads.firstOrNull { it.ref == thread.ref }?.unread ?: thread.unread
             val firstUnread = if (unread > 0) res.messages.filter { !it.isSelf }.takeLast(unread).firstOrNull()?.id else null
@@ -269,7 +297,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         launchApi(onDone = { updateChat(chat.ref) { it.copy(loadingMore = false) } }) { api ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE, before = oldest.ts)
             updateChat(chat.ref) {
-                it.copy(messages = merge(it.messages, res.messages), hasMore = res.messages.size >= PAGE_SIZE)
+                it.copy(messages = merge(it.messages, res.messages, cap = false), hasMore = res.messages.size >= PAGE_SIZE)
             }
         }
     }
@@ -328,17 +356,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         updateChat(chat.ref) { it.copy(uploading = it.uploading + uris.size) }
         viewModelScope.launch {
-            for (uri in uris) {
-                try {
-                    val api = client ?: break
-                    val file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
-                    api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    _state.update { it.copy(error = e.message ?: "Couldn't send the file") }
-                } finally {
-                    updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
+            var remaining = uris.size
+            try {
+                for (uri in uris) {
+                    var file: PickedFile? = null
+                    try {
+                        val api = client ?: break
+                        file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
+                        api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        _state.update { it.copy(error = e.message ?: "Couldn't send the file") }
+                    } finally {
+                        file?.let { f -> withContext(NonCancellable + Dispatchers.IO) { runCatching { f.cleanup() } } }
+                        remaining--
+                        updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
+                    }
+                }
+            } finally {
+                if (remaining > 0) {
+                    updateChat(chat.ref) { it.copy(uploading = (it.uploading - remaining).coerceAtLeast(0)) }
                 }
             }
         }
@@ -384,8 +422,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Looks someone up by phone; [onResult] gets null when nobody uses that number (the error says so). */
-    fun findUser(phone: String, onResult: (FoundUser?) -> Unit) = launchApi(onError = { onResult(null) }) { api ->
-        onResult(api.findUser(phone))
+    fun findUser(phone: String, onResult: (FoundUser?) -> Unit) {
+        var delivered = false
+        launchApi(onDone = { if (!delivered) onResult(null) }) { api ->
+            val user = api.findUser(phone)
+            delivered = true
+            onResult(user)
+        }
     }
 
     fun sendFriendRequest(user: FoundUser, message: String, onSent: () -> Unit) = launchApi { api ->
@@ -407,21 +450,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Groups ----
 
-    fun createGroup(name: String, members: List<String>, onCreated: (ThreadSummary) -> Unit) = launchApi { api ->
-        val created = api.createGroup(name, members)
-        refreshThreads(api)
-        val thread = _state.value.threads.firstOrNull { it.kind == "group" && it.id == created.groupId }
-            ?: ThreadSummary(id = created.groupId, kind = "group", name = name.ifBlank { "New group" })
-        if (created.failed.isNotEmpty()) {
-            _state.update { it.copy(notice = "${notAddedNames(created.failed)} couldn't be added") }
+    fun createGroup(name: String, members: List<String>, onDone: () -> Unit = {}, onCreated: (ThreadSummary) -> Unit) =
+        launchApi(onDone = onDone) { api ->
+            val created = api.createGroup(name, members)
+            refreshThreads(api)
+            val thread = _state.value.threads.firstOrNull { it.kind == "group" && it.id == created.groupId }
+                ?: ThreadSummary(id = created.groupId, kind = "group", name = name.ifBlank { "New group" })
+            if (created.failed.isNotEmpty()) {
+                _state.update { it.copy(notice = "${notAddedNames(created.failed)} couldn't be added") }
+            }
+            onCreated(thread)
         }
-        onCreated(thread)
-    }
 
-    fun addMembers(members: List<String>, onDone: () -> Unit) {
-        val chat = _state.value.chat ?: return
-        if (chat.kind != "group" || members.isEmpty()) return
-        launchApi { api ->
+    fun addMembers(members: List<String>, onFinished: () -> Unit = {}, onDone: () -> Unit) {
+        val chat = _state.value.chat
+        if (chat == null || chat.kind != "group" || members.isEmpty()) {
+            onFinished()
+            return
+        }
+        launchApi(onDone = onFinished) { api ->
             val result = api.addGroupMembers(chat.id, members)
             val added = members.size - result.failed.size
             _state.update {
@@ -555,15 +602,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             is ServerEvent.Status -> {
                 val wasLoggedIn = _state.value.status?.isLoggedIn == true
                 _state.update { it.copy(status = event.status, connectionError = null) }
-                if (event.status.isLoggedIn && !wasLoggedIn) refreshThreads(api)
+                if (event.status.isLoggedIn && !wasLoggedIn) scheduleRefreshThreads(api)
             }
-            is ServerEvent.ThreadsChanged -> refreshThreads(api)
+            is ServerEvent.ThreadsChanged -> scheduleRefreshThreads(api)
             is ServerEvent.Message -> onMessage(api, event.message)
             is ServerEvent.MessageUpdated -> onMessageUpdated(event.message)
             is ServerEvent.MessageDeleted -> {
                 updateChat(event.thread) { it.copy(messages = it.messages.filterNot { m -> m.id == event.id }) }
                 if (_state.value.selected?.id == event.id) _state.update { it.copy(selected = null) }
-                refreshThreads(api)
+                scheduleRefreshThreads(api)
             }
             is ServerEvent.Typing -> onTyping(event)
             // Notifications are the service's business (MessageNotifier).
@@ -580,7 +627,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         val known = _state.value.threads.any { it.ref == ref }
         if (!known) {
-            refreshThreads(api)
+            scheduleRefreshThreads(api)
         } else {
             _state.update { s ->
                 val threads = s.threads.map { t ->
@@ -615,13 +662,39 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Coalesces WebSocket-driven thread refreshes off the event collector so transient errors don't drop the stream. */
+    private fun scheduleRefreshThreads(api: ApiClient) {
+        if (refreshThreadsJob?.isActive == true) {
+            refreshThreadsPending = true
+            return
+        }
+        refreshThreadsPending = false
+        refreshThreadsJob = viewModelScope.launch {
+            do {
+                refreshThreadsPending = false
+                try {
+                    refreshThreads(api)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Best-effort refresh from WS events; keep the live collector running.
+                }
+            } while (refreshThreadsPending)
+        }
+    }
+
     private suspend fun refreshThreads(api: ApiClient) {
         val threads = api.threads()
         _state.update { it.copy(threads = threads) }
     }
 
     private suspend fun markRead(api: ApiClient, ref: ThreadRef) {
-        runCatching { api.markRead(ref.kind, ref.id) }
+        try {
+            api.markRead(ref.kind, ref.id)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
         _state.update { s -> s.copy(threads = s.threads.map { if (it.ref == ref) it.copy(unread = 0) else it }) }
     }
 
@@ -633,7 +706,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun launchApi(onDone: () -> Unit = {}, onError: () -> Unit = {}, block: suspend (ApiClient) -> Unit) {
-        val api = client ?: return
+        val api = client
+        if (api == null) {
+            onError()
+            onDone()
+            return
+        }
         viewModelScope.launch {
             try {
                 block(api)
@@ -657,8 +735,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val MAX_CHAT_MESSAGES = 300
 
         /** Newer copies of a message (reactions, recalls, receipts) replace older ones. */
-        private fun merge(current: List<ChatMessage>, incoming: List<ChatMessage>): List<ChatMessage> =
-            (incoming + current).distinctBy { it.id }.sortedBy { it.ts }.takeLast(MAX_CHAT_MESSAGES)
+        private fun merge(current: List<ChatMessage>, incoming: List<ChatMessage>, cap: Boolean = true): List<ChatMessage> {
+            val merged = (incoming + current).distinctBy { it.id }.sortedBy { it.ts }
+            return if (cap) merged.takeLast(maxOf(MAX_CHAT_MESSAGES, current.size)) else merged
+        }
 
         /** Positions of "@Name" for each picked member, in text order, without overlaps. */
         fun findMentions(text: String, members: List<GroupMember>): List<Mention> {

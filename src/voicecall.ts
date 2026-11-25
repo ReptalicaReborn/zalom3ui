@@ -16,7 +16,7 @@ export const DEFAULT_VOICE_CALL_DOMAIN = "https://voicecall-wpa.chat.zalo.me";
 export function voiceCallDomain(serviceMap: unknown): string {
     const entry = (serviceMap as { voice_call?: unknown } | null | undefined)?.voice_call;
     const first = Array.isArray(entry) ? entry[0] : entry;
-    return typeof first === "string" && /^https?:\/\//.test(first) ? first.replace(/\/+$/, "") : DEFAULT_VOICE_CALL_DOMAIN;
+    return typeof first === "string" && /^https:\/\//.test(first) ? first.replace(/\/+$/, "") : DEFAULT_VOICE_CALL_DOMAIN;
 }
 
 /** A call ringing on this account, with what answering or declining it needs. */
@@ -114,17 +114,35 @@ export function hangUp(send: VoiceCallSender, call: RingingCall, imei: string): 
     return send("endcall", { uidTo: call.callerId, callId: call.rawCallId, status: 3, imei });
 }
 
+const MIN_SRTP_SESSION_BYTES = 30;
+
 /** What joining the call's media server needs, from the request: 32-bit zrtc ids, call id, session and server. */
-export function mediaParamsOf(call: RingingCall): { server: string; userId: number; partnerId: number; callId: number; session: string } | null {
+export function mediaParamsOf(
+    call: RingingCall,
+): { server: string; userId: number; partnerId: number; callId: number; session: string; srtpKey?: string } | null {
     const d = call.data;
     const params = jsonObject(d.params);
+    const zrtcConfig = jsonObject(params?.zrtc_config) ?? jsonObject(d.zrtc_config);
     const server = text(d.rtpAddress) || text(params?.rtpIP);
     const userId = Number(params?.userId ?? d.uidTo);
     const partnerId = Number(d.uidFrom);
     const callId = Number(call.rawCallId);
-    const session = text(d.session) || text(params?.sessId);
-    if (!server || !session || ![userId, partnerId, callId].every((n) => Number.isInteger(n) && n > 0 && n <= 0xffffffff)) return null;
-    return { server, userId, partnerId, callId, session };
+    const rawSrtpKey = text(zrtcConfig?.srtpKey);
+    const srtpKey =
+        rawSrtpKey && (Buffer.from(rawSrtpKey, "utf8").length >= MIN_SRTP_SESSION_BYTES || Buffer.from(rawSrtpKey, "base64").length >= MIN_SRTP_SESSION_BYTES)
+            ? rawSrtpKey
+            : undefined;
+    const session = text(d.session) || text(params?.sessId) || srtpKey || "";
+    if (
+        !server ||
+        !session ||
+        Buffer.from(session, "utf8").length < MIN_SRTP_SESSION_BYTES ||
+        Buffer.from(session, "latin1").length < MIN_SRTP_SESSION_BYTES ||
+        ![userId, partnerId, callId].every((n) => Number.isInteger(n) && n > 0 && n <= 0xffffffff)
+    ) {
+        return null;
+    }
+    return { server, userId, partnerId, callId, session, ...(srtpKey ? { srtpKey } : {}) };
 }
 
 /** Zalo PC's call platform (`zrtc::Utility::getPlatform`); phones send 1. */
@@ -132,8 +150,9 @@ export const ZRTC_PLATFORM_PC = 2;
 
 /**
  * Our side's `extendData`, with the fields Zalo PC's `CallController::getExtendData` writes: the call type (a video call
- * stays one even answered without a camera, as Zalo PC's plain Accept does), platform, packet / SRTP / congestion-control
- * modes (as the caller asked), no P2P candidates, the call's media server, and the video codec list.
+ * stays one even answered without a camera, as Zalo PC's plain Accept does), platform, packet / congestion-control
+ * modes, only the SRTP mode we actually implement (`srtpMode: 1`, `srtcp: 0`), no P2P candidates, the call's media
+ * server, and the video codec list.
  */
 export function ourExtendData(call: RingingCall): Record<string, unknown> {
     const params = jsonObject(call.data.params);
@@ -156,8 +175,8 @@ export function ourExtendData(call: RingingCall): Record<string, unknown> {
         sP2P: 0,
         select2side: 1,
         spTcp: 1,
-        srtcp: num("srtcp", 0),
-        srtpMode: num("srtpMode", 1),
+        srtcp: 0,
+        srtpMode: 1,
         tpType: 0,
         supportCallBusy: 1,
         supportHevcDecode: 0,

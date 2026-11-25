@@ -83,6 +83,7 @@ class Writer {
     }
     str16(s: string | Buffer) {
         const b = typeof s === "string" ? Buffer.from(s, "utf8") : s;
+        if (b.length > 0xffff) throw new RangeError(`zrtc str16 too long (${b.length} bytes)`);
         return this.u16(b.length).bytes(b);
     }
     bytes(b: Buffer) {

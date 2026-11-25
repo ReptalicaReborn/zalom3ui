@@ -162,3 +162,134 @@ test("audio and video under one SSRC (as Zalo's apps send them) both decrypt: ea
     assert.equal(call.stats.video.decrypted, 3, "video");
     assert.ok(frames.length >= 1 && frames.every((k) => k), "key frames came through");
 });
+
+test("parseServer rejects malformed IPs and accepts valid IPv4/IPv6 addresses", () => {
+    assert.deepEqual(parseServer("[2001:db8::7]:4200"), { host: "2001:db8::7", port: 4200 });
+    assert.deepEqual(parseServer("::1:4200"), { host: "::1", port: 4200 });
+    assert.equal(parseServer("1.2.3.4.5:4200"), null);
+    assert.equal(parseServer(":::4200"), null);
+    assert.equal(parseServer("::::4200"), null);
+    assert.equal(parseServer("[192.0.2.10:4200"), null);
+    assert.equal(parseServer("192.0.2.10]:4200"), null);
+    assert.equal(parseServer("192.0.2.10:0"), null);
+    assert.equal(parseServer("192.0.2.10:65536"), null);
+});
+
+test("UDP source filtering, InitCall userId validation, RTCP token validation, unauthenticated isolation, and stats.received cap", async () => {
+    const session = "TEST-made-up-session-0123456789abcdefghijklmnop";
+    const { EventEmitter } = await import("node:events");
+    let closedCount = 0;
+    const fakeSocket = Object.assign(new EventEmitter(), {
+        send: () => {},
+        close: () => {
+            closedCount++;
+            if (closedCount > 1) throw new Error("already closed");
+        },
+    });
+    let keyRequests = 0;
+    const call = new MediaCall({
+        server: { host: "192.0.2.10", port: 4200 },
+        userId: 1001,
+        partnerId: 2002,
+        callId: 3003,
+        session,
+        log: () => {},
+        createSocket: () => fakeSocket as unknown as dgram.Socket,
+        onKeyFrameRequest: () => keyRequests++,
+    });
+
+    // Outbound SSRC never collides with videoSsrc or partnerId.
+    const audioSsrc = (call as unknown as { ssrc: number }).ssrc;
+    const videoSsrc = (call as unknown as { videoSsrc: number }).videoSsrc;
+    assert.notEqual(audioSsrc, videoSsrc);
+    assert.notEqual(audioSsrc, 2002);
+
+    const joinPromise = call.join(500, 200);
+
+    // Build an InitCall response helper.
+    const makeInitReply = (userId: number, token: number) => {
+        const req = zrtc.initCall({ isCaller: false, userId, partnerId: 2002, callId: 3003, session });
+        const reply = Buffer.concat([req.subarray(0, 21), Buffer.alloc(12)]);
+        reply[0] = zrtc.Kind.Response;
+        reply.writeUInt32LE(0, 21); // error = 0
+        reply.writeUInt32LE(1, 25); // value38
+        reply.writeUInt32LE(token, 29); // value18
+        return reply;
+    };
+
+    // Wrong source host suffix (old endsWith bug) and wrong source port are rejected.
+    fakeSocket.emit("message", makeInitReply(1001, 111), { address: "10.192.0.2.10", port: 4200 });
+    fakeSocket.emit("message", makeInitReply(1001, 111), { address: "192.0.2.10", port: 9999 });
+    assert.equal(call.token, null);
+    assert.equal(call.stats.received.other_source, 2);
+
+    // Right source, wrong userId on InitCall response is rejected.
+    fakeSocket.emit("message", makeInitReply(9999, 222), { address: "192.0.2.10", port: 4200 });
+    assert.equal(call.token, null);
+    assert.equal(call.stats.received.init_wrong_user, 1);
+
+    // IPv4-mapped IPv6 address + exact port + matching userId succeeds.
+    fakeSocket.emit("message", makeInitReply(1001, 777), { address: "::ffff:192.0.2.10", port: 4200 });
+    assert.equal(await joinPromise, 777);
+
+    // VideoRtcp with wrong token is rejected; matching token is accepted.
+    const { pli } = await import("../src/rtcp.js");
+    fakeSocket.emit("message", zrtc.rtcp(888, pli(0x5555, videoSsrc), true), { address: "192.0.2.10", port: 4200 });
+    assert.equal(keyRequests, 0);
+    assert.equal(call.stats.received.rtcp_wrong_token, 1);
+    fakeSocket.emit("message", zrtc.rtcp(777, pli(0x5555, videoSsrc), true), { address: "192.0.2.10", port: 4200 });
+    assert.equal(keyRequests, 1);
+
+    // Unauthenticated AudioIn and VideoIn packets must NOT mutate SSRCs, payloadTypes, seq/ts stats, or ReceiveStats.
+    const bogusRtp = Buffer.alloc(30);
+    bogusRtp[0] = 0x80;
+    bogusRtp[1] = OPUS_PT;
+    bogusRtp.writeUInt16BE(55, 2);
+    bogusRtp.writeUInt32BE(12345, 4);
+    bogusRtp.writeUInt32BE(0xdeadbeef, 8);
+    fakeSocket.emit("message", Buffer.concat([Buffer.from([zrtc.Kind.AudioIn]), bogusRtp]), { address: "192.0.2.10", port: 4200 });
+    fakeSocket.emit("message", Buffer.concat([Buffer.from([zrtc.Kind.VideoIn]), bogusRtp]), { address: "192.0.2.10", port: 4200 });
+    assert.equal(call.stats.audio.failed, 1);
+    assert.equal(call.stats.audio.ssrcs, 0);
+    assert.deepEqual(call.stats.audio.payloadTypes, {});
+    assert.equal(call.stats.audio.firstSeq, undefined);
+    assert.equal(call.stats.audio.lastSeq, undefined);
+    assert.equal(call.stats.video.failed, 1);
+    assert.equal(call.stats.video.ssrcs, 0);
+    assert.deepEqual(call.stats.video.payloadTypes, {});
+
+    // Unknown received keys are capped at 64, overflowing into "other_cmd".
+    for (let k = 100; k < 220; k++) {
+        fakeSocket.emit("message", Buffer.from([k, 0, 1]), { address: "192.0.2.10", port: 4200 });
+    }
+    assert.ok(Object.keys(call.stats.received).length <= 65, "received keys bounded");
+    assert.ok((call.stats.received.other_cmd ?? 0) > 0, "overflow bucketed into other_cmd");
+
+    // Pre-close socket to verify close()'s delayed socket.close() try/catch doesn't throw.
+    fakeSocket.close();
+    call.close(false);
+    await new Promise((r) => setTimeout(r, 80));
+});
+
+test("close() during join() does not leak timers and startSilence() after close() is a no-op", async () => {
+    const session = "TEST-made-up-session-0123456789abcdefghijklmnop";
+    const { EventEmitter } = await import("node:events");
+    const fakeSocket = Object.assign(new EventEmitter(), {
+        send: () => {},
+        close: () => {},
+    });
+    const call = new MediaCall({
+        server: { host: "192.0.2.10", port: 4200 },
+        userId: 1001,
+        partnerId: 2002,
+        callId: 3003,
+        session,
+        log: () => {},
+        createSocket: () => fakeSocket as unknown as dgram.Socket,
+    });
+    const p = call.join(5000, 100);
+    call.close(false);
+    assert.equal(await p, null);
+    call.startSilence();
+    assert.equal((call as unknown as { timers: unknown[] }).timers.length, 0);
+});

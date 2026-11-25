@@ -46,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,6 +59,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.zalom3ui.app.data.SessionStatus
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,17 +70,20 @@ fun LoginScreen(
     onSettings: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val qr = remember(status.qrImage) { status.qrImage?.let(::decodeDataUrl) }
     var showHelp by rememberSaveable { mutableStateOf(false) }
 
     fun save() {
         val bitmap = qr ?: return
-        val ok = QrActions.saveToGallery(context, bitmap)
-        Toast.makeText(
-            context,
-            if (ok) "Saved to Pictures. In Zalo, open the QR scanner and pick it from your gallery." else "Couldn't save the image",
-            Toast.LENGTH_LONG,
-        ).show()
+        scope.launch {
+            val ok = QrActions.saveToGallery(context, bitmap)
+            Toast.makeText(
+                context,
+                if (ok) "Saved to Pictures. In Zalo, open the QR scanner and pick it from your gallery." else "Couldn't save the image",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
     }
     val storagePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) save()
@@ -203,7 +208,7 @@ fun LoginScreen(
                             Spacer(Modifier.size(8.dp))
                             Text("Save image")
                         }
-                        OutlinedButton(onClick = { QrActions.share(context, qr) }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        OutlinedButton(onClick = { scope.launch { QrActions.share(context, qr) } }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
                             Icon(Icons.Outlined.Share, null, Modifier.size(18.dp))
                             Spacer(Modifier.size(8.dp))
                             Text("Share")

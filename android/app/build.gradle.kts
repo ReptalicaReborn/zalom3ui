@@ -105,11 +105,16 @@ abstract class FetchNodeMobileTask : DefaultTask() {
                 part.delete()
                 throw GradleException("nodejs-mobile download has SHA-256 $actual, expected ${sha256.get()}")
             }
-            part.renameTo(zip)
+            if (!part.renameTo(zip)) {
+                part.copyTo(zip, overwrite = true)
+                part.delete()
+            }
+            if (!zip.exists()) throw GradleException("Failed to move ${part.path} to ${zip.path}")
         }
 
         val out = outputDir.get().asFile
         out.deleteRecursively()
+        val outPrefix = out.canonicalPath + File.separator
         ZipInputStream(zip.inputStream().buffered()).use { zin ->
             while (true) {
                 val entry = zin.nextEntry ?: break
@@ -117,7 +122,7 @@ abstract class FetchNodeMobileTask : DefaultTask() {
                     ((entry.name.startsWith("bin/") && entry.name.endsWith("/libnode.so")) || entry.name.startsWith("include/"))
                 if (!keep) continue
                 val target = File(out, entry.name)
-                require(target.canonicalPath.startsWith(out.canonicalPath)) { "Bad zip entry ${entry.name}" }
+                require(target.canonicalPath.startsWith(outPrefix)) { "Bad zip entry ${entry.name}" }
                 target.parentFile.mkdirs()
                 target.outputStream().use { zin.copyTo(it) }
             }
@@ -149,13 +154,12 @@ abstract class BundleServerTask : DefaultTask() {
     fun bundle() {
         val root = repoRoot.get().asFile
         val npm = if (System.getProperty("os.name").startsWith("Windows")) "npm.cmd" else "npm"
-        execOps.exec {
-            workingDir = root
-            commandLine(npm, "run", "--silent", "bundle")
-        }
         val target = File(outputDir.get().asFile, "server/server.mjs")
         target.parentFile.mkdirs()
-        File(root, "dist/server.bundle.mjs").copyTo(target, overwrite = true)
+        execOps.exec {
+            workingDir = root
+            commandLine(npm, "run", "--silent", "bundle", "--", "--outfile=${target.absolutePath}")
+        }
     }
 }
 

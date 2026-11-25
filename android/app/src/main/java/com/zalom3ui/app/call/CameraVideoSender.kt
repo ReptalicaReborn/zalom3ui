@@ -17,6 +17,7 @@ import android.media.MediaFormat
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Range
 import android.util.Size
 import android.view.Display
@@ -48,9 +49,13 @@ class CameraVideoSender(
 ) {
     private val app = context.applicationContext
     private val cameras = app.getSystemService(CameraManager::class.java)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val cameraLock = Any()
+    private val encoderLock = Any()
 
-    // Guarded by this, except where the GL thread owns it.
-    private var encoder: MediaCodec? = null
+    // Guarded by this / encoderLock, except where the GL thread owns it.
+    @Volatile private var encoder: MediaCodec? = null
+    private var encoderInputSurface: Surface? = null
     private var gl: CameraGl? = null
     private var glThread: HandlerThread? = null
     @Volatile private var glHandler: Handler? = null
@@ -59,7 +64,7 @@ class CameraVideoSender(
     private val failing = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var previewSurface: Surface? = null
 
-    // Owned by the GL thread.
+    // Owned by the GL thread (device, session, and generation are also guarded by cameraLock).
     private var texture: SurfaceTexture? = null
     private var textureSurface: Surface? = null
     private var device: CameraDevice? = null
@@ -82,19 +87,29 @@ class CameraVideoSender(
         if (running) return
         check(app.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) { "Camera permission is missing" }
         val enc = createEncoder()
-        val input: Surface
-        try {
-            input = enc.createInputSurface()
-            enc.start()
+        val input = try {
+            enc.createInputSurface()
         } catch (e: Exception) {
             runCatching { enc.release() }
             throw e
         }
-        encoder = enc
+        try {
+            enc.start()
+        } catch (e: Exception) {
+            runCatching { input.release() }
+            runCatching { enc.release() }
+            throw e
+        }
+        synchronized(encoderLock) {
+            encoder = enc
+        }
+        encoderInputSurface = input
         config = null
         failing.set(false)
         front = frontCamera
-        running = true
+        synchronized(cameraLock) {
+            running = true
+        }
         drainThread = Thread({ drain(enc) }, "camera-encoder").apply { isDaemon = true; start() }
         val t = HandlerThread("camera-gl").apply { start() }
         glThread = t
@@ -105,34 +120,51 @@ class CameraVideoSender(
 
     @Synchronized
     fun stop() {
-        if (!running) return
-        running = false
+        val wasRunning = synchronized(cameraLock) {
+            if (!running) {
+                false
+            } else {
+                running = false
+                generation++
+                true
+            }
+        }
+        if (!wasRunning) return
         val h = glHandler
         val t = glThread
         if (h != null && t != null) {
             val done = CountDownLatch(1)
-            h.post {
-                tearDown()
-                done.countDown()
+            val posted = h.post {
+                try {
+                    tearDown()
+                } finally {
+                    done.countDown()
+                }
             }
-            done.await(2, TimeUnit.SECONDS)
+            if (posted) awaitQuietly(done, 2, TimeUnit.SECONDS)
             t.quitSafely()
-            runCatching { t.join(1000) }
+            joinQuietly(t, 1000)
         }
+        closeCamera()
         glHandler = null
         glThread = null
-        drainThread?.let { runCatching { it.join(1000) } }
+        drainThread?.let { joinQuietly(it, 1000) }
         drainThread = null
-        encoder?.let {
-            runCatching { it.stop() }
-            runCatching { it.release() }
+        synchronized(encoderLock) {
+            encoder?.let {
+                runCatching { it.stop() }
+                runCatching { it.release() }
+            }
+            encoder = null
         }
-        encoder = null
+        encoderInputSurface?.let { runCatching { it.release() } }
+        encoderInputSurface = null
     }
 
     /** Changes between the front and the back camera. */
     fun switchCamera() {
         glHandler?.post {
+            if (!running) return@post
             front = !front
             openCamera()
         }
@@ -140,8 +172,11 @@ class CameraVideoSender(
 
     /** Encodes a key frame now (the other side lost one). */
     fun requestKeyFrame() {
-        val e = encoder ?: return
-        runCatching { e.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+        synchronized(encoderLock) {
+            val e = encoder
+            if (!running || e == null) return
+            runCatching { e.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+        }
     }
 
     /**
@@ -152,36 +187,59 @@ class CameraVideoSender(
         previewSurface = surface
         val h = glHandler ?: return
         val done = CountDownLatch(1)
-        h.post {
+        val posted = h.post {
             try {
                 gl?.setPreview(surface)
             } finally {
                 done.countDown()
             }
         }
-        if (surface == null) done.await(500, TimeUnit.MILLISECONDS)
+        if (surface == null && posted) awaitQuietly(done, 500, TimeUnit.MILLISECONDS)
+    }
+
+    private fun awaitQuietly(latch: CountDownLatch, timeout: Long, unit: TimeUnit) {
+        try {
+            latch.await(timeout, unit)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun joinQuietly(thread: Thread, millis: Long) {
+        try {
+            thread.join(millis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun createEncoder(): MediaCodec {
-        fun format(profile: Boolean): MediaFormat = MediaFormat.createVideoFormat(MIME, OUT_W, OUT_H).apply {
+        fun format(profile: Boolean, cbr: Boolean): MediaFormat = MediaFormat.createVideoFormat(MIME, OUT_W, OUT_H).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
             setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, KEY_FRAME_SECONDS)
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            if (cbr) setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             if (profile) setInteger(MediaFormat.KEY_PROFILE, PROFILE_CONSTRAINED_BASELINE)
         }
-        for (withProfile in listOf(true, false)) {
+        val attempts = listOf(
+            true to true,
+            false to true,
+            true to false,
+            false to false,
+        )
+        var lastError: Exception? = null
+        for ((withProfile, withCbr) in attempts) {
             val c = MediaCodec.createEncoderByType(MIME)
             try {
-                c.configure(format(withProfile), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                c.configure(format(withProfile, withCbr), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 return c
             } catch (e: Exception) {
                 runCatching { c.release() }
-                if (!withProfile) throw e
+                lastError = e
             }
         }
-        error("unreachable")
+        throw lastError!!
     }
 
     /** Takes encoded frames out of the encoder until it is released. */
@@ -216,6 +274,7 @@ class CameraVideoSender(
     // ---- GL thread ----
 
     private fun setUp(encoderInput: Surface, handler: Handler) {
+        if (!running) return
         try {
             val g = CameraGl(encoderInput)
             g.init()
@@ -266,7 +325,10 @@ class CameraVideoSender(
 
     @SuppressLint("MissingPermission") // checked in start()
     private fun openCamera() {
-        val mine = ++generation
+        val mine = synchronized(cameraLock) {
+            if (!running) return
+            ++generation
+        }
         closeCamera()
         try {
             val id = pickCamera() ?: run {
@@ -274,36 +336,64 @@ class CameraVideoSender(
                 return
             }
             val chars = cameras.getCameraCharacteristics(id)
+            front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             camSize = pickSize(chars)
             texture?.setDefaultBufferSize(camSize.width, camSize.height)
-            val handler = glHandler ?: return
+            val stillOpen = synchronized(cameraLock) { running && mine == generation }
+            if (!stillOpen) return
+            // Use the main looper for Camera2 state callbacks so an asynchronous onOpened() still runs and immediately
+            // closes the camera if stop() already quit glThread.
             cameras.openCamera(
                 id,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
-                        if (mine != generation || !running) {
-                            camera.close()
+                        val accept = synchronized(cameraLock) {
+                            if (mine != generation || !running) {
+                                false
+                            } else {
+                                device = camera
+                                true
+                            }
+                        }
+                        if (!accept) {
+                            runCatching { camera.close() }
                             return
                         }
-                        device = camera
-                        startSession(camera, chars, mine)
+                        val posted = glHandler?.post {
+                            val active = synchronized(cameraLock) { mine == generation && running && device === camera }
+                            if (active) startSession(camera, chars, mine)
+                        } ?: false
+                        if (!posted) {
+                            synchronized(cameraLock) {
+                                if (device === camera) device = null
+                            }
+                            runCatching { camera.close() }
+                        }
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        if (mine == generation && running) fail("The camera was disconnected")
+                        val active = synchronized(cameraLock) {
+                            if (device === camera) device = null
+                            mine == generation && running
+                        }
+                        runCatching { camera.close() }
+                        if (active) fail("The camera was disconnected")
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        if (mine == generation && running) fail("The camera failed (error $error)")
+                        val active = synchronized(cameraLock) {
+                            if (device === camera) device = null
+                            mine == generation && running
+                        }
+                        runCatching { camera.close() }
+                        if (active) fail("The camera failed (error $error)")
                     }
                 },
-                handler,
+                mainHandler,
             )
         } catch (e: Exception) {
-            fail("Couldn't open the camera: ${e.message}")
+            if (running) fail("Couldn't open the camera: ${e.message}")
         }
     }
 
@@ -315,43 +405,72 @@ class CameraVideoSender(
                 listOf(target),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
-                        if (mine != generation || !running) {
-                            s.close()
+                        val accept = synchronized(cameraLock) {
+                            if (mine != generation || !running || device !== camera) {
+                                false
+                            } else {
+                                session = s
+                                true
+                            }
+                        }
+                        if (!accept) {
+                            runCatching { s.close() }
                             return
                         }
-                        session = s
-                        try {
-                            val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                                addTarget(target)
-                                pickFpsRange(chars)?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-                                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        val posted = glHandler?.post {
+                            val active = synchronized(cameraLock) { mine == generation && running && session === s }
+                            if (!active) return@post
+                            try {
+                                val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                    addTarget(target)
+                                    pickFpsRange(chars)?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                                    val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                                    if (afModes != null && CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO in afModes) {
+                                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                    }
+                                }
+                                s.setRepeatingRequest(req.build(), null, null)
+                            } catch (e: Exception) {
+                                if (running) fail("Couldn't start the camera: ${e.message}")
                             }
-                            s.setRepeatingRequest(req.build(), null, glHandler)
-                        } catch (e: Exception) {
-                            fail("Couldn't start the camera: ${e.message}")
+                        } ?: false
+                        if (!posted) {
+                            synchronized(cameraLock) {
+                                if (session === s) session = null
+                            }
+                            runCatching { s.close() }
                         }
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
-                        if (mine == generation && running) fail("The camera couldn't be configured")
+                        val active = synchronized(cameraLock) { mine == generation && running }
+                        if (active) fail("The camera couldn't be configured")
                     }
                 },
-                glHandler,
+                mainHandler,
             )
         } catch (e: Exception) {
-            fail("Couldn't start the camera: ${e.message}")
+            if (running) fail("Couldn't start the camera: ${e.message}")
         }
     }
 
     private fun closeCamera() {
-        session?.let { runCatching { it.close() } }
-        session = null
-        device?.let { runCatching { it.close() } }
-        device = null
+        val s: CameraCaptureSession?
+        val d: CameraDevice?
+        synchronized(cameraLock) {
+            s = session
+            session = null
+            d = device
+            device = null
+        }
+        s?.let { runCatching { it.close() } }
+        d?.let { runCatching { it.close() } }
     }
 
     private fun tearDown() {
-        generation++
+        synchronized(cameraLock) {
+            generation++
+        }
         closeCamera()
         textureSurface?.release()
         textureSurface = null

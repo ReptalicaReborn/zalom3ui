@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { incomingCallOf, parseJsonKeepingBigInts } from "../src/calls.js";
 import { ZaloSession } from "../src/session.js";
 import { ChatStore } from "../src/store.js";
-import { ANSWER_CODEC, DEFAULT_VOICE_CALL_DOMAIN, acceptCall, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallDomain } from "../src/voicecall.js";
+import { ANSWER_CODEC, DEFAULT_VOICE_CALL_DOMAIN, acceptCall, declineCall, hangUp, mediaParamsOf, ourExtendData, ringRing, ringingCallOf, voiceCallDomain } from "../src/voicecall.js";
 
 test("the voice call service comes from the login's service map, with Zalo PC's default", () => {
     assert.equal(voiceCallDomain({ voice_call: ["https://voicecall-wpa.chat.zalo.me/"] }), "https://voicecall-wpa.chat.zalo.me");
@@ -124,3 +124,67 @@ test("picking up: media parameters from the request, answer status 0 with our co
     assert.deepEqual(sent[1], ["endcall", { uidTo: "4459000000000000001", callId: 321000003, status: 3, imei: "imei-1" }]);
     assert.equal(mediaParamsOf({ ...call, data: {} }), null, "nothing to join without a server and session");
 });
+
+test("voiceCallDomain rejects plain HTTP and falls back to default", () => {
+    assert.equal(voiceCallDomain({ voice_call: "http://insecure.example" }), DEFAULT_VOICE_CALL_DOMAIN);
+    assert.equal(voiceCallDomain({ voice_call: ["http://insecure.example/"] }), DEFAULT_VOICE_CALL_DOMAIN);
+});
+
+test("ourExtendData always advertises only supported SRTP settings (srtpMode 1, srtcp 0)", () => {
+    const control = {
+        act: "request",
+        data: {
+            uidFrom: "465000001",
+            uidN: "4459000000000000001",
+            uidTo: "438000002",
+            callId: "321000003",
+            params: JSON.stringify({
+                extendData: JSON.stringify({ callType: 0, srtpMode: 2, srtcp: 1, packetMode: 2 }),
+            }),
+        },
+        raw: {},
+    };
+    const call = ringingCallOf(incomingCallOf(control)!, control);
+    const ext = ourExtendData(call);
+    assert.equal(ext.srtpMode, 1);
+    assert.equal(ext.srtcp, 0);
+});
+
+test("mediaParamsOf validates >=30-byte session and supports zrtc_config.srtpKey fallback", () => {
+    const makeCall = (data: Record<string, unknown>) => {
+        const control = { act: "request", data, raw: {} };
+        return ringingCallOf(incomingCallOf(control)!, control);
+    };
+    const base = {
+        uidFrom: "465000001",
+        uidN: "4459000000000000001",
+        uidTo: "438000002",
+        callId: "321000003",
+        rtpAddress: "192.0.2.10:4200",
+    };
+
+    // Short/corrupt session (< 30 bytes) returns null instead of throwing later in SrtpContext.fromSession.
+    assert.equal(mediaParamsOf(makeCall({ ...base, session: "too-short-session" })), null);
+
+    // Fallback to zrtc_config.srtpKey (raw >= 30-byte string) when session/sessId are absent.
+    const rawKey = "0123456789abcdef0123456789abcd";
+    const fromRaw = mediaParamsOf(makeCall({ ...base, params: JSON.stringify({ userId: 438000002, zrtc_config: { srtpKey: rawKey } }) }));
+    assert.deepEqual(fromRaw, {
+        server: "192.0.2.10:4200",
+        userId: 438000002,
+        partnerId: 465000001,
+        callId: 321000003,
+        session: rawKey,
+        srtpKey: rawKey,
+    });
+
+    // Fallback to base64 zrtc_config.srtpKey inside stringified zrtc_config.
+    const b64Key = Buffer.alloc(30, 0x42).toString("base64");
+    const fromB64 = mediaParamsOf(makeCall({ ...base, params: JSON.stringify({ userId: 438000002, zrtc_config: JSON.stringify({ srtpKey: b64Key }) }) }));
+    assert.equal(fromB64?.session, b64Key);
+    assert.equal(fromB64?.srtpKey, b64Key);
+
+    // Short zrtc_config.srtpKey is rejected when no valid session exists.
+    assert.equal(mediaParamsOf(makeCall({ ...base, params: JSON.stringify({ userId: 438000002, zrtc_config: { srtpKey: "short" } }) })), null);
+});
+

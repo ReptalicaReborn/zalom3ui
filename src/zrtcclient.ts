@@ -1,5 +1,6 @@
 import dgram from "node:dgram";
 import crypto from "node:crypto";
+import net from "node:net";
 import { ReceiveStats, parseRtcp, pli, receiverReport, sdesCname, senderReport } from "./rtcp.js";
 import { SrtpContext, rtpHeader } from "./srtp.js";
 import * as zrtc from "./zrtc.js";
@@ -16,10 +17,14 @@ export type MediaServer = { host: string; port: number };
 
 /** "ip:port" (IPv4) or "[ipv6]:port" / "ipv6:port". */
 export function parseServer(address: string): MediaServer | null {
-    const m = /^\[?([0-9a-fA-F:.]+?)\]?:(\d{1,5})$/.exec(address.trim());
+    const trimmed = address.trim();
+    const m = /^(?:\[([0-9a-fA-F:.]+)\]|([0-9a-fA-F:.]+)):(\d{1,5})$/.exec(trimmed);
     if (!m) return null;
-    const port = Number(m[2]);
-    return port > 0 && port < 65536 ? { host: m[1], port } : null;
+    const host = m[1] ?? m[2];
+    if (!m[1] && host.endsWith(":")) return null;
+    if (net.isIP(host) === 0) return null;
+    const port = Number(m[3]);
+    return port > 0 && port < 65536 ? { host, port } : null;
 }
 
 /** Opus payload type and RTP clock of the codec Zalỏ offers ("opus/16000/1", payload 112, 20 ms frames). */
@@ -108,6 +113,8 @@ export type MediaStats = {
 
 /** How often we send RTCP (sender + receiver report): WebRTC's audio interval is ~5 s; a little more often is fine. */
 const RTCP_MS = 2000;
+const MAX_SSRCS = 64;
+const MAX_RECEIVED_KEYS = 64;
 
 export class MediaCall {
     readonly stats: MediaStats = {
@@ -156,9 +163,10 @@ export class MediaCall {
     private closed = false;
     private seq = crypto.randomInt(0, 0x8000);
     private ts = crypto.randomInt(0, 0x7fffffff);
-    private readonly ssrc = crypto.randomInt(1, 0x7fffffff);
+    private readonly ssrc: number;
     private firstAudio = true;
     private loggedUnknown = 0;
+    private receivedKeyCount = 0;
     /** When the app last sent a frame: silence fills in only while it doesn't. */
     private lastFrameAt = 0;
     /** The other side's audio stream, for our receiver reports. */
@@ -170,17 +178,34 @@ export class MediaCall {
         this.srtp = SrtpContext.fromSession(o.session);
         this.videoSrtp = SrtpContext.fromSession(o.session);
         this.videoSsrc = o.userId >>> 0 || crypto.randomInt(0x8000_0000, 0xffff_ffff);
+        const partnerSsrc = o.partnerId >>> 0;
+        let audioSsrc = crypto.randomInt(1, 0x7fffffff);
+        while (audioSsrc === this.videoSsrc || audioSsrc === partnerSsrc) {
+            audioSsrc = crypto.randomInt(1, 0x7fffffff);
+        }
+        this.ssrc = audioSsrc;
         this.assembler = this.newAssembler();
         this.socket = o.createSocket ? o.createSocket() : dgram.createSocket(o.server.host.includes(":") ? "udp6" : "udp4");
         this.socket.on("message", (msg, from) => {
-            if (from.address === o.server.host || from.address.endsWith(o.server.host)) this.onPacket(msg);
-            else this.count("received", "other_source");
+            if ((from.address === o.server.host || from.address === `::ffff:${o.server.host}`) && from.port === o.server.port) {
+                this.onPacket(msg);
+            } else {
+                this.count("received", "other_source");
+            }
         });
         this.socket.on("error", (err) => o.log({ kind: "media_socket_error", error: err.message }));
     }
 
     private count(dir: "sent" | "received", what: string) {
-        this.stats[dir][what] = (this.stats[dir][what] ?? 0) + 1;
+        const bucket = this.stats[dir];
+        if (dir === "received" && !Object.prototype.hasOwnProperty.call(bucket, what)) {
+            if (this.receivedKeyCount >= MAX_RECEIVED_KEYS) {
+                bucket["other_cmd"] = (bucket["other_cmd"] ?? 0) + 1;
+                return;
+            }
+            this.receivedKeyCount++;
+        }
+        bucket[what] = (bucket[what] ?? 0) + 1;
     }
 
     private send(packet: Buffer, what: string) {
@@ -191,6 +216,7 @@ export class MediaCall {
 
     /** Joins the call on the media server; resolves with the token, or null when the server didn't accept in time. */
     async join(timeoutMs = 5000, retryMs = 400): Promise<number | null> {
+        if (this.closed) return null;
         const init = zrtc.initCall({
             isCaller: this.o.isCaller ?? false,
             userId: this.o.userId,
@@ -208,7 +234,7 @@ export class MediaCall {
         });
         this.joinWaiter = null;
         this.clearTimers();
-        if (!ok) return null;
+        if (!ok || this.closed) return null;
         const ping = () => this.send(zrtc.ping({ userId: this.o.userId, serverId: this.token ?? 0, session: this.o.session }), "ping");
         this.timers.push(setInterval(ping, this.o.pingMs ?? 2000));
         this.timers.push(setInterval(() => this.sendRtcp(), this.o.rtcpMs ?? RTCP_MS));
@@ -221,6 +247,7 @@ export class MediaCall {
      * microphone starts, or if it stalls), so the other side never sees the call go quiet.
      */
     startSilence(): void {
+        if (this.closed) return;
         this.timers.push(
             setInterval(() => {
                 if (Date.now() - this.lastFrameAt > 3 * FRAME_MS) this.sendFrame(OPUS_SILENCE);
@@ -236,7 +263,7 @@ export class MediaCall {
 
     /** Wraps one encoded Opus frame in RTP, protects it and sends it. */
     private sendFrame(opus: Buffer): void {
-        if (this.token === null) return;
+        if (this.token === null || this.closed) return;
         const rtp = Buffer.alloc(12);
         rtp[0] = 0x80;
         rtp[1] = OPUS_PT | (this.firstAudio ? 0x80 : 0);
@@ -400,7 +427,13 @@ export class MediaCall {
         this.closed = true;
         this.clearTimers();
         this.joinWaiter?.(false);
-        setTimeout(() => this.socket.close(), 50).unref();
+        setTimeout(() => {
+            try {
+                this.socket.close();
+            } catch {
+                // Socket may already be closed.
+            }
+        }, 50).unref();
     }
 
     private clearTimers() {
@@ -417,54 +450,73 @@ export class MediaCall {
             if (this.loggedUnknown++ < 5) this.o.log({ kind: "media_unparsable", bytes: msg.length, head: msg.subarray(0, 24).toString("hex"), error: String(err) });
             return;
         }
-        if (p.type === "control") {
-            this.count("received", `control_${p.kind}_${p.cmd}`);
-            const summary = { kind: p.kind, cmd: p.cmd, sub: p.sub, ...(p.error !== undefined ? { error: p.error } : {}) };
-            if (this.stats.controls.length < 40) this.stats.controls.push(summary);
-            if (p.kind === zrtc.Kind.Response && (p.cmd === zrtc.Cmd.InitCallCallee || p.cmd === zrtc.Cmd.InitCallCaller)) {
-                this.o.log({ kind: "media_init_answer", error: p.error, value38: p.value38, value18: p.value18, address: p.text });
-                if (p.error === 0 && this.token === null) {
-                    this.token = p.value18 ?? null;
-                    this.natAddress = p.text ?? null;
-                    this.joinWaiter?.(true);
-                } else if (p.error !== 0) {
-                    this.joinWaiter?.(false);
+        try {
+            if (p.type === "control") {
+                this.count("received", `control_${p.kind}_${p.cmd}`);
+                const summary = { kind: p.kind, cmd: p.cmd, sub: p.sub, ...(p.error !== undefined ? { error: p.error } : {}) };
+                if (this.stats.controls.length < 40) this.stats.controls.push(summary);
+                if (p.kind === zrtc.Kind.Response && (p.cmd === zrtc.Cmd.InitCallCallee || p.cmd === zrtc.Cmd.InitCallCaller)) {
+                    if (p.userId !== (this.o.userId >>> 0)) {
+                        this.count("received", "init_wrong_user");
+                        return;
+                    }
+                    this.o.log({ kind: "media_init_answer", error: p.error, value38: p.value38, value18: p.value18, address: p.text });
+                    if (p.error === 0 && this.token === null) {
+                        this.token = p.value18 ?? null;
+                        this.natAddress = p.text ?? null;
+                        this.joinWaiter?.(true);
+                    } else if (p.error !== 0) {
+                        this.joinWaiter?.(false);
+                    }
+                } else {
+                    this.o.log({ kind: "media_control", packetKind: p.kind, cmd: p.cmd, sub: p.sub, error: p.error, ...(p.text ? { textBytes: p.text.length } : {}) });
                 }
-            } else {
-                this.o.log({ kind: "media_control", packetKind: p.kind, cmd: p.cmd, sub: p.sub, error: p.error, ...(p.text ? { textBytes: p.text.length } : {}) });
+                return;
             }
-            return;
+            if (p.type === "media") {
+                this.count("received", `media_${p.kind}`);
+                if (p.kind === zrtc.Kind.AudioIn) this.onAudio(p.payload);
+                else if (p.kind === zrtc.Kind.AudioRtcp) {
+                    if (this.token !== null && p.token !== (this.token >>> 0)) {
+                        this.count("received", "rtcp_wrong_token");
+                        return;
+                    }
+                    this.onRtcp(p.payload);
+                } else if (p.kind === zrtc.Kind.VideoRtcp) {
+                    if (this.token !== null && p.token !== (this.token >>> 0)) {
+                        this.count("received", "rtcp_wrong_token");
+                        return;
+                    }
+                    this.onRtcp(p.payload, true);
+                } else if (p.kind === zrtc.Kind.VideoIn) this.onVideo(p.payload);
+                return;
+            }
+            this.count("received", p.type === "p2p" ? `p2p_${p.cmd}` : `kind_${p.kind}`);
+            if (p.type === "unknown" && this.loggedUnknown++ < 5) this.o.log({ kind: "media_unknown", head: msg.subarray(0, 24).toString("hex"), bytes: msg.length });
+        } catch (err) {
+            this.count("received", "handler_error");
+            if (this.loggedUnknown++ < 5) this.o.log({ kind: "media_packet_error", error: String(err) });
         }
-        if (p.type === "media") {
-            this.count("received", `media_${p.kind}`);
-            if (p.kind === zrtc.Kind.AudioIn) this.onAudio(p.payload);
-            else if (p.kind === zrtc.Kind.AudioRtcp) this.onRtcp(p.payload);
-            else if (p.kind === zrtc.Kind.VideoRtcp) this.onRtcp(p.payload, true);
-            else if (p.kind === zrtc.Kind.VideoIn) this.onVideo(p.payload);
-            return;
-        }
-        this.count("received", p.type === "p2p" ? `p2p_${p.cmd}` : `kind_${p.kind}`);
-        if (p.type === "unknown" && this.loggedUnknown++ < 5) this.o.log({ kind: "media_unknown", head: msg.subarray(0, 24).toString("hex"), bytes: msg.length });
     }
 
     private onVideo(payload: Buffer) {
         const v = this.stats.video;
         v.packets++;
         v.bytes += payload.length;
-        const h = rtpHeader(payload);
-        if (!h) {
-            v.failed++;
-            return;
-        }
-        v.payloadTypes[h.payloadType] = (v.payloadTypes[h.payloadType] ?? 0) + 1;
-        this.videoSsrcs.add(h.ssrc);
-        v.ssrcs = this.videoSsrcs.size;
         const rtp = this.videoSrtp.unprotect(payload);
         if (!rtp) {
             v.failed++;
             return;
         }
+        const h = rtpHeader(rtp);
+        if (!h) {
+            v.failed++;
+            return;
+        }
         v.decrypted++;
+        v.payloadTypes[h.payloadType] = (v.payloadTypes[h.payloadType] ?? 0) + 1;
+        if (this.videoSsrcs.size < MAX_SSRCS) this.videoSsrcs.add(h.ssrc);
+        v.ssrcs = this.videoSsrcs.size;
         if (!this.incomingVideo || this.incomingVideo.ssrc !== h.ssrc) {
             // A new stream (first packet, or the other side restarted its encoder): assemble afresh.
             if (this.incomingVideo) {
@@ -485,14 +537,24 @@ export class MediaCall {
         const a = this.stats.audio;
         a.packets++;
         a.bytes += payload.length;
-        const h = rtpHeader(payload);
-        if (!h) {
+        if (!rtpHeader(payload)) {
             a.failed++;
             if (this.loggedUnknown++ < 5) this.o.log({ kind: "media_not_rtp", head: payload.subarray(0, 16).toString("hex"), bytes: payload.length });
             return;
         }
+        const rtp = this.srtp.unprotect(payload);
+        if (!rtp) {
+            a.failed++;
+            return;
+        }
+        const h = rtpHeader(rtp);
+        if (!h) {
+            a.failed++;
+            return;
+        }
+        a.decrypted++;
         a.payloadTypes[h.payloadType] = (a.payloadTypes[h.payloadType] ?? 0) + 1;
-        this.ssrcs.add(h.ssrc);
+        if (this.ssrcs.size < MAX_SSRCS) this.ssrcs.add(h.ssrc);
         if (!this.incoming || this.incoming.ssrc !== h.ssrc) this.incoming = new ReceiveStats(h.ssrc, OPUS_CLOCK);
         this.incoming.onPacket(h.seq, h.timestamp, Date.now());
         a.ssrcs = this.ssrcs.size;
@@ -500,12 +562,6 @@ export class MediaCall {
         a.lastSeq = h.seq;
         if (this.lastTs !== null && a.timestampSteps.length < 8) a.timestampSteps.push((h.timestamp - this.lastTs) >>> 0);
         this.lastTs = h.timestamp;
-        const rtp = this.srtp.unprotect(payload);
-        if (!rtp) {
-            a.failed++;
-            return;
-        }
-        a.decrypted++;
         if (a.opusToc.length < 5 && rtp.length > h.headerLength) a.opusToc.push(rtp[h.headerLength].toString(16).padStart(2, "0"));
         if (rtp.length > h.headerLength) this.o.onAudio?.(h.seq, h.timestamp, rtp.subarray(h.headerLength));
     }

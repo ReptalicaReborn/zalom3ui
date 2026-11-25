@@ -135,30 +135,41 @@ export function parseRtcp(buf: Buffer): RtcpPacket[] {
     let at = 0;
     while (at + 4 <= buf.length) {
         if (buf[at] >> 6 !== 2) break;
+        const padded = (buf[at] & 0x20) !== 0;
         const count = buf[at] & 0x1f;
         const type = buf[at + 1];
         const len = (buf.readUInt16BE(at + 2) + 1) * 4;
         if (at + len > buf.length) break;
         const p = buf.subarray(at, at + len);
-        if (type === RtcpType.SR && len >= 28) {
+        let body = p;
+        if (padded) {
+            const padLen = p[len - 1];
+            if (padLen < 1 || padLen > len - 4) break;
+            body = p.subarray(0, len - padLen);
+        }
+        const bodyLen = body.length;
+        if (type === RtcpType.SR && bodyLen >= 28) {
             out.push({
                 type: "SR",
-                ssrc: p.readUInt32BE(4),
-                ntpSec: p.readUInt32BE(8),
-                ntpFrac: p.readUInt32BE(12),
-                rtpTimestamp: p.readUInt32BE(16),
-                packets: p.readUInt32BE(20),
-                octets: p.readUInt32BE(24),
-                blocks: readBlocks(p, 28, count),
+                ssrc: body.readUInt32BE(4),
+                ntpSec: body.readUInt32BE(8),
+                ntpFrac: body.readUInt32BE(12),
+                rtpTimestamp: body.readUInt32BE(16),
+                packets: body.readUInt32BE(20),
+                octets: body.readUInt32BE(24),
+                blocks: readBlocks(body, 28, count),
             });
-        } else if (type === RtcpType.RR && len >= 8) {
-            out.push({ type: "RR", ssrc: p.readUInt32BE(4), blocks: readBlocks(p, 8, count) });
-        } else if (type === RtcpType.PSFB && count === 1 && len >= 12) {
-            out.push({ type: "PLI", ssrc: p.readUInt32BE(4), mediaSsrc: p.readUInt32BE(8) });
-        } else if (type === RtcpType.PSFB && count === 4 && len >= 20) {
-            out.push({ type: "FIR", ssrc: p.readUInt32BE(4), mediaSsrc: p.readUInt32BE(12) });
+        } else if (type === RtcpType.RR && bodyLen >= 8) {
+            out.push({ type: "RR", ssrc: body.readUInt32BE(4), blocks: readBlocks(body, 8, count) });
+        } else if (type === RtcpType.PSFB && count === 1 && bodyLen >= 12) {
+            out.push({ type: "PLI", ssrc: body.readUInt32BE(4), mediaSsrc: body.readUInt32BE(8) });
+        } else if (type === RtcpType.PSFB && count === 4 && bodyLen >= 20) {
+            const senderSsrc = body.readUInt32BE(4);
+            for (let off = 12; off + 8 <= bodyLen; off += 8) {
+                out.push({ type: "FIR", ssrc: senderSsrc, mediaSsrc: body.readUInt32BE(off) });
+            }
         } else {
-            out.push({ type: "other", packetType: type, ssrc: len >= 8 ? p.readUInt32BE(4) : null, bytes: len });
+            out.push({ type: "other", packetType: type, ssrc: bodyLen >= 8 ? body.readUInt32BE(4) : null, bytes: len });
         }
         at += len;
     }
@@ -218,16 +229,20 @@ export class ReceiveStats {
         this.expectedPrior = expected;
         this.receivedPrior = this.received;
         const lostInterval = expectedInterval - receivedInterval;
-        const fraction = expectedInterval <= 0 || lostInterval <= 0 ? 0 : Math.floor((lostInterval << 8) / expectedInterval);
+        const fraction =
+            expectedInterval <= 0 || lostInterval <= 0
+                ? 0
+                : Math.min(255, Math.max(0, Math.floor((lostInterval * 256) / expectedInterval)));
+        const delayMs = this.lastSr ? Math.max(0, nowMs - this.lastSr.at) : 0;
         return {
             ssrc: this.ssrc,
-            fractionLost: Math.min(255, fraction),
+            fractionLost: fraction,
             cumulativeLost: lost,
             highestSeq: extendedMax >>> 0,
             jitter: Math.floor(this.jitter) >>> 0,
             lsr: this.lastSr?.middle ?? 0,
             // Delay since that SR, in 1/65536 s.
-            dlsr: this.lastSr ? Math.floor(((nowMs - this.lastSr.at) / 1000) * 65536) >>> 0 : 0,
+            dlsr: this.lastSr ? Math.min(0xffffffff, Math.floor((delayMs / 1000) * 65536)) >>> 0 : 0,
         };
     }
 }

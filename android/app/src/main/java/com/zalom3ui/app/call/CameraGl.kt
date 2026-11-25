@@ -45,53 +45,52 @@ internal class CameraGl(private val encoderSurface: Surface) {
     private val size = IntArray(1)
 
     fun init() {
-        display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        check(display != EGL14.EGL_NO_DISPLAY) { "no EGL display" }
-        val version = IntArray(2)
-        check(EGL14.eglInitialize(display, version, 0, version, 1)) { "EGL init failed" }
-        val attribs = intArrayOf(
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGLExt.EGL_RECORDABLE_ANDROID, 1,
-            EGL14.EGL_NONE,
-        )
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val count = IntArray(1)
-        check(EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, count, 0) && count[0] > 0) { "no EGL config" }
-        config = configs[0]
-        context = EGL14.eglCreateContext(
-            display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0,
-        )
-        check(context != EGL14.EGL_NO_CONTEXT) { "no EGL context" }
-        encoderEgl = windowSurface(encoderSurface) ?: error("no EGL surface for the encoder")
-        makeCurrent(encoderEgl)
+        try {
+            display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            check(display != EGL14.EGL_NO_DISPLAY) { "no EGL display" }
+            val version = IntArray(2)
+            check(EGL14.eglInitialize(display, version, 0, version, 1)) { "EGL init failed" }
+            val attribs = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8,
+                EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGLExt.EGL_RECORDABLE_ANDROID, 1,
+                EGL14.EGL_NONE,
+            )
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            check(EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, count, 0) && count[0] > 0) { "no EGL config" }
+            config = configs[0]
+            context = EGL14.eglCreateContext(
+                display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0,
+            )
+            check(context != EGL14.EGL_NO_CONTEXT) { "no EGL context" }
+            encoderEgl = windowSurface(encoderSurface) ?: error("no EGL surface for the encoder")
+            makeCurrent(encoderEgl)
 
-        program = buildProgram()
-        aPos = GLES20.glGetAttribLocation(program, "aPos")
-        aTex = GLES20.glGetAttribLocation(program, "aTex")
-        uMvp = GLES20.glGetUniformLocation(program, "uMvp")
-        uTex = GLES20.glGetUniformLocation(program, "uTexMatrix")
-        val tex = IntArray(1)
-        GLES20.glGenTextures(1, tex, 0)
-        textureId = tex[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            program = buildProgram()
+            aPos = GLES20.glGetAttribLocation(program, "aPos")
+            aTex = GLES20.glGetAttribLocation(program, "aTex")
+            uMvp = GLES20.glGetUniformLocation(program, "uMvp")
+            uTex = GLES20.glGetUniformLocation(program, "uTexMatrix")
+            val tex = IntArray(1)
+            GLES20.glGenTextures(1, tex, 0)
+            textureId = tex[0]
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        } catch (e: Throwable) {
+            release()
+            throw e
+        }
     }
 
     /** Points the self-view at [surface] (null removes it). A surface that can't be drawn on is ignored. */
     fun setPreview(surface: Surface?) {
-        if (previewEgl != EGL14.EGL_NO_SURFACE) {
-            // Leave the surface before destroying it, then go back to the encoder's.
-            EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-            EGL14.eglDestroySurface(display, previewEgl)
-            previewEgl = EGL14.EGL_NO_SURFACE
-            makeCurrent(encoderEgl)
-        }
+        destroyPreview()
         if (surface != null && surface.isValid) previewEgl = windowSurface(surface) ?: EGL14.EGL_NO_SURFACE
     }
 
@@ -106,15 +105,42 @@ internal class CameraGl(private val encoderSurface: Surface) {
     fun draw(texture: SurfaceTexture, camWidth: Int, camHeight: Int, rotation: Int, frontCamera: Boolean, outWidth: Int, outHeight: Int) {
         val st = FloatArray(16)
         texture.getTransformMatrix(st)
-        drawTo(encoderEgl, st, camWidth, camHeight, rotation, outWidth, outHeight, frontCamera, mirror = false, cover = false, nanos = texture.timestamp)
+        check(
+            drawTo(encoderEgl, st, camWidth, camHeight, rotation, outWidth, outHeight, frontCamera, mirror = false, cover = false, nanos = texture.timestamp),
+        ) { "eglSwapBuffers failed for encoder" }
         if (previewEgl != EGL14.EGL_NO_SURFACE) {
-            EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_WIDTH, size, 0)
-            val w = size[0]
-            EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_HEIGHT, size, 0)
-            val h = size[0]
-            if (w > 0 && h > 0) drawTo(previewEgl, st, camWidth, camHeight, rotation, w, h, frontCamera, mirror = frontCamera, cover = true, nanos = 0)
-            // The encoder's surface stays current between frames.
-            makeCurrent(encoderEgl)
+            var previewOk = false
+            try {
+                val hasW = EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_WIDTH, size, 0)
+                val w = size[0]
+                val hasH = EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_HEIGHT, size, 0)
+                val h = size[0]
+                if (hasW && hasH) {
+                    previewOk = if (w > 0 && h > 0) {
+                        drawTo(previewEgl, st, camWidth, camHeight, rotation, w, h, frontCamera, mirror = frontCamera, cover = true, nanos = 0)
+                    } else {
+                        true
+                    }
+                }
+            } catch (_: Exception) {
+                previewOk = false
+            }
+            if (!previewOk) {
+                destroyPreview()
+            } else {
+                // The encoder's surface stays current between frames.
+                makeCurrent(encoderEgl)
+            }
+        }
+    }
+
+    private fun destroyPreview() {
+        if (previewEgl != EGL14.EGL_NO_SURFACE) {
+            // Leave the surface before destroying it, then go back to the encoder's.
+            EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            EGL14.eglDestroySurface(display, previewEgl)
+            previewEgl = EGL14.EGL_NO_SURFACE
+            if (encoderEgl != EGL14.EGL_NO_SURFACE) makeCurrent(encoderEgl)
         }
     }
 
@@ -130,7 +156,7 @@ internal class CameraGl(private val encoderSurface: Surface) {
         mirror: Boolean,
         cover: Boolean,
         nanos: Long,
-    ) {
+    ): Boolean {
         makeCurrent(target)
         GLES20.glViewport(0, 0, w, h)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -170,7 +196,7 @@ internal class CameraGl(private val encoderSurface: Surface) {
         GLES20.glDisableVertexAttribArray(aTex)
 
         if (nanos > 0) EGLExt.eglPresentationTimeANDROID(display, target, nanos)
-        EGL14.eglSwapBuffers(display, target)
+        return EGL14.eglSwapBuffers(display, target)
     }
 
     fun release() {
@@ -183,8 +209,11 @@ internal class CameraGl(private val encoderSurface: Surface) {
         EGL14.eglTerminate(display)
         display = EGL14.EGL_NO_DISPLAY
         context = EGL14.EGL_NO_CONTEXT
+        config = null
         previewEgl = EGL14.EGL_NO_SURFACE
         encoderEgl = EGL14.EGL_NO_SURFACE
+        program = 0
+        textureId = 0
     }
 
     private fun windowSurface(s: Surface): EGLSurface? {
@@ -200,49 +229,66 @@ internal class CameraGl(private val encoderSurface: Surface) {
     }
 
     private fun buildProgram(): Int {
-        val vs = compile(
-            GLES20.GL_VERTEX_SHADER,
-            """
-            uniform mat4 uMvp;
-            uniform mat4 uTexMatrix;
-            attribute vec4 aPos;
-            attribute vec4 aTex;
-            varying vec2 vTex;
-            void main() {
-                gl_Position = uMvp * aPos;
-                vTex = (uTexMatrix * aTex).xy;
+        var vs = 0
+        var fs = 0
+        try {
+            vs = compile(
+                GLES20.GL_VERTEX_SHADER,
+                """
+                uniform mat4 uMvp;
+                uniform mat4 uTexMatrix;
+                attribute vec4 aPos;
+                attribute vec4 aTex;
+                varying vec2 vTex;
+                void main() {
+                    gl_Position = uMvp * aPos;
+                    vTex = (uTexMatrix * aTex).xy;
+                }
+                """.trimIndent(),
+            )
+            fs = compile(
+                GLES20.GL_FRAGMENT_SHADER,
+                """
+                #extension GL_OES_EGL_image_external : require
+                precision mediump float;
+                varying vec2 vTex;
+                uniform samplerExternalOES sTex;
+                void main() {
+                    gl_FragColor = texture2D(sTex, vTex);
+                }
+                """.trimIndent(),
+            )
+            val p = GLES20.glCreateProgram()
+            check(p != 0) { "glCreateProgram failed" }
+            GLES20.glAttachShader(p, vs)
+            GLES20.glAttachShader(p, fs)
+            GLES20.glLinkProgram(p)
+            val ok = IntArray(1)
+            GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0)
+            if (ok[0] != GLES20.GL_TRUE) {
+                val log = GLES20.glGetProgramInfoLog(p)
+                GLES20.glDeleteProgram(p)
+                error("GL link failed: $log")
             }
-            """.trimIndent(),
-        )
-        val fs = compile(
-            GLES20.GL_FRAGMENT_SHADER,
-            """
-            #extension GL_OES_EGL_image_external : require
-            precision mediump float;
-            varying vec2 vTex;
-            uniform samplerExternalOES sTex;
-            void main() {
-                gl_FragColor = texture2D(sTex, vTex);
-            }
-            """.trimIndent(),
-        )
-        val p = GLES20.glCreateProgram()
-        GLES20.glAttachShader(p, vs)
-        GLES20.glAttachShader(p, fs)
-        GLES20.glLinkProgram(p)
-        val ok = IntArray(1)
-        GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0)
-        check(ok[0] == GLES20.GL_TRUE) { "GL link failed: " + GLES20.glGetProgramInfoLog(p) }
-        return p
+            return p
+        } finally {
+            if (vs != 0) GLES20.glDeleteShader(vs)
+            if (fs != 0) GLES20.glDeleteShader(fs)
+        }
     }
 
     private fun compile(type: Int, source: String): Int {
         val s = GLES20.glCreateShader(type)
+        check(s != 0) { "glCreateShader failed" }
         GLES20.glShaderSource(s, source)
         GLES20.glCompileShader(s)
         val ok = IntArray(1)
         GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
-        check(ok[0] == GLES20.GL_TRUE) { "GL shader failed: " + GLES20.glGetShaderInfoLog(s) }
+        if (ok[0] != GLES20.GL_TRUE) {
+            val log = GLES20.glGetShaderInfoLog(s)
+            GLES20.glDeleteShader(s)
+            error("GL shader failed: $log")
+        }
         return s
     }
 
