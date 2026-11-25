@@ -35,6 +35,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.zalom3ui.app.server.StartupLog
 
 private object Routes {
     const val HOME = "home"
@@ -124,7 +125,13 @@ private fun AppNav(vm: AppViewModel) {
                     onRetry = vm::startLiveUpdates,
                     onSettings = { nav.navigate(Routes.SETTINGS) },
                 )
-                status == null -> LoadingScreen(if (state.settings.onDevice) "Starting Zalo…" else "Connecting…")
+                status == null && state.settings.onDevice -> StartingScreen(
+                    since = state.startingSince,
+                    error = state.startupError,
+                    onRestart = vm::restartLocalServer,
+                    onShareLog = { QrActions.shareText(context, "zaloo-startup-log.txt", "Share startup log", StartupLog.report(context)) },
+                )
+                status == null -> LoadingScreen("Connecting…")
                 !status.isLoggedIn -> LoginScreen(
                     status = status,
                     onLogin = vm::login,

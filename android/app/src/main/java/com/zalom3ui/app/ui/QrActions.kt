@@ -60,17 +60,20 @@ object QrActions {
     }
 
     /** Opens the share sheet with the call log as a text file (to send it for the call research). */
-    fun shareCallLog(context: Context, log: String) {
+    fun shareCallLog(context: Context, log: String) = shareText(context, "zaloo-call-log.txt", "Share call log", log)
+
+    /** Opens the share sheet with [text] as a file named [fileName]. */
+    fun shareText(context: Context, fileName: String, title: String, text: String) {
         val dir = File(context.cacheDir, "shared").apply { mkdirs() }
-        val file = File(dir, "zaloo-call-log.txt")
-        file.writeText(log)
+        val file = File(dir, fileName)
+        file.writeText(text)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(send, "Share call log").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        context.startActivity(Intent.createChooser(send, title).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     /** Scanners need a white border around the code; the image from Zalo is tight-cropped. */

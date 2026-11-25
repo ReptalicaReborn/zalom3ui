@@ -36,6 +36,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -219,6 +222,55 @@ fun LoadingScreen(label: String? = null) {
         }
     }
 }
+
+/**
+ * "Starting Zalo…" for the on-phone server. If it takes long, says what's in the way and offers a restart and the
+ * startup log (phones that block background services leave it here).
+ */
+@Composable
+fun StartingScreen(since: Long, error: String?, onRestart: () -> Unit, onShareLog: () -> Unit) {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(since) {
+        while (true) {
+            now = System.currentTimeMillis()
+            kotlinx.coroutines.delay(1_000)
+        }
+    }
+    val slow = since > 0 && now - since > SLOW_START_MS
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        CircularProgressIndicator()
+        Spacer(Modifier.height(16.dp))
+        Text("Starting Zalo…", style = MaterialTheme.typography.bodyLarge)
+        if (slow) {
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "This is taking longer than it should." + (error?.let { "\n\n$it" } ?: ""),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Some phones (Xiaomi, Oppo, Vivo, Huawei…) block background services for new apps: in the phone's app " +
+                    "settings for Zalỏ, allow Autostart and set Battery saver to No restrictions, then restart below.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(onClick = onShareLog) { Text("Share startup log") }
+                Button(onClick = onRestart) { Text("Restart") }
+            }
+        }
+    }
+}
+
+private const val SLOW_START_MS = 12_000L
 
 @Composable
 fun ConnectionErrorScreen(error: String, onRetry: () -> Unit, onSettings: () -> Unit) {

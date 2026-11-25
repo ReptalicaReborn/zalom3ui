@@ -1,8 +1,36 @@
+import fs from "node:fs";
 import path from "node:path";
+import util from "node:util";
 import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { ZaloSession } from "./session.js";
 import { ChatStore } from "./store.js";
+
+// LOG_FILE (set by the Android app): copy console output there, so a server that won't start can be diagnosed.
+const logFile = process.env.LOG_FILE;
+if (logFile) {
+    try {
+        if (fs.existsSync(logFile) && fs.statSync(logFile).size > 256 * 1024) fs.renameSync(logFile, logFile + ".1");
+    } catch {
+        // Logging must never stop the server.
+    }
+    for (const level of ["log", "warn", "error"] as const) {
+        const original = console[level].bind(console);
+        console[level] = (...args: unknown[]) => {
+            original(...args);
+            try {
+                const text = args.map((a) => (a instanceof Error ? (a.stack ?? a.message) : typeof a === "string" ? a : util.inspect(a))).join(" ");
+                fs.appendFileSync(logFile, `${new Date().toISOString()} ${level} ${text}\n`);
+            } catch {
+                // Ignore: the file may be gone.
+            }
+        };
+    }
+}
+process.on("uncaughtException", (err) => {
+    console.error("Uncaught exception:", err);
+    process.exit(1);
+});
 
 const config = loadConfig();
 const store = new ChatStore(path.join(config.dataDir, "messages.json"));

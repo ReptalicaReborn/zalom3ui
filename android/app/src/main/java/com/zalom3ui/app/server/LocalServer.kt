@@ -12,8 +12,16 @@ object LocalServer {
 
     fun url(context: Context): String = "http://127.0.0.1:${port(context)}"
 
-    fun start(context: Context) {
-        ContextCompat.startForegroundService(context, Intent(context, NodeService::class.java))
+    /** Asks Android for the server's service. Phones that block it (battery savers, autostart rules) are logged. */
+    fun start(context: Context): Throwable? {
+        StartupLog.write(context, "app: start service requested (port ${port(context)})")
+        return try {
+            ContextCompat.startForegroundService(context, Intent(context, NodeService::class.java))
+            null
+        } catch (e: Exception) {
+            StartupLog.error(context, "app: Android refused to start the service", e)
+            e
+        }
     }
 
     /** Stops the server; its process exits, since Node can only start once per process. */

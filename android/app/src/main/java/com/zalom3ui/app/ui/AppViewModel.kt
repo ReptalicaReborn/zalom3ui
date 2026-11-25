@@ -79,6 +79,9 @@ data class UiState(
     val stickers: StickerSearch = StickerSearch(),
     /** A chat to open, asked for by a tapped notification. */
     val openRequest: ThreadRef? = null,
+    /** While the on-phone server starts: when it was asked for, and the latest reason it can't be reached yet. */
+    val startingSince: Long = 0,
+    val startupError: String? = null,
 )
 
 data class StickerSearch(
@@ -144,8 +147,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val api = client ?: return
         val onDevice = _state.value.settings.onDevice
         if (onDevice) {
-            LocalServer.start(getApplication())
+            val refused = LocalServer.start(getApplication())
             localStartedAt = System.currentTimeMillis()
+            _state.update {
+                it.copy(
+                    startingSince = if (it.status == null) localStartedAt else it.startingSince,
+                    startupError = refused?.let { e -> "Android didn't start the Zalo service: ${e.message ?: e.javaClass.simpleName}" },
+                )
+            }
         }
         // Repeated while visible: the server forgets a chat nobody confirms is still open.
         presenceJob?.cancel()
@@ -164,9 +173,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    // While the on-phone server boots, keep showing "starting" rather than an error.
+                    // While the on-phone server boots, keep showing "starting" rather than an error; the starting screen
+                    // shows the reason after a while (startupError).
                     val error = if (booting) null else e.message ?: "Cannot reach server"
-                    _state.update { it.copy(connectionError = error) }
+                    _state.update { it.copy(connectionError = error, startupError = e.message ?: e.javaClass.simpleName) }
                 }
                 delay(if (booting) LOCAL_BOOT_RETRY_MS else RECONNECT_DELAY_MS)
             }
@@ -533,7 +543,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshAll(api: ApiClient) {
         val status = api.status()
         val threads = if (status.isLoggedIn) api.threads() else emptyList()
-        _state.update { it.copy(status = status, threads = threads, connectionError = null) }
+        _state.update { it.copy(status = status, threads = threads, connectionError = null, startupError = null) }
         _state.value.chat?.let { chat ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE)
             updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages), loading = false) }

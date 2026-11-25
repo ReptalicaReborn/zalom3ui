@@ -52,6 +52,7 @@ class NodeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        StartupLog.write(this, "service: created")
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
@@ -64,6 +65,7 @@ class NodeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        StartupLog.write(this, "service: start command (already running: $started)")
         if (!started) {
             started = true
             // Node needs a bigger stack than Android's default thread stack.
@@ -73,6 +75,7 @@ class NodeService : Service() {
     }
 
     override fun onDestroy() {
+        StartupLog.write(this, "service: destroyed")
         runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
         super.onDestroy()
         Process.killProcess(Process.myPid())
@@ -92,11 +95,16 @@ class NodeService : Service() {
             Os.setenv("DATA_DIR", dataDir.absolutePath, true)
             Os.setenv("HOME", filesDir.absolutePath, true)
             Os.setenv("TMPDIR", cacheDir.absolutePath, true)
+            // The server copies its console output here, so a failed start can be shared (StartupLog.report).
+            Os.setenv("LOG_FILE", StartupLog.serverLog(this).absolutePath, true)
 
+            StartupLog.write(this, "service: starting Node on port ${LocalServer.port(this)}")
             val code = NodeRuntime.startNode(arrayOf("node", "--max-old-space-size=$HEAP_MB", script.absolutePath))
             Log.w(TAG, "Node exited with code $code")
+            StartupLog.write(this, "service: Node exited with code $code")
         } catch (e: Throwable) {
             Log.e(TAG, "Could not run the Zalo server", e)
+            StartupLog.error(this, "service: could not run Node", e)
         }
         stopSelf()
         Process.killProcess(Process.myPid())
