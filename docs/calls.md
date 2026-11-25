@@ -113,9 +113,16 @@ What a call needs, all from Zalo's servers rather than from a handshake between 
 (own, partner, call), the **session**, the media **servers** (`rtpAddress`/`rtcpAddress`, `servers`, `tcpServers`,
 `fallbackServers`, IPv6 variants), and the **SRTP key**. Zalo PC passes `srtpKey` unchanged to libsrtp as the
 master key + salt, the same key for both directions (each stream is told apart by its SSRC), with `srtpMode` as the
-crypto suite (1 or 2: AES-128 counter mode with an HMAC-SHA1 tag). That is plain RFC 3711 SRTP. Other request
-fields the call program reads: `session`, `sessionId`, `srtpMode`, `srtpNoSeq`, `srtpRTCP`, `packetMode`,
-`protocol`, `p2pAddress`, `partnerIP`, `platform`, `codec`, `extendData`, `forceTCP`.
+crypto suite (1 or 2: AES-128 counter mode with an HMAC-SHA1 tag). That is plain RFC 3711 SRTP. 
+
+Where these sit in an incoming call (`voip` / `request` control, read by `_parseActRequest`): `status`, `uidFrom`,
+`uidTo`, `ts`, `uidN` and `params`, which holds `platform`, `protocol`, `id`, `sessId`, `extendData`, `rtpIP`,
+`rtcpIP`, `avatar`, `Dname`, `codec`, `servers` and **`zrtc_config`**. `zrtc_config` (`ZRtcConfig::fromJson`) is
+the media setup: `srtpKey`, `srtpMode`, `srtpNoSeq`, `srtpRTCP`, `packetMode`, `opus` / `g711` / `pcma` / `pcmu`,
+`audioSampleRate`, `audioChannel`, `audioBitrate`, `audioNack`, `jbMs`, `tcpServers`, `fallbackServers`,
+`selectedServer`, `numSelectedServer`, `supportTCP`, `forceTCP`, `preferIpv6`, `partnerIP`, `sP2P` and about two
+hundred tuning values (echo cancellation, gain control, bandwidth estimation, video). The caller gets the same
+`servers` / `zrtc_config` / `sessId` in the answer to its `requestcall` (`_parse401Response`).
 
 Getting audio to flow means reimplementing that network layer (how a call connects to Zalo's media relays, the packet
 format, how the SRTP keys are agreed) and feeding it from an Android audio pipeline (Opus, echo cancellation).
