@@ -328,6 +328,64 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    // ---- Polls (group chats) ----
+
+    /**
+     * `{ question, options: string[], allowMultiple?, allowAddOptions?, anonymous?, hideVotePreview?, expiresAt? }`
+     * (`expiresAt` epoch ms, absent or 0 for none). Answers with the poll view; the poll message itself arrives over /ws.
+     */
+    api.post("/groups/:id/polls", wrap(async (req, res) => {
+        const { question, options, expiresAt } = req.body ?? {};
+        if (typeof question !== "string" || !question.trim()) throw new HttpError(400, "question is required");
+        if (question.trim().length > MAX_POLL_TEXT) throw new HttpError(400, `question is limited to ${MAX_POLL_TEXT} characters`);
+        const cleaned = cleanOptions(options);
+        if (cleaned.length < 2) throw new HttpError(400, "A poll needs at least 2 different options");
+        if (cleaned.length > MAX_POLL_OPTIONS) throw new HttpError(400, `A poll takes at most ${MAX_POLL_OPTIONS} options`);
+        let deadline = 0;
+        if (expiresAt !== undefined && expiresAt !== null && expiresAt !== 0) {
+            if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+                throw new HttpError(400, "expiresAt must be a time in the future (epoch ms)");
+            }
+            deadline = Math.floor(expiresAt);
+        }
+        const flag = (v: unknown) => v === true;
+        const poll = await session.createPoll(req.params.id, {
+            question: question.trim(),
+            options: cleaned,
+            allowMultiple: flag(req.body.allowMultiple),
+            allowAddOptions: flag(req.body.allowAddOptions),
+            anonymous: flag(req.body.anonymous),
+            hideVotePreview: flag(req.body.hideVotePreview),
+            expiresAt: deadline,
+        });
+        res.status(201).json(poll);
+    }));
+
+    api.get("/polls/:pollId", wrap(async (req, res) => {
+        res.json(await session.pollDetail(parsePollId(req.params.pollId)));
+    }));
+
+    /** `{ optionIds: number[] }`: the options this account now chooses; an empty list removes its vote. */
+    api.post("/polls/:pollId/vote", wrap(async (req, res) => {
+        const ids = req.body?.optionIds;
+        if (!Array.isArray(ids) || !ids.every((i) => Number.isInteger(i) && i >= 0) || ids.length > MAX_POLL_OPTIONS) {
+            throw new HttpError(400, "optionIds must be an array of option ids");
+        }
+        res.json(await session.votePoll(parsePollId(req.params.pollId), [...new Set<number>(ids)]));
+    }));
+
+    /** `{ options: string[] }` */
+    api.post("/polls/:pollId/options", wrap(async (req, res) => {
+        const cleaned = cleanOptions(req.body?.options);
+        if (cleaned.length === 0) throw new HttpError(400, "options must hold at least one option");
+        if (cleaned.length > MAX_POLL_OPTIONS) throw new HttpError(400, `At most ${MAX_POLL_OPTIONS} options at a time`);
+        res.json(await session.addPollOptions(parsePollId(req.params.pollId), cleaned));
+    }));
+
+    api.post("/polls/:pollId/lock", wrap(async (req, res) => {
+        res.json(await session.lockPoll(parsePollId(req.params.pollId)));
+    }));
+
     // ---- Calls (docs/calls.md) ----
 
     /** Declines a call ringing on this account. */
@@ -523,6 +581,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     const onTyping = (typing: { threadKind: ThreadKind; threadId: string; uid: string; name: string }) =>
         broadcast({ type: "typing", ...typing });
     const onThreads = () => broadcast({ type: "threads" });
+    const onPoll = (poll: { pollId: number }) => broadcast({ type: "poll", pollId: poll.pollId });
 
     session.on("call_audio", onCallAudio);
     session.on("call", onCallAudioClose);
@@ -536,6 +595,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     session.on("message_deleted", onMessageDeleted);
     session.on("typing", onTyping);
     session.on("threads", onThreads);
+    session.on("poll", onPoll);
 
     wss.on("connection", (ws: WebSocket) => {
         ws.on("error", () => {});
@@ -577,6 +637,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
         session.off("message_deleted", onMessageDeleted);
         session.off("typing", onTyping);
         session.off("threads", onThreads);
+        session.off("poll", onPoll);
         wss.close();
         audioWss.close();
     });
@@ -623,6 +684,27 @@ export function isKeyFrameWanted(data: Buffer): boolean {
 }
 
 /** Express 4 does not forward rejected promises to the error handler on its own. */
+const MAX_POLL_TEXT = 200;
+const MAX_POLL_OPTIONS = 30;
+
+/** Trimmed, non-empty, de-duplicated option texts; anything that isn't a string array gives an empty list. */
+function cleanOptions(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<string>();
+    for (const v of value) {
+        if (typeof v !== "string") continue;
+        const text = v.trim().slice(0, MAX_POLL_TEXT);
+        if (text) seen.add(text);
+    }
+    return [...seen];
+}
+
+function parsePollId(value: string): number {
+    const id = Number(value);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, "Invalid poll id");
+    return id;
+}
+
 function wrap(handler: (req: Request, res: Response) => Promise<void>) {
     return (req: Request, res: Response, next: NextFunction) => {
         handler(req, res).catch(next);

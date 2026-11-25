@@ -5,6 +5,9 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zalom3ui.app.data.ApiClient
+import com.zalom3ui.app.data.ApiException
+import com.zalom3ui.app.data.CreatePollRequest
+import com.zalom3ui.app.data.PollDetail
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.FoundUser
@@ -28,7 +31,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -97,6 +102,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val settingsStore = SettingsStore(app)
     private val _state = MutableStateFlow(UiState(settings = settingsStore.load(), appearance = settingsStore.loadAppearance()))
     val state: StateFlow<UiState> = _state.asStateFlow()
+
+    private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
+    /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
+    val pollEvents: SharedFlow<Long> = _pollEvents
+
+    private fun pollApi(): ApiClient = client ?: throw ApiException("Not connected to the server")
+
+    suspend fun loadPoll(pollId: Long): PollDetail = pollApi().poll(pollId)
+
+    suspend fun votePoll(pollId: Long, optionIds: List<Long>): PollDetail = pollApi().votePoll(pollId, optionIds)
+
+    suspend fun addPollOptions(pollId: Long, options: List<String>): PollDetail = pollApi().addPollOptions(pollId, options)
+
+    suspend fun lockPoll(pollId: Long): PollDetail = pollApi().lockPoll(pollId)
+
+    /** Creates a poll in the open group chat; the poll message then arrives like any other. */
+    suspend fun createPoll(request: CreatePollRequest): PollDetail {
+        val chat = _state.value.chat?.takeIf { it.kind == "group" } ?: throw ApiException("Polls can only be created in groups")
+        return pollApi().createPoll(chat.id, request)
+    }
 
     private var client: ApiClient? = null
     private var liveJob: Job? = null
@@ -613,6 +638,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 scheduleRefreshThreads(api)
             }
             is ServerEvent.Typing -> onTyping(event)
+            is ServerEvent.PollChanged -> _pollEvents.tryEmit(event.pollId)
             // Notifications are the service's business (MessageNotifier).
             is ServerEvent.Read, is ServerEvent.CallIncoming, is ServerEvent.CallConnected, is ServerEvent.CallPeer, is ServerEvent.CallEnded -> Unit
         }

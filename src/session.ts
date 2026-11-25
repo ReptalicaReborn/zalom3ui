@@ -37,6 +37,7 @@ import { ControlPoller, serverList } from "./ctrlpoll.js";
 import { acceptCall, camMicState, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
 import { MediaCall, parseServer } from "./zrtcclient.js";
 import { HttpError } from "./errors.js";
+import { buildPollView, pollIdOfGroupEvent, type CreatePollInput, type PollView } from "./polls.js";
 import {
     ChatStore,
     normalizeMessage,
@@ -116,6 +117,8 @@ type SessionEvents = {
     message_deleted: [DeletedEvent];
     typing: [TypingEvent];
     threads: [];
+    /** A poll changed (created, voted on, closed): clients showing it should reload it. */
+    poll: [{ pollId: number }];
 };
 
 /** Controls in which the other side says its camera or microphone changed (not the end of a call). */
@@ -145,6 +148,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private resumeRetry: { timer: NodeJS.Timeout; wake: () => void } | null = null;
     private resuming = false;
     private members = new Map<string, { at: number; list: GroupMember[] }>();
+    /** Poll id -> the group it lives in, learned from poll messages; polls only carry their creator. */
+    private pollGroups = new Map<number, string>();
     private friendList = new Map<string, Person>();
     private stickers = new Map<number, StickerInfo>();
     private stickerLookups = new Map<number, Promise<StickerInfo | null>>();
@@ -520,6 +525,96 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         list = list.filter((m) => m.id !== ownId).sort((a, b) => a.name.localeCompare(b.name));
         this.members.set(groupId, { at: Date.now(), list });
         return list;
+    }
+
+    // ---- Polls ----
+
+    async createPoll(groupId: string, input: CreatePollInput): Promise<PollView> {
+        const api = this.requireApi();
+        const detail = await api.createPoll(
+            {
+                question: input.question,
+                options: input.options,
+                expiredTime: input.expiresAt,
+                allowMultiChoices: input.allowMultiple,
+                allowAddNewOption: input.allowAddOptions,
+                hideVotePreview: input.hideVotePreview,
+                isAnonymous: input.anonymous,
+            },
+            groupId,
+        );
+        this.pollGroups.set(Number(detail.poll_id), groupId);
+        this.emit("poll", { pollId: Number(detail.poll_id) });
+        return this.pollViewWithNames(detail);
+    }
+
+    async pollDetail(pollId: number): Promise<PollView> {
+        return this.pollViewWithNames(await this.requireApi().getPollDetail(pollId));
+    }
+
+    /** Sets the whole set of options this account has chosen; an empty list takes the vote back. */
+    async votePoll(pollId: number, optionIds: number[]): Promise<PollView> {
+        const api = this.requireApi();
+        const detail = await api.getPollDetail(pollId);
+        if (detail.closed || (detail.expired_time > 0 && detail.expired_time <= Date.now())) throw new HttpError(409, "This poll is closed");
+        const known = new Set(detail.options.map((o) => o.option_id));
+        if (optionIds.some((id) => !known.has(id))) throw new HttpError(400, "Unknown option");
+        if (!detail.allow_multi_choices && optionIds.length > 1) throw new HttpError(400, "This poll takes one choice");
+        await api.votePoll(pollId, optionIds);
+        return this.refreshedPoll(pollId);
+    }
+
+    async addPollOptions(pollId: number, options: string[]): Promise<PollView> {
+        const api = this.requireApi();
+        const detail = await api.getPollDetail(pollId);
+        if (detail.closed) throw new HttpError(409, "This poll is closed");
+        if (!detail.allow_add_new_option && detail.creator !== this.status.ownId) throw new HttpError(403, "This poll doesn't take new options");
+        // Zalo wants the options this account has chosen so adding doesn't clear them.
+        const votedOptionIds = detail.options.filter((o) => o.voted).map((o) => o.option_id);
+        await api.addPollOptions({ pollId, options: options.map((content) => ({ voted: false, content })), votedOptionIds });
+        return this.refreshedPoll(pollId);
+    }
+
+    async lockPoll(pollId: number): Promise<PollView> {
+        const api = this.requireApi();
+        const view = await this.pollViewWithNames(await api.getPollDetail(pollId));
+        if (!view.canClose) throw new HttpError(403, "Only the creator or a group admin can close a poll");
+        await api.lockPoll(pollId);
+        return this.refreshedPoll(pollId);
+    }
+
+    private async refreshedPoll(pollId: number): Promise<PollView> {
+        const view = await this.pollDetail(pollId);
+        this.emit("poll", { pollId });
+        return view;
+    }
+
+    private async isGroupAdmin(groupId: string | undefined): Promise<boolean> {
+        if (!groupId || !this.status.ownId) return false;
+        try {
+            const info = (await this.requireApi().getGroupInfo(groupId)).gridInfoMap[groupId];
+            return !!info && (info.creatorId === this.status.ownId || (info.adminIds ?? []).includes(this.status.ownId));
+        } catch {
+            return false;
+        }
+    }
+
+    private async pollViewWithNames(detail: Parameters<typeof buildPollView>[0]): Promise<PollView> {
+        const groupId = this.pollGroups.get(Number(detail.poll_id));
+        const names = new Map<string, string>();
+        if (groupId) {
+            try {
+                for (const m of await this.groupMembers(groupId)) names.set(m.id, m.name);
+            } catch {
+                // Ids stand in for names.
+            }
+        }
+        if (this.status.ownId) names.set(this.status.ownId, this.status.ownName ?? "You");
+        return this.pollView(detail, await this.isGroupAdmin(groupId), names);
+    }
+
+    private pollView(detail: Parameters<typeof buildPollView>[0], isAdmin = false, names?: Map<string, string>): PollView {
+        return buildPollView(detail, { ownId: this.status.ownId, isAdmin, now: Date.now(), names });
     }
 
     // ---- Notifications ----
@@ -1253,6 +1348,11 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         listener.on("delivered_messages", (ds) => live() && ds.forEach((d) => this.onDelivered(d)));
         listener.on("group_event", (e) => {
             if (!live() || !e.threadId) return;
+            const pollId = pollIdOfGroupEvent(e);
+            if (pollId !== null) {
+                this.pollGroups.set(pollId, e.threadId);
+                this.emit("poll", { pollId });
+            }
             this.members.delete(e.threadId);
             this.loadGroups(api, [e.threadId], generation).then(() => live() && this.emit("threads"), () => {});
         });
@@ -1298,6 +1398,12 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             return;
         }
         const msg = normalizeMessage(rawMsg);
+        const poll = msg.attachment?.poll;
+        if (poll) {
+            if (msg.threadKind === "group") this.pollGroups.set(poll.pollId, msg.threadId);
+            // Votes and closing arrive as poll messages too.
+            if (poll.event) this.emit("poll", { pollId: poll.pollId });
+        }
         if (this.store.addMessage(msg)) this.emit("message", this.store.toPublic(msg));
     }
 

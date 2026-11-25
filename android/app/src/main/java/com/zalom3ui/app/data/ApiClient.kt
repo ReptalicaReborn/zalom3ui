@@ -8,6 +8,7 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
@@ -59,6 +60,30 @@ class ApiClient(serverUrl: String, private val token: String?) {
     suspend fun retry(): SessionStatus = post("retry")
 
     suspend fun logout(): SessionStatus = post("logout")
+
+    // ---- Polls ----
+
+    suspend fun createPoll(groupId: String, request: CreatePollRequest): PollDetail =
+        post("groups", groupId, "polls", body = createPollBody(request).toString())
+
+    suspend fun poll(pollId: Long): PollDetail = get("polls", pollId.toString())
+
+    /** [optionIds] is the whole set this account chooses; empty takes the vote back. */
+    suspend fun votePoll(pollId: Long, optionIds: List<Long>): PollDetail =
+        post("polls", pollId.toString(), "vote", body = buildJsonObject { putJsonArray("optionIds") { optionIds.forEach { add(JsonPrimitive(it)) } } }.toString())
+
+    suspend fun addPollOptions(pollId: Long, options: List<String>): PollDetail =
+        post("polls", pollId.toString(), "options", body = buildJsonObject { putJsonArray("options") { options.forEach { add(JsonPrimitive(it)) } } }.toString())
+
+    suspend fun lockPoll(pollId: Long): PollDetail = post("polls", pollId.toString(), "lock")
+
+    internal fun createPollBody(request: CreatePollRequest): JsonObject = buildJsonObject {
+        put("question", request.question.trim())
+        putJsonArray("options") { request.options.map { it.trim() }.filter { it.isNotEmpty() }.distinct().forEach { add(JsonPrimitive(it)) } }
+        put("allowMultiple", request.allowMultiple)
+        put("allowAddOptions", request.allowAddOptions)
+        if (request.expiresAt > 0) put("expiresAt", request.expiresAt)
+    }
 
     // ---- Messages ----
 
@@ -355,6 +380,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
             "message_deleted" -> ServerEvent.MessageDeleted(obj.threadRef(), obj.string("id"))
             "typing" -> ServerEvent.Typing(obj.threadRef(), obj.string("uid"), obj.string("name"))
             "threads" -> ServerEvent.ThreadsChanged
+            "poll" -> obj["pollId"]?.jsonPrimitive?.longOrNull?.let { ServerEvent.PollChanged(it) }
             else -> null
         }
     }

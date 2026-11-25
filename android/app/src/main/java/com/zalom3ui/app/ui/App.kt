@@ -15,6 +15,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.GroupAdd
@@ -168,6 +169,13 @@ private fun AppNav(vm: AppViewModel) {
         }
     }
 
+    // Poll cards and the poll sheet load and change polls through this (see Polls.kt).
+    val polls = remember(vm) {
+        Polls(scope, vm::loadPoll, vm::votePoll, vm::addPollOptions, vm::lockPoll, vm::createPoll)
+    }
+    LaunchedEffect(polls) { vm.pollEvents.collect { polls.onChanged(it) } }
+
+    CompositionLocalProvider(LocalPolls provides polls) {
     NavHost(
         navController = nav,
         startDestination = Routes.HOME,
@@ -408,6 +416,7 @@ private fun AppNav(vm: AppViewModel) {
                 onClearCallLog = vm::clearCallLog,
             )
         }
+    }
     }
 }
 
