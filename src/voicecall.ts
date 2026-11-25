@@ -21,10 +21,10 @@ export function voiceCallDomain(serviceMap: unknown): string {
 
 /** A call ringing on this account, with what answering or declining it needs. */
 export type RingingCall = IncomingCall & {
-    /** The call id exactly as Zalo sent it (number or text): it is sent back the same way. */
-    rawCallId: unknown;
-    /** Zalo's call type as sent (`callType`), echoed when declining. */
-    callType: unknown;
+    /** The call id as Zalo PC's call program sends it back: a number (it fits in 32 bits). */
+    rawCallId: number | string;
+    /** Zalo PC's call type for an incoming call: 1 voice, 3 video. */
+    callType: number;
     /** The request's full data, for answering later (media servers, codec, session). */
     data: Record<string, unknown>;
     receivedAt: number;
@@ -32,22 +32,32 @@ export type RingingCall = IncomingCall & {
 
 export function ringingCallOf(incoming: IncomingCall, control: CallControl, now = Date.now()): RingingCall {
     const d = control.data;
+    const id = Number(d.callId ?? d.call_id ?? incoming.callId);
     return {
         ...incoming,
-        rawCallId: d.callId ?? d.call_id ?? incoming.callId,
-        callType: d.callType ?? d.type ?? (incoming.video ? 1 : 0),
+        rawCallId: Number.isSafeInteger(id) ? id : incoming.callId,
+        // ZCallInfo::_updateCallInfo(ZIncomingCallInfo): video ? 3 : 1.
+        callType: incoming.video ? 3 : 1,
         data: d,
         receivedAt: now,
     };
 }
 
 /**
- * Declines a ringing call. Zalo PC has no separate "decline" request: its call program sends signal 405, which the
- * renderer turns into `/api/voicecall/cancel` with the other side's id, both when a caller gives up and when the
- * person being called declines.
+ * Declines a ringing call. Zalo PC has no separate "decline" request: its call program sends signal 405
+ * (`ZCallInfo::_processCancleCallJob`: the caller's noised id `uidN`, the call id as a number, the call type, status 0),
+ * which the renderer turns into `/api/voicecall/cancel`; the same request a caller sends to give up.
  */
 export function declineCall(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
     return send("cancel", { callerId: call.callerId, callId: call.rawCallId, callType: call.callType, status: 0, imei });
+}
+
+/**
+ * Tells the caller this device is ringing (signal 407, `/api/voicecall/ringring`). Zalo PC's call program sends it as
+ * soon as a call arrives; Zalo may only take a decline from a device that rang.
+ */
+export function ringRing(send: VoiceCallSender, call: RingingCall, imei: string): Promise<unknown> {
+    return send("ringring", { callerId: call.callerId, callId: call.rawCallId, status: 0, imei });
 }
 
 /** A [VoiceCallSender] on a logged-in zca-js session. */

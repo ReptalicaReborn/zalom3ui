@@ -91,6 +91,8 @@ const MIN_GAP_MS = 1_000;
 const EARLY_EMPTY_MS = 9_000;
 const EARLY_EMPTY_WAIT_MS = 5_000;
 const BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
+/** When an answer only repeats controls already seen (the cursor didn't move), wait this long before the next poll. */
+const REPEAT_WAIT_MS = 30_000;
 
 /** The control servers of a login answer: a list of URLs, or one URL. */
 export function serverList(value: unknown): string[] {
@@ -106,6 +108,8 @@ export class ControlPoller {
     private lastActionIdOther = "1";
     private server = 0;
     private failures = 0;
+    /** Ids of controls already handed over (most recent last), to notice answers that only repeat themselves. */
+    private seen = new Set<string>();
 
     constructor(private readonly deps: PollerDeps) {}
 
@@ -166,12 +170,22 @@ export class ControlPoller {
                 this.lastActionId = String(d.lastActionId);
             }
             const controls = controlsIn(d);
+            const fresh = controls.filter((c) => {
+                const id = String((c as { controlId?: unknown; actionId?: unknown }).controlId ?? (c as { actionId?: unknown }).actionId ?? "");
+                if (!id) return true;
+                if (this.seen.has(id)) return false;
+                this.seen.add(id);
+                if (this.seen.size > 500) this.seen.delete(this.seen.values().next().value as string);
+                return true;
+            });
             deps.onEvent({
                 kind: "ctrl_poll",
                 keys: Object.keys(d).slice(0, 30),
-                controls: controls.map((c) => `${String(c.content.act_type ?? "?")}/${String(c.content.act ?? "?")}`),
+                controls: fresh.map((c) => `${String(c.content.act_type ?? "?")}/${String(c.content.act ?? "?")}`),
+                ...(fresh.length < controls.length ? { repeated: controls.length - fresh.length } : {}),
             });
-            if (controls.length) deps.onControls(controls);
+            if (fresh.length) deps.onControls(fresh);
+            else if (controls.length) await this.sleep(REPEAT_WAIT_MS);
         }
         return true;
     }

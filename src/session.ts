@@ -33,7 +33,7 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
-import { declineCall, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
+import { declineCall, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -533,8 +533,15 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         const call = this.ringing.get(callId);
         if (!call) throw new HttpError(404, "That call isn't ringing any more");
         const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
+        const send = voiceCallSender(api);
         try {
-            const answer = await declineCall(voiceCallSender(api), call, imei);
+            const rang = await ringRing(send, call, imei);
+            this.callTrace.record({ kind: "ringring", callId, answer: rang });
+        } catch (err) {
+            this.callTrace.record({ kind: "ringring_failed", callId, error: describeError(err) });
+        }
+        try {
+            const answer = await declineCall(send, call, imei);
             this.callTrace.record({ kind: "declined", callId, answer });
         } catch (err) {
             this.callTrace.record({ kind: "decline_failed", callId, error: describeError(err) });
@@ -570,6 +577,12 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
         if (!ctx.secretKey) {
             this.callTrace.record({ kind: "ctrl_poll_unavailable", reason: "no session key" });
+            return;
+        }
+        // Zalo PC reads controls from its socket and never long-polls when the account says so; neither does Zalỏ
+        // (the chat socket carries the call controls then).
+        if (socket.enable_ctrl_socket === true && socket.disable_lp === true) {
+            this.callTrace.record({ kind: "ctrl_poll_skipped", reason: "controls come over the socket (disable_lp)" });
             return;
         }
         const GET = "zalooControlGet";
@@ -623,7 +636,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         } else if (incoming) {
             for (const [id, call] of this.ringing) if (now - call.receivedAt > RINGING_MAX_AGE_MS) this.ringing.delete(id);
             this.ringing.set(incoming.callId, ringingCallOf(incoming, control, now));
-            const caller = this.friendList.get(incoming.callerId)?.name ?? this.store.getThread("user", incoming.callerId)?.name ?? "";
+            const caller =
+                this.friendList.get(incoming.callerId)?.name ?? this.store.getThread("user", incoming.callerId)?.name ?? incoming.displayName ?? "";
             const groupName = incoming.groupId ? this.store.getThread("group", incoming.groupId)?.name : undefined;
             this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
         } else if (CALL_ENDING_ACTS.has(control.act)) {

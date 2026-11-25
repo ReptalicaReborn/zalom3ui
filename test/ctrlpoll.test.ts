@@ -138,3 +138,28 @@ test("a call seen both ways rings once; an old one doesn't ring at all", () => {
     assert.equal(events.length, 1, "a ten-minute-old request (in seconds) is history");
     assert.match(session.callLog(), /call_too_old/);
 });
+
+test("an answer that only repeats controls already handed over hands over nothing and waits", async () => {
+    const control = { actionId: "1", controlId: "1", content: { act_type: "voip", act: "request", data: "{}" } };
+    const body = { status: 200, body: JSON.stringify({ error_code: 0, data: sealCbc(JSON.stringify({ data: { lastActionId: 5, controls: [control] } })) }) };
+    const slept: number[] = [];
+    const got: unknown[] = [];
+    const events: Record<string, unknown>[] = [];
+    const answers = [body, body];
+    const p = new ControlPoller({
+        servers: ["https://ctrl.example"],
+        secretKey: KEY,
+        apiVersion: 1,
+        apiType: 1,
+        holdSeconds: 30,
+        get: async () => answers.shift()!,
+        onControls: (c) => got.push(...c),
+        onEvent: (e) => events.push(e),
+        sleep: async (ms) => void slept.push(ms),
+    });
+    await p.pollOnce();
+    await p.pollOnce();
+    assert.equal(got.length, 1, "handed over once");
+    assert.equal(events[1].repeated, 1);
+    assert.ok(slept.includes(30_000), "waits before polling again");
+});

@@ -109,6 +109,15 @@ u32 (server id on ping and end call), **u16 command**, u8 sub-value. Payloads st
 | 5 echo | both | str16 |
 | 32 forward | both | sub-value picks str32 or str16 |
 
+A real incoming request (`voip` / `request`): `uidFrom` and `uidTo` are the 32-bit zrtc ids of caller and callee,
+`uidN` the caller's noised Zalo id, `callId` 32-bit, `session` a ~150-character base64url string, `rtpAddress` /
+`rtcpAddress` one media server (`ip:4200`), `codec` the caller's list (Opus 16 kHz mono, payload type 112, 20 ms
+frames), and `params` with `extendData` (call type, `packetMode: 2`, the caller's P2P candidates, `serverAddr` with
+IPv4/IPv6 media servers), `zrtc_config` (`srtpMode: 1`, no `srtpKey`, audio 16 kHz mono 20 kbit/s, packets up to
+1300 bytes) and `settings`. **SRTP key:** with no `srtpKey`, `CallController::parseCallConfig` takes the first
+`GetSrtpCryptoLengths(srtpMode)` = 30 characters of the session as the master key (16) + salt (14); mode 1 has a
+10-byte tag: AES_CM_128_HMAC_SHA1_80.
+
 What a call needs, all from Zalo's servers rather than from a handshake between the phones: the 32-bit zrtc ids
 (own, partner, call), the **session**, the media **servers** (`rtpAddress`/`rtcpAddress`, `servers`, `tcpServers`,
 `fallbackServers`, IPv6 variants), and the **SRTP key**. Zalo PC passes `srtpKey` unchanged to libsrtp as the
@@ -143,9 +152,15 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   Each control is announced once even if both channels carry it, and a call request over 2 minutes old is not
   announced (replayed history).
 - **Decline:** the call notification has **Decline**. Zalo PC has no separate decline request: its call program sends
-  signal 405, which becomes `/api/voicecall/cancel` with the other side's id (`callerId`), the call id and call type as
-  received, `status: 0` and the device id; the same request a caller sends to give up. The call log records
-  `declined` with Zalo's answer, or `decline_failed`. An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
+  signal 405 (`ZCallInfo::_processCancleCallJob`), which becomes `/api/voicecall/cancel` with the caller's noised id
+  (`uidN`) as `callerId`, the call id **as a number**, the call type (1 voice, 3 video: `extendData.callType` 0 or 1)
+  and `status: 0`; the same request a caller sends to give up. The first try sent the id as text and type 0: Zalo
+  answered but the caller kept ringing. Zalỏ now also sends `ringring` (signal 407, which Zalo PC sends as soon as a
+  call arrives) right before. The call log records `ringring`, then `declined` with Zalo's answer, or
+  `decline_failed`.
+- **Control poll:** only when the account's settings say Zalo PC would long-poll (`enable_ctrl_socket` off or
+  `disable_lp` off). On an account with both set the chat socket carried every call, and the poll answers kept
+  repeating the same backlog; repeats now make the poll wait 30 s. An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
   it goes away when the call is answered elsewhere, cancelled or ended.
 - **Call log:** every call event is appended to `call-trace.jsonl` in the server's data folder (2 MB, then rotated).
   *Settings → Call research → Share call log* exports it; *Clear call log* empties it. It holds call ids, user ids and

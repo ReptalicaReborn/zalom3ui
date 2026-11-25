@@ -26,7 +26,20 @@ export type IncomingCall = {
     group: boolean;
     groupId?: string;
     ts: number;
+    /** The caller's display name as the request carries it (`params.Dname`), for callers who aren't contacts. */
+    displayName?: string;
 };
+
+/** JSON text parsed (keeping long ids), an object passed through, anything else null. */
+export function jsonObject(value: unknown): Record<string, unknown> | null {
+    if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+    if (typeof value !== "string" || !value.trim().startsWith("{")) return null;
+    try {
+        return parseJsonKeepingBigInts(value) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+}
 
 /** First 4 bytes of a frame: version, command (little-endian u16), sub-command (same layout zca-js reads). */
 export function frameHeader(frame: Buffer): { version: number; cmd: number; subCmd: number } | null {
@@ -223,13 +236,18 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
     // Seconds or milliseconds.
     const ts = raw ? (raw < 1e12 ? raw * 1000 : raw) : now;
     const type = Number(text("callType", "type", "calltype"));
+    // A 1:1 request carries its details in `params`, and the call type (0 voice, 1 video) in `params.extendData`.
+    const params = jsonObject(d.params);
+    const extend = jsonObject(params?.extendData);
+    const displayName = typeof params?.Dname === "string" && params.Dname ? params.Dname : undefined;
     return {
         callId: text("callId", "call_id"),
         callerId,
-        video: type === 1 || text("isVideo") === "1" || d.isVideo === true,
+        video: type === 1 || Number(extend?.callType) === 1 || text("isVideo") === "1" || d.isVideo === true,
         group: control.act === "group_request",
         groupId: text("groupId", "gid") || undefined,
         ts,
+        ...(displayName ? { displayName } : {}),
     };
 }
 
