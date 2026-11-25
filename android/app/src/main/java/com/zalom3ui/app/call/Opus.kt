@@ -43,6 +43,8 @@ class OpusEncoder(sampleRate: Int = 16000, private val channels: Int = 1, bitrat
 
 class OpusDecoder(sampleRate: Int = 16000, private val channels: Int = 1) : AutoCloseable {
     private val frameSize = sampleRate / 50
+    /** Room for the longest Opus packet (120 ms), in case the other side sends frames longer than 20 ms. */
+    private val maxFrameSize = sampleRate * 120 / 1000
     private var handle: Long
 
     init {
@@ -50,11 +52,12 @@ class OpusDecoder(sampleRate: Int = 16000, private val channels: Int = 1) : Auto
         handle = nativeCreate(sampleRate, channels)
     }
 
-    /** Decodes one packet into one 20 ms frame; null = the packet was lost (packet-loss concealment). */
+    /** Decodes one packet (normally one 20 ms frame); null = the packet was lost (packet-loss concealment). */
     @Synchronized
     fun decode(packet: ByteArray?): ShortArray {
         check(handle != 0L) { "OpusDecoder is closed" }
-        return nativeDecode(handle, packet, frameSize, channels)
+        // Concealment makes exactly one 20 ms frame; a real packet decodes to however long it is.
+        return nativeDecode(handle, packet, if (packet == null) frameSize else maxFrameSize, channels)
     }
 
     @Synchronized
