@@ -117,8 +117,9 @@ export function mediaParamsOf(call: RingingCall): { server: string; userId: numb
 export const ZRTC_PLATFORM_PC = 2;
 
 /**
- * Our side's `extendData`, with the fields Zalo PC's `CallController::getExtendData` writes: the call type, platform,
- * packet / SRTP / congestion-control modes (as the caller asked), no P2P candidates, and the call's media server.
+ * Our side's `extendData`, with the fields Zalo PC's `CallController::getExtendData` writes: the call type (a video call
+ * stays one even answered without a camera, as Zalo PC's plain Accept does), platform, packet / SRTP / congestion-control
+ * modes (as the caller asked), no P2P candidates, the call's media server, and the video codec list.
  */
 export function ourExtendData(call: RingingCall): Record<string, unknown> {
     const params = jsonObject(call.data.params);
@@ -143,6 +144,9 @@ export function ourExtendData(call: RingingCall): Record<string, unknown> {
         supportCallBusy: 1,
         supportHevcDecode: 0,
         serverAddr: servers,
+        // Both official apps always list their video codec, voice calls included. Answering a video call without it
+        // crashed the caller's Android app; H.264 only (no HEVC), like supportHevcDecode says.
+        video: { codec: [{ name: "h264", payload: 97 }] },
     };
 }
 

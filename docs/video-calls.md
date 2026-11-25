@@ -31,6 +31,10 @@ From the arm64 `ZaloCall` (symbols, its own packet builders run in an emulator, 
 The call log now describes any video that arrives (`call_done` → `stats.video`: payload types, the type inside RED,
 H.264 NAL unit types), so answering one video call confirms the RED/H.264 layout before any of the code below.
 
+Answering a video call (voice only) first crashed the caller's official Android app: our `extendData` said call
+type 1 but had no `video` codec list, which both official apps always send, voice calls included. It now always lists
+H.264 (payload 97).
+
 ## Plan
 
 | Step | Where | What |

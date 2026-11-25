@@ -612,7 +612,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             }
             try {
                 const answer = await acceptCall(send, call, p.server);
-                this.callTrace.record({ kind: "answered", callId, answer, test: testSeconds !== undefined });
+                this.callTrace.record({ kind: "answered", callId, answer, video: call.video, test: testSeconds !== undefined });
             } catch (err) {
                 media.close();
                 this.callTrace.record({ kind: "answer_failed", callId, error: describeError(err) });

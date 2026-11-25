@@ -69,6 +69,7 @@ test("declining is an answer with status 3, as Zalo PC's call program sends it",
         assert.equal(ours.platform, 2, "Zalo PC's platform");
         assert.deepEqual(ours.p2p, [], "never the caller's own addresses");
         assert.deepEqual(ours.serverAddr, [{ rtp: "192.0.2.10:4200", rtcp: "192.0.2.10:4200" }]);
+        assert.deepEqual(ours.video, { codec: [{ name: "h264", payload: 97 }] }, "always, as the official apps send it");
         sent.length = 0;
         await ringRing(async (endpoint, params) => void sent.push([endpoint, params]), call, "imei-1");
         assert.deepEqual(sent, [["ringring", { callerId: "4459000000000000001", callId: 321000003, status: 0, imei: "imei-1" }]]);

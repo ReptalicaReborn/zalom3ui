@@ -165,6 +165,7 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   control with status 3. Two earlier tries used `/api/voicecall/cancel` (the caller giving up): Zalo accepted it but
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
+- **Voice calls work** (answered in Zalỏ, both sides hear each other through Zalo's own media servers).
 - **Answer:** the incoming call is a proper call notification (`CallStyle`, full screen on the lock screen) with
   Answer and Decline. Answer asks for the microphone, opens the call screen and picks up the way Zalo PC does:
   `ringring`, join the call's media server over UDP (init call, command 12, with the request's `uidTo` / `uidFrom` /
