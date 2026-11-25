@@ -23,9 +23,11 @@ import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -96,14 +98,69 @@ fun App(vm: AppViewModel) {
 private fun AppNav(vm: AppViewModel) {
     val nav = rememberNavController()
     val context = LocalContext.current
+
+    val configuration = LocalConfiguration.current
+    // Tablets (not phones turned sideways) show the chat list and the open chat side by side, like Telegram.
+    val wide = configuration.smallestScreenWidthDp >= 600 && configuration.screenWidthDp >= 700
+    val wideNow by rememberUpdatedState(wide)
+
+    /** Shows the chat the view model just opened: beside the list on a tablet, as its own screen on a phone. */
+    fun goToChat() {
+        nav.popBackStack(Routes.HOME, inclusive = false)
+        if (!wideNow) nav.navigate(Routes.CHAT)
+    }
+
+    /** What the chat screen can do, for the phone screen and the tablet pane alike. */
+    fun chatActions(chat: ChatState, onBack: () -> Unit) =
+        ChatActions(
+            onBack = onBack,
+            onSend = { text, quote, mentioned, onSent -> vm.send(text, quote, mentioned, onSent) },
+            onStartTyping = vm::notifyTyping,
+            onLoadMembers = vm::loadMembers,
+            onLoadEarlier = vm::loadEarlier,
+            onReact = vm::toggleReaction,
+            onRecall = { vm.recall(it) },
+            onDelete = { vm.deleteForMe(it) },
+            onForward = { msg ->
+                vm.select(msg)
+                nav.navigate(Routes.FORWARD)
+            },
+            onPin = { vm.setPinned(chat.ref, it) },
+            onMute = { vm.setMuted(chat.ref, it) },
+            onMarkUnread = {
+                vm.markUnread(chat.ref)
+                if (wideNow) vm.closeChat(chat.ref) else nav.popBackStack(Routes.HOME, inclusive = false)
+            },
+            onDeleteConversation = { vm.deleteConversation(chat.ref) },
+            onSendFiles = vm::sendFiles,
+            onSearchStickers = vm::searchStickers,
+            onSendSticker = vm::sendSticker,
+            onShowMembers = { nav.navigate(Routes.MEMBERS) },
+            onAddMembers = { nav.navigate(Routes.ADD_MEMBERS) },
+            onRenameGroup = vm::renameGroup,
+            onLeaveGroup = { silent ->
+                vm.leaveGroup(silent) {
+                    vm.closeChat(chat.ref)
+                    nav.popBackStack(Routes.HOME, inclusive = false)
+                }
+            },
+        )
     // A tapped notification: open its chat once the chat list knows it.
     val openState by vm.state.collectAsStateWithLifecycle()
     LaunchedEffect(openState.openRequest, openState.threads) {
         if (openState.openRequest == null) return@LaunchedEffect
         val thread = vm.consumeOpenRequest() ?: return@LaunchedEffect
         vm.openChat(thread)
-        nav.popBackStack(Routes.HOME, inclusive = false)
-        nav.navigate(Routes.CHAT)
+        goToChat()
+    }
+    // Turning a tablet (or resizing a window) moves an open chat between its own screen and the pane.
+    LaunchedEffect(wide) {
+        val route = nav.currentDestination?.route
+        if (wide && route == Routes.CHAT) {
+            nav.popBackStack(Routes.HOME, inclusive = false)
+        } else if (!wide && route == Routes.HOME && vm.state.value.chat != null) {
+            nav.navigate(Routes.CHAT)
+        }
     }
 
     NavHost(
@@ -138,12 +195,26 @@ private fun AppNav(vm: AppViewModel) {
                     onRetry = vm::retryLogin,
                     onSettings = { nav.navigate(Routes.SETTINGS) },
                 )
-                else -> ThreadListScreen(
+                else -> TwoPaneHome(
+                    wide = wide,
+                    chat = state.chat,
+                    onCloseChat = { vm.closeChat() },
+                    chatPane = { chat ->
+                        ChatScreen(
+                            chat = chat,
+                            thread = state.threads.firstOrNull { it.ref == chat.ref },
+                            typing = state.typing[chat.ref.key],
+                            stickers = state.stickers,
+                            actions = chatActions(chat, onBack = { vm.closeChat(chat.ref) }),
+                        )
+                    },
+                ) { selectedKey -> ThreadListScreen(
                     state = state,
+                    selectedKey = selectedKey,
                     actions = ThreadListActions(
                         onOpen = { thread ->
                             vm.openChat(thread)
-                            nav.navigate(Routes.CHAT)
+                            if (!wideNow) nav.navigate(Routes.CHAT)
                         },
                         onNewChat = { nav.navigate(Routes.NEW_CHAT) },
                         onReconnect = vm::reconnectZalo,
@@ -155,7 +226,7 @@ private fun AppNav(vm: AppViewModel) {
                         onMarkUnread = { vm.markUnread(it.ref) },
                         onDelete = { vm.deleteConversation(it.ref) },
                     ),
-                )
+                ) }
             }
         }
         composable(Routes.NEW_CHAT) {
@@ -167,8 +238,7 @@ private fun AppNav(vm: AppViewModel) {
                 onBack = { nav.popBackStack() },
                 onPick = { thread ->
                     vm.openChat(thread)
-                    nav.popBackStack()
-                    nav.navigate(Routes.CHAT)
+                    goToChat()
                 },
                 actions = listOf(
                     PickerAction("New group", Icons.Outlined.GroupAdd) { nav.navigate(Routes.NEW_GROUP) },
@@ -197,8 +267,7 @@ private fun AppNav(vm: AppViewModel) {
                     vm.createGroup(name, ids) { thread ->
                         busy = false
                         vm.openChat(thread)
-                        nav.popBackStack(Routes.HOME, inclusive = false)
-                        nav.navigate(Routes.CHAT)
+                        goToChat()
                     }
                 },
             )
@@ -223,8 +292,7 @@ private fun AppNav(vm: AppViewModel) {
                 onUndo = vm::undoFriendRequest,
                 onMessage = { user ->
                     vm.openUserChat(user)
-                    nav.popBackStack(Routes.HOME, inclusive = false)
-                    nav.navigate(Routes.CHAT)
+                    goToChat()
                 },
             )
         }
@@ -240,8 +308,7 @@ private fun AppNav(vm: AppViewModel) {
                 onOpen = { member ->
                     val existing = state.threads.firstOrNull { it.kind == "user" && it.id == member.id }
                     vm.openChat(existing ?: com.zalom3ui.app.data.ThreadSummary(id = member.id, kind = "user", name = member.name))
-                    nav.popBackStack(Routes.HOME, inclusive = false)
-                    nav.navigate(Routes.CHAT)
+                    goToChat()
                 },
                 onRemove = vm::removeMember,
             )
@@ -276,7 +343,7 @@ private fun AppNav(vm: AppViewModel) {
             LaunchedEffect(entry) {
                 val ref = vm.state.value.chat?.ref
                 entry.lifecycle.addObserver(LifecycleEventObserver { _, event ->
-                    if (event == Lifecycle.Event.ON_DESTROY) vm.closeChat(ref)
+                    if (event == Lifecycle.Event.ON_DESTROY && !wideNow) vm.closeChat(ref)
                 })
             }
             val chat = state.chat
@@ -288,39 +355,7 @@ private fun AppNav(vm: AppViewModel) {
                     thread = state.threads.firstOrNull { it.ref == chat.ref },
                     typing = state.typing[chat.ref.key],
                     stickers = state.stickers,
-                    actions = ChatActions(
-                        onBack = { nav.popBackStack() },
-                        onSend = { text, quote, mentioned, onSent -> vm.send(text, quote, mentioned, onSent) },
-                        onStartTyping = vm::notifyTyping,
-                        onLoadMembers = vm::loadMembers,
-                        onLoadEarlier = vm::loadEarlier,
-                        onReact = vm::toggleReaction,
-                        onRecall = { vm.recall(it) },
-                        onDelete = { vm.deleteForMe(it) },
-                        onForward = { msg ->
-                            vm.select(msg)
-                            nav.navigate(Routes.FORWARD)
-                        },
-                        onPin = { vm.setPinned(chat.ref, it) },
-                        onMute = { vm.setMuted(chat.ref, it) },
-                        onMarkUnread = {
-                            vm.markUnread(chat.ref)
-                            nav.popBackStack(Routes.HOME, inclusive = false)
-                        },
-                        onDeleteConversation = { vm.deleteConversation(chat.ref) },
-                        onSendFiles = vm::sendFiles,
-                        onSearchStickers = vm::searchStickers,
-                        onSendSticker = vm::sendSticker,
-                        onShowMembers = { nav.navigate(Routes.MEMBERS) },
-                        onAddMembers = { nav.navigate(Routes.ADD_MEMBERS) },
-                        onRenameGroup = vm::renameGroup,
-                        onLeaveGroup = { silent ->
-                            vm.leaveGroup(silent) {
-                                vm.closeChat(chat.ref)
-                                nav.popBackStack(Routes.HOME, inclusive = false)
-                            }
-                        },
-                    ),
+                    actions = chatActions(chat, onBack = { nav.popBackStack() }),
                 )
             }
         }

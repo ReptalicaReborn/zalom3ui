@@ -679,7 +679,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         fun sortThreads(threads: List<ThreadSummary>): List<ThreadSummary> =
-            threads.sortedWith(compareByDescending<ThreadSummary> { it.pinned }.thenByDescending { it.lastMessage?.ts ?: 0 })
+            threads.sortedWith(compareByDescending<ThreadSummary> { it.pinned }.thenByDescending { it.lastMessage?.ts ?: 0L })
     }
 }
 

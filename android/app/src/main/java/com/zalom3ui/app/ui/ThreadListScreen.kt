@@ -2,6 +2,7 @@ package com.zalom3ui.app.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -90,7 +91,7 @@ private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ThreadListScreen(state: UiState, actions: ThreadListActions) {
+fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: String? = null) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     var menuFor by remember { mutableStateOf<String?>(null) }
@@ -187,6 +188,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions) {
                     items(chatHits, key = { it.key }) { thread ->
                         ConversationRow(
                             thread = thread,
+                            selected = thread.key == selectedKey,
                             typing = state.typing[thread.key],
                             menuOpen = false,
                             onClick = { actions.onOpen(thread) },
@@ -223,6 +225,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions) {
                     items(pinned, key = { it.key }) { thread ->
                         ConversationRow(
                             thread = thread,
+                            selected = thread.key == selectedKey,
                             typing = state.typing[thread.key],
                             menuOpen = menuFor == thread.key,
                             onClick = { actions.onOpen(thread) },
@@ -236,6 +239,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions) {
                 items(others, key = { it.key }) { thread ->
                     ConversationRow(
                         thread = thread,
+                        selected = thread.key == selectedKey,
                         typing = state.typing[thread.key],
                         menuOpen = menuFor == thread.key,
                         onClick = { actions.onOpen(thread) },
@@ -331,6 +335,8 @@ private fun OverflowMenu(hasUnread: Boolean, onMarkAllRead: () -> Unit, onSettin
 @Composable
 private fun ConversationRow(
     thread: ThreadSummary,
+    /** The chat open beside the list (tablets). */
+    selected: Boolean = false,
     typing: TypingInfo?,
     menuOpen: Boolean,
     onClick: () -> Unit,
@@ -345,6 +351,7 @@ private fun ConversationRow(
         Row(
             Modifier
                 .fillMaxWidth()
+                .background(if (selected) colors.surfaceContainerHighest else Color.Transparent)
                 .combinedClickable(onClick = onClick, onLongClick = onLongClick)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
