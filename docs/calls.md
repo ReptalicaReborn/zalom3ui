@@ -77,17 +77,45 @@ servers in the call request rather than from a handshake between the phones, so 
 only the packet format and the start-up exchange with the media server (`_sendRequestInitZRTPToServer`, ping, echo,
 P2P binding, TCP fallback).
 
-First look at the packet format (`zrtc::ZRTPPacket::_buildPacketInternal`, arm64; tentative):
+### zrtc packets (mapped)
 
-- Byte 0 is the packet kind.
-- Kinds 3, 5, 7, 13, 15 (media): kind, a 32-bit value (the stream's token or SSRC), then the payload.
-- Kind 1 (control): kind, a byte, four 32-bit values, a 16-bit command, a byte, then a body that depends on the
-  command (commands up to 51).
-- Kind 0x7f: peer-to-peer packets (binding request/response, echo, signal).
-- Multi-byte fields are written in the machine's (little-endian) order.
+Worked out from Zalo PC's call program (arm64) and checked by running its own packet functions in an emulator:
+`src/zrtc.ts` builds and parses them, and `test/zrtc.test.ts` holds byte strings that the official functions
+produced. Numbers are little-endian; strings carry a 16-bit length (some forwards use 32-bit).
 
-The call log of a real call shows the request's data (media servers, session, key), which turns these into a working
-start-up exchange.
+Byte 0 is the kind:
+
+| Kind | From | Layout |
+|---|---|---|
+| 1 request | client (and server, for forward/echo) | 21-byte control header + body |
+| 2 response | media server | 21-byte control header + body |
+| 3 audio | client | `03`, u32 stream token, SRTP-protected RTP |
+| 4 / 5 audio | server | `04` + RTP, or `05`, u32 token, RTP |
+| 7 audio FEC | both | client: `07` + token + data; server: `07` + data |
+| 13 / 14 / 15 video | client / server / server | like audio |
+| 0x7f P2P | other phone | `7f`, u8, u8, u32 sender, u16 command, … (binding, echo, direct media) |
+
+Control header: kind (u8), flag (u8: `7e` on init/end call, `01` on the rest), u32, u32, **u32 own zrtc user id**,
+u32 (server id on ping and end call), **u16 command**, u8 sub-value. Payloads stop at 1400 bytes.
+
+| Command | Sent by | Body |
+|---|---|---|
+| 11 init call (caller) | client | u32 call id, u32 partner id, str16 session; sub = attempt (1, then 2) |
+| 12 init call (person called) | client | same + str16 extra (empty at first) |
+| 11/12 response | server | u32 error; if 0: u32, u32, str16 our address as the server sees it (for P2P) |
+| 2 ping | client | str16 session; user id + server id in the header |
+| 3 end call | client | u32 call id; response: u32 error |
+| 14 change address | client | str16; response: u32 error |
+| 5 echo | both | str16 |
+| 32 forward | both | sub-value picks str32 or str16 |
+
+What a call needs, all from Zalo's servers rather than from a handshake between the phones: the 32-bit zrtc ids
+(own, partner, call), the **session**, the media **servers** (`rtpAddress`/`rtcpAddress`, `servers`, `tcpServers`,
+`fallbackServers`, IPv6 variants), and the **SRTP key**. Zalo PC passes `srtpKey` unchanged to libsrtp as the
+master key + salt, the same key for both directions (each stream is told apart by its SSRC), with `srtpMode` as the
+crypto suite (1 or 2: AES-128 counter mode with an HMAC-SHA1 tag). That is plain RFC 3711 SRTP. Other request
+fields the call program reads: `session`, `sessionId`, `srtpMode`, `srtpNoSeq`, `srtpRTCP`, `packetMode`,
+`protocol`, `p2pAddress`, `partnerIP`, `platform`, `codec`, `extendData`, `forceTCP`.
 
 Getting audio to flow means reimplementing that network layer (how a call connects to Zalo's media relays, the packet
 format, how the SRTP keys are agreed) and feeding it from an Android audio pipeline (Opus, echo cancellation).
