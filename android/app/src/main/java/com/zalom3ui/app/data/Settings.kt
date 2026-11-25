@@ -73,7 +73,22 @@ class SettingsStore(context: Context) {
         return token
     }
 
+    /**
+     * Loopback port of this install's on-phone server, picked at random once. A fixed port would clash with another app
+     * that runs the same server (Zalo Lite uses 38123): the UI would then talk to that app's server, which refuses our
+     * token, and ours could not start.
+     */
+    fun localPort(): Int {
+        prefs.getInt(KEY_LOCAL_PORT, 0).takeIf { it in LOCAL_PORT_RANGE }?.let { return it }
+        val port = LOCAL_PORT_RANGE.first + SecureRandom().nextInt(LOCAL_PORT_RANGE.last - LOCAL_PORT_RANGE.first + 1)
+        // commit, not apply: the server process reads this from disk right after.
+        prefs.edit().putInt(KEY_LOCAL_PORT, port).commit()
+        return port
+    }
+
     private companion object {
+        val LOCAL_PORT_RANGE = 40000..59999
+        const val KEY_LOCAL_PORT = "local_port"
         const val KEY_ON_DEVICE = "on_device"
         const val KEY_URL = "server_url"
         const val KEY_TOKEN = "token"

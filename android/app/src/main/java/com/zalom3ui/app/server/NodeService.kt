@@ -43,7 +43,7 @@ class NodeService : Service() {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             scope.launch {
-                runCatching { ApiClient(LocalServer.URL, SettingsStore(this@NodeService).localToken()).retry() }
+                runCatching { ApiClient(LocalServer.url(this@NodeService), SettingsStore(this@NodeService).localToken()).retry() }
             }
         }
     }
@@ -87,7 +87,7 @@ class NodeService : Service() {
 
             val dataDir = File(filesDir, "zalo").apply { mkdirs() }
             Os.setenv("HOST", "127.0.0.1", true)
-            Os.setenv("PORT", LocalServer.PORT.toString(), true)
+            Os.setenv("PORT", LocalServer.port(this).toString(), true)
             Os.setenv("ACCESS_TOKEN", SettingsStore(this).localToken(), true)
             Os.setenv("DATA_DIR", dataDir.absolutePath, true)
             Os.setenv("HOME", filesDir.absolutePath, true)

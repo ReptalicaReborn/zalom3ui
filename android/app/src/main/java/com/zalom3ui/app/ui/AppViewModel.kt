@@ -507,7 +507,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun rebuildClient() {
         val settings = _state.value.settings
         client = when {
-            settings.onDevice -> ApiClient(LocalServer.URL, settingsStore.localToken())
+            settings.onDevice -> ApiClient(LocalServer.url(getApplication()), settingsStore.localToken())
             settings.isConfigured -> ApiClient(settings.serverUrl, settings.token.ifBlank { null })
             else -> null
         }

@@ -43,7 +43,7 @@ class MessageNotifier(private val context: Context) {
         scope.launch {
             while (isActive) {
                 try {
-                    val api = ApiClient(LocalServer.URL, SettingsStore(context).localToken())
+                    val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
                     api.events().collect { onEvent(it) }
                 } catch (e: CancellationException) {
                     throw e
@@ -184,7 +184,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val api = ApiClient(LocalServer.URL, SettingsStore(context).localToken())
+                val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
                 if (intent.action == ACTION_REPLY && !text.isNullOrEmpty()) api.send(ref.kind, ref.id, text)
                 // Replying reads the chat, as in the official app; the server's "read" event removes the notification.
                 api.markRead(ref.kind, ref.id)
