@@ -96,19 +96,23 @@ internal class CameraGl(private val encoderSurface: Surface) {
     }
 
     /**
-     * Draws the latest [SurfaceTexture] frame. [camWidth] x [camHeight] is the camera buffer size, [rotation] the clockwise
-     * degrees that make it upright, [mirrorPreview] flips the self-view like a mirror (front camera).
+     * Draws the latest [SurfaceTexture] frame. The texture's own transform already turns the camera picture upright for
+     * the device's natural orientation (and mirrors a front camera): Camera2 sets that buffer transform from the sensor
+     * orientation. [camWidth] x [camHeight] is the picture's size in that natural orientation, [rotation] the clockwise
+     * degrees that make it upright on the screen as it's turned now. For a [frontCamera] the texture's mirror is undone
+     * first, in the texture's own orientation (undoing it after a 90° turn would flip the picture upside down instead):
+     * the video we send is unmirrored, and the self-view is then mirrored on screen like a selfie.
      */
-    fun draw(texture: SurfaceTexture, camWidth: Int, camHeight: Int, rotation: Int, mirrorPreview: Boolean, outWidth: Int, outHeight: Int) {
+    fun draw(texture: SurfaceTexture, camWidth: Int, camHeight: Int, rotation: Int, frontCamera: Boolean, outWidth: Int, outHeight: Int) {
         val st = FloatArray(16)
         texture.getTransformMatrix(st)
-        drawTo(encoderEgl, st, camWidth, camHeight, rotation, outWidth, outHeight, mirror = false, cover = false, nanos = texture.timestamp)
+        drawTo(encoderEgl, st, camWidth, camHeight, rotation, outWidth, outHeight, frontCamera, mirror = false, cover = false, nanos = texture.timestamp)
         if (previewEgl != EGL14.EGL_NO_SURFACE) {
             EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_WIDTH, size, 0)
             val w = size[0]
             EGL14.eglQuerySurface(display, previewEgl, EGL14.EGL_HEIGHT, size, 0)
             val h = size[0]
-            if (w > 0 && h > 0) drawTo(previewEgl, st, camWidth, camHeight, rotation, w, h, mirrorPreview, cover = true, nanos = 0)
+            if (w > 0 && h > 0) drawTo(previewEgl, st, camWidth, camHeight, rotation, w, h, frontCamera, mirror = frontCamera, cover = true, nanos = 0)
             // The encoder's surface stays current between frames.
             makeCurrent(encoderEgl)
         }
@@ -122,6 +126,7 @@ internal class CameraGl(private val encoderSurface: Surface) {
         rotation: Int,
         w: Int,
         h: Int,
+        unmirrorTexture: Boolean,
         mirror: Boolean,
         cover: Boolean,
         nanos: Long,
@@ -140,6 +145,8 @@ internal class CameraGl(private val encoderSurface: Surface) {
         Matrix.setIdentityM(model, 0)
         Matrix.scaleM(model, 0, scale, scale, 1f)
         Matrix.rotateM(model, 0, -rotation.toFloat(), 0f, 0f, 1f)
+        // Undo the front camera's mirror in the texture's own (natural) orientation, before the turn.
+        if (unmirrorTexture) Matrix.scaleM(model, 0, -1f, 1f, 1f)
         Matrix.scaleM(model, 0, camWidth / 2f, camHeight / 2f, 1f)
         Matrix.multiplyMM(mvp, 0, proj, 0, model, 0)
         if (mirror) {

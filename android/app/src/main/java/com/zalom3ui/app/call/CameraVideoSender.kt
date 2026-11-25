@@ -35,7 +35,9 @@ import kotlin.math.abs
  *   The camera captures 640x480 (sensor shape). If the phone is turned sideways the picture is rotated to stay upright
  *   and gets black bars.
  * - Constrained baseline, CBR, 500 kbit/s, 15 fps, key frame every 2 s and on [requestKeyFrame].
- * - The front camera is sent as the camera sees it (not mirrored); only the self-view is mirrored.
+ * - The front camera is sent as the camera sees it (not mirrored); only the self-view is mirrored. Camera2 hands the
+ *   texture over already rotated for the sensor and mirrored for a front camera, so only the screen's rotation and the
+ *   mirror are undone here.
  *
  * Needs the CAMERA permission already granted. [onFrame] and [onError] run on worker threads.
  */
@@ -234,15 +236,22 @@ class CameraVideoSender(
         if (!running || st !== texture) return
         try {
             st.updateTexImage()
-            g.draw(st, camSize.width, camSize.height, rotation(), mirrorPreview = front, outWidth = OUT_W, outHeight = OUT_H)
+            // The texture comes already turned by the sensor orientation: its upright size swaps for a 90°/270° sensor.
+            val turnedSensor = sensorOrientation % 180 == 90
+            val w = if (turnedSensor) camSize.height else camSize.width
+            val h = if (turnedSensor) camSize.width else camSize.height
+            // Front camera: the texture is mirrored; the video we send isn't (as other apps send it), the self-view is.
+            g.draw(st, w, h, rotation(), frontCamera = front, outWidth = OUT_W, outHeight = OUT_H)
         } catch (e: Exception) {
             fail("Camera drawing failed: ${e.message}")
         }
     }
 
     /**
-     * Clockwise degrees that make the camera buffer upright in the real world. The display rotation is the screen's
-     * rotation against the phone's natural position, so the phone itself is turned the other way.
+     * Clockwise degrees that make the (already sensor-corrected) texture upright on the screen as it's turned now, which
+     * is upright in the real world since the call screen follows the device. Only the display rotation is left to undo:
+     * Camera2 applies the sensor orientation itself for SurfaceTexture outputs (rotating by it again turned the picture
+     * 90° on a real call, from a tablet whose front camera sits on the long edge).
      */
     private fun rotation(): Int {
         val display = app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
@@ -252,7 +261,7 @@ class CameraVideoSender(
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-        return if (front) (sensorOrientation - d + 360) % 360 else (sensorOrientation + d) % 360
+        return (360 - d) % 360
     }
 
     @SuppressLint("MissingPermission") // checked in start()
