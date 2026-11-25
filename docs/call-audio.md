@@ -72,6 +72,15 @@ WebSocket `ws://127.0.0.1:<port>/ws/call-audio?token=<local token>` (same port a
 The server sends the other side's audio already decrypted (just the Opus payload). The socket is open only while a
 call is connected; the server closes it when the call ends.
 
+Video uses the same socket (docs/video-calls.md):
+
+| Direction | Bytes |
+|---|---|
+| server → app | `03`, u8 flags (bit 0: key frame), u32 RTP timestamp (90 kHz, big-endian), H.264 access unit in Annex B (start codes; SPS/PPS in front of every key frame) |
+| app → server | `04`, u8 flags (bit 0: key frame), H.264 access unit in Annex B (SPS/PPS in front of every key frame) |
+| server → app | `05`: the other side asked for a key frame (RTCP PLI / FIR): encode one now |
+| app → server | `06`: our decoder needs a key frame (start, or a decode error): the server sends a PLI |
+
 ## 4. Call API (server, under `/api`)
 
 | Request | Does |
@@ -80,12 +89,16 @@ call is connected; the server closes it when the call ends.
 | `POST /calls/:callId/decline` | Declines (exists) |
 | `POST /calls/hangup` | Ends the connected call. 204 |
 | `GET /calls/current` | `{callId, callerId, callerName, video, state: "connecting" \| "connected", connectedAt}` or 404 |
+| `POST /calls/mute` | `{muted}`: tells the other side (the app silences the microphone itself) |
+| `POST /calls/camera` | `{on}`: tells the other side our camera is on / off (`/api/voicecall/conf`); the app starts / stops sending video |
 
 Events on the existing `/ws` socket, `{"type":"call","call":{…}}`:
 
 - `{"type":"incoming","call":{callId, callerId, callerName, video, group, groupId?, ts}}` (exists)
 - `{"type":"connected","callId","callerId","callerName","video","connectedAt"}` (new)
 - `{"type":"ended","callId","act"}` (exists; `act` says why: `"endcall"`, `"cancel"`, `"declined"`, `"hangup"`…)
+- `{"type":"peer","callId","cameraOn","muted"}` (new): the other side turned its camera / microphone on or off
+  (`voip` controls `onoff_camera`, `params.type` 0 = off, and `mute_audio`, 1 = muted)
 
 ## 5. Screens (`com.zalom3ui.app.ui.call`)
 

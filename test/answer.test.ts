@@ -100,9 +100,9 @@ test("answering joins the media server, answers, carries audio both ways, and en
     await new Promise((r) => setTimeout(r, 10));
     assert.deepEqual(sent.at(-1), ["conf", { calleeId: "4459000000000000001", callId: 321000003, isOnCam: -1, isOnMic: 1, data: "" }]);
 
-    session.onCallControl({ act: "endcall", data: { callId: "321000003" }, raw: {} });
-    assert.equal(session.currentCall(), null);
-    assert.deepEqual(events.at(-1), { type: "ended", callId: "321000003", act: "endcall" });
+    session.onCallControl({ act: "end_call", data: { callId: "321000003" }, raw: {} });
+    assert.equal(session.currentCall(), null, "end_call (with the underscore) ends it too");
+    assert.deepEqual(events.at(-1), { type: "ended", callId: "321000003", act: "end_call" });
     assert.ok(!sent.some(([e]) => e === "endcall"), "the caller hung up: nothing to send");
     media.close();
 });

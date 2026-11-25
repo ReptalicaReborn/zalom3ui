@@ -255,7 +255,19 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
 export const RINGING_MAX_AGE_MS = 2 * 60_000;
 
 /** Acts after which a ringing call is over (answered elsewhere, cancelled, ended). */
-export const CALL_ENDING_ACTS = new Set(["answer", "cancel", "endcall", "group_answer", "group_cancel", "group_endcall", "group_finish"]);
+export const CALL_ENDING_ACTS = new Set([
+    "answer",
+    "cancel",
+    "endcall",
+    // Also seen as these (the Zalos project's engine handles all of them as the end of a call).
+    "end_call",
+    "reject",
+    "busy",
+    "group_answer",
+    "group_cancel",
+    "group_endcall",
+    "group_finish",
+]);
 
 const TRACE_MAX_BYTES = 2 * 1024 * 1024;
 

@@ -49,7 +49,7 @@ H.264 (payload 97).
 
 | Step | Where | What |
 |---|---|---|
-| V0 | — | Answer a video call (voice only for now) and share the call log: confirms RED 118 / H.264 97, SSRCs, NAL types. |
+| V0 | — | Answer a video call (voice only for now) and share the call log: confirms payload types 97/98, SSRCs, first-byte types. |
 | V1 | server | Receive: kind 14 → SRTP → Zalo's frame assembler (pt 97/98, `1c` chunks, marker, reorder) → whole access units (Annex B, timestamp, key-frame flag) to the app over the call socket (new message type `03`). RTCP PLI when video starts or a frame is lost, NACK for missing sequence numbers. |
 | V2 | app | Decode with `MediaCodec` (`video/avc`, hardware) onto a `SurfaceView`; the call screen shows the other side full screen. |
 | V3 | app | Camera: CameraX/Camera2 into a `MediaCodec` H.264 encoder (Surface input, constrained baseline, 640×480 or 360p, 15–24 fps, 300–800 kbit/s, key frame every ~2 s and on request); access units to the server (`04`); small self-view. |
