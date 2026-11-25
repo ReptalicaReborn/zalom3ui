@@ -14,7 +14,13 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Shapes
+import androidx.compose.material3.Typography
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import com.zalom3ui.app.data.Appearance
+import com.zalom3ui.app.data.ColorTheme
 import com.zalom3ui.app.data.ThemeMode
 
 // A calm messenger look: plain white (or near-black) surfaces, one strong blue for actions and your own bubbles.
@@ -82,6 +88,80 @@ private val DarkColors = darkColorScheme(
     surfaceContainerHighest = Color(0xFF333336),
 )
 
+// "ReptDoc gold": the dark warm palette of the diyhrtvn site. A dark-only theme.
+private val GoldBg = Color(0xFF14120F)
+private val GoldSurface = Color(0xFF1A1714)
+private val GoldSurface2 = Color(0xFF221E1A)
+private val GoldLine = Color(0xFF2E2923)
+private val GoldLine2 = Color(0xFF3D362E)
+private val GoldInk = Color(0xFFEAE1D9)
+private val GoldInk2 = Color(0xFFC9C0B5)
+private val GoldMuted = Color(0xFF8C8378)
+private val Gold = Color(0xFFE6C275)
+private val GoldOn = Color(0xFF1A1206)
+private val GoldSoft = Color(0xFF2A2419) // rgba(230,194,117,0.1) over the base, flattened
+private val GoldWarn = Color(0xFFE07A5F)
+
+private val GoldColors = darkColorScheme(
+    primary = Gold,
+    onPrimary = GoldOn,
+    primaryContainer = GoldSoft,
+    onPrimaryContainer = Gold,
+    secondary = GoldInk2,
+    onSecondary = GoldOn,
+    secondaryContainer = GoldSurface2,
+    onSecondaryContainer = GoldInk,
+    tertiary = Color(0xFFD9A98B),
+    onTertiary = GoldOn,
+    tertiaryContainer = GoldSurface2,
+    onTertiaryContainer = GoldInk,
+    error = GoldWarn,
+    onError = Color(0xFF2B0E06),
+    errorContainer = Color(0xFF4A2218),
+    onErrorContainer = Color(0xFFFFDAD0),
+    background = GoldBg,
+    onBackground = GoldInk,
+    surface = GoldBg,
+    onSurface = GoldInk,
+    surfaceVariant = GoldSurface2,
+    onSurfaceVariant = GoldMuted,
+    outline = GoldLine2,
+    outlineVariant = GoldLine,
+    surfaceContainerLowest = Color(0xFF0F0D0B),
+    surfaceContainerLow = GoldSurface,
+    surfaceContainer = GoldSurface,
+    surfaceContainerHigh = GoldSurface2,
+    surfaceContainerHighest = Color(0xFF2A2520),
+)
+
+// 14dp corners like the site; buttons stay pills.
+private val GoldShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(10.dp),
+    medium = RoundedCornerShape(14.dp),
+    large = RoundedCornerShape(18.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+)
+
+// Rounder than the Material defaults so cards, dialogs and FABs feel softer in every theme.
+private val AppShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(32.dp),
+)
+
+/** Titles get heavier weights, so the hierarchy reads at a glance. */
+private fun emphasizedTypography(base: Typography) = base.copy(
+    headlineLarge = base.headlineLarge.copy(fontWeight = FontWeight.SemiBold),
+    headlineMedium = base.headlineMedium.copy(fontWeight = FontWeight.SemiBold),
+    headlineSmall = base.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
+    titleLarge = base.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+    titleMedium = base.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+    labelLarge = base.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+)
+
 private val OutgoingBlue = Color(0xFF2C67E8)
 
 /** Colors of the conversation screen that Material's color scheme has no slot for. */
@@ -108,7 +188,7 @@ val LocalChatColors = staticCompositionLocalOf {
 
 /** Whether the app is drawn dark, from the theme setting or the system. */
 @Composable
-fun isAppInDarkTheme(appearance: Appearance): Boolean = when (appearance.themeMode) {
+fun isAppInDarkTheme(appearance: Appearance): Boolean = if (appearance.colorTheme == ColorTheme.GOLD) true else when (appearance.themeMode) {
     ThemeMode.SYSTEM -> isSystemInDarkTheme()
     ThemeMode.LIGHT -> false
     ThemeMode.DARK -> true
@@ -117,15 +197,25 @@ fun isAppInDarkTheme(appearance: Appearance): Boolean = when (appearance.themeMo
 @Composable
 fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> Unit) {
     val dark = isAppInDarkTheme(appearance)
-    val dynamic = appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    val gold = appearance.colorTheme == ColorTheme.GOLD
+    val dynamic = !gold && appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val context = LocalContext.current
     val colors: ColorScheme = when {
+        gold -> GoldColors
         dynamic && dark -> dynamicDarkColorScheme(context)
         dynamic -> dynamicLightColorScheme(context)
         dark -> DarkColors
         else -> LightColors
     }
     val chat = when {
+        gold -> ChatColors(
+            background = GoldBg,
+            outgoing = Gold,
+            onOutgoing = GoldOn,
+            incoming = GoldSurface2,
+            onIncoming = GoldInk,
+            dark = true,
+        )
         dynamic -> ChatColors(
             background = colors.background,
             outgoing = colors.primary,
@@ -152,7 +242,13 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
         )
     }
     CompositionLocalProvider(LocalChatColors provides chat) {
-        MaterialTheme(colorScheme = colors, content = content)
+        // The expressive look, built from what material3 1.3 offers: rounder shapes and heavier titles.
+        MaterialTheme(
+            colorScheme = colors,
+            shapes = if (gold) GoldShapes else AppShapes,
+            typography = emphasizedTypography(Typography()),
+            content = content,
+        )
     }
 }
 

@@ -59,6 +59,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.Appearance
+import com.zalom3ui.app.data.ColorTheme
 import com.zalom3ui.app.data.ServerSettings
 import com.zalom3ui.app.data.ThemeMode
 
@@ -69,6 +70,7 @@ fun SettingsScreen(
     appearance: Appearance,
     profileName: String?,
     profileId: String?,
+    profileAvatar: String? = null,
     loggedIn: Boolean,
     canGoBack: Boolean,
     onBack: () -> Unit,
@@ -112,7 +114,7 @@ fun SettingsScreen(
                     Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Avatar(profileName.orEmpty(), "", key = profileId ?: "me", isGroup = false, size = 64.dp)
+                    Avatar(profileName.orEmpty(), profileAvatar.orEmpty(), key = profileId ?: "me", isGroup = false, size = 64.dp)
                     Spacer(Modifier.width(16.dp))
                     Column {
                         Text(profileName ?: "Zalo account", style = MaterialTheme.typography.titleLarge)
@@ -126,14 +128,25 @@ fun SettingsScreen(
                 HorizontalDivider()
             }
 
-            SectionHeader("Appearance")
-            ListItem(
+            SectionHeader("What bout the theme / look fancy mate")
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                ColorTheme.entries.forEachIndexed { i, option ->
+                    SegmentedButton(
+                        selected = appearance.colorTheme == option,
+                        onClick = { onAppearance(appearance.copy(colorTheme = option)) },
+                        shape = SegmentedButtonDefaults.itemShape(i, ColorTheme.entries.size),
+                    ) { Text(option.label) }
+                }
+            }
+            // Gold is a dark-only palette, so the light/dark and wallpaper options have nothing to do there.
+            val zaloLook = appearance.colorTheme == ColorTheme.ZALO
+            if (zaloLook) ListItem(
                 modifier = Modifier.clickable { pickTheme = true },
                 leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
-                headlineContent = { Text("Theme") },
+                headlineContent = { Text("Light or dark") },
                 supportingContent = { Text(appearance.themeMode.label) },
             )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (zaloLook && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 ListItem(
                     modifier = Modifier.clickable { onAppearance(appearance.copy(dynamicColor = !appearance.dynamicColor)) },
                     leadingContent = { Icon(Icons.Outlined.Palette, null) },

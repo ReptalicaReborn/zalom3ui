@@ -18,12 +18,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Chat
+import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PersonRemove
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -157,28 +159,50 @@ fun FriendPickerScreen(
     }
 }
 
-/** Friend requests other people sent: accept or decline. */
+/** The A–Z heading a friend is listed under ("#" for names that don't start with a letter). */
+fun friendLetter(name: String): String {
+    val c = foldForSearch(name.trim()).firstOrNull()
+    return if (c != null && c.isLetter()) c.uppercaseChar().toString() else "#"
+}
+
+/**
+ * Contacts: friend requests I got (accept or decline), requests I sent (take back), then every friend A–Z with
+ * search and a message shortcut.
+ */
 @Composable
-fun FriendRequestsScreen(
-    requests: List<FriendRequest>?,
+fun FriendsScreen(
+    friends: List<Person>,
+    received: List<FriendRequest>?,
+    sent: List<FriendRequest>?,
     onLoad: () -> Unit,
     onBack: () -> Unit,
     onAccept: (FriendRequest) -> Unit,
     onReject: (FriendRequest) -> Unit,
+    onUndo: (FriendRequest) -> Unit,
+    onAddFriend: () -> Unit,
+    onMessage: (Person) -> Unit,
 ) {
     LaunchedEffect(Unit) { onLoad() }
-    PeopleScaffold(title = "Friend requests", onBack = onBack) { modifier ->
-        when {
-            requests == null -> LoadingScreen()
-            requests.isEmpty() -> Text(
-                "No friend requests",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = modifier.padding(24.dp),
-            )
-            else -> LazyColumn(modifier.fillMaxSize()) {
-                items(requests, key = { it.id }) { r ->
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val shown = remember(friends, query) { filterPeople(friends, query) }
+    val grouped = remember(shown) { shown.groupBy { friendLetter(it.name) }.toSortedMap(compareBy({ it == "#" }, { it })) }
+    val searching = query.isNotBlank()
+    PeopleScaffold(title = "Contacts", onBack = onBack) { modifier ->
+        LazyColumn(modifier.fillMaxSize()) {
+            item(key = "add") {
+                FilledTonalButton(
+                    onClick = onAddFriend,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth(),
+                ) {
+                    Icon(Icons.Outlined.PersonAdd, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Add friend by phone number")
+                }
+            }
+            if (!received.isNullOrEmpty() && !searching) {
+                item(key = "h-received") { SectionHeader("Friend requests (${received.size})") }
+                items(received, key = { "r-${it.id}" }) { r ->
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(r.name, r.avatar, key = "user:${r.id}", isGroup = false, size = 48.dp)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
@@ -191,6 +215,44 @@ fun FriendRequestsScreen(
                                 OutlinedButton(onClick = { onReject(r) }) { Text("Decline") }
                             }
                         }
+                    }
+                }
+            }
+            if (!sent.isNullOrEmpty() && !searching) {
+                item(key = "h-sent") { SectionHeader("Sent requests (${sent.size})") }
+                items(sent, key = { "s-${it.id}" }) { r ->
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(r.name, r.avatar, key = "user:${r.id}", isGroup = false, size = 40.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(r.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Waiting for an answer", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        TextButton(onClick = { onUndo(r) }) { Text("Undo") }
+                    }
+                }
+            }
+            item(key = "search") {
+                SearchPill(query = query, onQuery = { query = it }, placeholder = "Search friends", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+            if (friends.isEmpty()) {
+                item(key = "empty") {
+                    Text("Your friends are still loading…", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(24.dp))
+                }
+            } else if (shown.isEmpty()) {
+                item(key = "none") { Text("No matches", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(24.dp)) }
+            }
+            grouped.forEach { (letter, people) ->
+                item(key = "h-$letter") { SectionHeader(letter) }
+                items(people, key = { "f-${it.id}" }) { person ->
+                    Row(
+                        Modifier.fillMaxWidth().clickable { onMessage(person) }.padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Avatar(person.name, person.avatar, key = "user:${person.id}", isGroup = false, size = 44.dp)
+                        Spacer(Modifier.width(16.dp))
+                        Text(person.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { onMessage(person) }) { Icon(Icons.AutoMirrored.Outlined.Chat, contentDescription = "Message ${person.name}") }
                     }
                 }
             }

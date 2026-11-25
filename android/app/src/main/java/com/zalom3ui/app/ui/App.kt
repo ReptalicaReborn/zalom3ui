@@ -1,6 +1,8 @@
 package com.zalom3ui.app.ui
 
 import android.widget.Toast
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -49,7 +51,7 @@ private object Routes {
     const val NEW_GROUP = "new_group"
     const val ADD_MEMBERS = "add_members"
     const val MEMBERS = "members"
-    const val FRIEND_REQUESTS = "friend_requests"
+    const val CONTACTS = "contacts"
     const val ADD_FRIEND = "add_friend"
     const val CHAT = "chat"
     const val FORWARD = "forward"
@@ -158,6 +160,8 @@ private fun AppNav(vm: AppViewModel) {
         vm.openChat(thread)
         goToChat()
     }
+    val signedIn = openState.status?.isLoggedIn == true
+    LaunchedEffect(signedIn) { if (signedIn) vm.loadFriendRequests() }
     // Turning a tablet (or resizing a window) moves an open chat between its own screen and the pane.
     LaunchedEffect(wide) {
         val route = nav.currentDestination?.route
@@ -171,10 +175,10 @@ private fun AppNav(vm: AppViewModel) {
     NavHost(
         navController = nav,
         startDestination = Routes.HOME,
-        enterTransition = { slideInHorizontally { it / 4 } + fadeIn() },
+        enterTransition = { slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it / 4 } + fadeIn() },
         exitTransition = { fadeOut() },
         popEnterTransition = { fadeIn() },
-        popExitTransition = { slideOutHorizontally { it / 4 } + fadeOut() },
+        popExitTransition = { slideOutHorizontally(spring(stiffness = Spring.StiffnessMedium)) { it / 4 } + fadeOut() },
     ) {
         // Each destination collects state itself so it never renders a stale capture.
         composable(Routes.HOME) {
@@ -227,6 +231,7 @@ private fun AppNav(vm: AppViewModel) {
                             if (!wideNow) nav.navigate(Routes.CHAT)
                         },
                         onNewChat = { nav.navigate(Routes.NEW_CHAT) },
+                        onContacts = { nav.navigate(Routes.CONTACTS) },
                         onReconnect = vm::reconnectZalo,
                         onSettings = { nav.navigate(Routes.SETTINGS) },
                         onMarkAllRead = vm::markAllRead,
@@ -253,8 +258,8 @@ private fun AppNav(vm: AppViewModel) {
                 actions = listOf(
                     PickerAction("New group", Icons.Outlined.GroupAdd) { nav.navigate(Routes.NEW_GROUP) },
                     PickerAction("Add friend", Icons.Outlined.PersonAdd) { nav.navigate(Routes.ADD_FRIEND) },
-                    PickerAction("Friend requests", Icons.Outlined.People, badge = state.friendRequests?.size ?: 0) {
-                        nav.navigate(Routes.FRIEND_REQUESTS)
+                    PickerAction("Contacts and requests", Icons.Outlined.People, badge = state.friendRequests?.size ?: 0) {
+                        nav.navigate(Routes.CONTACTS)
                     },
                 ),
             )
@@ -281,14 +286,25 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.FRIEND_REQUESTS) {
+        composable(Routes.CONTACTS) {
             val state by vm.state.collectAsStateWithLifecycle()
-            FriendRequestsScreen(
-                requests = state.friendRequests,
-                onLoad = vm::loadFriendRequests,
+            FriendsScreen(
+                friends = state.friends,
+                received = state.friendRequests,
+                sent = state.sentRequests,
+                onLoad = {
+                    vm.loadFriends()
+                    vm.loadFriendRequests()
+                },
                 onBack = { nav.popBackStack() },
                 onAccept = vm::acceptFriend,
                 onReject = vm::rejectFriend,
+                onUndo = vm::cancelSentRequest,
+                onAddFriend = { nav.navigate(Routes.ADD_FRIEND) },
+                onMessage = { person ->
+                    vm.openFriendChat(person)
+                    goToChat()
+                },
             )
         }
         composable(Routes.ADD_FRIEND) {
@@ -388,6 +404,7 @@ private fun AppNav(vm: AppViewModel) {
                 appearance = state.appearance,
                 profileName = state.status?.ownName,
                 profileId = state.status?.ownId,
+                profileAvatar = state.status?.ownAvatar,
                 loggedIn = state.status?.isLoggedIn == true,
                 canGoBack = true,
                 onBack = { nav.popBackStack() },

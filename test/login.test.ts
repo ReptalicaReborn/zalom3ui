@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -210,4 +211,28 @@ test("GotLoginInfo writes credentials atomically with mode 0600", async () => {
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test("the signed-in profile's name and picture are part of the status", async () => {
+    const { session } = setup([]);
+    const listener = Object.assign(new EventEmitter(), {
+        start() {},
+        requestOldMessages() {},
+        requestOldReactions() {},
+    });
+    const api = {
+        listener,
+        getOwnId: () => "me",
+        fetchAccountInfo: async () => ({ profile: { displayName: "Chi", avatar: "https://a/me.jpg" } }),
+    };
+    const internals = session as unknown as {
+        onLoggedIn(api: unknown, generation: number): Promise<void>;
+        generation: number;
+        loadContacts: () => Promise<void>;
+    };
+    internals.loadContacts = async () => {};
+    await internals.onLoggedIn(api, internals.generation);
+    const s = session.getStatus();
+    assert.equal(s.ownName, "Chi");
+    assert.equal(s.ownAvatar, "https://a/me.jpg");
 });

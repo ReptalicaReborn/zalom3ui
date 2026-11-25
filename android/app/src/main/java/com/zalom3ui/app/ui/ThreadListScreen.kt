@@ -38,7 +38,10 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material.icons.outlined.People
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -77,6 +80,7 @@ import com.zalom3ui.app.data.ThreadSummary
 class ThreadListActions(
     val onOpen: (ThreadSummary) -> Unit,
     val onNewChat: () -> Unit,
+    val onContacts: () -> Unit,
     val onReconnect: () -> Unit,
     val onSettings: () -> Unit,
     val onMarkAllRead: () -> Unit,
@@ -135,7 +139,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                         IconButton(onClick = actions.onSettings) {
                             Avatar(
                                 name = state.status?.ownName.orEmpty(),
-                                url = "",
+                                url = state.status?.ownAvatar.orEmpty(),
                                 key = state.status?.ownId ?: "me",
                                 isGroup = false,
                                 size = 32.dp,
@@ -144,6 +148,12 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     },
                     title = { Text(stringResource(R.string.app_name)) },
                     actions = {
+                        IconButton(onClick = actions.onContacts) {
+                            val pending = state.friendRequests?.size ?: 0
+                            BadgedBox(badge = { if (pending > 0) Badge { Text(pending.toString()) } }) {
+                                Icon(Icons.Outlined.People, contentDescription = "Contacts")
+                            }
+                        }
                         IconButton(onClick = { searching = true }) { Icon(Icons.Outlined.Search, contentDescription = "Search") }
                         OverflowMenu(
                             hasUnread = chats.any { it.unread > 0 },
@@ -159,6 +169,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
             if (!searching) {
                 FloatingActionButton(
                     onClick = actions.onNewChat,
+                    shape = MaterialTheme.shapes.large,
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 ) { Icon(Icons.Outlined.Edit, contentDescription = "New chat") }

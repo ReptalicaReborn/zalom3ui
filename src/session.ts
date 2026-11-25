@@ -61,6 +61,8 @@ export type SessionStatus = {
     scannedBy: string | null;
     ownId: string | null;
     ownName: string | null;
+    /** My Zalo profile picture URL, when Zalo gave one. */
+    ownAvatar: string | null;
     error: string | null;
     /** A saved session couldn't reach Zalo and will be retried; a QR login can replace it. */
     retrying: boolean;
@@ -169,6 +171,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         scannedBy: null,
         ownId: null,
         ownName: null,
+            ownAvatar: null,
         error: null,
         retrying: false,
     };
@@ -296,6 +299,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             scannedBy: null,
             ownId: null,
             ownName: null,
+            ownAvatar: null,
             error: null,
             retrying: false,
         });
@@ -992,6 +996,25 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             }));
     }
 
+    /** Friend requests I sent that nobody has answered yet, newest first. */
+    async sentFriendRequests(): Promise<FriendRequest[]> {
+        let sent: Record<string, { userId?: string; displayName?: string; zaloName?: string; avatar?: string; fReqInfo?: { message?: string; time?: number } }> = {};
+        try {
+            sent = await this.requireApi().getSentFriendRequest();
+        } catch {
+            // Zalo answers with an error when there are none.
+        }
+        return Object.entries(sent)
+            .map(([key, d]) => ({
+                id: String(d.userId ?? key),
+                name: d.displayName || d.zaloName || String(d.userId ?? key),
+                avatar: d.avatar ?? "",
+                message: d.fReqInfo?.message ?? "",
+                time: d.fReqInfo?.time ?? 0,
+            }))
+            .sort((a, b) => b.time - a.time);
+    }
+
     async acceptFriendRequest(userId: string): Promise<void> {
         const api = this.requireApi();
         await api.acceptFriendRequest(userId);
@@ -1233,8 +1256,11 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         const ownId = api.getOwnId();
         this.store.ownId = ownId;
         let ownName: string | null = null;
+        let ownAvatar: string | null = null;
         try {
-            ownName = (await api.fetchAccountInfo()).profile.displayName;
+            const { profile } = await api.fetchAccountInfo();
+            ownName = profile.displayName;
+            ownAvatar = profile.avatar || null;
         } catch {
             // Not essential.
         }
@@ -1283,7 +1309,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
         listener.on("error", (err) => console.error("Zalo listener error:", err));
 
-        this.setStatus({ state: "ready", ownId, ownName, qrImage: null, scannedBy: null, error: null });
+        this.setStatus({ state: "ready", ownId, ownName, ownAvatar, qrImage: null, scannedBy: null, error: null });
         listener.start({ retryOnClose: true });
 
         this.loadContacts(api, generation).catch((err) => console.warn("Could not load contacts:", err));

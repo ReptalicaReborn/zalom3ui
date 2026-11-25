@@ -24,8 +24,15 @@ enum class ThemeMode(val label: String) {
     DARK("Dark"),
 }
 
+/** Which palette the app uses. Gold is a dark-only palette, so it overrides light/dark and wallpaper colors. */
+enum class ColorTheme(val label: String) {
+    ZALO("Zalỏ blue"),
+    GOLD("ReptDoc gold"),
+}
+
 data class Appearance(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val colorTheme: ColorTheme = ColorTheme.ZALO,
     /** Material You colors from the wallpaper (Android 12+) instead of the app's blue. */
     val dynamicColor: Boolean = false,
 )
@@ -55,12 +62,14 @@ class SettingsStore(context: Context) {
 
     fun loadAppearance(): Appearance = Appearance(
         themeMode = ThemeMode.entries.firstOrNull { it.name == prefs.getString(KEY_THEME, null) } ?: ThemeMode.SYSTEM,
+        colorTheme = ColorTheme.entries.firstOrNull { it.name == prefs.getString(KEY_COLOR_THEME, null) } ?: ColorTheme.ZALO,
         dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
     )
 
     fun saveAppearance(appearance: Appearance) {
         prefs.edit()
             .putString(KEY_THEME, appearance.themeMode.name)
+            .putString(KEY_COLOR_THEME, appearance.colorTheme.name)
             .putBoolean(KEY_DYNAMIC_COLOR, appearance.dynamicColor)
             .apply()
     }
@@ -139,5 +148,6 @@ class SettingsStore(context: Context) {
         const val KEY_LOCAL_TOKEN = "local_token"
         const val KEY_THEME = "theme"
         const val KEY_DYNAMIC_COLOR = "dynamic_color"
+        const val KEY_COLOR_THEME = "color_theme"
     }
 }

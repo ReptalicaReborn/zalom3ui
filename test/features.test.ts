@@ -153,6 +153,21 @@ test("friend requests: only received ones are listed; accepting reloads friends"
     assert.deepEqual(session.friends(), [{ id: "7", name: "Bảo", avatar: "a7" }]);
 });
 
+test("sent friend requests are listed newest first, and none is not an error", async () => {
+    const { session } = setup({
+        getSentFriendRequest: {
+            "5": { userId: "5", displayName: "Lan", zaloName: "lan", avatar: "a5", fReqInfo: { message: "Hi", time: 10 } },
+            "6": { userId: "6", displayName: "", zaloName: "minh", avatar: "", fReqInfo: { message: "", time: 20 } },
+        },
+    });
+    assert.deepEqual(await session.sentFriendRequests(), [
+        { id: "6", name: "minh", avatar: "", message: "", time: 20 },
+        { id: "5", name: "Lan", avatar: "a5", message: "Hi", time: 10 },
+    ]);
+    const none = setup({ getSentFriendRequest: new Error("none") });
+    assert.deepEqual(await none.session.sentFriendRequests(), []);
+});
+
 test("finding someone by phone says whether they are a friend or already asked", async () => {
     const { session } = setup({
         findUser: { uid: "42", display_name: "Chi", zalo_name: "chi", avatar: "a42" },
