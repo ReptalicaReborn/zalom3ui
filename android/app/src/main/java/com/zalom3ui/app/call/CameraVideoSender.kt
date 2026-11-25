@@ -320,7 +320,9 @@ class CameraVideoSender(
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-        return (360 - d) % 360
+        // The display rotation itself, not its inverse: on a real call from a tablet (always turned, its natural position is
+        // landscape) 360 - d sent the picture upside down, and the earlier sensor-rotated version 90° off; only d fits both.
+        return d
     }
 
     @SuppressLint("MissingPermission") // checked in start()
