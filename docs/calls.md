@@ -166,6 +166,12 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
 - **Voice calls work** (answered in Zalỏ, both sides hear each other through Zalo's own media servers).
+- **Outgoing calls** (voice and video, 1:1 chats; written from the Zalos project's engine, not yet confirmed on real
+  calls): `requestcall` (answer: `servers`, `sessId`, `zrtc_config`, `fromId` / `toId`), join the media server as the
+  caller (init call command 11), `request` with that server, the Opus codec and our extendData, then `ring_ring`,
+  `answer` (status 0 picks up, 3 declines, 1 busy), `busy`, `reject`, `cancel`. `answerack` once connected; `cancel`
+  while it rings, `endcall` afterwards. The API and events are in `docs/call-audio.md` §4. The call log notes the
+  `requestcall` answer's field names (`request_call`) to help debugging.
 - **Answer:** the incoming call is a proper call notification (`CallStyle`, full screen on the lock screen) with
   Answer and Decline. Answer asks for the microphone, opens the call screen and picks up the way Zalo PC does:
   `ringring`, join the call's media server over UDP (init call, command 12, with the request's `uidTo` / `uidFrom` /

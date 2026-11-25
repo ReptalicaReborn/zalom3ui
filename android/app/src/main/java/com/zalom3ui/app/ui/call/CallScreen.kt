@@ -46,6 +46,9 @@ sealed interface CallPhase {
 
     data object Connecting : CallPhase
 
+    /** A call we placed, not picked up yet: "Calling…", or "Ringing…" once their phone rings. */
+    data class Calling(val ringing: Boolean) : CallPhase
+
     /** [since] is epoch millis. */
     data class Connected(val since: Long) : CallPhase
 
@@ -134,6 +137,7 @@ fun CallScreen(
             when (state.phase) {
                 is CallPhase.Ringing -> RingingButtons(state, onAnswer, onAnswerWithVideo, onDecline)
                 CallPhase.Connecting, is CallPhase.Connected -> ConnectedButtons(state, onHangUp, onToggleMute, onToggleSpeaker)
+                is CallPhase.Calling -> LabeledButton(Icons.Filled.CallEnd, "Cancel", MaterialTheme.colorScheme.error, MaterialTheme.colorScheme.onError, onHangUp)
                 CallPhase.Ended -> Unit
             }
         }
@@ -146,6 +150,7 @@ internal fun callStatusText(state: CallScreenState): String {
     return when (val phase = state.phase) {
         is CallPhase.Ringing -> if (phase.video) "Incoming video call" else "Incoming voice call"
         CallPhase.Connecting -> "Connecting…"
+        is CallPhase.Calling -> if (phase.ringing) "Ringing…" else "Calling…"
         is CallPhase.Connected -> elapsedText(phase.since)
         CallPhase.Ended -> "Call ended"
     }

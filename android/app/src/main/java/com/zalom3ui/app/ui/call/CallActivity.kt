@@ -52,6 +52,20 @@ class CallActivity : ComponentActivity() {
     private var answering = false
     private var cameraDenied by mutableStateOf(false)
 
+    /** This screen was opened to place a call (not to answer one). */
+    private var outgoing by mutableStateOf(false)
+    private var placeWithVideo = false
+
+    /** Placing a call asks for the microphone and, for video, the camera; a refused camera still places a voice-only start. */
+    private val placePermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            error = "Allow the microphone in the phone's app settings to make calls"
+        } else {
+            if (placeWithVideo && !hasPermission(Manifest.permission.CAMERA)) cameraDenied = true
+            placeCall()
+        }
+    }
+
     /** Answering asks for the microphone and, with video, the camera in one go; a refused camera still answers by voice. */
     private var answerWithVideo = false
 
@@ -72,6 +86,7 @@ class CallActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         answerWithVideo = savedInstanceState?.getBoolean(STATE_ANSWER_WITH_VIDEO, false) ?: false
+        placeWithVideo = savedInstanceState?.getBoolean(STATE_PLACE_WITH_VIDEO, false) ?: false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -116,7 +131,10 @@ class CallActivity : ComponentActivity() {
                     onRemoteSurface = CallService::setRemoteSurface,
                     onPreviewSurface = CallService::setPreviewSurface,
                     onDecline = ::decline,
-                    onHangUp = { CallService.hangUp(this@CallActivity) },
+                    onHangUp = {
+                        // Before the call service exists there is nothing to cancel.
+                        if (outgoing && CallService.state.value is CallState.Idle) finish() else CallService.hangUp(this@CallActivity)
+                    },
                     onToggleMute = { CallService.setMuted(!muted) },
                     onToggleSpeaker = { CallService.setSpeaker(!speaker) },
                 )
@@ -146,6 +164,7 @@ class CallActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_ANSWER_WITH_VIDEO, answerWithVideo)
+        outState.putBoolean(STATE_PLACE_WITH_VIDEO, placeWithVideo)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -155,7 +174,7 @@ class CallActivity : ComponentActivity() {
     }
 
     private fun updateKeepScreenOn(state: CallState) {
-        val keepOn = state is CallState.Ringing || state is CallState.Connecting || state is CallState.Connected
+        val keepOn = state is CallState.Ringing || state is CallState.Calling || state is CallState.Connecting || state is CallState.Connected
         if (keepOn) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
@@ -204,6 +223,7 @@ class CallActivity : ComponentActivity() {
     }
 
     private fun nameOf(s: CallState): String = when (s) {
+        is CallState.Calling -> s.name
         is CallState.Connecting -> s.name
         is CallState.Connected -> s.name
         is CallState.Ringing -> s.name
@@ -211,6 +231,7 @@ class CallActivity : ComponentActivity() {
     }.ifBlank { callerName }
 
     private fun avatarOf(s: CallState): String? = when (s) {
+        is CallState.Calling -> s.avatar
         is CallState.Connecting -> s.avatar
         is CallState.Connected -> s.avatar
         is CallState.Ringing -> s.avatar
@@ -218,13 +239,58 @@ class CallActivity : ComponentActivity() {
     } ?: avatar
 
     private fun phaseOf(s: CallState): CallPhase = when (s) {
+        is CallState.Calling -> CallPhase.Calling(s.ringing)
         is CallState.Connecting -> CallPhase.Connecting
         is CallState.Connected -> CallPhase.Connected(s.since)
         is CallState.Ended -> CallPhase.Ended
-        else -> CallPhase.Ringing(video)
+        else -> if (outgoing) CallPhase.Calling(false) else CallPhase.Ringing(video)
+    }
+
+    /** Opened to call someone: ask for the permissions, then start the call. A call already running is just shown. */
+    private fun handleOutgoing(intent: Intent, isFreshStart: Boolean) {
+        outgoing = true
+        callId = PENDING_ID
+        callerId = intent.getStringExtra(EXTRA_CALLER_ID).orEmpty()
+        callerName = intent.getStringExtra(EXTRA_CALLER_NAME).orEmpty()
+        avatar = intent.getStringExtra(EXTRA_AVATAR)
+        video = intent.getBooleanExtra(EXTRA_VIDEO, false)
+        if (!isFreshStart || callerId.isEmpty()) return
+        // A finished call's "Ended" would close this screen again.
+        if (CallService.state.value is CallState.Ended) CallService.reset()
+        val s = CallService.state.value
+        if (s is CallState.Calling || s is CallState.Connecting || s is CallState.Connected) return
+        placeWithVideo = video
+        val missing = buildList {
+            if (!hasPermission(Manifest.permission.RECORD_AUDIO)) add(Manifest.permission.RECORD_AUDIO)
+            if (video && !hasPermission(Manifest.permission.CAMERA)) add(Manifest.permission.CAMERA)
+        }
+        if (missing.isEmpty()) placeCall() else placePermissions.launch(missing.toTypedArray())
+    }
+
+    private fun placeCall() {
+        val s = CallService.state.value
+        if (s is CallState.Calling || s is CallState.Connecting || s is CallState.Connected) return
+        try {
+            // A video call starts with the camera on, if we may use it; the service switches it on once they pick up.
+            CallService.startOutgoing(
+                this,
+                callerId,
+                callerName,
+                avatar,
+                video = placeWithVideo,
+                camera = placeWithVideo && hasPermission(Manifest.permission.CAMERA),
+            )
+        } catch (e: Exception) {
+            error = e.message ?: "Couldn't place the call"
+        }
     }
 
     private fun handle(intent: Intent, isFreshStart: Boolean) {
+        if (intent.action == ACTION_OUTGOING) {
+            handleOutgoing(intent, isFreshStart)
+            return
+        }
+        outgoing = false
         val id = intent.getStringExtra(EXTRA_CALL_ID).orEmpty()
         if (id.isEmpty()) {
             finish()
@@ -338,6 +404,10 @@ class CallActivity : ComponentActivity() {
     companion object {
         const val ACTION_RING = "com.zalom3ui.app.action.CALL_SHOW"
         const val ACTION_ANSWER = "com.zalom3ui.app.action.CALL_ANSWER_NOW"
+        /** Place a call to [EXTRA_CALLER_ID]. */
+        const val ACTION_OUTGOING = "com.zalom3ui.app.action.CALL_PLACE"
+        private const val PENDING_ID = "outgoing"
+        private const val STATE_PLACE_WITH_VIDEO = "placeWithVideo"
         const val EXTRA_CALL_ID = "callId"
         const val EXTRA_CALLER_ID = "callerId"
         const val EXTRA_CALLER_NAME = "callerName"
@@ -351,6 +421,16 @@ class CallActivity : ComponentActivity() {
 
         /** Application-scoped coroutine scope so answer/decline requests survive Activity rotation or finish. */
         private val callActionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** Opens the call screen to call [peerId] (a 1:1 chat's person); it asks for the permissions and places the call. */
+        fun outgoingIntent(context: Context, peerId: String, name: String, avatar: String? = null, video: Boolean = false): Intent =
+            Intent(context, CallActivity::class.java)
+                .setAction(ACTION_OUTGOING)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(EXTRA_CALLER_ID, peerId)
+                .putExtra(EXTRA_CALLER_NAME, name)
+                .putExtra(EXTRA_AVATAR, avatar)
+                .putExtra(EXTRA_VIDEO, video)
 
         /** [answerNow]: the Answer button of the notification, so the call is picked up as soon as the screen opens. */
         fun intent(

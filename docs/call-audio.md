@@ -87,8 +87,9 @@ Video uses the same socket (docs/video-calls.md):
 |---|---|
 | `POST /calls/:callId/answer` | Picks up a ringing call: joins the media server, answers. 204, or 4xx/5xx `{error}` |
 | `POST /calls/:callId/decline` | Declines (exists) |
-| `POST /calls/hangup` | Ends the connected call. 204 |
-| `GET /calls/current` | `{callId, callerId, callerName, video, state: "connecting" \| "connected", connectedAt}` or 404 |
+| `POST /calls/start` | `{userId, video}`: places a 1:1 call (see below). Returns the call (`state: "calling"`, `outgoing: true`); 4xx/5xx `{error}` |
+| `POST /calls/hangup` | Ends the call in progress: hang up when connected, cancel while calling / ringing. 204 |
+| `GET /calls/current` | `{callId, callerId, callerName, video, state: "connecting" \| "calling" \| "ringing" \| "connected", connectedAt, outgoing?: true}` or 404. For a call we placed, `callerId` / `callerName` are the person called and `state` starts as "calling" |
 | `POST /calls/mute` | `{muted}`: tells the other side (the app silences the microphone itself) |
 | `POST /calls/camera` | `{on}`: tells the other side our camera is on / off (`/api/voicecall/conf`); the app starts / stops sending video |
 
@@ -96,9 +97,25 @@ Events on the existing `/ws` socket, `{"type":"call","call":{…}}`:
 
 - `{"type":"incoming","call":{callId, callerId, callerName, video, group, groupId?, ts}}` (exists)
 - `{"type":"connected","callId","callerId","callerName","video","connectedAt"}` (new)
-- `{"type":"ended","callId","act"}` (exists; `act` says why: `"endcall"`, `"cancel"`, `"declined"`, `"hangup"`…)
+- `{"type":"ended","callId","act"}` (exists; `act` says why: `"endcall"`, `"cancel"`, `"declined"`, `"hangup"`…). For
+  calls we placed: `"declined"` (they declined), `"busy"`, `"no_answer"` (rang 60 s), `"unreachable"` (no ring within
+  20 s, or Zalo said they can't be reached), `"cancel"` (we cancelled), `"failed"` (Zalo or the media server refused),
+  plus `"endcall"` / `"end_call"` when they hang up.
+- Calls we placed (`POST /calls/start`), each with the call's fields (`callId, callerId, callerName, video, state,
+  connectedAt, outgoing: true`):
+  `{"type":"outgoing",…}` (request sent, `state: "calling"`), `{"type":"ringing",…}` (the other phone rings), then
+  `{"type":"connected",…}` or `{"type":"ended",…}`.
 - `{"type":"peer","callId","cameraOn","muted"}` (new): the other side turned its camera / microphone on or off
   (`voip` controls `onoff_camera`, `params.type` 0 = off, and `mute_audio`, 1 = muted)
+
+Placing a call (`ZaloSession.startCall`, mirroring the Zalos project's engine): `requestcall` (answer: media `servers`,
+`sessId`, `zrtc_config`, our 32-bit `fromId` and the callee's `toId`; its field names go to the call log) -> join the
+first media server that accepts us as the caller (init call command 11) -> `request` naming that server, Opus codec
+and our extendData (`callType` 1 for video) -> wait for the callee's controls: `ring_ring`, `answer` (status 0 = picked
+up: we send `answerack`, start silence fill and the audio / video link; 3 = declined, 1 = busy), `busy`, `reject`,
+`cancel`. Cancelling while it rings sends `cancel`; hanging up when connected sends `endcall`. After `connected`
+everything (the `/ws/call-audio` socket, mute, camera, hang up) works as for an answered call. For a video call the
+app turns its camera on after `connected` with `POST /calls/camera`.
 
 ## 5. Screens (`com.zalom3ui.app.ui.call`)
 

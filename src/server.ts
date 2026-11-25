@@ -348,6 +348,12 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    /** `{ "userId": "123", "video": true | false }`: places a 1:1 call; progress arrives as call events. Answers the call. */
+    api.post("/calls/start", wrap(async (req, res) => {
+        const userId = typeof req.body?.userId === "string" ? req.body.userId : "";
+        res.json(await session.startCall(userId, req.body?.video === true));
+    }));
+
     api.post("/calls/hangup", (_req, res) => {
         session.hangUpCall();
         res.status(204).end();
