@@ -25,6 +25,11 @@ export function parseServer(address: string): MediaServer | null {
 export const OPUS_PT = 112;
 export const OPUS_CLOCK = 16000;
 export const FRAME_MS = 20;
+/** Video payload types in Zalo calls (zrtc::ConstParams): H.264 97, RED 118 wrapping it, ULPFEC 119. */
+export const H264_PT = 97;
+export const RED_PT = 118;
+export const ULPFEC_PT = 119;
+
 /** A 20 ms Opus frame of silence (CELT, any decoder plays it as silence). */
 export const OPUS_SILENCE = Buffer.from([0xf8, 0xff, 0xfe]);
 
@@ -62,6 +67,11 @@ export type MediaStats = {
         bytes: number;
     };
     controls: { kind: number; cmd: number; sub: number; error?: number }[];
+    /**
+     * The other side's video (not played yet): what it looks like, for docs/video-calls.md. RTP payload types, the
+     * payload type inside RED (118) packets, and H.264 NAL unit types (1 slice, 5 IDR, 7 SPS, 8 PPS, 24 STAP-A, 28 FU-A).
+     */
+    video: { packets: number; decrypted: number; failed: number; ssrcs: number; payloadTypes: Record<string, number>; redInner: Record<string, number>; nalTypes: Record<string, number>; bytes: number };
     /** RTCP from the other side: packet types seen, and the last loss / jitter it reported about our audio. */
     rtcp: { packets: number; types: Record<string, number>; theirView?: { fractionLost: number; cumulativeLost: number; jitter: number } };
 };
@@ -76,7 +86,9 @@ export class MediaCall {
         audio: { packets: 0, decrypted: 0, failed: 0, payloadTypes: {}, ssrcs: 0, timestampSteps: [], opusToc: [], bytes: 0 },
         controls: [],
         rtcp: { packets: 0, types: {} },
+        video: { packets: 0, decrypted: 0, failed: 0, ssrcs: 0, payloadTypes: {}, redInner: {}, nalTypes: {}, bytes: 0 },
     };
+    private videoSsrcs = new Set<number>();
     token: number | null = null;
     natAddress: string | null = null;
     private readonly socket: dgram.Socket;
@@ -252,10 +264,39 @@ export class MediaCall {
             this.count("received", `media_${p.kind}`);
             if (p.kind === zrtc.Kind.AudioIn) this.onAudio(p.payload);
             else if (p.kind === zrtc.Kind.AudioRtcp) this.onRtcp(p.payload);
+            else if (p.kind === zrtc.Kind.VideoIn) this.onVideo(p.payload);
             return;
         }
         this.count("received", p.type === "p2p" ? `p2p_${p.cmd}` : `kind_${p.kind}`);
         if (p.type === "unknown" && this.loggedUnknown++ < 5) this.o.log({ kind: "media_unknown", head: msg.subarray(0, 24).toString("hex"), bytes: msg.length });
+    }
+
+    private onVideo(payload: Buffer) {
+        const v = this.stats.video;
+        v.packets++;
+        v.bytes += payload.length;
+        const h = rtpHeader(payload);
+        if (!h) {
+            v.failed++;
+            return;
+        }
+        const bump = (m: Record<string, number>, k: number) => (m[k] = (m[k] ?? 0) + 1);
+        bump(v.payloadTypes, h.payloadType);
+        this.videoSsrcs.add(h.ssrc);
+        v.ssrcs = this.videoSsrcs.size;
+        const rtp = this.srtp.unprotect(payload);
+        if (!rtp) {
+            v.failed++;
+            return;
+        }
+        v.decrypted++;
+        let body = rtp.subarray(h.headerLength);
+        if (h.payloadType === RED_PT && body.length > 0) {
+            // RED (RFC 2198) as WebRTC sends it: one block, a 1-byte header with the inner payload type.
+            bump(v.redInner, body[0] & 0x7f);
+            body = body[0] & 0x80 ? Buffer.alloc(0) : body.subarray(1);
+        }
+        if (body.length > 0) bump(v.nalTypes, body[0] & 0x1f);
     }
 
     private onAudio(payload: Buffer) {
