@@ -57,6 +57,11 @@ H.264 (payload 97).
 | V5 | both | Answer video calls with video (our `extendData.video` codec list, `callType` 1), camera on/off, front/back switch, speaker on by default. |
 | V6 | both | Outgoing calls, voice and video: `requestcall` → servers, session, config → init call as caller (command 11) → `request` with our media server → wait for `answer`. |
 
+**Status:** V1–V5 are built (server: `src/video.ts`, `src/zrtcclient.ts`; app: `call/VideoDecoder.kt`,
+`call/CameraVideoSender.kt`, `ui/call/VideoCallLayout.kt`) and tested against fakes; not yet on a real call. Each stream
+has its own SRTP context (Zalo's apps send audio and video under one SSRC, their user id; ours is ours). V6
+(outgoing calls) is next.
+
 Steps V1–V2 (see the other side) need no camera permission and can be tested against any video call; V3–V4 need a
 real phone to check the other side sees us.
 
