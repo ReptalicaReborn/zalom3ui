@@ -6,12 +6,15 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { WebSocketServer, type WebSocket } from "ws";
 import type { Config } from "./config.js";
 import { HttpError } from "./errors.js";
-import type { MuteOption, ZaloSession } from "./session.js";
+import type { MuteOption, UploadFile, ZaloSession } from "./session.js";
 import { REACTIONS, type MentionInfo, type ThreadKind } from "./store.js";
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const MAX_TEXT_LENGTH = 4000;
 const MUTE_OPTIONS = new Set<MuteOption>(["1h", "4h", "8am", "forever"]);
+/** Zalo itself takes larger files; this is what a phone comfortably holds in memory while it uploads. */
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_FRIEND_MESSAGE = 150;
 
 export function createServer(config: Config, session: ZaloSession): http.Server {
     const app = express();
@@ -108,6 +111,18 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    /** The chat a client shows (or `{}` for none). Clients repeat it while it stays open. */
+    api.put("/presence", (req, res) => {
+        const { kind, id } = (req.body ?? {}) as { kind?: unknown; id?: unknown };
+        if (kind === undefined && id === undefined) {
+            session.setViewing(null, null);
+        } else {
+            if (typeof id !== "string" || !id) throw new HttpError(400, "id is required");
+            session.setViewing(parseKind(String(kind)), id);
+        }
+        res.status(204).end();
+    });
+
     // ---- Messages ----
 
     api.get("/threads/:kind/:id/messages", wrap(async (req, res) => {
@@ -120,10 +135,40 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         if (kind === "group" && before === undefined && session.store.getMessages(kind, id).length < 20) {
             await session.fetchGroupHistory(id).catch((err) => console.warn("Group history failed:", err));
         }
-        res.json({
-            thread: session.store.getThread(kind, id) ?? null,
-            messages: session.store.getMessages(kind, id, { before, limit }),
-        });
+        const messages = session.store.getMessages(kind, id, { before, limit });
+        session.fillStickerImages(messages);
+        res.json({ thread: session.store.getThread(kind, id) ?? null, messages });
+    }));
+
+    /**
+     * One photo or file as the raw request body; `name` is its file name (the extension decides photo or file),
+     * `width` / `height` the pixel size of a photo.
+     */
+    api.post(
+        "/threads/:kind/:id/attachments",
+        express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
+        wrap(async (req, res) => {
+            const kind = parseKind(req.params.kind);
+            const name = typeof req.query.name === "string" ? path.basename(req.query.name.trim()) : "";
+            if (!name || !name.includes(".")) throw new HttpError(400, "name must be a file name with an extension");
+            if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new HttpError(400, "The request body is the file");
+            const file: UploadFile = { data: req.body, filename: name, width: positiveInt(req.query.width), height: positiveInt(req.query.height) };
+            const msgIds = await session.sendAttachment(kind, req.params.id, file);
+            res.status(201).json({ msgIds });
+        }),
+    );
+
+    api.get("/stickers", wrap(async (req, res) => {
+        const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+        if (!q) throw new HttpError(400, "q is required");
+        res.json(await session.searchStickers(q));
+    }));
+
+    api.post("/threads/:kind/:id/stickers", wrap(async (req, res) => {
+        const id = Number(req.body?.id);
+        if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, "id must be a sticker id");
+        await session.sendSticker(parseKind(req.params.kind), req.params.id, id);
+        res.status(201).end();
     }));
 
     api.post("/threads/:kind/:id/messages", wrap(async (req, res) => {
@@ -167,6 +212,77 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    // ---- Friends ----
+
+    api.get("/friends", (_req, res) => {
+        res.json(session.friends());
+    });
+
+    api.get("/friend-requests", wrap(async (_req, res) => {
+        res.json(await session.friendRequests());
+    }));
+
+    api.post("/friend-requests/:userId/accept", wrap(async (req, res) => {
+        await session.acceptFriendRequest(req.params.userId);
+        res.status(204).end();
+    }));
+
+    api.post("/friend-requests/:userId/reject", wrap(async (req, res) => {
+        await session.rejectFriendRequest(req.params.userId);
+        res.status(204).end();
+    }));
+
+    /** Sends a friend request: `{ "userId", "message"? }`. */
+    api.post("/friend-requests", wrap(async (req, res) => {
+        const userId = typeof req.body?.userId === "string" ? req.body.userId : "";
+        if (!userId) throw new HttpError(400, "userId is required");
+        const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, MAX_FRIEND_MESSAGE) : "";
+        await session.sendFriendRequest(userId, message);
+        res.status(204).end();
+    }));
+
+    /** Takes back a request I sent. */
+    api.delete("/friend-requests/:userId", wrap(async (req, res) => {
+        await session.undoFriendRequest(req.params.userId);
+        res.status(204).end();
+    }));
+
+    api.get("/users/find", wrap(async (req, res) => {
+        const phone = typeof req.query.phone === "string" ? req.query.phone.replace(/[\s.()-]/g, "") : "";
+        if (!/^\+?\d{8,15}$/.test(phone)) throw new HttpError(400, "phone must be a phone number");
+        res.json(await session.findUser(phone.replace(/^\+/, "")));
+    }));
+
+    // ---- Groups ----
+
+    /** `{ "name"?, "members": [userId, …] }` (at least 2 people besides me). */
+    api.post("/groups", wrap(async (req, res) => {
+        const members = parseIds(req.body?.members, "members");
+        const name = typeof req.body?.name === "string" ? req.body.name : "";
+        res.status(201).json(await session.createGroup(name, members));
+    }));
+
+    api.post("/groups/:id/members", wrap(async (req, res) => {
+        res.json(await session.addGroupMembers(req.params.id, parseIds(req.body?.members, "members")));
+    }));
+
+    api.delete("/groups/:id/members/:userId", wrap(async (req, res) => {
+        await session.removeGroupMember(req.params.id, req.params.userId);
+        res.status(204).end();
+    }));
+
+    api.put("/groups/:id/name", wrap(async (req, res) => {
+        if (typeof req.body?.name !== "string") throw new HttpError(400, "name must be a string");
+        await session.renameGroup(req.params.id, req.body.name);
+        res.status(204).end();
+    }));
+
+    /** `{ "silent"?: true }`: only the group's admins learn that I left. */
+    api.post("/groups/:id/leave", wrap(async (req, res) => {
+        await session.leaveGroup(req.params.id, req.body?.silent === true);
+        res.status(204).end();
+    }));
+
     app.use("/api", api);
     app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
         const status = err instanceof HttpError ? err.status : 500;
@@ -202,7 +318,17 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     };
 
     session.on("status", (status) => broadcast({ type: "status", status }));
-    session.on("message", (message) => broadcast({ type: "message", message }));
+    // `notify`: whether a phone should show it (not mine, not muted, not the chat that is open, not old history).
+    session.on("message", (message) => {
+        const notify = session.shouldNotify(message);
+        broadcast({
+            type: "message",
+            message,
+            notify,
+            ...(notify ? { threadName: session.threadName(message.threadKind, message.threadId) } : {}),
+        });
+    });
+    session.on("read", (read) => broadcast({ type: "read", ...read }));
     session.on("message_updated", (message) => broadcast({ type: "message_updated", message }));
     session.on("message_deleted", (deleted) => broadcast({ type: "message_deleted", ...deleted }));
     session.on("typing", (typing) => broadcast({ type: "typing", ...typing }));
@@ -226,6 +352,18 @@ function isAuthorized(config: Config, header: string | undefined, queryToken: un
     const a = Buffer.from(presented);
     const b = Buffer.from(config.accessToken);
     return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function positiveInt(value: unknown): number | undefined {
+    const n = typeof value === "string" ? Number(value) : NaN;
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+function parseIds(input: unknown, field: string): string[] {
+    if (!Array.isArray(input) || input.length === 0 || !input.every((v) => typeof v === "string" && v.length > 0)) {
+        throw new HttpError(400, `${field} must be a non-empty array of user ids`);
+    }
+    return input as string[];
 }
 
 function parseKind(kind: string): ThreadKind {

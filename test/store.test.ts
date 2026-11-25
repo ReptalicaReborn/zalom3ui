@@ -62,7 +62,54 @@ test("normalizeMessage labels attachments and group threads", () => {
     assert.equal(m.threadKind, "group");
     assert.equal(m.threadId, "g1");
     assert.equal(m.text, "[Photo]");
-    assert.deepEqual(m.attachment, { title: undefined, href: "https://x/y.jpg", thumb: "https://x/t.jpg" });
+    assert.deepEqual(m.attachment, { kind: "photo", href: "https://x/y.jpg", thumb: "https://x/t.jpg" });
+});
+
+test("normalizeMessage reads photo, video, voice and file details from params", () => {
+    const photo = normalizeMessage(
+        raw({
+            msgType: "chat.photo",
+            content: { href: "https://x/n.jpg", thumb: "https://x/t.jpg", params: JSON.stringify({ hd: "https://x/hd.jpg", width: 1280, height: "720" }) },
+        }),
+    );
+    assert.deepEqual(photo.attachment, { kind: "photo", href: "https://x/hd.jpg", thumb: "https://x/t.jpg", width: 1280, height: 720 });
+
+    const video = normalizeMessage(
+        raw({
+            msgType: "chat.video.msg",
+            content: { href: "https://x/v.mp4", thumb: "https://x/v.jpg", params: JSON.stringify({ duration: 12500, video_width: 720, video_height: 1280 }) },
+        }),
+    );
+    assert.equal(video.text, "[Video]");
+    assert.deepEqual(video.attachment, { kind: "video", href: "https://x/v.mp4", thumb: "https://x/v.jpg", width: 720, height: 1280, duration: 12500 });
+
+    const voice = normalizeMessage(raw({ msgType: "chat.voice", content: { href: "https://x/a.m4a", params: '{"duration":"4200"}' } }));
+    assert.deepEqual(voice.attachment, { kind: "voice", href: "https://x/a.m4a", duration: 4200 });
+
+    const file = normalizeMessage(
+        raw({ msgType: "share.file", content: { title: "Báo cáo.PDF", href: "https://x/f", params: JSON.stringify({ fileSize: "20480" }) } }),
+    );
+    assert.equal(file.text, "[File] Báo cáo.PDF");
+    assert.deepEqual(file.attachment, { kind: "file", title: "Báo cáo.PDF", href: "https://x/f", size: 20480, fileExt: "pdf" });
+});
+
+test("normalizeMessage reads stickers, links and contact cards", () => {
+    const sticker = normalizeMessage(raw({ msgType: "chat.sticker", content: { id: 46991, catId: 10425, type: 7 } }));
+    assert.equal(sticker.text, "[Sticker]");
+    assert.deepEqual(sticker.attachment, { kind: "sticker", sticker: { id: 46991, catId: 10425, type: 7 } });
+
+    const link = normalizeMessage(
+        raw({ msgType: "chat.recommended", content: { action: "recommened.link", title: "Tin tức", description: "Mô tả", href: "https://news.example/a", thumb: "https://x/l.jpg", params: "{}" } }),
+    );
+    assert.equal(link.text, "[Link] Tin tức");
+    assert.equal(link.attachment?.kind, "link");
+    assert.equal(link.attachment?.description, "Mô tả");
+
+    const card = normalizeMessage(
+        raw({ msgType: "chat.recommended", content: { action: "recommened.user", title: "An", thumb: "https://x/a.jpg", params: "123456" } }),
+    );
+    assert.equal(card.text, "[Contact] An");
+    assert.deepEqual(card.attachment, { kind: "contact", title: "An", thumb: "https://x/a.jpg", userId: "123456" });
 });
 
 test("normalizeMessage falls back for unknown content", () => {

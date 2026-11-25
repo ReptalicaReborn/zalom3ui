@@ -45,11 +45,7 @@ export type StoredMessage = {
     msgType: string;
     /** Plain text, or a readable placeholder for non-text messages. */
     text: string;
-    attachment?: {
-        title?: string;
-        href?: string;
-        thumb?: string;
-    };
+    attachment?: Attachment;
     quote?: QuoteInfo;
     mentions?: MentionInfo[];
     recalled?: boolean;
@@ -59,6 +55,38 @@ export type StoredMessage = {
     seenBy?: string[];
     /** Missing for messages cached before this field existed. */
     raw?: RawRef;
+};
+
+export type AttachmentKind =
+    | "photo"
+    | "sticker"
+    | "gif"
+    | "video"
+    | "voice"
+    | "file"
+    | "link"
+    | "contact"
+    | "location"
+    | "other";
+
+/** What a non-text message shows. Older cached messages only have title/href/thumb. */
+export type Attachment = {
+    kind?: AttachmentKind;
+    title?: string;
+    description?: string;
+    /** The photo, video, voice clip or file itself (Zalo CDN), or the shared link. */
+    href?: string;
+    thumb?: string;
+    width?: number;
+    height?: number;
+    /** Video and voice length in ms. */
+    duration?: number;
+    /** File size in bytes. */
+    size?: number;
+    fileExt?: string;
+    sticker?: { id: number; catId: number; type: number };
+    /** Contact cards: the user id the card is for. */
+    userId?: string;
 };
 
 export type ReactionSummary = {
@@ -150,6 +178,17 @@ const REACTION_BY_CODE = new Map(Object.entries(REACTIONS).map(([key, r]) => [r.
 
 const MAX_MESSAGES_PER_THREAD = 500;
 
+const KIND_BY_MSG_TYPE: Record<string, AttachmentKind> = {
+    "chat.photo": "photo",
+    "chat.sticker": "sticker",
+    "chat.gif": "gif",
+    "chat.video.msg": "video",
+    "chat.voice": "voice",
+    "share.file": "file",
+    "chat.link": "link",
+    "chat.location.new": "location",
+};
+
 const MSG_TYPE_LABELS: Record<string, string> = {
     "chat.photo": "[Photo]",
     "chat.video.msg": "[Video]",
@@ -223,18 +262,75 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
     }
 
     const content = (data.content ?? {}) as Record<string, unknown>;
-    const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : undefined);
-    const attachment = {
-        title: str(content.title),
-        href: str(content.href),
-        thumb: str(content.thumb),
-    };
-    if (attachment.title || attachment.href || attachment.thumb) {
-        msg.attachment = attachment;
-    }
-    const label = MSG_TYPE_LABELS[data.msgType] ?? "[Unsupported message]";
-    msg.text = attachment.title ? `${label} ${attachment.title}` : label;
+    const attachment = parseAttachment(data.msgType, content);
+    if (attachment) msg.attachment = attachment;
+    const label =
+        attachment?.kind === "contact" ? "[Contact]" : (MSG_TYPE_LABELS[data.msgType] ?? "[Unsupported message]");
+    // Photos and stickers have no useful title; files, links and cards are named by theirs.
+    const named = attachment?.title && attachment.kind !== "photo" && attachment.kind !== "gif";
+    msg.text = named ? `${label} ${attachment.title}` : label;
     return msg;
+}
+
+/**
+ * Reads what a photo, sticker, video, voice clip, file, link, card or location message shows. Zalo puts most details in
+ * `content.params`, a JSON string whose keys differ by type (and over time), so every field is optional.
+ */
+export function parseAttachment(msgType: string, content: Record<string, unknown>): Attachment | undefined {
+    const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : undefined);
+    const num = (...vs: unknown[]) => {
+        for (const v of vs) {
+            const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+            if (Number.isFinite(n) && n > 0) return n;
+        }
+        return undefined;
+    };
+    let params: Record<string, unknown> = {};
+    if (typeof content.params === "string" && content.params.startsWith("{")) {
+        try {
+            const parsed = JSON.parse(content.params);
+            if (parsed && typeof parsed === "object") params = parsed as Record<string, unknown>;
+        } catch {
+            // Not JSON: a contact card keeps the user id here.
+        }
+    }
+
+    if (msgType === "chat.sticker") {
+        const id = num(content.id);
+        const catId = num(content.catId, content.cateId);
+        if (id === undefined) return undefined;
+        return { kind: "sticker", sticker: { id, catId: catId ?? 0, type: num(content.type) ?? 0 } };
+    }
+
+    let kind: AttachmentKind = KIND_BY_MSG_TYPE[msgType] ?? "other";
+    if (msgType === "chat.recommended") {
+        const action = str(content.action) ?? "";
+        kind = action === "recommened.user" ? "contact" : action === "recommened.link" ? "link" : "other";
+    }
+    const attachment: Attachment = {
+        kind,
+        title: str(content.title),
+        description: str(content.description),
+        // A photo's "hd" copy is the full-size one when Zalo sends it.
+        href: (kind === "photo" ? str(params.hd) : undefined) ?? str(content.href),
+        thumb: str(content.thumb),
+        width: num(params.width, params.video_width, params.w),
+        height: num(params.height, params.video_height, params.h),
+        duration: num(params.duration),
+        size: num(params.fileSize, params.size),
+        fileExt: str(params.fileExt)?.toLowerCase(),
+    };
+    if (kind === "contact" && typeof content.params === "string" && /^\d+$/.test(content.params)) {
+        attachment.userId = content.params;
+    }
+    if (kind === "file" && !attachment.fileExt && attachment.title?.includes(".")) {
+        attachment.fileExt = attachment.title.split(".").pop()?.toLowerCase();
+    }
+    for (const key of Object.keys(attachment) as (keyof Attachment)[]) {
+        if (attachment[key] === undefined) delete attachment[key];
+    }
+    const shows = attachment.title || attachment.href || attachment.thumb || attachment.description;
+    return shows || kind !== "other" ? attachment : undefined;
 }
 
 type Snapshot = {
@@ -448,6 +544,24 @@ export class ChatStore {
         this.messages.delete(key);
         this.markedUnread.delete(key);
         this.scheduleSave();
+    }
+
+    /** Forgets a conversation entirely (a group I left): its messages, pin, mute and read state. */
+    removeThread(kind: ThreadKind, id: string): void {
+        const key = threadKey(kind, id);
+        this.clearThreadMessages(kind, id);
+        this.threads.delete(key);
+        this.readUpTo.delete(key);
+        this.pinned.delete(key);
+        this.mutedUntil.delete(key);
+        this.scheduleSave();
+    }
+
+    /** Fills in an attachment detail learned later (a sticker's image). Returns the updated message. */
+    patchAttachment(msgId: string, patch: Partial<Attachment>): StoredMessage | undefined {
+        return this.update(msgId, (m) => {
+            if (m.attachment) m.attachment = { ...m.attachment, ...patch };
+        });
     }
 
     lastMessage(kind: ThreadKind, id: string): StoredMessage | undefined {

@@ -53,10 +53,19 @@ export type SessionStatus = {
 export type TypingEvent = { threadKind: ThreadKind; threadId: string; uid: string; name: string };
 export type DeletedEvent = { threadKind: ThreadKind; threadId: string; id: string };
 export type GroupMember = { id: string; name: string };
+export type Person = { id: string; name: string; avatar: string };
+export type FriendRequest = Person & { message: string; time: number };
+export type FoundUser = Person & { isFriend: boolean; requested: boolean };
+export type StickerInfo = { id: number; catId: number; type: number; url: string };
+/** A file to send, as the client uploaded it. Photos need their size so Zalo can lay them out. */
+export type UploadFile = { data: Buffer; filename: string; width?: number; height?: number };
 export type MuteOption = "1h" | "4h" | "8am" | "forever";
+
+export type ReadEvent = { threadKind: ThreadKind; threadId: string };
 
 type SessionEvents = {
     status: [SessionStatus];
+    read: [ReadEvent];
     message: [ChatMessage];
     message_updated: [ChatMessage];
     message_deleted: [DeletedEvent];
@@ -71,6 +80,13 @@ const SEEN_RECEIPT_LIMIT = 50;
 const RESUME_RETRY_MIN_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 60_000;
 const SESSION_EXPIRED = "Your Zalo session has ended. Log in again with the QR code.";
+const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp"]);
+const STICKER_SEARCH_LIMIT = 30;
+const MAX_GROUP_NAME = 100;
+/** A client says which chat it shows at least this often; after that the chat counts as closed again. */
+const VIEWING_TTL_MS = 90_000;
+/** Older messages (replayed after a reconnect) are history, not news: no notification. */
+const NOTIFY_MAX_AGE_MS = 10 * 60_000;
 
 export class ZaloSession extends EventEmitter<SessionEvents> {
     private api: API | null = null;
@@ -81,6 +97,10 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private resumeRetry: { timer: NodeJS.Timeout; wake: () => void } | null = null;
     private resuming = false;
     private members = new Map<string, { at: number; list: GroupMember[] }>();
+    private friendList = new Map<string, Person>();
+    private stickers = new Map<number, StickerInfo>();
+    private stickerLookups = new Map<number, Promise<StickerInfo | null>>();
+    private viewing: { key: string; until: number } | null = null;
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -317,6 +337,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     async markRead(kind: ThreadKind, threadId: string): Promise<void> {
         const unread = this.store.unreadMessages(kind, threadId);
         const wasMarkedUnread = this.store.markRead(kind, threadId);
+        // Clears the chat's notification on the phone.
+        this.emit("read", { threadKind: kind, threadId });
         if (!this.api) return;
 
         // Let the sender see "seen", as the official app does. Best effort.
@@ -413,7 +435,240 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return list;
     }
 
+    // ---- Notifications ----
+
+    /** The chat a client has open (null = none), so its messages don't also notify. */
+    setViewing(kind: ThreadKind | null, threadId: string | null, now = Date.now()): void {
+        this.viewing = kind && threadId ? { key: threadKey(kind, threadId), until: now + VIEWING_TTL_MS } : null;
+    }
+
+    /** Whether a new message deserves a phone notification. */
+    shouldNotify(msg: ChatMessage, now = Date.now()): boolean {
+        if (msg.isSelf || msg.recalled) return false;
+        if (now - msg.ts > NOTIFY_MAX_AGE_MS) return false;
+        if (this.store.isMuted(msg.threadKind, msg.threadId, now)) return false;
+        const key = threadKey(msg.threadKind, msg.threadId);
+        return !(this.viewing && this.viewing.key === key && this.viewing.until > now);
+    }
+
+    threadName(kind: ThreadKind, threadId: string): string {
+        return this.store.getThread(kind, threadId)?.name ?? threadId;
+    }
+
+    /** Looks up sticker images for these messages (cached copies stored before they were known). */
+    fillStickerImages(messages: ChatMessage[]): void {
+        for (const m of messages) {
+            if (m.attachment?.kind !== "sticker" || m.attachment.thumb) continue;
+            const stored = this.store.getMessage(m.id);
+            if (stored) this.fillStickerImage(stored);
+        }
+    }
+
+    // ---- Photos, files and stickers ----
+
+    /**
+     * Sends one photo or file. Zalo sends jpg/png/webp as photos (they need their pixel size) and anything else as a
+     * file; GIFs need a path-based metadata reader zca-js has no hook for here, so they are refused.
+     */
+    async sendAttachment(kind: ThreadKind, threadId: string, file: UploadFile): Promise<string[]> {
+        const api = this.requireApi();
+        const ext = path.extname(file.filename).slice(1).toLowerCase();
+        if (!ext) throw new HttpError(400, "The file needs a name with an extension");
+        if (ext === "gif") throw new HttpError(400, "GIFs can't be sent yet");
+        if (file.data.length === 0) throw new HttpError(400, "The file is empty");
+        const isPhoto = PHOTO_EXTENSIONS.has(ext);
+        if (isPhoto && !(file.width && file.height)) throw new HttpError(400, "Photos need their width and height");
+        const res = await api.sendMessage(
+            {
+                msg: "",
+                attachments: [
+                    {
+                        data: file.data,
+                        filename: file.filename as `${string}.${string}`,
+                        metadata: isPhoto
+                            ? { totalSize: file.data.length, width: file.width, height: file.height }
+                            : { totalSize: file.data.length },
+                    },
+                ],
+            },
+            threadId,
+            toThreadType(kind),
+        );
+        // The message itself comes back through the listener, which stores it.
+        return res.attachment.map((a) => String(a.msgId));
+    }
+
+    /** Zalo's sticker search ("hi", "love", "cảm ơn"…), with the image of each. */
+    async searchStickers(keyword: string): Promise<StickerInfo[]> {
+        const api = this.requireApi();
+        const ids = (await api.getStickers(keyword)).slice(0, STICKER_SEARCH_LIMIT);
+        const missing = ids.filter((id) => !this.stickers.has(id));
+        if (missing.length) {
+            for (const d of await api.getStickersDetail(missing)) this.rememberSticker(d);
+        }
+        return ids.map((id) => this.stickers.get(id)).filter((s): s is StickerInfo => !!s);
+    }
+
+    async sendSticker(kind: ThreadKind, threadId: string, stickerId: number): Promise<void> {
+        const api = this.requireApi();
+        const sticker = this.stickers.get(stickerId) ?? (await this.lookupSticker(stickerId));
+        if (!sticker) throw new HttpError(404, "Sticker not found");
+        await api.sendSticker({ id: sticker.id, cateId: sticker.catId, type: sticker.type }, threadId, toThreadType(kind));
+    }
+
+    // ---- Friends ----
+
+    friends(): Person[] {
+        return [...this.friendList.values()].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    /** Friend requests other people sent me. */
+    async friendRequests(): Promise<FriendRequest[]> {
+        const res = await this.requireApi().getFriendRecommendations();
+        return (res.recommItems ?? [])
+            .map((item) => item.dataInfo)
+            .filter((d) => d && d.recommType === 2)
+            .map((d) => ({
+                id: String(d.userId),
+                name: d.displayName || d.zaloName,
+                avatar: d.avatar ?? "",
+                message: d.recommInfo?.message ?? "",
+                time: d.recommTime ?? 0,
+            }));
+    }
+
+    async acceptFriendRequest(userId: string): Promise<void> {
+        const api = this.requireApi();
+        await api.acceptFriendRequest(userId);
+        // Load their name and avatar as a friend, and show the chat.
+        await this.loadFriends(api).catch(() => {});
+        this.emit("threads");
+    }
+
+    async rejectFriendRequest(userId: string): Promise<void> {
+        await this.requireApi().rejectFriendRequest(userId);
+    }
+
+    /** Looks someone up by phone number, as the official "Add friend" does. */
+    async findUser(phone: string): Promise<FoundUser> {
+        const api = this.requireApi();
+        const user = await api.findUser(phone).catch(() => null);
+        if (!user || !user.uid) throw new HttpError(404, "No Zalo account uses this phone number");
+        const id = String(user.uid);
+        let requested = false;
+        try {
+            requested = id in (await api.getSentFriendRequest());
+        } catch {
+            // Zalo answers with an error when there are none.
+        }
+        return {
+            id,
+            name: user.display_name || user.zalo_name,
+            avatar: user.avatar ?? "",
+            isFriend: this.friendList.has(id),
+            requested,
+        };
+    }
+
+    async sendFriendRequest(userId: string, message: string): Promise<void> {
+        await this.requireApi().sendFriendRequest(message, userId);
+    }
+
+    async undoFriendRequest(userId: string): Promise<void> {
+        await this.requireApi().undoFriendRequest(userId);
+    }
+
+    // ---- Groups ----
+
+    async createGroup(name: string, memberIds: string[]): Promise<{ groupId: string; failed: string[] }> {
+        const api = this.requireApi();
+        const members = [...new Set(memberIds)].filter((id) => id !== this.status.ownId);
+        if (members.length < 2) throw new HttpError(400, "A group needs at least 2 other people");
+        const trimmed = name.trim().slice(0, MAX_GROUP_NAME);
+        const res = await api.createGroup({ name: trimmed || undefined, members });
+        const groupId = String(res.groupId);
+        await this.loadGroups(api, [groupId]).catch(() => {});
+        if (!this.store.getThread("group", groupId)) {
+            this.store.upsertThread({ id: groupId, kind: "group", name: trimmed || "New group", avatar: "" });
+        }
+        this.emit("threads");
+        return { groupId, failed: (res.errorMembers ?? []).map(String) };
+    }
+
+    async addGroupMembers(groupId: string, memberIds: string[]): Promise<{ failed: string[] }> {
+        const ids = [...new Set(memberIds)].filter((id) => id !== this.status.ownId);
+        if (!ids.length) throw new HttpError(400, "Pick someone to add");
+        const res = await this.requireApi().addUserToGroup(ids, groupId);
+        this.members.delete(groupId);
+        return { failed: (res.errorMembers ?? []).map(String) };
+    }
+
+    async removeGroupMember(groupId: string, memberId: string): Promise<void> {
+        const res = await this.requireApi().removeUserFromGroup(memberId, groupId);
+        this.members.delete(groupId);
+        if (res.errorMembers?.length) throw new HttpError(403, "Only the group's owner and deputies can remove members");
+    }
+
+    async renameGroup(groupId: string, name: string): Promise<void> {
+        const trimmed = name.trim();
+        if (!trimmed) throw new HttpError(400, "The group needs a name");
+        await this.requireApi().changeGroupName(trimmed.slice(0, MAX_GROUP_NAME), groupId);
+        const info = this.store.getThread("group", groupId);
+        this.store.upsertThread({ id: groupId, kind: "group", name: trimmed.slice(0, MAX_GROUP_NAME), avatar: info?.avatar ?? "" });
+        this.emit("threads");
+    }
+
+    /** Leaves a group (silently: only its admins are told). The chat is gone afterwards, as in the official app. */
+    async leaveGroup(groupId: string, silent: boolean): Promise<void> {
+        await this.requireApi().leaveGroup(groupId, silent);
+        this.members.delete(groupId);
+        this.store.removeThread("group", groupId);
+        this.emit("threads");
+    }
+
     // ---- Internals ----
+
+    private rememberSticker(d: { id: number; cateId: number; type: number; stickerWebpUrl?: string | null; stickerUrl?: string }): StickerInfo | null {
+        const url = d.stickerWebpUrl || d.stickerUrl || "";
+        if (!d.id || !url) return null;
+        const info = { id: Number(d.id), catId: Number(d.cateId), type: Number(d.type), url };
+        this.stickers.set(info.id, info);
+        return info;
+    }
+
+    private lookupSticker(id: number): Promise<StickerInfo | null> {
+        const known = this.stickers.get(id);
+        if (known) return Promise.resolve(known);
+        let pending = this.stickerLookups.get(id);
+        if (!pending) {
+            const api = this.api;
+            pending = (api ? api.getStickersDetail([id]) : Promise.resolve([]))
+                .then((list) => list.map((d) => this.rememberSticker(d)).find((s) => s?.id === id) ?? null)
+                .catch(() => null)
+                .finally(() => this.stickerLookups.delete(id));
+            this.stickerLookups.set(id, pending);
+        }
+        return pending;
+    }
+
+    /** A sticker message carries only ids: look up its image and update the message. */
+    private fillStickerImage(msg: StoredMessage): void {
+        const sticker = msg.attachment?.kind === "sticker" ? msg.attachment.sticker : undefined;
+        if (!sticker || msg.attachment?.thumb) return;
+        void this.lookupSticker(sticker.id).then((info) => {
+            if (info) this.updated(this.store.patchAttachment(msg.id, { thumb: info.url }));
+        });
+    }
+
+    private async loadFriends(api: API): Promise<void> {
+        const friends = await api.getAllFriends();
+        this.friendList.clear();
+        for (const f of friends) {
+            const person = { id: String(f.userId), name: f.displayName || f.zaloName, avatar: f.avatar ?? "" };
+            this.friendList.set(person.id, person);
+            this.store.upsertThread({ id: person.id, kind: "user", name: person.name, avatar: person.avatar });
+        }
+    }
 
     private requireApi(): API {
         if (!this.api || (this.status.state !== "ready" && this.status.state !== "disconnected")) {
@@ -573,7 +828,10 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             return;
         }
         const msg = normalizeMessage(rawMsg);
-        if (this.store.addMessage(msg)) this.emit("message", this.store.toPublic(msg));
+        if (this.store.addMessage(msg)) {
+            this.emit("message", this.store.toPublic(msg));
+            this.fillStickerImage(msg);
+        }
     }
 
     private onUndo(undo: Undo): void {
@@ -635,10 +893,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     private async loadContacts(api: API): Promise<void> {
-        const friends = await api.getAllFriends();
-        for (const f of friends) {
-            this.store.upsertThread({ id: f.userId, kind: "user", name: f.displayName || f.zaloName, avatar: f.avatar });
-        }
+        await this.loadFriends(api);
         await this.loadGroups(api, Object.keys((await api.getAllGroups()).gridVerMap));
 
         // Pinned and muted conversations are account settings shared with the phone app.
