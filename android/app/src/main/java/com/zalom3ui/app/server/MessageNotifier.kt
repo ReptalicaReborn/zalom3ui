@@ -20,6 +20,7 @@ import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.ui.call.CallActivity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -137,58 +138,65 @@ class MessageNotifier(private val context: Context) {
 
     private val ringing = LinkedHashSet<String>()
 
-    /** "Bảo is calling": Zalỏ can't answer calls, so it says who is calling and opens the official app. */
+    /**
+     * "Bảo is calling": a real call notification for 1:1 calls (Answer opens the call screen and picks up, Decline
+     * declines). Group calls can't be answered here, so they only say who is calling and open the official app.
+     */
     private fun showCall(call: IncomingCall) {
         ensureCallChannel(context)
-        val tag = CALL_TAG + call.callId.ifEmpty { call.callerId }
+        val tag = callTag(call.callId.ifEmpty { call.callerId })
         ringing += tag
-        val zalo = context.packageManager.getLaunchIntentForPackage(ZALO_PACKAGE)
-        val openZalo = zalo?.let {
-            PendingIntent.getActivity(context, tag.hashCode(), it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        }
+        val pendingFlags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         val ref = if (call.group && call.groupId != null) ThreadRef("group", call.groupId) else ThreadRef("user", call.callerId)
-        val openChat = PendingIntent.getActivity(
-            context,
-            tag.hashCode() + 1,
-            MainActivity.openChatIntent(context, ref),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+        val openChat = PendingIntent.getActivity(context, tag.hashCode() + 1, MainActivity.openChatIntent(context, ref), pendingFlags)
         val what = if (call.video) "Video call" else "Voice call"
-        val title = buildString {
-            append(call.callerName.ifBlank { "Someone" })
-            append(" is calling")
-            call.groupName?.let { append(" in ").append(it) }
-        }
+        val callerName = call.callerName.ifBlank { "Someone" }
         val builder = NotificationCompat.Builder(context, CALLS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("📞 $title")
-            .setContentText(if (zalo != null) "$what · answer it in the Zalo app" else "$what · Zalỏ can't answer calls yet")
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setContentIntent(openZalo ?: openChat)
             .setAutoCancel(true)
             // Zalo rings for about a minute; a call that never said it ended disappears on its own.
             .setTimeoutAfter(CALL_TIMEOUT_MS)
         if (call.callId.isNotEmpty() && !call.group) {
+            val person = Person.Builder().setName(callerName).setImportant(true).build()
+            val screen = { answerNow: Boolean ->
+                CallActivity.intent(context, call.callId, call.callerId, callerName, video = call.video, answerNow = answerNow)
+            }
+            val answer = PendingIntent.getActivity(context, tag.hashCode() + 3, screen(true), pendingFlags)
             val decline = PendingIntent.getBroadcast(
                 context,
                 tag.hashCode() + 2,
                 CallActionReceiver.declineIntent(context, call.callId, tag),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                pendingFlags,
             )
-            builder.addAction(R.drawable.ic_launcher_foreground, "Decline", decline)
-            val answerTest = PendingIntent.getBroadcast(
-                context,
-                tag.hashCode() + 3,
-                CallActionReceiver.answerTestIntent(context, call.callId, tag),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-            // Picks up without sound for 30 s and records the media connection (Settings → Call research).
-            builder.addAction(R.drawable.ic_launcher_foreground, "Answer (test)", answerTest)
+            val ringingScreen = PendingIntent.getActivity(context, tag.hashCode() + 4, screen(false), pendingFlags)
+            builder
+                .setContentTitle(callerName)
+                .setContentText("Incoming ${what.lowercase()}")
+                .setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
+                .setContentIntent(ringingScreen)
+            // Android 14+ lets users revoke this; without it the heads-up notification still rings.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
+                context.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
+            ) {
+                builder.setFullScreenIntent(ringingScreen, true)
+            }
+        } else {
+            val zalo = context.packageManager.getLaunchIntentForPackage(ZALO_PACKAGE)
+            val openZalo = zalo?.let { PendingIntent.getActivity(context, tag.hashCode(), it, pendingFlags) }
+            val title = buildString {
+                append(callerName)
+                append(" is calling")
+                call.groupName?.let { append(" in ").append(it) }
+            }
+            builder
+                .setContentTitle("📞 $title")
+                .setContentText(if (zalo != null) "$what · answer it in the Zalo app" else "$what · Zalỏ can't answer group calls")
+                .setContentIntent(openZalo ?: openChat)
+            if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
+            else builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
         }
-        // Android shows three buttons at most.
-        if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
-        else builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
         if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, builder.build()) }
     }
 
@@ -209,6 +217,9 @@ class MessageNotifier(private val context: Context) {
         const val CHANNEL_ID = "messages"
         const val CALLS_CHANNEL_ID = "calls"
         private const val CALL_TAG = "call:"
+
+        /** Notification tag of the incoming call [callId]; the call screen cancels it when answering. */
+        fun callTag(callId: String): String = CALL_TAG + callId
         const val CALL_NOTIFICATION_ID = 200
         private const val CALL_TIMEOUT_MS = 75_000L
         /** The official Zalo app, which answers the calls. */
@@ -217,7 +228,7 @@ class MessageNotifier(private val context: Context) {
         fun ensureCallChannel(context: Context) {
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(CALLS_CHANNEL_ID, "Incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {
-                    description = "Who is calling (calls are answered in the Zalo app)"
+                    description = "Incoming Zalo calls"
                 },
             )
         }
