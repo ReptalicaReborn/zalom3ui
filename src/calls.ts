@@ -184,8 +184,13 @@ export function callControlsOf(frame: Buffer, cipherKey: string | undefined): Ca
 }
 
 function controlsOf(decoded: unknown): CallControl[] {
+    return callControlsIn(controlList(decoded));
+}
+
+/** The `voip` controls of a list of controls (`{content: {act_type, act, data}}`), from the socket or the control poll. */
+export function callControlsIn(controls: unknown[]): CallControl[] {
     const out: CallControl[] = [];
-    for (const control of controlList(decoded)) {
+    for (const control of controls) {
         const content = (control as { content?: Record<string, unknown> })?.content;
         if (!content || content.act_type !== "voip") continue;
         let data = content.data;
@@ -214,7 +219,9 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
     };
     const callerId = text("callerId", "uidN", "fromUid", "uidFrom", "uid", "hostCall", "srcId");
     if (!callerId) return null;
-    const ts = Number(text("ts")) || now;
+    const raw = Number(text("ts", "time", "timestamp"));
+    // Seconds or milliseconds.
+    const ts = raw ? (raw < 1e12 ? raw * 1000 : raw) : now;
     const type = Number(text("callType", "type", "calltype"));
     return {
         callId: text("callId", "call_id"),
@@ -225,6 +232,9 @@ export function incomingCallOf(control: CallControl, now = Date.now()): Incoming
         ts,
     };
 }
+
+/** A call request older than this is history (a replayed control), not a ringing phone. */
+export const RINGING_MAX_AGE_MS = 2 * 60_000;
 
 /** Acts after which a ringing call is over (answered elsewhere, cancelled, ended). */
 export const CALL_ENDING_ACTS = new Set(["answer", "cancel", "endcall", "group_answer", "group_cancel", "group_endcall", "group_finish"]);

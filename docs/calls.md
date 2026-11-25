@@ -72,7 +72,18 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
 ## What Zalỏ does already
 
 - **Who is calling:** Zalỏ's server reads the realtime `voip` controls itself (`src/calls.ts`: frame header, AES-GCM +
-  zlib payload, big ids kept as text). An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
+  zlib/gzip payload, big ids kept as text), from two places:
+  - the chat WebSocket zca-js opens (`zpw_ws`). In the first test call it carried nothing about the call;
+  - Zalo's **control channel**, which Zalo PC keeps apart from chat (`src/ctrlpoll.ts`). Zalo PC reads it over a
+    socket or, with `enable_ctrl_socket` off, by long polling the control servers of the login answer
+    (`zpw_ctrs_new`): `GET <server>/?zpw_ver=…&zpw_type=…&params=<lastActionId>,<lastActionIdOther>,<ids>&ts=<unix>`,
+    held up to `zpw_conf.lp_ctl_timeout` seconds (30), answered `{error_code, data}` with `data` AES-CBC encrypted
+    under the session key. Zalỏ polls the same way. On error `-69` or a kick-out it stops (Zalo PC would log out;
+    Zalỏ never does), and if Zalo closes the chat socket as a duplicate while polling, polling stays off until the
+    next login.
+
+  Each control is announced once even if both channels carry it, and a call request over 2 minutes old is not
+  announced (replayed history). An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
   it goes away when the call is answered elsewhere, cancelled or ended.
 - **Call log:** every call event is appended to `call-trace.jsonl` in the server's data folder (2 MB, then rotated).
   *Settings → Call research → Share call log* exports it; *Clear call log* empties it. It holds call ids, user ids and
@@ -83,7 +94,9 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
 1. In Zalỏ (account A): *Settings → Call research → Clear call log*.
 2. From the official Zalo app on another phone (account B), call account A: a voice call, then a video call. Let one
    ring out, decline one in the official app on A's phone if it is there too, and answer one there and talk ~10 s.
-3. *Share call log* and send the file.
+3. *Share call log* and send the file. Its first lines say whether the control poll could start: `ctrl_setup`
+   (which login fields and control servers there were), then `ctrl_poll_start` and one `ctrl_poll` per answer
+   (field names and control types only), or `ctrl_poll_error` / `ctrl_poll_refused` / `ctrl_poll_off`.
 
 That shows the caller's real call request (media addresses, codec, session) and the answer / cancel / end events, which
 step 1 below needs.

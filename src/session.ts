@@ -21,7 +21,18 @@ import {
     type Undo,
     ZaloApiLoginQRAborted,
 } from "zca-js";
-import { CALL_ENDING_ACTS, CallTrace, incomingCallOf, inspectFrame, type CallControl, type FrameInfo, type IncomingCall } from "./calls.js";
+import {
+    CALL_ENDING_ACTS,
+    CallTrace,
+    RINGING_MAX_AGE_MS,
+    callControlsIn,
+    incomingCallOf,
+    inspectFrame,
+    type CallControl,
+    type FrameInfo,
+    type IncomingCall,
+} from "./calls.js";
+import { ControlPoller, serverList } from "./ctrlpoll.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -111,6 +122,13 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private readonly callTrace: CallTrace;
     /** Sockets already tapped for call events (zca-js opens a new one on each reconnect). */
     private tappedSockets = new WeakSet<object>();
+    /** The control-channel poll (calls reach Zalo PC there, not on the chat socket), for [ctrlPollApi]. */
+    private ctrlPoller: ControlPoller | null = null;
+    private ctrlPollApi: API | null = null;
+    /** Turned off for this login when Zalo closed the chat socket while the poll ran, in case the two clash. */
+    private ctrlPollOff = false;
+    /** "act:callId" of call controls already handled, so one that comes both ways is announced once. */
+    private handledCallControls = new Map<string, number>();
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -220,6 +238,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     async logout(): Promise<void> {
         this.cancelResume();
         this.abortQR?.();
+        this.stopControlPoll();
+        this.ctrlPollOff = false;
         this.api?.listener.stop();
         this.api = null;
         this.members.clear();
@@ -504,11 +524,83 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
     }
 
-    /** Public for tests: one decoded voip control. */
-    onCallControl(control: CallControl): void {
-        this.callTrace.record({ kind: "control", act: control.act, control: control.raw });
-        const incoming = incomingCallOf(control);
-        if (incoming) {
+    /**
+     * Polls Zalo's control servers the way Zalo PC does (src/ctrlpoll.ts), for the call events the chat socket never
+     * carries. Notes in the call log what the login offered (field names, server hosts, socket flags), so a log shows
+     * why it could not run.
+     */
+    private startControlPoll(api: API): void {
+        if (this.ctrlPollOff || (this.ctrlPoller && this.ctrlPollApi === api)) return;
+        this.stopControlPoll();
+        const ctx = api.getContext() as unknown as {
+            loginInfo?: Record<string, unknown>;
+            secretKey?: string | null;
+            settings?: { features?: { socket?: Record<string, unknown> } };
+            API_TYPE: number;
+            API_VERSION: number;
+        };
+        const info = ctx.loginInfo ?? {};
+        const servers = serverList(info.zpw_ctrs_new);
+        const socket = ctx.settings?.features?.socket ?? {};
+        this.callTrace.record({
+            kind: "ctrl_setup",
+            loginKeys: Object.keys(info).filter((k) => k.startsWith("zpw_")).sort(),
+            servers: servers.map(hostOf),
+            socket: { enable_ctrl_socket: socket.enable_ctrl_socket, enable_chat_socket: socket.enable_chat_socket, disable_lp: socket.disable_lp },
+        });
+        if (!ctx.secretKey) {
+            this.callTrace.record({ kind: "ctrl_poll_unavailable", reason: "no session key" });
+            return;
+        }
+        const GET = "zalooControlGet";
+        if (!(GET in api)) {
+            api.custom<Response, { url: string; signal: AbortSignal }>(GET, ({ utils, props }) =>
+                utils.request(props.url, { method: "GET", signal: props.signal }),
+            );
+        }
+        const get = (api as unknown as Record<string, (p: { url: string; signal: AbortSignal }) => Promise<Response>>)[GET];
+        const hold = Number((info.zpw_conf as { lp_ctl_timeout?: unknown } | undefined)?.lp_ctl_timeout);
+        const live = () => this.api === api && this.ctrlPollApi === api;
+        const poller = new ControlPoller({
+            servers,
+            secretKey: ctx.secretKey,
+            apiVersion: ctx.API_VERSION,
+            apiType: ctx.API_TYPE,
+            holdSeconds: hold > 0 && hold < 300 ? hold : 30,
+            get: async (url, signal) => {
+                const res = await get({ url, signal });
+                return { status: res.status, body: await res.text() };
+            },
+            onControls: (controls) => {
+                if (live()) for (const control of callControlsIn(controls)) this.onCallControl(control, "poll");
+            },
+            onEvent: (entry) => live() && this.callTrace.record(entry),
+        });
+        this.ctrlPoller = poller;
+        this.ctrlPollApi = api;
+        poller.start();
+    }
+
+    private stopControlPoll(): void {
+        this.ctrlPoller?.stop();
+        this.ctrlPoller = null;
+        this.ctrlPollApi = null;
+    }
+
+    /** Public for tests: one decoded voip control, from the chat socket or the control poll. */
+    onCallControl(control: CallControl, source: "socket" | "poll" = "socket", now = Date.now()): void {
+        this.callTrace.record({ kind: "control", source, act: control.act, control: control.raw });
+        const callId = control.data.callId ?? control.data.call_id;
+        if (callId !== undefined && callId !== "") {
+            const key = `${control.act}:${String(callId)}`;
+            for (const [k, at] of this.handledCallControls) if (now - at > 10 * 60_000) this.handledCallControls.delete(k);
+            if (this.handledCallControls.has(key)) return;
+            this.handledCallControls.set(key, now);
+        }
+        const incoming = incomingCallOf(control, now);
+        if (incoming && now - incoming.ts > RINGING_MAX_AGE_MS) {
+            this.callTrace.record({ kind: "call_too_old", callId: incoming.callId, ageSeconds: Math.round((now - incoming.ts) / 1000) });
+        } else if (incoming) {
             const caller = this.friendList.get(incoming.callerId)?.name ?? this.store.getThread("user", incoming.callerId)?.name ?? "";
             const groupName = incoming.groupId ? this.store.getThread("group", incoming.groupId)?.name : undefined;
             this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
@@ -747,6 +839,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         this.loginInFlight = fn()
             .catch((err: unknown) => {
                 if (generation !== this.generation) return;
+                this.stopControlPoll();
                 this.api = null;
                 this.setStatus({ state: "logged_out", qrImage: null, scannedBy: null, error: describeError(err) });
             })
@@ -815,6 +908,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private async onLoggedIn(api: API, generation: number): Promise<void> {
         // Logged out (or replaced by a QR login) while this login was in flight.
         if (generation !== this.generation) return;
+        if (this.ctrlPollApi !== api) this.stopControlPoll();
         this.api = api;
         const ownId = api.getOwnId();
         this.store.ownId = ownId;
@@ -843,6 +937,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
         listener.on("connected", () => {
             this.tapCallEvents(listener);
+            if (live()) this.startControlPoll(api);
             this.setStatus({ state: "ready", error: null });
             // Ask the server to replay messages and reactions we missed while offline.
             listener.requestOldMessages(ThreadType.User);
@@ -852,10 +947,16 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
         listener.on("closed", (code, reason) => {
             if (!live()) return;
-            const error =
-                code === CloseReason.DuplicateConnection || code === CloseReason.KickConnection
-                    ? "Zalo Web was opened somewhere else. Only one web session can listen at a time."
-                    : `Connection closed (${code}${reason ? `: ${reason}` : ""})`;
+            const kicked = code === CloseReason.DuplicateConnection || code === CloseReason.KickConnection;
+            if (kicked && this.ctrlPoller) {
+                // Maybe Zalo Web elsewhere, maybe the poll: stop it so it can't be the reason this keeps happening.
+                this.stopControlPoll();
+                this.ctrlPollOff = true;
+                this.callTrace.record({ kind: "ctrl_poll_off", reason: `chat socket closed (${code}) while polling` });
+            }
+            const error = kicked
+                ? "Zalo Web was opened somewhere else. Only one web session can listen at a time."
+                : `Connection closed (${code}${reason ? `: ${reason}` : ""})`;
             this.setStatus({ state: "disconnected", error });
         });
         listener.on("error", (err) => console.error("Zalo listener error:", err));
@@ -1034,6 +1135,15 @@ export function isTransientError(err: unknown): boolean {
 }
 
 /** A short, human-readable reason; Node's "fetch failed" alone says nothing. */
+/** The host of a server URL, for the call log. */
+function hostOf(url: string): string {
+    try {
+        return new URL(url).host;
+    } catch {
+        return "?";
+    }
+}
+
 export function describeError(err: unknown): string {
     if (!(err instanceof Error)) return String(err);
     const cause = (err as { cause?: { code?: unknown; message?: unknown } }).cause;

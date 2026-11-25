@@ -1,0 +1,140 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { callControlsIn } from "../src/calls.js";
+import { ControlPoller, controlsIn, decodeAesCbc, pollCursor, readPollAnswer, serverList } from "../src/ctrlpoll.js";
+import { ZaloSession, type CallEvent } from "../src/session.js";
+import { ChatStore } from "../src/store.js";
+
+const KEY = crypto.randomBytes(32).toString("base64");
+
+/** Encrypts like Zalo's servers do for zca-js's decodeAES: AES-CBC, zero IV, base64, URL-encoded. */
+function sealCbc(text: string, key = KEY): string {
+    const cipher = crypto.createCipheriv("aes-256-cbc", Buffer.from(key, "base64"), Buffer.alloc(16));
+    return encodeURIComponent(Buffer.concat([cipher.update(text, "utf8"), cipher.final()]).toString("base64"));
+}
+
+const voipRequest = {
+    content: { act_type: "voip", act: "request", data: '{"callerId":1234567890123456789,"callId":42,"callType":0}' },
+};
+
+test("the poll cursor has Zalo PC's format", () => {
+    assert.equal(pollCursor("0", "1"), "0,1," + encodeURIComponent(Buffer.from("{}").toString("base64") + ",1"));
+    assert.equal(pollCursor("0", "1"), "0,1,e30%3D%2C1");
+});
+
+test("control servers are read from a list or a single URL", () => {
+    assert.deepEqual(serverList(["https://a.example/x", 3, "nope"]), ["https://a.example/x"]);
+    assert.deepEqual(serverList("https://b.example"), ["https://b.example"]);
+    assert.deepEqual(serverList(undefined), []);
+});
+
+test("poll answers: empty, encrypted data, plain JSON data, refusals", () => {
+    assert.deepEqual(readPollAnswer("", KEY), { kind: "empty" });
+    assert.deepEqual(readPollAnswer('{"error_code":0,"data":""}', KEY), { kind: "empty" });
+
+    // Written as text: a JS number literal would already round the id.
+    const inner = `{"data":{"lastActionId":98765432109876543210,"controls":${JSON.stringify([voipRequest])}}}`;
+    const answer = readPollAnswer(JSON.stringify({ error_code: 0, data: sealCbc(inner) }), KEY);
+    assert.equal(answer.kind, "data");
+    if (answer.kind !== "data") return;
+    assert.equal(answer.data.lastActionId, "98765432109876543210", "long ids keep every digit");
+    assert.equal(controlsIn(answer.data).length, 1);
+
+    const plain = readPollAnswer(JSON.stringify({ error_code: 0, data: inner }), KEY);
+    assert.equal(plain.kind, "data");
+
+    assert.deepEqual(readPollAnswer('{"error_code":-69,"error_message":"x"}', KEY), { kind: "error", code: -69, message: "x" });
+    assert.equal(readPollAnswer(JSON.stringify({ error_code: 0, data: sealCbc("{}", crypto.randomBytes(32).toString("base64")) }), KEY).kind, "error");
+    assert.equal(decodeAesCbc(KEY, "not base64 at all"), null);
+});
+
+test("controls are found wherever the answer keeps them, in either shape", () => {
+    const found = controlsIn({ a: { list: [voipRequest] }, b: [{ act_type: "voip", act: "cancel", data: { callId: 42 } }] });
+    assert.deepEqual(found.map((c) => c.content.act), ["request", "cancel"]);
+    const calls = callControlsIn(found);
+    assert.equal(calls[0].data.callerId, "1234567890123456789");
+    assert.equal(calls[1].data.callId, 42);
+});
+
+function poller(answers: { status: number; body: string }[], events: Record<string, unknown>[], urls: string[] = []) {
+    const got: unknown[] = [];
+    const p = new ControlPoller({
+        servers: ["https://ctrl1.example/", "https://ctrl2.example"],
+        secretKey: KEY,
+        apiVersion: 685,
+        apiType: 30,
+        holdSeconds: 30,
+        get: async (url) => {
+            urls.push(url);
+            const next = answers.shift();
+            if (!next) throw new Error("no more answers");
+            return next;
+        },
+        onControls: (c) => got.push(...c),
+        onEvent: (e) => events.push(e),
+        sleep: async () => {},
+    });
+    return { p, got };
+}
+
+test("a poll follows the action ids, hands over controls and asks Zalo PC's URL", async () => {
+    const events: Record<string, unknown>[] = [];
+    const urls: string[] = [];
+    const body = (inner: unknown) => ({ status: 200, body: JSON.stringify({ error_code: 0, data: sealCbc(JSON.stringify(inner)) }) });
+    const { p, got } = poller([body({ data: { lastActionId: 500, controls: [voipRequest] } }), body({ data: { resetLastActionId: 7 } })], events, urls);
+    assert.equal(await p.pollOnce(), true);
+    assert.equal(got.length, 1);
+    assert.match(urls[0], /^https:\/\/ctrl1\.example\/\?zpw_ver=685&zpw_type=30&params=0,1,e30%3D%2C1&ts=\d+$/);
+    assert.ok(p.cursor.startsWith("500,1,"));
+    assert.equal(await p.pollOnce(), true);
+    assert.ok(p.cursor.startsWith("7,1,"));
+    assert.deepEqual(events.map((e) => e.kind), ["ctrl_poll", "ctrl_poll"]);
+    assert.deepEqual(events[0].controls, ["voip/request"]);
+});
+
+test("network failures move to the next server; a refusal stops polling for good", async () => {
+    const events: Record<string, unknown>[] = [];
+    const urls: string[] = [];
+    const { p } = poller([{ status: 502, body: "" }, { status: 200, body: '{"error_code":-69}' }], events, urls);
+    // pollOnce on its own (not started) treats a failure as the end.
+    p.start();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(urls[1].startsWith("https://ctrl2.example/?"), "rotates servers after a failure");
+    assert.deepEqual(events.map((e) => e.kind), ["ctrl_poll_start", "ctrl_poll_error", "ctrl_poll_refused"]);
+    assert.equal(urls.length, 2, "no poll after the refusal");
+});
+
+test("no control servers: says so in the call log and does nothing", () => {
+    const events: Record<string, unknown>[] = [];
+    const p = new ControlPoller({
+        servers: [],
+        secretKey: KEY,
+        apiVersion: 1,
+        apiType: 1,
+        holdSeconds: 30,
+        get: async () => assert.fail("must not poll"),
+        onControls: () => {},
+        onEvent: (e) => events.push(e),
+    });
+    p.start();
+    assert.equal(events[0].kind, "ctrl_poll_unavailable");
+});
+
+test("a call seen both ways rings once; an old one doesn't ring at all", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-ctrl-"));
+    const session = new ZaloSession(new ChatStore(), dir);
+    const events: CallEvent[] = [];
+    session.on("call", (e) => events.push(e));
+    const now = 1_800_000_000_000;
+    const request = { act: "request", data: { callerId: "5", callId: "1", ts: now - 1000 }, raw: {} };
+    session.onCallControl(request, "socket", now);
+    session.onCallControl(request, "poll", now);
+    assert.equal(events.length, 1);
+    session.onCallControl({ act: "request", data: { callerId: "5", callId: "2", ts: (now - 10 * 60_000) / 1000 }, raw: {} }, "poll", now);
+    assert.equal(events.length, 1, "a ten-minute-old request (in seconds) is history");
+    assert.match(session.callLog(), /call_too_old/);
+});
