@@ -45,12 +45,12 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
                 const reply = Buffer.concat([msg.subarray(0, 21), Buffer.from([0, 0, 0, 0, 1, 0, 0, 0, 0x39, 0x30, 0, 0, 9, 0]), Buffer.from("127.0.0.1")]);
                 reply[0] = zrtc.Kind.Response;
                 server.send(reply, from.port, from.address);
-                // A video packet: RED (118) around H.264 (97), an IDR slice.
+                // A video packet: a key frame (pt 98, marker) holding one IDR slice in Annex B.
                 const vrtp = Buffer.alloc(12);
                 vrtp[0] = 0x80;
-                vrtp[1] = 118;
+                vrtp[1] = 0x80 | 98;
                 vrtp.writeUInt32BE(0x5151, 8);
-                server.send(Buffer.concat([Buffer.from([zrtc.Kind.VideoIn]), callerSrtp.protect(Buffer.concat([vrtp, Buffer.from([97, 0x65, 0x88])]))]), from.port, from.address);
+                server.send(Buffer.concat([Buffer.from([zrtc.Kind.VideoIn]), callerSrtp.protect(Buffer.concat([vrtp, Buffer.from([0, 0, 0, 1, 0x65, 0x88])]))]), from.port, from.address);
                 // Then three packets of the caller's audio.
                 for (let i = 0; i < 3; i++) {
                     const rtp = Buffer.alloc(12);
@@ -97,10 +97,11 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     assert.equal(call.stats.audio.decrypted, 3);
     assert.deepEqual(call.stats.audio.timestampSteps, [320, 320]);
     assert.deepEqual(call.stats.audio.opusToc, ["78", "78", "78"]);
+    const v = call.stats.video;
     assert.deepEqual(
-        { ...call.stats.video, bytes: 0 },
-        { packets: 1, decrypted: 1, failed: 0, ssrcs: 1, payloadTypes: { 118: 1 }, redInner: { 97: 1 }, nalTypes: { 5: 1 }, bytes: 0 },
-        "video is described, not played",
+        { packets: v.packets, decrypted: v.decrypted, failed: v.failed, ssrcs: v.ssrcs, payloadTypes: v.payloadTypes, nalTypes: v.nalTypes, frames: v.frames, keys: v.keys },
+        { packets: 1, decrypted: 1, failed: 0, ssrcs: 1, payloadTypes: { 98: 1 }, nalTypes: { 5: 1 }, frames: 1, keys: 1 },
+        "video is assembled into frames",
     );
     assert.deepEqual(heard, [[100, 1000, "78010203"], [101, 1320, "78010203"], [102, 1640, "78010203"]], "decrypted Opus handed over");
     assert.ok(seen.audio >= 3, "sent audio every 20 ms");

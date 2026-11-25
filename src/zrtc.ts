@@ -167,6 +167,12 @@ export function audio(token: number, rtp: Buffer): Buffer {
     return new Writer().u8(Kind.Audio).u32(token).bytes(rtp).done();
 }
 
+/** One video packet to the media server: kind 13, the stream token, then the SRTP-protected RTP packet. */
+export function video(token: number, rtp: Buffer): Buffer {
+    if (rtp.length > MAX_PAYLOAD) throw new Error(`Video packet too large (${rtp.length} bytes)`);
+    return new Writer().u8(Kind.Video).u32(token).bytes(rtp).done();
+}
+
 export type Packet =
     | ({ type: "control" } & ControlHeader & {
           /** Error code of a response (0 = success), when the command has one. */

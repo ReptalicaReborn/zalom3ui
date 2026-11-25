@@ -312,6 +312,12 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     });
 
+    /** `{ "on": true | false }`: tells the other side our camera is on / off; the app's video is forwarded only while on. */
+    api.post("/calls/camera", (req, res) => {
+        session.setCallCamera(req.body?.on === true);
+        res.status(204).end();
+    });
+
     api.get("/calls/current", (_req, res) => {
         const call = session.currentCall();
         if (!call) {
@@ -371,14 +377,27 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     session.on("call", (call) => {
         if (call.type === "ended") for (const client of audioWss.clients) client.close(1000, "call ended");
     });
+    const sendToApp = (frame: Buffer) => {
+        if (audioWss.clients.size === 0) return;
+        for (const client of audioWss.clients) if (client.readyState === client.OPEN) client.send(frame);
+    };
+    session.on("call_video", ({ key, timestamp, data }) => sendToApp(encodeVideoToApp(key, timestamp, data)));
+    session.on("call_key_frame", () => sendToApp(KEY_FRAME_REQUEST));
     audioWss.on("connection", (ws: WebSocket) => {
         if (!session.currentCall()) {
             ws.close(1008, "no call in progress");
             return;
         }
         ws.on("message", (data: Buffer, isBinary: boolean) => {
-            const opus = isBinary ? decodeAudioFromApp(data) : null;
-            if (opus) session.sendCallAudio(opus);
+            if (!isBinary) return;
+            const opus = decodeAudioFromApp(data);
+            if (opus) {
+                session.sendCallAudio(opus);
+                return;
+            }
+            const video = decodeVideoFromApp(data);
+            if (video) session.sendCallVideo(video);
+            else if (isKeyFrameWanted(data)) session.requestCallKeyFrame();
         });
     });
 
@@ -424,6 +443,32 @@ export function encodeAudioToApp(seq: number, timestamp: number, opus: Buffer): 
 /** App → server audio message: `02` + one Opus frame; anything else is ignored. */
 export function decodeAudioFromApp(data: Buffer): Buffer | null {
     return data.length > 1 && data.length <= 1276 && data[0] === 2 ? data.subarray(1) : null;
+}
+
+/** Server → app video message: `03`, u8 flags (bit 0 = key frame), u32 RTP timestamp (90 kHz), H.264 access unit (Annex B). */
+export function encodeVideoToApp(key: boolean, timestamp: number, data: Buffer): Buffer {
+    const head = Buffer.alloc(6);
+    head[0] = 3;
+    head[1] = key ? 1 : 0;
+    head.writeUInt32BE(timestamp >>> 0, 2);
+    return Buffer.concat([head, data]);
+}
+
+/** Server → app: the other side asked for a key frame. */
+export const KEY_FRAME_REQUEST = Buffer.from([5]);
+
+/** Biggest access unit accepted from the app (a 640x480 key frame is a few tens of kilobytes). */
+const MAX_VIDEO_FRAME = 512 * 1024;
+
+/** App → server video message: `04`, u8 flags (bit 0 = key frame), access unit; anything else is ignored. */
+export function decodeVideoFromApp(data: Buffer): { key: boolean; data: Buffer } | null {
+    if (data.length < 3 || data.length > MAX_VIDEO_FRAME + 2 || data[0] !== 4) return null;
+    return { key: (data[1] & 1) !== 0, data: data.subarray(2) };
+}
+
+/** App → server: its decoder needs a key frame (`06`). */
+export function isKeyFrameWanted(data: Buffer): boolean {
+    return data.length >= 1 && data[0] === 6;
 }
 
 /** Express 4 does not forward rejected promises to the error handler on its own. */

@@ -83,9 +83,34 @@ export function sdesCname(ssrc: number, cname: string): Buffer {
     return Buffer.concat([header(1, RtcpType.SDES, 1 + (4 + padded.length) / 4), s, padded]);
 }
 
+/** Picture loss indication (RFC 4585, PSFB format 1): [from] asks the sender of [media] for a key frame. */
+export function pli(from: number, media: number): Buffer {
+    const b = Buffer.alloc(12);
+    b[0] = 0x81;
+    b[1] = RtcpType.PSFB;
+    b.writeUInt16BE(2, 2);
+    b.writeUInt32BE(from >>> 0, 4);
+    b.writeUInt32BE(media >>> 0, 8);
+    return b;
+}
+
+/** Full intra request (RFC 5104, PSFB format 4): same ask as a PLI, with a request counter. */
+export function fir(from: number, media: number, seqNo: number): Buffer {
+    const b = Buffer.alloc(20);
+    b[0] = 0x84;
+    b[1] = RtcpType.PSFB;
+    b.writeUInt16BE(4, 2);
+    b.writeUInt32BE(from >>> 0, 4);
+    // Media SSRC of the header is 0 for FIR; the target is in the FCI entry.
+    b.writeUInt32BE(media >>> 0, 12);
+    b[16] = seqNo & 0xff;
+    return b;
+}
+
 export type RtcpPacket =
     | { type: "SR"; ssrc: number; ntpSec: number; ntpFrac: number; rtpTimestamp: number; packets: number; octets: number; blocks: ReportBlock[] }
     | { type: "RR"; ssrc: number; blocks: ReportBlock[] }
+    | { type: "PLI" | "FIR"; ssrc: number; mediaSsrc: number }
     | { type: "other"; packetType: number; ssrc: number | null; bytes: number };
 
 function readBlocks(buf: Buffer, at: number, count: number): ReportBlock[] {
@@ -128,6 +153,10 @@ export function parseRtcp(buf: Buffer): RtcpPacket[] {
             });
         } else if (type === RtcpType.RR && len >= 8) {
             out.push({ type: "RR", ssrc: p.readUInt32BE(4), blocks: readBlocks(p, 8, count) });
+        } else if (type === RtcpType.PSFB && count === 1 && len >= 12) {
+            out.push({ type: "PLI", ssrc: p.readUInt32BE(4), mediaSsrc: p.readUInt32BE(8) });
+        } else if (type === RtcpType.PSFB && count === 4 && len >= 20) {
+            out.push({ type: "FIR", ssrc: p.readUInt32BE(4), mediaSsrc: p.readUInt32BE(12) });
         } else {
             out.push({ type: "other", packetType: type, ssrc: len >= 8 ? p.readUInt32BE(4) : null, bytes: len });
         }

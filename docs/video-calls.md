@@ -59,3 +59,16 @@ H.264 (payload 97).
 
 Steps V1–V2 (see the other side) need no camera permission and can be tested against any video call; V3–V4 need a
 real phone to check the other side sees us.
+
+## Server side, as built (V1 and V4)
+
+`src/video.ts` (frame assembler, packetizer), `MediaCall` in `src/zrtcclient.ts` (`onVideo`, `onKeyFrameRequest`,
+`sendVideoFrame`, `requestKeyFrame`), the socket messages in `docs/call-audio.md` §3. Things the app should know:
+
+- Frames to the app carry the other side's raw 90 kHz RTP timestamp (it starts at a random value: use differences).
+  Key frames always start with SPS + PPS (cached ones are put in front when the sender leaves them out).
+- After a lost frame the server delivers nothing until the next key frame and asks for one itself (PLI); delta frames
+  before the first key frame are dropped the same way.
+- The app's frames are forwarded only after `POST /calls/camera {on: true}`; the server stamps its own 90 kHz clock on
+  each frame as it arrives, so the app need not send timestamps. Send SPS + PPS in front of every key frame.
+- `05` (key frame requested) can come several times a second; the server already spaces them ≥ 250 ms.

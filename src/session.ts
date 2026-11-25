@@ -28,6 +28,7 @@ import {
     callControlsIn,
     incomingCallOf,
     inspectFrame,
+    jsonObject,
     type CallControl,
     type FrameInfo,
     type IncomingCall,
@@ -86,12 +87,19 @@ type ActiveCall = {
     finish: (reason: string, hangUp: boolean) => void;
     /** Tells the other side our camera / microphone state. */
     camMic?: (state: { camOn?: boolean; muted?: boolean }) => void;
+    /** Our camera, as the app last said: video from the app is only forwarded while it is on. */
+    camOn: boolean;
+    /** The other side's camera and microphone, from their `onoff_camera` / `mute_audio` controls. */
+    peer: { cameraOn: boolean; muted: boolean };
+    /** Which peer controls have arrived at least once. */
+    peerHeard: Set<string>;
 };
 
 export type CallEvent =
     | { type: "incoming"; call: IncomingCall & { callerName: string; groupName?: string } }
     | ({ type: "connected" } & CurrentCall)
-    | { type: "ended"; callId: string; act: string };
+    | { type: "ended"; callId: string; act: string }
+    | { type: "peer"; callId: string; cameraOn: boolean; muted: boolean };
 
 type SessionEvents = {
     status: [SessionStatus];
@@ -99,6 +107,10 @@ type SessionEvents = {
     call: [CallEvent];
     /** The other side's audio in a call picked up here: decrypted Opus frames for the app. */
     call_audio: [{ seq: number; timestamp: number; opus: Buffer }];
+    /** The other side's video in a call picked up here: one H.264 access unit (Annex B), 90 kHz timestamp. */
+    call_video: [{ key: boolean; timestamp: number; data: Buffer }];
+    /** The other side asked for a key frame: the app's encoder should produce one. */
+    call_key_frame: [];
     message: [ChatMessage];
     message_updated: [ChatMessage];
     message_deleted: [DeletedEvent];
@@ -106,6 +118,8 @@ type SessionEvents = {
     threads: [];
 };
 
+/** Controls in which the other side says its camera or microphone changed (not the end of a call). */
+const PEER_ACTS = new Set(["onoff_camera", "mute_audio"]);
 const GROUP_INFO_BATCH = 50;
 const MEMBER_INFO_BATCH = 100;
 const MEMBERS_CACHE_MS = 10 * 60_000;
@@ -592,7 +606,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.friendList.get(call.callerId)?.name ?? this.store.getThread("user", call.callerId)?.name ?? call.displayName ?? "Someone";
         const current: CurrentCall = { callId, callerId: call.callerId, callerName, video: call.video, state: "connecting", connectedAt: null };
         // Claimed before the first await, so a second answer can't race this one.
-        const active: ActiveCall = { info: current, media: null, finish: () => {} };
+        const active: ActiveCall = { info: current, media: null, finish: () => {}, camOn: false, peer: { cameraOn: true, muted: false }, peerHeard: new Set() };
         this.activeCall = active;
         try {
             await ringRing(send, call, imei).then(
@@ -607,6 +621,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                 session: p.session,
                 log: (e) => this.callTrace.record({ callId, ...e }),
                 onAudio: (seq, ts, opus) => this.emit("call_audio", { seq, timestamp: ts, opus }),
+                onVideo: (frame) => this.emit("call_video", frame),
+                onKeyFrameRequest: () => this.emit("call_key_frame"),
             });
             active.media = media;
             const started = Date.now();
@@ -676,6 +692,24 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     setCallMuted(muted: boolean): void {
         if (!this.activeCall) throw new HttpError(404, "No call in progress");
         this.activeCall.camMic?.({ muted });
+    }
+
+    /** The app turned its camera on or off: tells the other side, and starts / stops forwarding the app's video. */
+    setCallCamera(on: boolean): void {
+        if (!this.activeCall) throw new HttpError(404, "No call in progress");
+        this.activeCall.camOn = on;
+        this.activeCall.camMic?.({ camOn: on });
+    }
+
+    /** One encoded video frame from the app's camera (H.264, Annex B), for the call in progress. */
+    sendCallVideo(frame: { key: boolean; data: Buffer }): void {
+        const call = this.activeCall;
+        if (call?.info.state === "connected" && call.camOn) call.media?.sendVideoFrame(frame);
+    }
+
+    /** The app's decoder needs a key frame: asks the other side for one. */
+    requestCallKeyFrame(): void {
+        if (this.activeCall?.info.state === "connected") this.activeCall.media?.requestKeyFrame("app");
     }
 
     /** The call in progress, if any. */
@@ -762,10 +796,20 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         this.callTrace.record({ kind: "control", source, act: control.act, control: control.raw });
         const callId = control.data.callId ?? control.data.call_id;
         if (callId !== undefined && callId !== "") {
+            // Camera / microphone toggles repeat legitimately (off, on, off…): they are told apart by state in
+            // onPeerControl, not by this once-per-call check.
+            if (PEER_ACTS.has(control.act)) {
+                this.onPeerControl(control, callId);
+                return;
+            }
             const key = `${control.act}:${String(callId)}`;
             for (const [k, at] of this.handledCallControls) if (now - at > 10 * 60_000) this.handledCallControls.delete(k);
             if (this.handledCallControls.has(key)) return;
             this.handledCallControls.set(key, now);
+        }
+        if (PEER_ACTS.has(control.act)) {
+            this.onPeerControl(control, undefined);
+            return;
         }
         const incoming = incomingCallOf(control, now);
         if (incoming && now - incoming.ts > RINGING_MAX_AGE_MS) {
@@ -786,6 +830,23 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             }
             this.emit("call", { type: "ended", callId: callId === undefined ? "" : String(callId), act: control.act });
         }
+    }
+
+    /** The other side turned its camera (`onoff_camera`, 0 = off) or microphone (`mute_audio`, 1 = muted) on or off. */
+    private onPeerControl(control: CallControl, callId: unknown): void {
+        const call = this.activeCall;
+        if (!call || (callId !== undefined && callId !== "" && String(callId) !== call.info.callId)) return;
+        const params = jsonObject(control.data.params);
+        // The Zalos project's engine reads `type`, falling back to `status`.
+        const value = Number(params?.type ?? params?.status);
+        if (!Number.isFinite(value)) return;
+        const before = JSON.stringify(call.peer);
+        if (control.act === "onoff_camera") call.peer.cameraOn = value !== 0;
+        else call.peer.muted = value === 1;
+        // The same state arriving again (a control that comes on both channels) isn't news, once we've heard one.
+        if (before === JSON.stringify(call.peer) && call.peerHeard.has(control.act)) return;
+        call.peerHeard.add(control.act);
+        this.emit("call", { type: "peer", callId: call.info.callId, ...call.peer });
     }
 
     // ---- Photos, files and stickers ----
