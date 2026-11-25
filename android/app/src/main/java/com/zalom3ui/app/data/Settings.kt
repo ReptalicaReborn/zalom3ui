@@ -24,10 +24,26 @@ enum class ThemeMode(val label: String) {
     DARK("Dark"),
 }
 
+enum class ChatAccent(val key: String, val label: String) {
+    ULTRAMARINE("ultramarine", "Ultramarine"),
+    CRIMSON("crimson", "Crimson"),
+    FOREST("forest", "Forest"),
+    PLUM("plum", "Plum"),
+    TEAL("teal", "Teal"),
+    SLATE("slate", "Slate"),
+    ;
+
+    companion object {
+        fun fromKey(key: String?): ChatAccent = entries.firstOrNull { it.key == key } ?: ULTRAMARINE
+    }
+}
+
 data class Appearance(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
-    /** Material You colors from the wallpaper (Android 12+) instead of the app's blue. */
+    /** Material You colors from the wallpaper (Android 12+) instead of the chosen chat accent. */
     val dynamicColor: Boolean = false,
+    val accent: ChatAccent = ChatAccent.ULTRAMARINE,
+    val tintedBackground: Boolean = false,
 )
 
 /** Server settings, kept in app-private storage shared by the UI and the on-phone server process. */
@@ -56,12 +72,16 @@ class SettingsStore(context: Context) {
     fun loadAppearance(): Appearance = Appearance(
         themeMode = ThemeMode.entries.firstOrNull { it.name == prefs.getString(KEY_THEME, null) } ?: ThemeMode.SYSTEM,
         dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
+        accent = ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null)),
+        tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
     )
 
     fun saveAppearance(appearance: Appearance) {
         prefs.edit()
             .putString(KEY_THEME, appearance.themeMode.name)
             .putBoolean(KEY_DYNAMIC_COLOR, appearance.dynamicColor)
+            .putString(KEY_CHAT_ACCENT, appearance.accent.key)
+            .putBoolean(KEY_CHAT_TINTED_BG, appearance.tintedBackground)
             .apply()
     }
 
@@ -139,5 +159,7 @@ class SettingsStore(context: Context) {
         const val KEY_LOCAL_TOKEN = "local_token"
         const val KEY_THEME = "theme"
         const val KEY_DYNAMIC_COLOR = "dynamic_color"
+        const val KEY_CHAT_ACCENT = "chat_accent"
+        const val KEY_CHAT_TINTED_BG = "chat_tinted_bg"
     }
 }

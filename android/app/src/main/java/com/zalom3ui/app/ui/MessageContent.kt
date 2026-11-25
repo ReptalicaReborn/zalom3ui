@@ -1,14 +1,34 @@
 package com.zalom3ui.app.ui
 
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +38,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -26,43 +47,80 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.MissedVideoCall
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
+import androidx.compose.material.icons.automirrored.outlined.PhoneMissed
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LocationOn
-import androidx.compose.material.icons.outlined.MissedVideoCall
-import androidx.compose.material.icons.outlined.PhoneMissed
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FloatingToolbarDefaults
+import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.FileProvider
+import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.Coil
 import coil.compose.SubcomposeAsyncImage
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
+import java.io.File
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.sin
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Kinds drawn as their own content (picture, player, card) instead of a "[Photo]" label. */
 private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call")
@@ -125,19 +183,50 @@ fun openExternally(context: Context, url: String, mimeType: String? = null) {
 
 /** The picture, player or card of a non-text message, inside its bubble. */
 @Composable
-fun AttachmentContent(a: Attachment, onOutgoing: Boolean, onOpenImage: (String) -> Unit) {
+fun AttachmentContent(
+    a: Attachment,
+    onOutgoing: Boolean,
+    onOpenImage: (String) -> Unit,
+    edgeToEdge: Boolean = false,
+) {
     val context = LocalContext.current
     when (a.kind) {
         "photo", "gif" -> {
             val image = a.image ?: return
-            MediaFrame(image, mediaAspect(a.width, a.height), onClick = { onOpenImage(a.href ?: image) })
+            MediaFrame(image, mediaAspect(a.width, a.height), edgeToEdge = edgeToEdge, onClick = { onOpenImage(a.href ?: image) })
         }
         "video" -> {
             Box(contentAlignment = Alignment.Center) {
                 if (a.thumb != null) {
-                    MediaFrame(a.thumb, mediaAspect(a.width, a.height), onClick = { a.href?.let { openExternally(context, it, "video/*") } })
+                    MediaFrame(
+                        a.thumb,
+                        mediaAspect(a.width, a.height),
+                        edgeToEdge = edgeToEdge,
+                        onClick = { a.href?.let { openExternally(context, it, "video/*") } },
+                    )
                 } else {
-                    Box(Modifier.width(220.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(12.dp)).background(Color.Black))
+                    val placeholderMod = if (edgeToEdge) {
+                        Modifier
+                            .widthIn(max = 280.dp)
+                            .fillMaxWidth()
+                            .aspectRatio(16f / 9f)
+                    } else {
+                        Modifier
+                            .width(220.dp)
+                            .aspectRatio(16f / 9f)
+                            .clip(RoundedCornerShape(12.dp))
+                    }
+                    Box(
+                        placeholderMod
+                            .background(Color.Black)
+                            .then(
+                                if (a.href != null) {
+                                    Modifier.clickable { openExternally(context, a.href, "video/*") }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                    )
                 }
                 Surface(shape = CircleShape, color = Color.Black.copy(alpha = 0.55f), contentColor = Color.White) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = "Play video", modifier = Modifier.padding(10.dp).size(28.dp))
@@ -209,17 +298,17 @@ private fun StickerPlaceholder() {
 }
 
 @Composable
-private fun MediaFrame(url: String, aspect: Float, onClick: () -> Unit) {
+private fun MediaFrame(url: String, aspect: Float, edgeToEdge: Boolean = false, onClick: () -> Unit) {
     SubcomposeAsyncImage(
         model = url,
         contentDescription = "Photo",
         contentScale = ContentScale.Crop,
         modifier = Modifier
-            .widthIn(max = 260.dp)
+            .widthIn(max = if (edgeToEdge) 280.dp else 260.dp)
             .fillMaxWidth()
             .aspectRatio(aspect)
             .heightIn(max = 360.dp)
-            .clip(RoundedCornerShape(12.dp))
+            .then(if (edgeToEdge) Modifier else Modifier.clip(RoundedCornerShape(12.dp)))
             .clickable(onClick = onClick),
         loading = { MediaPlaceholder() },
         error = { MediaPlaceholder() },
@@ -267,9 +356,9 @@ private fun CallCard(a: Attachment, onOutgoing: Boolean) {
     val call = a.call
     val missed = call?.missed == true
     val icon = when {
-        call?.video == true && missed -> Icons.Outlined.MissedVideoCall
+        call?.video == true && missed -> Icons.AutoMirrored.Outlined.MissedVideoCall
         call?.video == true -> Icons.Outlined.Videocam
-        missed -> Icons.Outlined.PhoneMissed
+        missed -> Icons.AutoMirrored.Outlined.PhoneMissed
         else -> Icons.Outlined.Call
     }
     val alert = if (onOutgoing) Color.White else MaterialTheme.colorScheme.error
@@ -334,18 +423,144 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
 
 // ---- Voice messages ----
 
+/** Live state of the single active voice clip. */
+data class VoicePlaybackState(
+    val url: String? = null,
+    val isPlaying: Boolean = false,
+    val positionMs: Int = 0,
+    val durationMs: Int = 0,
+    val speed: Float = 1f,
+)
+
+/** Deterministic speech-like waveform bar heights in `0.22f..1.0f` derived from [seed]. */
+internal fun voiceWaveformBars(seed: String, count: Int = 28): List<Float> {
+    if (count <= 0) return emptyList()
+    var state = -3750763034362895579L // FNV-1a 64-bit offset basis
+    for (ch in seed) {
+        state = (state xor ch.code.toLong()) * 1099511628211L
+    }
+    fun nextFloat(): Float {
+        state += -7046029254386353131L // SplitMix64 increment
+        var z = state
+        z = (z xor (z ushr 30)) * -4658895280553007687L
+        z = (z xor (z ushr 27)) * -7723592293110705685L
+        z = z xor (z ushr 31)
+        return ((z ushr 40).toInt() and 0xFFFFFF) / 16777215f
+    }
+    val phase1 = nextFloat() * (PI * 2.0)
+    val phase2 = nextFloat() * (PI * 2.0)
+    val freq1 = 2.0 + nextFloat() * 1.5
+    val freq2 = 4.0 + nextFloat() * 2.5
+    return List(count) { i ->
+        val t = if (count == 1) 0.5 else i.toDouble() / (count - 1)
+        val edge = 0.55 + 0.45 * sin(PI * t)
+        val phrase = 0.5 + 0.3 * sin(PI * freq1 * t + phase1) + 0.2 * sin(PI * freq2 * t + phase2)
+        val detail = nextFloat()
+        val raw = (edge * (0.55 * phrase + 0.45 * detail)).toFloat()
+        (0.22f + raw.coerceIn(0f, 1f) * 0.78f).coerceIn(0.22f, 1.0f)
+    }
+}
+
+/** Cycles voice playback speed: 1× -> 1.5× -> 2× -> 1×. */
+internal fun nextPlaybackSpeed(current: Float): Float = when {
+    current < 1.25f -> 1.5f
+    current < 1.75f -> 2f
+    else -> 1f
+}
+
+/** Formats a voice playback speed multiplier as `"1×"`, `"1.5×"`, or `"2×"`. */
+internal fun formatSpeed(speed: Float): String = when {
+    abs(speed - 1.5f) < 0.05f -> "1.5×"
+    abs(speed - 2f) < 0.05f -> "2×"
+    else -> "1×"
+}
+
 /** Plays one voice message at a time, streamed from Zalo's CDN. */
 object VoicePlayback {
     private var player: MediaPlayer? = null
+    private var prepared = false
+    private var pendingSeekFraction: Float? = null
+
     private val _playing = MutableStateFlow<String?>(null)
     /** URL of the clip playing (or loading), if any. */
     val playing: StateFlow<String?> = _playing.asStateFlow()
 
+    private val _state = MutableStateFlow(VoicePlaybackState())
+    /** Full playback state including live position, duration, and speed. */
+    val state: StateFlow<VoicePlaybackState> = _state.asStateFlow()
+
     fun toggle(context: Context, url: String) {
-        if (_playing.value == url) stop() else play(context, url)
+        val current = _state.value
+        val p = player
+        if (current.url == url && p != null) {
+            if (!prepared) {
+                stop()
+            } else if (current.isPlaying) {
+                runCatching { p.pause() }
+                val pos = runCatching { p.currentPosition }.getOrDefault(current.positionMs).coerceAtLeast(0)
+                _playing.value = null
+                _state.value = current.copy(isPlaying = false, positionMs = pos)
+            } else {
+                applySpeed(p, current.speed)
+                runCatching { p.start() }
+                _playing.value = url
+                _state.value = current.copy(isPlaying = true)
+            }
+        } else {
+            play(context, url)
+        }
+    }
+
+    /** Refreshes [state] with the underlying player's live position and duration. */
+    fun refreshPosition() {
+        val p = player ?: return
+        if (!prepared) return
+        val cur = _state.value
+        val pos = runCatching { p.currentPosition }.getOrNull()?.coerceAtLeast(0) ?: return
+        val dur = runCatching { p.duration }.getOrNull()?.takeIf { it > 0 } ?: cur.durationMs
+        val isPlayingNow = runCatching { p.isPlaying }.getOrDefault(cur.isPlaying)
+        if (pos != cur.positionMs || dur != cur.durationMs || isPlayingNow != cur.isPlaying) {
+            _state.value = cur.copy(isPlaying = isPlayingNow, positionMs = pos, durationMs = dur)
+        }
+    }
+
+    /** Seeks [url] to [fraction] (`0f..1f`) when it is the active clip. */
+    fun seekTo(url: String, fraction: Float) {
+        val clamped = fraction.coerceIn(0f, 1f)
+        val p = player ?: return
+        val cur = _state.value
+        if (cur.url != url) return
+        if (!prepared) {
+            pendingSeekFraction = clamped
+            return
+        }
+        val dur = runCatching { p.duration }.getOrDefault(cur.durationMs).coerceAtLeast(0)
+        if (dur > 0) {
+            val targetMs = (dur * clamped).toInt().coerceIn(0, dur)
+            runCatching { p.seekTo(targetMs) }
+            _state.value = cur.copy(positionMs = targetMs, durationMs = dur)
+        }
+    }
+
+    /** Advances playback speed (`1× -> 1.5× -> 2× -> 1×`) and applies it to the active player. */
+    fun cycleSpeed(): Float {
+        val next = nextPlaybackSpeed(_state.value.speed)
+        _state.value = _state.value.copy(speed = next)
+        player?.takeIf { prepared }?.let { applySpeed(it, next) }
+        return next
+    }
+
+    private fun applySpeed(p: MediaPlayer, speed: Float) {
+        runCatching {
+            val wasPlaying = p.isPlaying
+            p.playbackParams = p.playbackParams.setSpeed(speed)
+            // Some Android implementations start a paused player when playbackParams is updated.
+            if (!wasPlaying && p.isPlaying) p.pause()
+        }
     }
 
     private fun play(context: Context, url: String) {
+        val keepSpeed = if (_state.value.url != null) _state.value.speed else 1f
         stop()
         val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
         val scheme = uri?.scheme?.lowercase()
@@ -354,13 +569,29 @@ object VoicePlayback {
         }
         val p = MediaPlayer()
         player = p
+        prepared = false
+        pendingSeekFraction = null
         _playing.value = url
+        _state.value = VoicePlaybackState(url = url, isPlaying = true, speed = keepSpeed)
         try {
             p.setAudioAttributes(
                 AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build(),
             )
             p.setDataSource(uri.toString())
-            p.setOnPreparedListener { if (player === it) it.start() }
+            p.setOnPreparedListener { mp ->
+                if (player === mp) {
+                    prepared = true
+                    val dur = runCatching { mp.duration }.getOrDefault(0).coerceAtLeast(0)
+                    pendingSeekFraction?.let { frac ->
+                        if (dur > 0) runCatching { mp.seekTo((dur * frac).toInt().coerceIn(0, dur)) }
+                        pendingSeekFraction = null
+                    }
+                    applySpeed(mp, _state.value.speed)
+                    runCatching { mp.start() }
+                    val pos = runCatching { mp.currentPosition }.getOrDefault(0).coerceAtLeast(0)
+                    _state.value = _state.value.copy(isPlaying = true, positionMs = pos, durationMs = dur)
+                }
+            }
             p.setOnCompletionListener { if (player === it) stop() }
             p.setOnErrorListener { mp, _, _ ->
                 if (player === mp) {
@@ -370,7 +601,7 @@ object VoicePlayback {
                 true
             }
             p.prepareAsync()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             stop()
             Toast.makeText(context.applicationContext, "Couldn't play this voice message", Toast.LENGTH_SHORT).show()
         }
@@ -379,55 +610,581 @@ object VoicePlayback {
     fun stop() {
         player?.let { runCatching { it.release() } }
         player = null
+        prepared = false
+        pendingSeekFraction = null
         _playing.value = null
+        _state.value = VoicePlaybackState()
     }
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun VoiceClip(a: Attachment, onOutgoing: Boolean) {
     val context = LocalContext.current
-    val playing by VoicePlayback.playing.collectAsStateWithLifecycle()
+    val playback by VoicePlayback.state.collectAsStateWithLifecycle()
     val href = a.href
-    val isPlaying = href != null && playing == href
-    Row(Modifier.widthIn(min = 180.dp), verticalAlignment = Alignment.CenterVertically) {
+    val isActiveClip = href != null && playback.url == href
+    val isPlaying = isActiveClip && playback.isPlaying
+
+    LaunchedEffect(isPlaying) {
+        while (isPlaying) {
+            VoicePlayback.refreshPosition()
+            delay(60L)
+        }
+    }
+
+    val bars = remember(href, a.duration) { voiceWaveformBars(href ?: a.title.orEmpty(), count = 28) }
+    var dragProgress by remember(href) { mutableStateOf<Float?>(null) }
+
+    val totalMs = when {
+        isActiveClip && playback.durationMs > 0 -> playback.durationMs.toLong()
+        a.duration != null -> a.duration
+        else -> 0L
+    }
+    val liveProgress = if (isActiveClip && totalMs > 0L) {
+        (playback.positionMs.toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val displayProgress = dragProgress ?: liveProgress
+    val displayPosMs = when {
+        dragProgress != null && totalMs > 0L -> (totalMs * (dragProgress ?: 0f)).toLong()
+        isActiveClip -> playback.positionMs.toLong().coerceAtLeast(0L)
+        else -> 0L
+    }
+
+    // Morph smoothly between a circle (paused) and a 12.dp rounded squircle (playing).
+    val playCorner by animateDpAsState(
+        targetValue = if (isPlaying) 12.dp else 22.dp,
+        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+        label = "voicePlayCorner",
+    )
+    val playedColor = if (onOutgoing) Color.White else MaterialTheme.colorScheme.primary
+    val unplayedColor = playedColor.copy(alpha = 0.35f)
+    val timerColor = LocalContentColor.current.copy(alpha = 0.8f)
+
+    Row(
+        modifier = Modifier.widthIn(min = 216.dp, max = 264.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Surface(
-            shape = CircleShape,
-            color = if (onOutgoing) Color.White.copy(alpha = 0.25f) else MaterialTheme.colorScheme.primary,
+            shape = RoundedCornerShape(playCorner),
+            color = if (onOutgoing) Color.White.copy(alpha = 0.22f) else MaterialTheme.colorScheme.primary,
             contentColor = if (onOutgoing) Color.White else MaterialTheme.colorScheme.onPrimary,
-            modifier = Modifier.size(40.dp).clickable(enabled = href != null) { href?.let { VoicePlayback.toggle(context, it) } },
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(playCorner))
+                .clickable(enabled = href != null) { href?.let { VoicePlayback.toggle(context, it) } },
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Icon(if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, contentDescription = if (isPlaying) "Pause" else "Play voice message")
+                Icon(
+                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play voice message",
+                    modifier = Modifier.size(24.dp),
+                )
             }
         }
         Spacer(Modifier.width(10.dp))
-        Column {
-            Text("Voice message", style = MaterialTheme.typography.bodyLarge)
-            a.duration?.let { Text(formatDuration(it), style = MaterialTheme.typography.bodySmall) }
+        Column(modifier = Modifier.weight(1f)) {
+            val currentIsActive by rememberUpdatedState(isActiveClip)
+            val scrubModifier = if (href != null) {
+                Modifier
+                    .pointerInput(href) {
+                        detectTapGestures { tap ->
+                            val frac = if (size.width > 0) (tap.x / size.width.toFloat()).coerceIn(0f, 1f) else 0f
+                            if (!currentIsActive) VoicePlayback.toggle(context, href)
+                            VoicePlayback.seekTo(href, frac)
+                        }
+                    }
+                    .pointerInput(href) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { start ->
+                                dragProgress = if (size.width > 0) (start.x / size.width.toFloat()).coerceIn(0f, 1f) else 0f
+                            },
+                            onHorizontalDrag = { change, _ ->
+                                change.consume()
+                                dragProgress = if (size.width > 0) (change.position.x / size.width.toFloat()).coerceIn(0f, 1f) else 0f
+                            },
+                            onDragEnd = {
+                                val target = dragProgress
+                                dragProgress = null
+                                if (target != null) {
+                                    if (!currentIsActive) VoicePlayback.toggle(context, href)
+                                    VoicePlayback.seekTo(href, target)
+                                }
+                            },
+                            onDragCancel = { dragProgress = null },
+                        )
+                    }
+            } else {
+                Modifier
+            }
+
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(28.dp)
+                    .then(scrubModifier),
+            ) {
+                if (bars.isEmpty() || size.width <= 0f || size.height <= 0f) return@Canvas
+                val step = size.width / bars.size
+                val barWidth = (step * 0.56f).coerceIn(2.dp.toPx(), 3.5.dp.toPx())
+                val radius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                for (i in bars.indices) {
+                    val barHeight = (size.height * bars[i]).coerceAtLeast(barWidth)
+                    val left = i * step + (step - barWidth) / 2f
+                    val top = (size.height - barHeight) / 2f
+                    val barFraction = (i + 0.5f) / bars.size.toFloat()
+                    val isBarPlayed = displayProgress > 0f && (barFraction <= displayProgress || (i == 0 && displayProgress > 0.01f))
+                    drawRoundRect(
+                        color = if (isBarPlayed) playedColor else unplayedColor,
+                        topLeft = Offset(left, top),
+                        size = Size(barWidth, barHeight),
+                        cornerRadius = radius,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val timerText = when {
+                    (isActiveClip || dragProgress != null) && totalMs > 0L ->
+                        "${formatDuration(displayPosMs)} / ${formatDuration(totalMs)}"
+                    isActiveClip -> formatDuration(displayPosMs)
+                    totalMs > 0L -> formatDuration(totalMs)
+                    else -> "Voice message"
+                }
+                Text(
+                    timerText,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                    color = timerColor,
+                    maxLines = 1,
+                )
+                AnimatedVisibility(visible = isActiveClip) {
+                    Surface(
+                        shape = CircleShape,
+                        color = if (onOutgoing) Color.White.copy(alpha = 0.22f) else MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = if (onOutgoing) Color.White else MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable { VoicePlayback.cycleSpeed() },
+                    ) {
+                        Text(
+                            formatSpeed(playback.speed),
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontFeatureSettings = "tnum",
+                            ),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
 // ---- Photo viewer ----
 
-/** Full-screen photo; tap or back closes it. */
+private const val PHOTO_SHARED_MAX_AGE_MS = 60 * 60_000L
+
+private fun clampPhotoOffset(offset: Offset, scale: Float, viewport: IntSize): Offset {
+    if (scale <= 1f || viewport.width <= 0 || viewport.height <= 0) return Offset.Zero
+    val maxX = ((viewport.width * (scale - 1f)) / 2f).coerceAtLeast(0f)
+    val maxY = ((viewport.height * (scale - 1f)) / 2f).coerceAtLeast(0f)
+    return Offset(offset.x.coerceIn(-maxX, maxX), offset.y.coerceIn(-maxY, maxY))
+}
+
+private suspend fun loadPhotoBitmap(context: Context, url: String): Bitmap? = withContext(Dispatchers.IO) {
+    val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
+    val scheme = uri?.scheme?.lowercase()
+    if (uri == null || scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
+        return@withContext null
+    }
+    runCatching {
+        val request = ImageRequest.Builder(context)
+            .data(uri.toString())
+            .allowHardware(false)
+            .build()
+        val result = Coil.imageLoader(context).execute(request)
+        if (result is SuccessResult) result.drawable.toBitmap() else null
+    }.getOrNull()
+}
+
+private suspend fun savePhotoToGallery(context: Context, bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
+    val isPng = bitmap.hasAlpha()
+    val format = if (isPng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+    val quality = if (isPng) 100 else 95
+    val ext = if (isPng) "png" else "jpg"
+    val mime = if (isPng) "image/png" else "image/jpeg"
+    val name = "zalo-photo-${System.currentTimeMillis()}.$ext"
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, mime)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/Zalỏ")
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return@runCatching false
+            try {
+                val out = resolver.openOutputStream(uri)
+                if (out == null) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    return@runCatching false
+                }
+                val ok = out.use { bitmap.compress(format, quality, it) }
+                if (!ok) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    return@runCatching false
+                }
+            } catch (e: Exception) {
+                runCatching { resolver.delete(uri, null, null) }
+                throw e
+            }
+            true
+        } else {
+            @Suppress("DEPRECATION")
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Zalỏ")
+            dir.mkdirs()
+            val file = File(dir, name)
+            val ok = file.outputStream().use { bitmap.compress(format, quality, it) }
+            if (!ok) {
+                file.delete()
+                return@runCatching false
+            }
+            @Suppress("DEPRECATION")
+            context.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(file)))
+            true
+        }
+    }.getOrDefault(false)
+}
+
+private suspend fun sharePhoto(context: Context, bitmap: Bitmap): Boolean {
+    val isPng = bitmap.hasAlpha()
+    val format = if (isPng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+    val quality = if (isPng) 100 else 95
+    val ext = if (isPng) "png" else "jpg"
+    val mime = if (isPng) "image/png" else "image/jpeg"
+    val uri = withContext(Dispatchers.IO) {
+        runCatching {
+            val dir = File(context.cacheDir, "shared").apply { mkdirs() }
+            val cutoff = System.currentTimeMillis() - PHOTO_SHARED_MAX_AGE_MS
+            dir.listFiles()?.forEach { f -> if (f.isFile && f.lastModified() < cutoff) f.delete() }
+            val file = File(dir, "zalo-photo.$ext")
+            val ok = file.outputStream().use { bitmap.compress(format, quality, it) }
+            if (!ok) return@runCatching null
+            FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        }.getOrNull()
+    } ?: return false
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = mime
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    return withContext(Dispatchers.Main) {
+        runCatching {
+            context.startActivity(Intent.createChooser(send, "Share photo").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        }.getOrDefault(false)
+    }
+}
+
+/** Full-screen zoomable photo viewer with pinch/double-tap zoom, swipe-to-dismiss, and M3 Expressive toolbar. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-fun PhotoViewer(url: String, onDismiss: () -> Unit) {
+fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
     val context = LocalContext.current
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(Modifier.fillMaxSize().background(Color.Black).clickable(onClick = onDismiss)) {
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    val currentOnDismiss by rememberUpdatedState(onDismiss)
+
+    val spatialSpec = MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
+    val effectsSpec = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
+    val dismissThresholdPx = with(density) { 140.dp.toPx() }
+
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var dismissOffsetY by remember { mutableFloatStateOf(0f) }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    var showChrome by remember { mutableStateOf(true) }
+    var busyAction by remember { mutableStateOf(false) }
+    var animJob by remember { mutableStateOf<Job?>(null) }
+
+    val scrimAlpha = (1f - abs(dismissOffsetY) / (dismissThresholdPx * 2.5f)).coerceIn(0.15f, 1f)
+    val dismissScale = (1f - abs(dismissOffsetY) / (dismissThresholdPx * 10f)).coerceIn(0.88f, 1f)
+    val isSwiping = abs(dismissOffsetY) > 1f
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = scrimAlpha))
+                .onSizeChanged { viewportSize = it }
+                .pointerInput(spatialSpec, dismissThresholdPx) {
+                    awaitEachGesture {
+                        var zoomAcc = 1f
+                        var panAcc = Offset.Zero
+                        var pastTouchSlop = false
+                        val touchSlop = viewConfiguration.touchSlop
+                        var swipingToDismiss = false
+
+                        awaitFirstDown(requireUnconsumed = false)
+                        do {
+                            val event = awaitPointerEvent()
+                            val canceled = event.changes.any { it.isConsumed }
+                            if (!canceled) {
+                                val zoomChange = event.calculateZoom()
+                                val panChange = event.calculatePan()
+                                val pointerCount = event.changes.count { it.pressed }
+
+                                if (!pastTouchSlop) {
+                                    zoomAcc *= zoomChange
+                                    panAcc += panChange
+                                    val centroidSize = event.calculateCentroidSize(useCurrent = false)
+                                    val zoomMotion = abs(1f - zoomAcc) * centroidSize
+                                    val panMotion = panAcc.getDistance()
+                                    if (pointerCount >= 2 || zoomMotion > touchSlop || panMotion > touchSlop) {
+                                        pastTouchSlop = true
+                                        animJob?.cancel()
+                                        if (pointerCount < 2 && scale <= 1.02f && abs(panAcc.y) > abs(panAcc.x)) {
+                                            swipingToDismiss = true
+                                        }
+                                    }
+                                }
+
+                                if (pastTouchSlop) {
+                                    if (pointerCount >= 2 || (scale > 1.02f && !swipingToDismiss)) {
+                                        swipingToDismiss = false
+                                        if (dismissOffsetY != 0f) dismissOffsetY = 0f
+                                        val newScale = (scale * zoomChange).coerceIn(1f, 4f)
+                                        val centroid = event.calculateCentroid(useCurrent = false)
+                                        val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+                                        val scaleRatio = if (scale > 0f) newScale / scale else 1f
+                                        val focusOffset = (centroid - center - offset) * (scaleRatio - 1f)
+                                        val candidateOffset = if (newScale <= 1.01f) {
+                                            Offset.Zero
+                                        } else {
+                                            offset + panChange - focusOffset
+                                        }
+                                        scale = newScale
+                                        offset = clampPhotoOffset(candidateOffset, newScale, viewportSize)
+                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    } else if (swipingToDismiss && scale <= 1.02f) {
+                                        dismissOffsetY += panChange.y
+                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    }
+                                }
+                            }
+                        } while (!canceled && event.changes.any { it.pressed })
+
+                        if (swipingToDismiss) {
+                            if (abs(dismissOffsetY) >= dismissThresholdPx) {
+                                currentOnDismiss()
+                            } else if (dismissOffsetY != 0f) {
+                                val startY = dismissOffsetY
+                                animJob?.cancel()
+                                animJob = scope.launch {
+                                    animate(
+                                        initialValue = startY,
+                                        targetValue = 0f,
+                                        animationSpec = spatialSpec,
+                                    ) { value, _ -> dismissOffsetY = value }
+                                }
+                            }
+                        } else if (scale < 1.02f && (scale != 1f || offset != Offset.Zero)) {
+                            val startScale = scale
+                            val startOffset = offset
+                            animJob?.cancel()
+                            animJob = scope.launch {
+                                animate(
+                                    initialValue = 0f,
+                                    targetValue = 1f,
+                                    animationSpec = spatialSpec,
+                                ) { t, _ ->
+                                    val nextScale = (startScale + (1f - startScale) * t).coerceIn(1f, 4f)
+                                    scale = nextScale
+                                    offset = clampPhotoOffset(
+                                        Offset(startOffset.x * (1f - t), startOffset.y * (1f - t)),
+                                        nextScale,
+                                        viewportSize,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                .pointerInput(spatialSpec) {
+                    detectTapGestures(
+                        onTap = { showChrome = !showChrome },
+                        onDoubleTap = { tap ->
+                            animJob?.cancel()
+                            val startScale = scale
+                            val startOffset = offset
+                            val targetScale = if (startScale > 1.05f) 1f else 2.5f
+                            val targetOffset = if (targetScale <= 1f) {
+                                Offset.Zero
+                            } else {
+                                val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+                                val rel = tap - center
+                                clampPhotoOffset(-rel * (targetScale - 1f), targetScale, viewportSize)
+                            }
+                            animJob = scope.launch {
+                                animate(
+                                    initialValue = 0f,
+                                    targetValue = 1f,
+                                    animationSpec = spatialSpec,
+                                ) { t, _ ->
+                                    val nextScale = (startScale + (targetScale - startScale) * t).coerceIn(1f, 4f)
+                                    scale = nextScale
+                                    offset = clampPhotoOffset(
+                                        Offset(
+                                            startOffset.x + (targetOffset.x - startOffset.x) * t,
+                                            startOffset.y + (targetOffset.y - startOffset.y) * t,
+                                        ),
+                                        nextScale,
+                                        viewportSize,
+                                    )
+                                }
+                            }
+                        },
+                    )
+                },
+        ) {
             SubcomposeAsyncImage(
                 model = url,
                 contentDescription = "Photo",
                 contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
-                loading = { Box(Modifier.fillMaxSize()) },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = scale * dismissScale
+                        scaleY = scale * dismissScale
+                        translationX = offset.x
+                        translationY = offset.y + dismissOffsetY
+                    },
+                loading = {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        LoadingIndicator(color = Color.White)
+                    }
+                },
+                error = {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Outlined.Image,
+                            contentDescription = "Couldn't load photo",
+                            tint = Color.White.copy(alpha = 0.6f),
+                            modifier = Modifier.size(48.dp),
+                        )
+                    }
+                },
             )
-            Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(8.dp)) {
-                IconButton(onClick = { openExternally(context, url, "image/*") }) {
-                    Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = "Open in another app", tint = Color.White)
+
+            // Top translucent gradient bar with optional subtitle and Close button.
+            AnimatedVisibility(
+                visible = showChrome && !isSwiping,
+                enter = fadeIn(animationSpec = effectsSpec),
+                exit = fadeOut(animationSpec = effectsSpec),
+                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Black.copy(alpha = 0.65f), Color.Transparent),
+                            ),
+                        )
+                        .statusBarsPadding()
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (!subtitle.isNullOrBlank()) {
+                        Text(
+                            subtitle,
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f).padding(start = 8.dp),
+                        )
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Outlined.Close, contentDescription = "Close", tint = Color.White)
+                    }
                 }
-                IconButton(onClick = onDismiss) { Icon(Icons.Outlined.Close, contentDescription = "Close", tint = Color.White) }
+            }
+
+            // Bottom M3 Expressive floating toolbar: Save to gallery, Share, Open externally.
+            AnimatedVisibility(
+                visible = showChrome && !isSwiping,
+                enter = fadeIn(animationSpec = effectsSpec),
+                exit = fadeOut(animationSpec = effectsSpec),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 16.dp),
+            ) {
+                HorizontalFloatingToolbar(
+                    expanded = true,
+                    colors = FloatingToolbarDefaults.standardFloatingToolbarColors(
+                        toolbarContainerColor = Color(0xCC1E1F22),
+                        toolbarContentColor = Color.White,
+                    ),
+                ) {
+                    IconButton(
+                        enabled = !busyAction,
+                        onClick = {
+                            busyAction = true
+                            scope.launch {
+                                val ok = try {
+                                    val bmp = loadPhotoBitmap(context, url)
+                                    if (bmp != null) savePhotoToGallery(context, bmp) else false
+                                } finally {
+                                    busyAction = false
+                                }
+                                Toast.makeText(
+                                    context,
+                                    if (ok) "Saved to gallery" else "Couldn't save photo",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        },
+                    ) {
+                        Icon(Icons.Outlined.Download, contentDescription = "Save to gallery")
+                    }
+                    IconButton(
+                        enabled = !busyAction,
+                        onClick = {
+                            busyAction = true
+                            scope.launch {
+                                val ok = try {
+                                    val bmp = loadPhotoBitmap(context, url)
+                                    if (bmp != null) sharePhoto(context, bmp) else false
+                                } finally {
+                                    busyAction = false
+                                }
+                                if (!ok) {
+                                    Toast.makeText(context, "Couldn't share photo", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                    ) {
+                        Icon(Icons.Outlined.Share, contentDescription = "Share")
+                    }
+                    IconButton(onClick = { openExternally(context, url, "image/*") }) {
+                        Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = "Open in another app")
+                    }
+                }
             }
         }
     }
