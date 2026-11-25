@@ -34,6 +34,7 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
+import { HistorySync, backupDownloader, fileServiceCaller, type HistorySyncStatus } from "./historysync.js";
 import { acceptCall, camMicState, declineCall, hangUp, mediaParamsOf, ringRing, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
 import { MediaCall, parseServer } from "./zrtcclient.js";
 import { HttpError } from "./errors.js";
@@ -116,6 +117,8 @@ type SessionEvents = {
     message_deleted: [DeletedEvent];
     typing: [TypingEvent];
     threads: [];
+    /** Progress of "sync messages from the phone" (src/historysync.ts). */
+    history_sync: [HistorySyncStatus];
 };
 
 /** Controls in which the other side says its camera or microphone changed (not the end of a call). */
@@ -174,6 +177,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     };
 
     private readonly credentialsFile: string;
+    /** Asks the phone's Zalo app for its chat history (docs/history-sync.md). */
+    readonly historySync: HistorySync;
 
     constructor(
         readonly store: ChatStore,
@@ -183,6 +188,24 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         super();
         this.credentialsFile = path.join(dataDir, "credentials.json");
         this.callTrace = new CallTrace(dataDir);
+        this.historySync = new HistorySync({
+            ownId: () => this.status.ownId,
+            imei: () => (this.requireApi().getContext() as unknown as { imei?: string }).imei ?? "",
+            pcName: "Zalo-Android",
+            // async: a missing login is a rejected promise, not a throw.
+            call: async (endpoint, params) => fileServiceCaller(this.requireApi())(endpoint, params),
+            download: async (url, onProgress, signal) => backupDownloader(this.requireApi())(url, onProgress, signal),
+            sink: this.store,
+            nameOf: (id) => {
+                const name = this.store.getThread("user", id)?.name ?? "";
+                return name === id ? "" : name;
+            },
+        });
+        this.historySync.on("change", (status) => {
+            this.emit("history_sync", status);
+            // Imported chats and last messages: clients reload their list.
+            if (status.state === "done") this.emit("threads");
+        });
     }
 
     getStatus(): SessionStatus {
@@ -270,6 +293,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     }
 
     async logout(): Promise<void> {
+        this.historySync.cancel();
         this.activeCall?.finish("logout", true);
         this.cancelResume();
         this.abortQR?.();
@@ -567,6 +591,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         ws.on("message", (data: unknown) => {
             if (!live()) return;
             if (!Buffer.isBuffer(data)) return;
+            this.historySync.onFrame(data, l.cipherKey);
             let info: FrameInfo | null;
             try {
                 info = inspectFrame(data, l.cipherKey);
@@ -844,7 +869,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
                 return { status: res.status, body: await res.text() };
             },
             onControls: (controls) => {
-                if (live()) for (const control of callControlsIn(controls)) this.onCallControl(control, "poll");
+                if (!live()) return;
+                this.historySync.onControls(controls);
+                for (const control of callControlsIn(controls)) this.onCallControl(control, "poll");
             },
             onEvent: (entry) => live() && this.callTrace.record(entry),
         });

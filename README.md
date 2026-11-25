@@ -180,9 +180,12 @@ All endpoints are under `/api` and accept `Authorization: Bearer <token>` (or `?
 | `POST` | `/groups/:id/members` | Add `{ "members": [userId…] }`; `DELETE /groups/:id/members/:userId` removes |
 | `PUT` | `/groups/:id/name` | `{ "name" }` |
 | `POST` | `/groups/:id/leave` | `{ "silent"?: true }` |
+| `POST` | `/history-sync/start` | Ask the phone's Zalo app to send its chat history ([docs/history-sync.md](docs/history-sync.md)); `/history-sync/cancel` stops it |
+| `GET` | `/history-sync/status` | State, progress and a log of what the phone sent (no message content) |
 
 `GET /ws` is a WebSocket that pushes `status`, `message` (with `notify` and `threadName` when a phone should show it),
-`message_updated` (reactions, recalls, receipts, sticker images), `message_deleted`, `read`, `typing` and `threads` events.
+`message_updated` (reactions, recalls, receipts, sticker images), `message_deleted`, `read`, `typing`, `threads` and
+`history_sync` (`state`, `progress`, `error`) events.
 The Android app uses this API; other clients can too.
 
 ## Not yet supported

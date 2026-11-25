@@ -10,6 +10,8 @@ import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.FriendRequest
 import com.zalom3ui.app.data.GroupMember
+import com.zalom3ui.app.data.HistorySyncEvent
+import com.zalom3ui.app.data.HistorySyncStatus
 import com.zalom3ui.app.data.Mention
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.Person
@@ -83,6 +85,9 @@ data class UiState(
     /** While the on-phone server starts: when it was asked for, and the latest reason it can't be reached yet. */
     val startingSince: Long = 0,
     val startupError: String? = null,
+    /** "Sync messages from phone": the server's progress, and whether its dialog is open (ui/HistorySync.kt). */
+    val historySync: HistorySyncStatus = HistorySyncStatus(),
+    val historySyncShown: Boolean = false,
 )
 
 data class StickerSearch(
@@ -328,6 +333,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (now - lastTypingSent < 3_000) return
         lastTypingSent = now
         viewModelScope.launch { runCatching { client?.typing(chat.kind, chat.id) } }
+    }
+
+    // ---- Sync messages from the phone (ui/HistorySync.kt) ----
+
+    fun startHistorySync() = launchApi { api ->
+        _state.update { it.copy(historySyncShown = true) }
+        val status = api.startHistorySync()
+        _state.update { it.copy(historySync = status) }
+    }
+
+    fun cancelHistorySync() = launchApi { api ->
+        _state.update { it.copy(historySyncShown = false) }
+        val status = api.cancelHistorySync()
+        _state.update { it.copy(historySync = status) }
+    }
+
+    fun hideHistorySync() {
+        _state.update { it.copy(historySyncShown = false) }
     }
 
     // ---- Call research ----
@@ -590,7 +613,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshAll(api: ApiClient) {
         val status = api.status()
         val threads = if (status.isLoggedIn) api.threads() else emptyList()
-        _state.update { it.copy(status = status, threads = threads, connectionError = null, startupError = null) }
+        val sync = if (status.isLoggedIn) runCatching { api.historySyncStatus() }.getOrNull() else null
+        _state.update {
+            it.copy(status = status, threads = threads, connectionError = null, startupError = null, historySync = sync ?: it.historySync)
+        }
         _state.value.chat?.let { chat ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE)
             updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages), loading = false) }
@@ -613,6 +639,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 scheduleRefreshThreads(api)
             }
             is ServerEvent.Typing -> onTyping(event)
+            is HistorySyncEvent -> {
+                val sync = event.status
+                _state.update { it.copy(historySync = sync, historySyncShown = it.historySyncShown || sync.isFinished) }
+                // Imported chats and last messages: reload the chat list.
+                if (sync.state == "done") scheduleRefreshThreads(api)
+            }
             // Notifications are the service's business (MessageNotifier).
             is ServerEvent.Read, is ServerEvent.CallIncoming, is ServerEvent.CallConnected, is ServerEvent.CallPeer, is ServerEvent.CallEnded -> Unit
         }

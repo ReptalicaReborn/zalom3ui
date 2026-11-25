@@ -90,6 +90,7 @@ fun App(vm: AppViewModel) {
             } else {
                 AppNav(vm)
             }
+            HistorySyncHost(vm)
             SnackbarHost(
                 snackbar,
                 Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding().padding(bottom = 72.dp),
@@ -404,6 +405,7 @@ private fun AppNav(vm: AppViewModel) {
                     vm.logout()
                     nav.popBackStack(Routes.HOME, inclusive = false)
                 },
+                onSyncHistory = vm::startHistorySync,
                 onShareCallLog = { vm.shareCallLog { log -> scope.launch { QrActions.shareCallLog(context, log) } } },
                 onClearCallLog = vm::clearCallLog,
             )

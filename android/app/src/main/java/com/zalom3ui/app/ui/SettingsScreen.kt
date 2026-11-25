@@ -24,6 +24,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -78,6 +79,7 @@ fun SettingsScreen(
     onLogout: () -> Unit,
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
+    onSyncHistory: () -> Unit = {},
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
     var serverUrl by rememberSaveable { mutableStateOf(current.serverUrl) }
@@ -222,6 +224,14 @@ fun SettingsScreen(
                     leadingContent = { Icon(Icons.Outlined.RestartAlt, null) },
                     headlineContent = { Text("Restart Zalo service") },
                     supportingContent = { Text("If messages stop arriving") },
+                )
+            }
+            if (loggedIn) {
+                ListItem(
+                    modifier = Modifier.clickable(onClick = onSyncHistory),
+                    leadingContent = { Icon(Icons.Outlined.Sync, null) },
+                    headlineContent = { Text("Sync messages from phone") },
+                    supportingContent = { Text("Copy your chat history from Zalo on your phone (the phone asks you to confirm)") },
                 )
             }
             if (current.onDevice && loggedIn) {

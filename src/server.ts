@@ -6,6 +6,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { WebSocketServer, type WebSocket } from "ws";
 import type { Config } from "./config.js";
 import { HttpError } from "./errors.js";
+import type { HistorySyncStatus } from "./historysync.js";
 import type { CallEvent, MuteOption, UploadFile, ZaloSession } from "./session.js";
 import { REACTIONS, type MentionInfo, type ThreadKind } from "./store.js";
 
@@ -328,6 +329,24 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    // ---- Sync messages from the phone (docs/history-sync.md) ----
+
+    /** Asks the phone's Zalo app to send its chat history; progress follows on /ws as `history_sync`. */
+    api.post("/history-sync/start", wrap(async (_req, res) => {
+        const wasActive = session.historySync.isActive();
+        const status = await session.historySync.start();
+        res.status(wasActive ? 200 : 202).json(status);
+    }));
+
+    api.post("/history-sync/cancel", (_req, res) => {
+        session.historySync.cancel();
+        res.json(session.historySync.getStatus());
+    });
+
+    api.get("/history-sync/status", (_req, res) => {
+        res.json({ ...session.historySync.getStatus(), log: session.historySync.getLog() });
+    });
+
     // ---- Calls (docs/calls.md) ----
 
     /** Declines a call ringing on this account. */
@@ -523,6 +542,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     const onTyping = (typing: { threadKind: ThreadKind; threadId: string; uid: string; name: string }) =>
         broadcast({ type: "typing", ...typing });
     const onThreads = () => broadcast({ type: "threads" });
+    const onHistorySync = (s: HistorySyncStatus) => broadcast({ type: "history_sync", ...s });
 
     session.on("call_audio", onCallAudio);
     session.on("call", onCallAudioClose);
@@ -536,6 +556,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
     session.on("message_deleted", onMessageDeleted);
     session.on("typing", onTyping);
     session.on("threads", onThreads);
+    session.on("history_sync", onHistorySync);
 
     wss.on("connection", (ws: WebSocket) => {
         ws.on("error", () => {});
@@ -575,6 +596,7 @@ function attachWebSocket(server: http.Server, config: Config, session: ZaloSessi
         session.off("call", onCallBroadcast);
         session.off("message_updated", onMessageUpdated);
         session.off("message_deleted", onMessageDeleted);
+        session.off("history_sync", onHistorySync);
         session.off("typing", onTyping);
         session.off("threads", onThreads);
         wss.close();
