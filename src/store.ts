@@ -67,6 +67,7 @@ export type AttachmentKind =
     | "link"
     | "contact"
     | "location"
+    | "call"
     | "other";
 
 /** What a non-text message shows. Older cached messages only have title/href/thumb. */
@@ -87,7 +88,15 @@ export type Attachment = {
     sticker?: { id: number; catId: number; type: number };
     /** Contact cards: the user id the card is for. */
     userId?: string;
+    /** Call log entries. */
+    call?: { video: boolean; missed: boolean; outgoing: boolean };
 };
+
+/** Where the official client loads a sticker's picture from (its default `stickerUrl` config) by sticker id. */
+export const STICKER_IMAGE_URL = "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=";
+
+/** Call log actions the official client draws as call cards. */
+const CALL_ACTION = /^recommened\.(misscall|calling|receivecall|calltime)$/;
 
 export type ReactionSummary = {
     key: string;
@@ -264,6 +273,10 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
     const content = (data.content ?? {}) as Record<string, unknown>;
     const attachment = parseAttachment(data.msgType, content);
     if (attachment) msg.attachment = attachment;
+    if (attachment?.kind === "call") {
+        msg.text = `[${attachment.title}]`;
+        return msg;
+    }
     const label =
         attachment?.kind === "contact" ? "[Contact]" : (MSG_TYPE_LABELS[data.msgType] ?? "[Unsupported message]");
     // Photos and stickers have no useful title; files, links and cards are named by theirs.
@@ -299,7 +312,36 @@ export function parseAttachment(msgType: string, content: Record<string, unknown
         const id = num(content.id);
         const catId = num(content.catId, content.cateId);
         if (id === undefined) return undefined;
-        return { kind: "sticker", sticker: { id, catId: catId ?? 0, type: num(content.type) ?? 0 } };
+        return { kind: "sticker", thumb: STICKER_IMAGE_URL + id, sticker: { id, catId: catId ?? 0, type: num(content.type) ?? 0 } };
+    }
+
+    // Call log: params {calltype (1 = video), isCaller, reason (1 busy, 2 no answer, 3 declined, 4/5 cancelled), duration (s)}.
+    const action = str(content.action) ?? "";
+    if (CALL_ACTION.test(action)) {
+        const missed = action.endsWith("misscall");
+        const video = Number(params.calltype) === 1;
+        const outgoing = params.isCaller !== undefined && params.isCaller !== null ? Boolean(params.isCaller) : action.endsWith("calling");
+        const reason = Number(params.reason) || 0;
+        const what = video ? "video call" : "voice call";
+        const title = outgoing
+            ? !missed
+                ? `Outgoing ${what}`
+                : reason === 4 || reason === 5
+                  ? "You cancelled the call"
+                  : reason === 3
+                    ? "Call declined"
+                    : reason === 1
+                      ? "Busy"
+                      : `Outgoing ${what}, no answer`
+            : !missed
+              ? `Incoming ${what}`
+              : reason === 3
+                ? "You declined the call"
+                : `Missed ${what}`;
+        const seconds = num(params.duration, content.duration);
+        const call: Attachment = { kind: "call", title, call: { video, missed, outgoing } };
+        if (!missed && seconds) call.duration = Math.round(seconds * 1000);
+        return call;
     }
 
     let kind: AttachmentKind = KIND_BY_MSG_TYPE[msgType] ?? "other";
@@ -555,13 +597,6 @@ export class ChatStore {
         this.pinned.delete(key);
         this.mutedUntil.delete(key);
         this.scheduleSave();
-    }
-
-    /** Fills in an attachment detail learned later (a sticker's image). Returns the updated message. */
-    patchAttachment(msgId: string, patch: Partial<Attachment>): StoredMessage | undefined {
-        return this.update(msgId, (m) => {
-            if (m.attachment) m.attachment = { ...m.attachment, ...patch };
-        });
     }
 
     lastMessage(kind: ThreadKind, id: string): StoredMessage | undefined {

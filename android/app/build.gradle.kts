@@ -188,6 +188,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.5")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // Animated stickers (WebP) and GIFs.
+    implementation("io.coil-kt:coil-gif:2.7.0")
 
     implementation("androidx.core:core-ktx:1.15.0")
     // Rotation of picked photos, so they are sent with the size they are shown at.

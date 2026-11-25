@@ -135,9 +135,7 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         if (kind === "group" && before === undefined && session.store.getMessages(kind, id).length < 20) {
             await session.fetchGroupHistory(id).catch((err) => console.warn("Group history failed:", err));
         }
-        const messages = session.store.getMessages(kind, id, { before, limit });
-        session.fillStickerImages(messages);
-        res.json({ thread: session.store.getThread(kind, id) ?? null, messages });
+        res.json({ thread: session.store.getThread(kind, id) ?? null, messages: session.store.getMessages(kind, id, { before, limit }) });
     }));
 
     /**

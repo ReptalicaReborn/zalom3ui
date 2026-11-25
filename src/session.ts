@@ -25,6 +25,7 @@ import { HttpError } from "./errors.js";
 import {
     ChatStore,
     normalizeMessage,
+    STICKER_IMAGE_URL,
     REACTIONS,
     recalledMessageId,
     threadKey,
@@ -455,15 +456,6 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return this.store.getThread(kind, threadId)?.name ?? threadId;
     }
 
-    /** Looks up sticker images for these messages (cached copies stored before they were known). */
-    fillStickerImages(messages: ChatMessage[]): void {
-        for (const m of messages) {
-            if (m.attachment?.kind !== "sticker" || m.attachment.thumb) continue;
-            const stored = this.store.getMessage(m.id);
-            if (stored) this.fillStickerImage(stored);
-        }
-    }
-
     // ---- Photos, files and stickers ----
 
     /**
@@ -629,8 +621,9 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     // ---- Internals ----
 
     private rememberSticker(d: { id: number; cateId: number; type: number; stickerWebpUrl?: string | null; stickerUrl?: string }): StickerInfo | null {
-        const url = d.stickerWebpUrl || d.stickerUrl || "";
-        if (!d.id || !url) return null;
+        if (!d.id) return null;
+        // The same picture received stickers show, so a sent sticker looks like the one picked.
+        const url = STICKER_IMAGE_URL + d.id;
         const info = { id: Number(d.id), catId: Number(d.cateId), type: Number(d.type), url };
         this.stickers.set(info.id, info);
         return info;
@@ -649,15 +642,6 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.stickerLookups.set(id, pending);
         }
         return pending;
-    }
-
-    /** A sticker message carries only ids: look up its image and update the message. */
-    private fillStickerImage(msg: StoredMessage): void {
-        const sticker = msg.attachment?.kind === "sticker" ? msg.attachment.sticker : undefined;
-        if (!sticker || msg.attachment?.thumb) return;
-        void this.lookupSticker(sticker.id).then((info) => {
-            if (info) this.updated(this.store.patchAttachment(msg.id, { thumb: info.url }));
-        });
     }
 
     private async loadFriends(api: API): Promise<void> {
@@ -828,10 +812,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             return;
         }
         const msg = normalizeMessage(rawMsg);
-        if (this.store.addMessage(msg)) {
-            this.emit("message", this.store.toPublic(msg));
-            this.fillStickerImage(msg);
-        }
+        if (this.store.addMessage(msg)) this.emit("message", this.store.toPublic(msg));
     }
 
     private onUndo(undo: Undo): void {

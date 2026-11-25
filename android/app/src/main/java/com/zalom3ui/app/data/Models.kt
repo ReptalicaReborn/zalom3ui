@@ -18,6 +18,13 @@ data class SessionStatus(
 }
 
 @Serializable
+data class CallInfo(
+    val video: Boolean = false,
+    val missed: Boolean = false,
+    val outgoing: Boolean = false,
+)
+
+@Serializable
 data class StickerRef(
     val id: Long,
     val catId: Long = 0,
@@ -27,7 +34,7 @@ data class StickerRef(
 /** Mirrors `Attachment` in the server's src/store.ts. Messages cached by older servers only have title/href/thumb. */
 @Serializable
 data class Attachment(
-    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location" or "other". */
+    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location", "call" or "other". */
     val kind: String? = null,
     val title: String? = null,
     val description: String? = null,
@@ -42,6 +49,8 @@ data class Attachment(
     val fileExt: String? = null,
     val sticker: StickerRef? = null,
     val userId: String? = null,
+    /** Call log entries ("Missed voice call", "Incoming video call"…). */
+    val call: CallInfo? = null,
 ) {
     /** The picture to show for a photo, GIF or sticker (the full image when there is no thumbnail). */
     val image: String? get() = when (kind) {

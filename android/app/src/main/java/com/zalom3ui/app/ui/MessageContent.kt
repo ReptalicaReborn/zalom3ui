@@ -29,13 +29,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LocationOn
+import androidx.compose.material.icons.outlined.MissedVideoCall
+import androidx.compose.material.icons.outlined.PhoneMissed
+import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -60,7 +65,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /** Kinds drawn as their own content (picture, player, card) instead of a "[Photo]" label. */
-private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location")
+private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
 fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null)
@@ -153,6 +158,7 @@ fun AttachmentContent(a: Attachment, onOutgoing: Boolean, onOpenImage: (String) 
             onOutgoing = onOutgoing,
             onClick = null,
         )
+        "call" -> CallCard(a, onOutgoing)
         "location" -> CardRow(
             icon = { Icon(Icons.Outlined.LocationOn, null, modifier = Modifier.size(32.dp)) },
             title = a.title ?: "Location",
@@ -238,6 +244,27 @@ private fun CardRow(
             subtitle?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis) }
         }
     }
+}
+
+/** A call log entry, drawn like the official client's call card (missed calls in red). Calls can't be placed from here. */
+@Composable
+private fun CallCard(a: Attachment, onOutgoing: Boolean) {
+    val call = a.call
+    val missed = call?.missed == true
+    val icon = when {
+        call?.video == true && missed -> Icons.Outlined.MissedVideoCall
+        call?.video == true -> Icons.Outlined.Videocam
+        missed -> Icons.Outlined.PhoneMissed
+        else -> Icons.Outlined.Call
+    }
+    val alert = if (onOutgoing) Color.White else MaterialTheme.colorScheme.error
+    CardRow(
+        icon = { Icon(icon, null, tint = if (missed) alert else LocalContentColor.current, modifier = Modifier.size(32.dp)) },
+        title = a.title ?: if (call?.video == true) "Video call" else "Voice call",
+        subtitle = a.duration?.let(::formatDuration),
+        onOutgoing = onOutgoing,
+        onClick = null,
+    )
 }
 
 @Composable

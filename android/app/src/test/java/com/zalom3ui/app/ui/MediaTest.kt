@@ -41,6 +41,17 @@ class MediaTest {
     }
 
     @Test
+    fun callLogsDecodeAndShowAsCards() {
+        val a = json.decodeFromString<Attachment>(
+            """{"kind":"call","title":"Missed video call","call":{"video":true,"missed":true,"outgoing":false}}""",
+        )
+        assertTrue(a.isShown())
+        assertTrue(a.call!!.missed)
+        assertTrue(a.call!!.video)
+        assertNull(a.image)
+    }
+
+    @Test
     fun oldAttachmentsWithoutKindKeepTheirLabel() {
         val a = Attachment(href = "https://x/y.jpg")
         assertFalse(a.isShown())
@@ -106,6 +117,7 @@ class MediaTest {
         assertEquals("📎 a.pdf", MessageNotifier.notificationText(msg(Attachment(kind = "file", title = "a.pdf"))))
         assertEquals("🎤 Voice message", MessageNotifier.notificationText(msg(Attachment(kind = "voice"))))
         assertEquals("[Link]", MessageNotifier.notificationText(msg(Attachment(kind = "link"), "[Link]")))
+        assertEquals("📞 Missed voice call", MessageNotifier.notificationText(msg(Attachment(kind = "call", title = "Missed voice call"))))
     }
 
     @Test

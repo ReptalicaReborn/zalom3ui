@@ -93,10 +93,38 @@ test("normalizeMessage reads photo, video, voice and file details from params", 
     assert.deepEqual(file.attachment, { kind: "file", title: "Báo cáo.PDF", href: "https://x/f", size: 20480, fileExt: "pdf" });
 });
 
+test("normalizeMessage reads call logs like the official client", () => {
+    const call = (action: string, params: Record<string, unknown>) =>
+        normalizeMessage(raw({ msgType: "chat.recommended", content: { action, title: "", params: JSON.stringify(params) } }));
+
+    const answered = call("recommened.calltime", { calltype: 0, isCaller: 0, duration: 125, reason: 0 });
+    assert.equal(answered.text, "[Incoming voice call]");
+    assert.deepEqual(answered.attachment, {
+        kind: "call",
+        title: "Incoming voice call",
+        call: { video: false, missed: false, outgoing: false },
+        duration: 125_000,
+    });
+
+    const missed = call("recommened.misscall", { calltype: 1, isCaller: 0, reason: 2, duration: 0 });
+    assert.equal(missed.text, "[Missed video call]");
+    assert.deepEqual(missed.attachment?.call, { video: true, missed: true, outgoing: false });
+    assert.equal(missed.attachment?.duration, undefined);
+
+    assert.equal(call("recommened.misscall", { calltype: 0, isCaller: 1, reason: 3 }).text, "[Call declined]");
+    assert.equal(call("recommened.misscall", { calltype: 0, isCaller: 1, reason: 4 }).text, "[You cancelled the call]");
+    assert.equal(call("recommened.misscall", { calltype: 0, isCaller: 0, reason: 3 }).text, "[You declined the call]");
+    assert.equal(call("recommened.calling", { calltype: 1, duration: 61 }).text, "[Outgoing video call]");
+});
+
 test("normalizeMessage reads stickers, links and contact cards", () => {
     const sticker = normalizeMessage(raw({ msgType: "chat.sticker", content: { id: 46991, catId: 10425, type: 7 } }));
     assert.equal(sticker.text, "[Sticker]");
-    assert.deepEqual(sticker.attachment, { kind: "sticker", sticker: { id: 46991, catId: 10425, type: 7 } });
+    assert.deepEqual(sticker.attachment, {
+        kind: "sticker",
+        thumb: "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=46991",
+        sticker: { id: 46991, catId: 10425, type: 7 },
+    });
 
     const link = normalizeMessage(
         raw({ msgType: "chat.recommended", content: { action: "recommened.link", title: "Tin tức", description: "Mô tả", href: "https://news.example/a", thumb: "https://x/l.jpg", params: "{}" } }),

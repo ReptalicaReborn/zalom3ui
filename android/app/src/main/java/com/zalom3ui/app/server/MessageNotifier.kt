@@ -169,6 +169,7 @@ class MessageNotifier(private val context: Context) {
                 "link" -> a.title?.let { "🔗 $it" } ?: msg.text
                 "contact" -> "Contact card: ${a.title.orEmpty()}"
                 "location" -> "📍 ${a.title ?: "Location"}"
+                "call" -> "📞 ${a.title ?: "Call"}"
                 else -> msg.text
             }
         }

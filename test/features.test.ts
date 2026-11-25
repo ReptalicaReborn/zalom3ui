@@ -62,8 +62,6 @@ function incoming(id: string, ts: number, extra: Partial<RawMessage["data"]> = {
     };
 }
 
-const tick = () => new Promise((r) => setImmediate(r));
-
 test("a photo is sent with its pixel size, a file with only its size", async () => {
     const { session, calls } = setup();
     const data = Buffer.from([1, 2, 3, 4]);
@@ -97,26 +95,19 @@ test("sticker search returns images, and a found sticker can be sent", async () 
         ],
     });
     assert.deepEqual(await session.searchStickers("hi"), [
-        { id: 5, catId: 50, type: 7, url: "https://s/5.webp" },
-        { id: 6, catId: 60, type: 7, url: "https://s/6.png" },
+        { id: 5, catId: 50, type: 7, url: "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=5" },
+        { id: 6, catId: 60, type: 7, url: "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=6" },
     ]);
     await session.sendSticker("user", "100", 6);
     const send = calls.find((c) => c.method === "sendSticker");
     assert.deepEqual(send?.args, [{ id: 6, cateId: 60, type: 7 }, "100", ThreadType.User]);
 });
 
-test("a received sticker gets its image looked up once and the message updated", async () => {
-    const { calls, events, ingest, store } = setup({
-        getStickersDetail: [{ id: 9, cateId: 1, type: 7, stickerWebpUrl: "https://s/9.webp" }],
-    });
+test("a received sticker shows its picture right away, with no lookup", () => {
+    const { calls, ingest, store } = setup();
     ingest(incoming("1", Date.now(), { msgType: "chat.sticker", content: { id: 9, catId: 1, type: 7 } }));
-    ingest(incoming("2", Date.now(), { msgType: "chat.sticker", content: { id: 9, catId: 1, type: 7 } }));
-    await tick();
-    await tick();
-    assert.equal(calls.filter((c) => c.method === "getStickersDetail").length, 1);
-    assert.equal(store.getMessage("1")?.attachment?.thumb, "https://s/9.webp");
-    assert.equal(store.getMessage("2")?.attachment?.thumb, "https://s/9.webp");
-    assert.equal(events.filter((e) => e.name === "message_updated").length, 2);
+    assert.equal(store.getMessage("1")?.attachment?.thumb, "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=9");
+    assert.equal(calls.length, 0);
 });
 
 test("notifications: not mine, not muted, not the open chat, not old history", () => {
