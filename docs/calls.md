@@ -104,7 +104,7 @@ u32 (server id on ping and end call), **u16 command**, u8 sub-value. Payloads st
 |---|---|---|
 | 11 init call (caller) | client | u32 call id, u32 partner id, str16 session; sub = attempt (1, then 2) |
 | 12 init call (person called) | client | same + str16 extra (empty at first) |
-| 11/12 response | server | u32 error; if 0: u32, u32, str16 our address as the server sees it (for P2P) |
+| 11/12 response | server | u32 error; if 0: u32, u32 (the **token**), and optionally str16 our address as the server sees it. Zalo's servers send the 33-byte form without the address |
 | 2 ping | client | str16 session; user id + server id in the header |
 | 3 end call | client | u32 call id; response: u32 error |
 | 14 change address | client | str16; response: u32 error |

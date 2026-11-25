@@ -245,7 +245,8 @@ export function parse(buf: Buffer): Packet {
                 if (pkt.error === 0) {
                     pkt.value38 = r.u32();
                     pkt.value18 = r.u32();
-                    pkt.text = r.str16();
+                    // The address is optional: Zalo's servers send just the error and the two numbers (33 bytes).
+                    if (r.left >= 2) pkt.text = r.str16();
                 }
             } else if (h.cmd === Cmd.EndCall || h.cmd === Cmd.ChangeAddress) {
                 pkt.error = r.u32();

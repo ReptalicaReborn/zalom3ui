@@ -61,6 +61,15 @@ test("init call response: error, two server numbers, our address", () => {
         { error: ok.error, value38: ok.value38, value18: ok.value18, text: ok.text, cmd: ok.cmd, sub: ok.sub, userId: ok.userId },
         { error: 0, value38: 0x11223344, value18: 0x55667788, text: "1.2.3.4:5678", cmd: 12, sub: 1, userId: 0xc3c3c3c3 },
     );
+    // What Zalo's media server really sends (33 bytes, no address); Zalo PC's parser takes it as a success.
+    const real = parse(Buffer.concat([hex("027e00000000000000006a3d201a000000000c0001"), u32(0), u32(0x11223344), u32(0x55667788)]));
+    assert.equal(real.type, "control");
+    if (real.type === "control") {
+        assert.deepEqual(
+            { error: real.error, value38: real.value38, value18: real.value18, text: real.text, userId: real.userId, cmd: real.cmd },
+            { error: 0, value38: 0x11223344, value18: 0x55667788, text: undefined, userId: 438320490, cmd: 12 },
+        );
+    }
     const failed = parse(Buffer.concat([hdr(2, 11, 1), u32(7)]));
     assert.equal(failed.type === "control" && failed.error, 7);
 });
