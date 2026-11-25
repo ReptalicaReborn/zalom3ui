@@ -30,6 +30,10 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += "-DNODE_MOBILE_DIR=${nodeMobileDir.get().asFile.absolutePath}"
+                // libnode.so (nodejs-mobile) links against the shared C++ runtime. With the shared STL the build packages
+                // libc++_shared.so next to it; without it Node can't load ("libc++_shared.so" not found) and the app stays
+                // on "Starting Zalo…".
+                arguments += "-DANDROID_STL=c++_shared"
             }
         }
     }

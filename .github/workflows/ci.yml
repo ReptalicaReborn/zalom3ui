@@ -62,8 +62,9 @@ jobs:
         run: |
           for apk in app/build/outputs/apk/debug/*.apk; do
             echo "$apk: $(du -h "$apk" | cut -f1)"
-            unzip -l "$apk" | grep -E "libnode\.so|libnodebridge\.so|assets/server/server\.mjs"
-            for f in libnode.so libnodebridge.so assets/server/server.mjs; do
+            unzip -l "$apk" | grep -E "libnode\.so|libnodebridge\.so|libc\+\+_shared\.so|assets/server/server\.mjs"
+            # libnode.so needs libc++_shared.so; without it Node fails to load on the phone.
+            for f in libnode.so libnodebridge.so libc++_shared.so assets/server/server.mjs; do
               unzip -l "$apk" | grep -q "$f" || { echo "::error::$f missing from $apk"; exit 1; }
             done
           done
