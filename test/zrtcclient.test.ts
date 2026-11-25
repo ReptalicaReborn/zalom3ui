@@ -113,3 +113,52 @@ test("joins, receives and decrypts the caller's audio, sends its own, hangs up",
     assert.equal(seen.ends, 1);
     assert.ok(logs.some((l) => l.kind === "media_init_answer" && l.value18 === 12345));
 });
+
+test("audio and video under one SSRC (as Zalo's apps send them) both decrypt: each stream has its own SRTP context", async () => {
+    const session = "TEST-made-up-session-0123456789abcdefghijklmnop";
+    const server = dgram.createSocket("udp4");
+    await new Promise<void>((r) => server.bind(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    // The caller's two SRTP contexts, same key, same SSRC, sequence numbers far apart.
+    const callerAudio = SrtpContext.fromSession(session);
+    const callerVideo = SrtpContext.fromSession(session);
+    const ssrc = 465000001;
+    const rtp = (pt: number, seq: number, ts: number, marker: boolean, payload: Buffer) => {
+        const h = Buffer.alloc(12);
+        h[0] = 0x80;
+        h[1] = pt | (marker ? 0x80 : 0);
+        h.writeUInt16BE(seq, 2);
+        h.writeUInt32BE(ts, 4);
+        h.writeUInt32BE(ssrc, 8);
+        return Buffer.concat([h, payload]);
+    };
+    server.on("message", (msg, from) => {
+        if (msg[0] !== zrtc.Kind.Request || msg.readUInt16LE(18) !== zrtc.Cmd.InitCallCallee) return;
+        const reply = Buffer.concat([msg.subarray(0, 21), Buffer.from([0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0])]);
+        reply[0] = zrtc.Kind.Response;
+        server.send(reply, from.port, from.address);
+        for (let i = 0; i < 3; i++) {
+            server.send(Buffer.concat([Buffer.from([zrtc.Kind.AudioIn]), callerAudio.protect(rtp(OPUS_PT, 100 + i, 320 * i, false, Buffer.from([0x78, i])))]), from.port, from.address);
+            // One key frame per packet: SPS, PPS, IDR in Annex B, payload type 98, marker set.
+            const au = Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88, i]);
+            server.send(Buffer.concat([Buffer.from([zrtc.Kind.VideoIn]), callerVideo.protect(rtp(98, 40000 + i, 3000 * i, true, au))]), from.port, from.address);
+        }
+    });
+    const frames: boolean[] = [];
+    const call = new MediaCall({
+        server: { host: "127.0.0.1", port },
+        userId: 438000002,
+        partnerId: ssrc,
+        callId: 1,
+        session,
+        log: () => {},
+        onVideo: (f) => frames.push(f.key),
+    });
+    assert.equal(await call.join(2000, 100), 7);
+    await new Promise((r) => setTimeout(r, 150));
+    call.close(false);
+    server.close();
+    assert.equal(call.stats.audio.decrypted, 3, "audio");
+    assert.equal(call.stats.video.decrypted, 3, "video");
+    assert.ok(frames.length >= 1 && frames.every((k) => k), "key frames came through");
+});

@@ -122,8 +122,11 @@ export class MediaCall {
         },
     };
     private videoSsrcs = new Set<number>();
-    /** Our own video stream (a different SSRC from the audio's). */
-    private readonly videoSsrc = crypto.randomInt(0x8000_0000, 0xffff_ffff);
+    /**
+     * Our own video stream's SSRC: our 32-bit zrtc user id, as Zalo's clients use (the Zalos project's engine does the
+     * same for audio and video). Its own SRTP context ([videoSrtp]) keeps it apart from the audio stream.
+     */
+    private readonly videoSsrc: number;
     private vSeq = crypto.randomInt(0, 0x8000);
     private readonly vTsBase = crypto.randomInt(0, 0x7fffffff);
     private readonly vClock0 = process.hrtime.bigint();
@@ -141,6 +144,11 @@ export class MediaCall {
     natAddress: string | null = null;
     private readonly socket: dgram.Socket;
     private readonly srtp: SrtpContext;
+    /**
+     * Video has its own SRTP context with the same key, like Zalo PC's call program (two SrtpTransports): the other side
+     * may use one SSRC (its user id) for both streams, and one context would mix up their rollover counters.
+     */
+    private readonly videoSrtp: SrtpContext;
     private readonly ssrcs = new Set<number>();
     private lastTs: number | null = null;
     private joinWaiter: ((ok: boolean) => void) | null = null;
@@ -160,6 +168,8 @@ export class MediaCall {
 
     constructor(private readonly o: MediaCallOptions) {
         this.srtp = SrtpContext.fromSession(o.session);
+        this.videoSrtp = SrtpContext.fromSession(o.session);
+        this.videoSsrc = o.userId >>> 0 || crypto.randomInt(0x8000_0000, 0xffff_ffff);
         this.assembler = this.newAssembler();
         this.socket = o.createSocket ? o.createSocket() : dgram.createSocket(o.server.host.includes(":") ? "udp6" : "udp4");
         this.socket.on("message", (msg, from) => {
@@ -291,7 +301,7 @@ export class MediaCall {
             this.vSeq = (this.vSeq + 1) & 0xffff;
             this.vSentPackets++;
             this.vSentOctets += chunk.length;
-            this.send(zrtc.video(this.token!, this.srtp.protect(Buffer.concat([rtp, chunk]))), "video");
+            this.send(zrtc.video(this.token!, this.videoSrtp.protect(Buffer.concat([rtp, chunk]))), "video");
         });
         const v = this.stats.video;
         v.sentFrames++;
@@ -449,7 +459,7 @@ export class MediaCall {
         v.payloadTypes[h.payloadType] = (v.payloadTypes[h.payloadType] ?? 0) + 1;
         this.videoSsrcs.add(h.ssrc);
         v.ssrcs = this.videoSsrcs.size;
-        const rtp = this.srtp.unprotect(payload);
+        const rtp = this.videoSrtp.unprotect(payload);
         if (!rtp) {
             v.failed++;
             return;
