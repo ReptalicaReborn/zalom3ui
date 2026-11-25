@@ -174,6 +174,11 @@ class ApiClient(serverUrl: String, private val token: String?) {
         post<Unit>("calls/mute", buildJsonObject { put("muted", muted) }.toString())
     }
 
+    /** Tells the other side our camera is on / off (the app starts or stops sending video itself). */
+    suspend fun setCamera(on: Boolean) {
+        post<Unit>("calls/camera", buildJsonObject { put("on", on) }.toString())
+    }
+
     /** The call being answered or connected on this account, or null when there is none. */
     suspend fun currentCall(): CurrentCall? = try {
         get<CurrentCall>("calls/current")
@@ -323,6 +328,11 @@ class ApiClient(serverUrl: String, private val token: String?) {
                         callerName = call.string("callerName"),
                         video = call["video"]?.jsonPrimitive?.booleanOrNull == true,
                         connectedAt = call["connectedAt"]?.jsonPrimitive?.longOrNull ?: 0L,
+                    )
+                    "peer" -> ServerEvent.CallPeer(
+                        callId = call.string("callId"),
+                        cameraOn = call["cameraOn"]?.jsonPrimitive?.booleanOrNull == true,
+                        muted = call["muted"]?.jsonPrimitive?.booleanOrNull == true,
                     )
                     else -> null
                 }

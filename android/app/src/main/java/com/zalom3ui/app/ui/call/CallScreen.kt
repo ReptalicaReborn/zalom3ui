@@ -1,5 +1,6 @@
 package com.zalom3ui.app.ui.call
 
+import android.view.Surface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,6 +19,7 @@ import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.Icon
@@ -61,6 +63,15 @@ data class CallScreenState(
     /** RECORD_AUDIO was refused: explain, and leave only Decline. */
     val micDenied: Boolean = false,
     val error: String? = null,
+    /** A video call: the screen shows pictures instead of just the avatar. */
+    val video: Boolean = false,
+    val cameraOn: Boolean = false,
+    /** The other side's camera is on, so their picture fills the screen. */
+    val peerCameraOn: Boolean = true,
+    /** Width / height of the other side's decoded picture, once known. */
+    val remoteAspect: Float? = null,
+    /** Something to tell about the camera (denied, couldn't start). */
+    val notice: String? = null,
 )
 
 private val AnswerGreen = Color(0xFF2E9E5B)
@@ -73,7 +84,18 @@ fun CallScreen(
     onHangUp: () -> Unit,
     onToggleMute: () -> Unit,
     onToggleSpeaker: () -> Unit,
+    onAnswerWithVideo: () -> Unit = {},
+    onToggleCamera: () -> Unit = {},
+    onSwitchCamera: () -> Unit = {},
+    onRemoteSurface: (Surface?) -> Unit = {},
+    onPreviewSurface: (Surface?) -> Unit = {},
 ) {
+    if (state.video && (state.phase == CallPhase.Connecting || state.phase is CallPhase.Connected)) {
+        VideoCallLayout(
+            state, onHangUp, onToggleMute, onToggleSpeaker, onToggleCamera, onSwitchCamera, onRemoteSurface, onPreviewSurface,
+        )
+        return
+    }
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).safeDrawingPadding()) {
         Column(
             Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 32.dp),
@@ -90,7 +112,7 @@ fun CallScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                statusText(state),
+                callStatusText(state),
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -104,9 +126,13 @@ fun CallScreen(
                     textAlign = TextAlign.Center,
                 )
             }
+            state.notice?.let {
+                Spacer(Modifier.height(16.dp))
+                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
+            }
             Box(Modifier.weight(1f))
             when (state.phase) {
-                is CallPhase.Ringing -> RingingButtons(state, onAnswer, onDecline)
+                is CallPhase.Ringing -> RingingButtons(state, onAnswer, onAnswerWithVideo, onDecline)
                 CallPhase.Connecting, is CallPhase.Connected -> ConnectedButtons(state, onHangUp, onToggleMute, onToggleSpeaker)
                 CallPhase.Ended -> Unit
             }
@@ -115,10 +141,10 @@ fun CallScreen(
 }
 
 @Composable
-private fun statusText(state: CallScreenState): String {
+internal fun callStatusText(state: CallScreenState): String {
     state.error?.let { return it }
     return when (val phase = state.phase) {
-        is CallPhase.Ringing -> if (phase.video) "Incoming video call (audio only)" else "Incoming voice call"
+        is CallPhase.Ringing -> if (phase.video) "Incoming video call" else "Incoming voice call"
         CallPhase.Connecting -> "Connecting…"
         is CallPhase.Connected -> elapsedText(phase.since)
         CallPhase.Ended -> "Call ended"
@@ -146,7 +172,7 @@ fun formatElapsed(millis: Long): String {
 }
 
 @Composable
-private fun RingingButtons(state: CallScreenState, onAnswer: () -> Unit, onDecline: () -> Unit) {
+private fun RingingButtons(state: CallScreenState, onAnswer: () -> Unit, onAnswerWithVideo: () -> Unit, onDecline: () -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
         LabeledButton(
             Icons.Filled.CallEnd,
@@ -156,6 +182,10 @@ private fun RingingButtons(state: CallScreenState, onAnswer: () -> Unit, onDecli
             onDecline,
         )
         if (!state.micDenied) LabeledButton(Icons.Filled.Call, "Answer", AnswerGreen, Color.White, onAnswer)
+        // Voice only stays one tap; the camera is something to choose, not a surprise.
+        if (!state.micDenied && (state.phase as? CallPhase.Ringing)?.video == true) {
+            LabeledButton(Icons.Filled.Videocam, "Answer with video", AnswerGreen, Color.White, onAnswerWithVideo)
+        }
     }
 }
 

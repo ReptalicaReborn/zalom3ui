@@ -7,7 +7,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.view.Surface
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
@@ -49,7 +54,7 @@ sealed interface CallState {
 }
 
 /**
- * Keeps an answered call alive in the background (microphone foreground service, main process): shows the ongoing-call
+ * Keeps an answered call alive in the background (microphone foreground service, plus camera while it is on, main process): shows the ongoing-call
  * notification, follows the call through the server's events, and owns the [CallMedia] while connected.
  */
 class CallService : Service() {
@@ -62,6 +67,10 @@ class CallService : Service() {
     private var avatar: String? = null
     private var ending = false
 
+    /** Camera wanted before the media was up (answered with video); started once connected. */
+    private var cameraWanted = false
+    private val main = Handler(Looper.getMainLooper())
+
     private val api: ApiClient get() = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -71,6 +80,7 @@ class CallService : Service() {
             ACTION_START -> begin(intent)
             ACTION_HANGUP -> hangUp()
             ACTION_STOP -> finish("Call ended")
+            ACTION_CAMERA -> setCamera(intent.getBooleanExtra(EXTRA_ON, false))
             else -> if (callId.isEmpty()) stopSelf()
         }
         return START_NOT_STICKY
@@ -86,9 +96,11 @@ class CallService : Service() {
         name = intent.getStringExtra(EXTRA_NAME).orEmpty()
         avatar = intent.getStringExtra(EXTRA_AVATAR)
         ending = false
+        // Only ask for the camera type when we may use it: Android 14 refuses the service otherwise.
+        cameraWanted = intent.getBooleanExtra(EXTRA_CAMERA, false) && hasCameraPermission()
         _state.value = CallState.Connecting(callId, name, avatar)
         try {
-            startInForeground()
+            startInForeground(cameraWanted)
         } catch (e: Exception) {
             // Android refused a microphone service (permission revoked, app not visible).
             finish("Couldn't keep the call running: ${e.message}")
@@ -111,6 +123,7 @@ class CallService : Service() {
                 api.events().collect { event ->
                     when (event) {
                         is ServerEvent.CallConnected -> if (event.callId == callId) onConnected(event.connectedAt)
+                        is ServerEvent.CallPeer -> if (event.callId.isEmpty() || event.callId == callId) _peerCamera.value = event.cameraOn
                         is ServerEvent.CallEnded -> if (event.callId.isEmpty() || event.callId == callId) finish("Call ended")
                         else -> Unit
                     }
@@ -141,9 +154,80 @@ class CallService : Service() {
             }
             return
         }
+        m.setVideoListener(videoListener)
+        remoteSurface?.let { m.setRemoteSurface(it) }
+        previewSurface?.let { m.setPreviewSurface(it) }
         media = m
         activeMedia = m
         _state.value = CallState.Connected(callId, name, since, avatar)
+        if (cameraWanted) main.post { setCamera(true) }
+    }
+
+    private val videoListener = object : VideoListener {
+        override fun onRemoteVideoSize(width: Int, height: Int) {
+            _remoteSize.value = width to height
+        }
+
+        override fun onCameraStopped(message: String) {
+            main.post { cameraFailed(message) }
+        }
+    }
+
+    private fun hasCameraPermission() =
+        checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+    /** Starts or stops sending our camera and tells the other side. Runs on the main thread (the service's). */
+    private fun setCamera(on: Boolean) {
+        if (ending) return
+        if (on) {
+            if (!hasCameraPermission()) {
+                cameraWanted = false
+                _cameraOn.value = false
+                _notice.value = "Allow the camera to send video"
+                return
+            }
+            val m = media
+            if (m == null) {
+                // Not connected yet: connecting starts the camera (cameraWanted).
+                cameraWanted = true
+                _cameraOn.value = true
+                return
+            }
+            if (!startCamera(m)) return
+        } else {
+            cameraWanted = false
+            media?.setCameraOn(false)
+            // Back to a microphone-only service; Android 14 wants the type to match what is running.
+            runCatching { startInForeground(false) }
+        }
+        _cameraOn.value = on
+        scope.launch { runCatching { api.setCamera(on) } }
+    }
+
+    private fun startCamera(m: CallMedia): Boolean {
+        try {
+            // The camera type goes on before the camera opens, and only while we are allowed to use it.
+            startInForeground(true)
+            m.setCameraOn(true)
+        } catch (e: Exception) {
+            m.setCameraOn(false)
+            runCatching { startInForeground(false) }
+            cameraWanted = false
+            _cameraOn.value = false
+            _notice.value = "Couldn't start the camera: ${e.message}"
+            return false
+        }
+        _notice.value = null
+        return true
+    }
+
+    private fun cameraFailed(message: String) {
+        if (ending || !_cameraOn.value) return
+        cameraWanted = false
+        _cameraOn.value = false
+        _notice.value = message
+        runCatching { startInForeground(false) }
+        scope.launch { runCatching { api.setCamera(false) } }
     }
 
     private fun hangUp() {
@@ -164,14 +248,20 @@ class CallService : Service() {
         media?.stop()
         media = null
         activeMedia = null
+        _cameraOn.value = false
         _state.value = CallState.Ended(reason)
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun startInForeground() {
+    /** (Re)declares the foreground service type: the microphone, plus the camera while it is on. */
+    private fun startInForeground(camera: Boolean) {
         ensureChannel(this)
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
+        var type = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (camera) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), type)
     }
 
@@ -218,6 +308,10 @@ class CallService : Service() {
         const val EXTRA_CALL_ID = "callId"
         const val EXTRA_NAME = "callerName"
         const val EXTRA_AVATAR = "avatar"
+        const val EXTRA_VIDEO = "video"
+        const val EXTRA_CAMERA = "camera"
+        const val EXTRA_ON = "on"
+        const val ACTION_CAMERA = "com.zalom3ui.app.action.CALL_CAMERA"
 
         const val CHANNEL_ID = "call_ongoing"
         private const val NOTIFICATION_ID = 201
@@ -232,8 +326,66 @@ class CallService : Service() {
         private val _speaker = MutableStateFlow(false)
         val speakerOn: StateFlow<Boolean> = _speaker.asStateFlow()
 
+        /** The call is a video call (shows the video screen). */
+        private val _videoCall = MutableStateFlow(false)
+        val videoCall: StateFlow<Boolean> = _videoCall.asStateFlow()
+
+        /** Our camera is on (or wanted, until the call connects). */
+        private val _cameraOn = MutableStateFlow(false)
+        val cameraOn: StateFlow<Boolean> = _cameraOn.asStateFlow()
+
+        /** The other side's camera is on; starts as true for a video call, then follows the server's `peer` events. */
+        private val _peerCamera = MutableStateFlow(false)
+        val peerCameraOn: StateFlow<Boolean> = _peerCamera.asStateFlow()
+
+        /** Size of the other side's picture once the first frame is decoded, for the aspect ratio. */
+        private val _remoteSize = MutableStateFlow<Pair<Int, Int>?>(null)
+        val remoteSize: StateFlow<Pair<Int, Int>?> = _remoteSize.asStateFlow()
+
+        /** Something the screen should say about the camera ("Couldn't start the camera: ..."). */
+        private val _notice = MutableStateFlow<String?>(null)
+        val notice: StateFlow<String?> = _notice.asStateFlow()
+
         @Volatile
         private var activeMedia: CallMedia? = null
+
+        // The screen's surfaces outlive the media (they exist while connecting), so they are kept here.
+        @Volatile
+        private var remoteSurface: Surface? = null
+
+        @Volatile
+        private var previewSurface: Surface? = null
+
+        /** The surface the other side's video is drawn on; null when it is destroyed. */
+        fun setRemoteSurface(surface: Surface?) {
+            remoteSurface = surface
+            activeMedia?.setRemoteSurface(surface)
+        }
+
+        /** The surface of our small self-view; null when it is destroyed. */
+        fun setPreviewSurface(surface: Surface?) {
+            previewSurface = surface
+            activeMedia?.setPreviewSurface(surface)
+        }
+
+        /**
+         * Turns our camera on or off. The caller must hold the CAMERA permission and be visible when turning it on
+         * (the service type changes to include the camera).
+         */
+        fun setCamera(context: Context, on: Boolean) {
+            _cameraOn.value = on
+            context.startService(
+                Intent(context, CallService::class.java).setAction(ACTION_CAMERA).putExtra(EXTRA_ON, on),
+            )
+        }
+
+        fun switchCamera() {
+            activeMedia?.switchCamera()
+        }
+
+        fun clearNotice() {
+            _notice.value = null
+        }
 
         /** The call screen is showing an incoming call. Does not overwrite a call already being answered. */
         fun showRinging(callId: String, name: String, avatar: String?) {
@@ -248,16 +400,33 @@ class CallService : Service() {
             if (s is CallState.Ended || s is CallState.Ringing) _state.value = CallState.Idle
         }
 
-        /** Starts the foreground service for a call being answered. Needs RECORD_AUDIO and the app in the foreground. */
-        fun start(context: Context, callId: String, name: String, avatar: String? = null) {
+        /**
+         * Starts the foreground service for a call being answered. Needs RECORD_AUDIO and the app in the foreground.
+         * [video]: a video call (speaker on, video screen); [camera]: also send our camera (CAMERA already granted).
+         */
+        fun start(
+            context: Context,
+            callId: String,
+            name: String,
+            avatar: String? = null,
+            video: Boolean = false,
+            camera: Boolean = false,
+        ) {
             _muted.value = false
-            _speaker.value = false
+            _speaker.value = video
+            _videoCall.value = video
+            _cameraOn.value = camera
+            _peerCamera.value = video
+            _remoteSize.value = null
+            _notice.value = null
             _state.value = CallState.Connecting(callId, name, avatar)
             val intent = Intent(context, CallService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_CALL_ID, callId)
                 .putExtra(EXTRA_NAME, name)
                 .putExtra(EXTRA_AVATAR, avatar)
+                .putExtra(EXTRA_VIDEO, video)
+                .putExtra(EXTRA_CAMERA, camera)
             ContextCompat.startForegroundService(context, intent)
         }
 

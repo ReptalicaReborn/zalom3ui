@@ -267,6 +267,8 @@ sealed interface ServerEvent {
         val video: Boolean,
         val connectedAt: Long,
     ) : ServerEvent
+    /** The other side turned its camera or microphone on or off during the call. */
+    data class CallPeer(val callId: String, val cameraOn: Boolean, val muted: Boolean) : ServerEvent
     data class MessageUpdated(val message: ChatMessage) : ServerEvent
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent

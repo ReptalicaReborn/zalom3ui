@@ -54,4 +54,18 @@ class CallEventsTest {
         val call = json.decodeFromString(CurrentCall.serializer(), """{"callId":"c1","state":"connecting"}""")
         assertEquals(0L, call.connectedAt)
     }
+
+    @Test
+    fun peer_isParsed() {
+        val event = api.parseEvent("""{"type":"call","call":{"type":"peer","callId":"c1","cameraOn":true,"muted":false}}""")
+        assertEquals(ServerEvent.CallPeer("c1", cameraOn = true, muted = false), event)
+    }
+
+    @Test
+    fun peer_mutedAndMissingFields() {
+        assertEquals(
+            ServerEvent.CallPeer("c1", cameraOn = false, muted = true),
+            api.parseEvent("""{"type":"call","call":{"type":"peer","callId":"c1","muted":true}}"""),
+        )
+    }
 }
