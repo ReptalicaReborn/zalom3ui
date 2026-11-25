@@ -5,3 +5,5 @@ local.properties
 *.iml
 .kotlin/
 .nodejs-mobile/
+# CMake output of the native Node bridge
+.cxx/
