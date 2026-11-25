@@ -66,6 +66,29 @@ So the signalling can be reproduced in Zalỏ's server once the exact parameters
   (`zrtc_call::ZMessageDeserializer`).
 - The binary keeps its C++ symbol names, which makes static analysis practical.
 
+Zalo Web (chat.zalo.me) has no call engine at all: it ships the same `voicecall` request builders but never asks for
+the microphone (no `getUserMedia`), and Zalo PC's only `RTCPeerConnection` reads the local IP. So there is no
+standard-WebRTC path to fall back on; every 1:1 call goes through zrtc.
+
+What the call program needs from signalling (`zrtc::CallController` setters): the call id, the partner's id, a
+**session id**, a **token**, an **SRTP key** (`setSrtpKey`), the protocol / packet mode, and the media server
+(`setCurrentServer(ZRTPServerInfo)`); `_parseExtendData` reads the request's `extendData`. The keys come from Zalo's
+servers in the call request rather than from a handshake between the phones, so there is no key agreement to rebuild,
+only the packet format and the start-up exchange with the media server (`_sendRequestInitZRTPToServer`, ping, echo,
+P2P binding, TCP fallback).
+
+First look at the packet format (`zrtc::ZRTPPacket::_buildPacketInternal`, arm64; tentative):
+
+- Byte 0 is the packet kind.
+- Kinds 3, 5, 7, 13, 15 (media): kind, a 32-bit value (the stream's token or SSRC), then the payload.
+- Kind 1 (control): kind, a byte, four 32-bit values, a 16-bit command, a byte, then a body that depends on the
+  command (commands up to 51).
+- Kind 0x7f: peer-to-peer packets (binding request/response, echo, signal).
+- Multi-byte fields are written in the machine's (little-endian) order.
+
+The call log of a real call shows the request's data (media servers, session, key), which turns these into a working
+start-up exchange.
+
 Getting audio to flow means reimplementing that network layer (how a call connects to Zalo's media relays, the packet
 format, how the SRTP keys are agreed) and feeding it from an Android audio pipeline (Opus, echo cancellation).
 
@@ -83,7 +106,11 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
     next login.
 
   Each control is announced once even if both channels carry it, and a call request over 2 minutes old is not
-  announced (replayed history). An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
+  announced (replayed history).
+- **Decline:** the call notification has **Decline**. Zalo PC has no separate decline request: its call program sends
+  signal 405, which becomes `/api/voicecall/cancel` with the other side's id (`callerId`), the call id and call type as
+  received, `status: 0` and the device id; the same request a caller sends to give up. The call log records
+  `declined` with Zalo's answer, or `decline_failed`. An incoming call shows a "📞 Bảo is calling" notification with **Open Zalo**;
   it goes away when the call is answered elsewhere, cancelled or ended.
 - **Call log:** every call event is appended to `call-trace.jsonl` in the server's data folder (2 MB, then rotated).
   *Settings → Call research → Share call log* exports it; *Clear call log* empties it. It holds call ids, user ids and

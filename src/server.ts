@@ -281,6 +281,14 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         res.status(204).end();
     }));
 
+    // ---- Calls (docs/calls.md) ----
+
+    /** Declines a call ringing on this account. */
+    api.post("/calls/:callId/decline", wrap(async (req, res) => {
+        await session.declineCall(req.params.callId);
+        res.status(204).end();
+    }));
+
     // ---- Call research (docs/calls.md) ----
 
     /** The call log: one JSON line per call event Zalo sent. Holds call ids and server addresses, no message text. */

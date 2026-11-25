@@ -169,6 +169,15 @@ class MessageNotifier(private val context: Context) {
             .setAutoCancel(true)
             // Zalo rings for about a minute; a call that never said it ended disappears on its own.
             .setTimeoutAfter(CALL_TIMEOUT_MS)
+        if (call.callId.isNotEmpty() && !call.group) {
+            val decline = PendingIntent.getBroadcast(
+                context,
+                tag.hashCode() + 2,
+                CallActionReceiver.declineIntent(context, call.callId, tag),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.addAction(R.drawable.ic_launcher_foreground, "Decline", decline)
+        }
         if (openZalo != null) builder.addAction(R.drawable.ic_launcher_foreground, "Open Zalo", openZalo)
         builder.addAction(R.drawable.ic_launcher_foreground, "Open chat", openChat)
         if (canNotify(context)) runCatching { NotificationManagerCompat.from(context).notify(tag, CALL_NOTIFICATION_ID, builder.build()) }
@@ -191,7 +200,7 @@ class MessageNotifier(private val context: Context) {
         const val CHANNEL_ID = "messages"
         const val CALLS_CHANNEL_ID = "calls"
         private const val CALL_TAG = "call:"
-        private const val CALL_NOTIFICATION_ID = 200
+        const val CALL_NOTIFICATION_ID = 200
         private const val CALL_TIMEOUT_MS = 75_000L
         /** The official Zalo app, which answers the calls. */
         const val ZALO_PACKAGE = "com.zing.zalo"
@@ -237,6 +246,53 @@ class MessageNotifier(private val context: Context) {
                 else -> msg.text
             }
         }
+    }
+}
+
+/** "Decline" on an incoming call notification: tells Zalo, then removes the notification. */
+class CallActionReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val callId = intent.getStringExtra(EXTRA_CALL_ID) ?: return
+        val tag = intent.getStringExtra(EXTRA_TAG) ?: return
+        val pending = goAsync()
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                ApiClient(LocalServer.url(context), SettingsStore(context).localToken()).declineCall(callId)
+                NotificationManagerCompat.from(context).cancel(tag, MessageNotifier.CALL_NOTIFICATION_ID)
+            } catch (e: Exception) {
+                // Say so on the notification instead of leaving the caller wondering whether it worked.
+                StartupLog.write(context, "Decline failed: ${e.message}")
+                showDeclineFailed(context, tag, e.message)
+            } finally {
+                pending.finish()
+            }
+        }
+    }
+
+    private fun showDeclineFailed(context: Context, tag: String, reason: String?) {
+        if (!MessageNotifier.canNotify(context)) return
+        MessageNotifier.ensureCallChannel(context)
+        val n = NotificationCompat.Builder(context, MessageNotifier.CALLS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Couldn't decline the call")
+            .setContentText(reason ?: "Zalo didn't answer")
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
+            .setTimeoutAfter(30_000)
+            .build()
+        runCatching { NotificationManagerCompat.from(context).notify(tag, MessageNotifier.CALL_NOTIFICATION_ID, n) }
+    }
+
+    companion object {
+        const val ACTION_DECLINE = "com.zalom3ui.app.action.DECLINE_CALL"
+        private const val EXTRA_CALL_ID = "callId"
+        private const val EXTRA_TAG = "tag"
+
+        fun declineIntent(context: Context, callId: String, tag: String): Intent =
+            Intent(context, CallActionReceiver::class.java)
+                .setAction(ACTION_DECLINE)
+                .putExtra(EXTRA_CALL_ID, callId)
+                .putExtra(EXTRA_TAG, tag)
     }
 }
 

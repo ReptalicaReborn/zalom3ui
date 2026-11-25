@@ -148,6 +148,11 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     // ---- Call research ----
 
+    /** Declines a call ringing on this account (the caller sees it declined). */
+    suspend fun declineCall(callId: String) {
+        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/decline")
+    }
+
     /** The server's call log (JSON lines of the call events Zalo sent). */
     suspend fun callLog(): String = withContext(Dispatchers.IO) {
         val builder = Request.Builder().url(url("debug/call-log")).get()

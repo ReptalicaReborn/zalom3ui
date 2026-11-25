@@ -40,6 +40,12 @@
             android:exported="false"
             android:process=":node" />
 
+        <!-- "Decline" on incoming call notifications. -->
+        <receiver
+            android:name=".server.CallActionReceiver"
+            android:exported="false"
+            android:process=":node" />
+
         <receiver
             android:name=".server.BootReceiver"
             android:exported="false">

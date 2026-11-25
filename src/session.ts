@@ -33,6 +33,7 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
+import { declineCall, ringingCallOf, voiceCallSender, type RingingCall } from "./voicecall.js";
 import { HttpError } from "./errors.js";
 import {
     ChatStore,
@@ -129,6 +130,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private ctrlPollOff = false;
     /** "act:callId" of call controls already handled, so one that comes both ways is announced once. */
     private handledCallControls = new Map<string, number>();
+    /** Calls ringing on this account now, by call id. */
+    private ringing = new Map<string, RingingCall>();
     private status: SessionStatus = {
         state: "logged_out",
         qrImage: null,
@@ -524,6 +527,23 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         });
     }
 
+    /** Declines a call ringing on this account; the caller sees it declined, as from the official apps. */
+    async declineCall(callId: string): Promise<void> {
+        const api = this.requireApi();
+        const call = this.ringing.get(callId);
+        if (!call) throw new HttpError(404, "That call isn't ringing any more");
+        const imei = (api.getContext() as unknown as { imei?: string }).imei ?? "";
+        try {
+            const answer = await declineCall(voiceCallSender(api), call, imei);
+            this.callTrace.record({ kind: "declined", callId, answer });
+        } catch (err) {
+            this.callTrace.record({ kind: "decline_failed", callId, error: describeError(err) });
+            throw new HttpError(502, `Zalo refused: ${describeError(err)}`);
+        }
+        this.ringing.delete(callId);
+        this.emit("call", { type: "ended", callId, act: "declined" });
+    }
+
     /**
      * Polls Zalo's control servers the way Zalo PC does (src/ctrlpoll.ts), for the call events the chat socket never
      * carries. Notes in the call log what the login offered (field names, server hosts, socket flags), so a log shows
@@ -601,11 +621,13 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         if (incoming && now - incoming.ts > RINGING_MAX_AGE_MS) {
             this.callTrace.record({ kind: "call_too_old", callId: incoming.callId, ageSeconds: Math.round((now - incoming.ts) / 1000) });
         } else if (incoming) {
+            for (const [id, call] of this.ringing) if (now - call.receivedAt > RINGING_MAX_AGE_MS) this.ringing.delete(id);
+            this.ringing.set(incoming.callId, ringingCallOf(incoming, control, now));
             const caller = this.friendList.get(incoming.callerId)?.name ?? this.store.getThread("user", incoming.callerId)?.name ?? "";
             const groupName = incoming.groupId ? this.store.getThread("group", incoming.groupId)?.name : undefined;
             this.emit("call", { type: "incoming", call: { ...incoming, callerName: caller || "Someone", ...(groupName ? { groupName } : {}) } });
         } else if (CALL_ENDING_ACTS.has(control.act)) {
-            const callId = control.data.callId ?? control.data.call_id;
+            if (callId !== undefined) this.ringing.delete(String(callId));
             this.emit("call", { type: "ended", callId: callId === undefined ? "" : String(callId), act: control.act });
         }
     }
