@@ -17,8 +17,13 @@ val nodeMobileSha256 = "bd7321eaa1a7602fbe0bb87302df2d79d87835cf4363fbdd17c350db
 val nodeMobileDir = layout.buildDirectory.dir("nodejs-mobile")
 
 android {
+    lint {
+        // AGP 8.7.3's lint crashes inside the lifecycle-runtime-android 2.9+ NullSafeMutableLiveData detector
+        // (pulled in by the Compose BOM bump). The app does not use LiveData, so nothing is lost.
+        disable += "NullSafeMutableLiveData"
+    }
     namespace = "com.zalom3ui.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.zalom3ui.app"
@@ -187,13 +192,14 @@ androidComponents {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    val composeBom = platform("androidx.compose:compose-bom:2025.10.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    implementation("androidx.compose.material3:material3")
+    // Material 3 Expressive (MaterialExpressiveTheme, MotionScheme, ButtonGroup, FloatingToolbar, LoadingIndicator, WavyProgressIndicator, MaterialShapes).
+    implementation("androidx.compose.material3:material3:1.5.0-alpha13")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.5")
     implementation("io.coil-kt:coil-compose:2.7.0")

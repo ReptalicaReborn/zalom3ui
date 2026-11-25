@@ -54,6 +54,7 @@ private object Routes {
     const val CHAT = "chat"
     const val FORWARD = "forward"
     const val SETTINGS = "settings"
+    const val CHAT_INFO = "chat_info"
 }
 
 @Composable
@@ -108,6 +109,8 @@ private fun AppNav(vm: AppViewModel) {
     // Tablets (not phones turned sideways) show the chat list and the open chat side by side, like Telegram.
     val wide = configuration.smallestScreenWidthDp >= 600 && configuration.screenWidthDp >= 700
     val wideNow by rememberUpdatedState(wide)
+    // Set by the chat-info screen's "Search" action; the chat screen consumes it and opens its search bar.
+    var pendingSearch by remember { mutableStateOf(false) }
 
     /** Shows the chat the view model just opened: beside the list on a tablet, as its own screen on a phone. */
     fun goToChat() {
@@ -142,6 +145,7 @@ private fun AppNav(vm: AppViewModel) {
             onSendSticker = vm::sendSticker,
             onShowMembers = { nav.navigate(Routes.MEMBERS) },
             onAddMembers = { nav.navigate(Routes.ADD_MEMBERS) },
+            onOpenInfo = { nav.navigate(Routes.CHAT_INFO) },
             onRenameGroup = vm::renameGroup,
             onLeaveGroup = { silent ->
                 vm.leaveGroup(silent) {
@@ -216,6 +220,8 @@ private fun AppNav(vm: AppViewModel) {
                             typing = state.typing[chat.ref.key],
                             stickers = state.stickers,
                             actions = chatActions(chat, onBack = { vm.closeChat(chat.ref) }),
+                            initialSearch = pendingSearch,
+                            onSearchConsumed = { pendingSearch = false },
                         )
                     },
                 ) { selectedKey -> ThreadListScreen(
@@ -361,6 +367,51 @@ private fun AppNav(vm: AppViewModel) {
                     typing = state.typing[chat.ref.key],
                     stickers = state.stickers,
                     actions = chatActions(chat, onBack = { nav.popBackStack() }),
+                    initialSearch = pendingSearch,
+                    onSearchConsumed = { pendingSearch = false },
+                )
+            }
+        }
+        composable(Routes.CHAT_INFO) {
+            val state by vm.state.collectAsStateWithLifecycle()
+            val chat = state.chat
+            if (chat == null) {
+                LaunchedEffect(Unit) { nav.popBackStack(Routes.HOME, inclusive = false) }
+            } else {
+                ChatInfoScreen(
+                    chat = chat,
+                    thread = state.threads.firstOrNull { it.ref == chat.ref },
+                    onBack = { nav.popBackStack() },
+                    onSearch = {
+                        pendingSearch = true
+                        nav.popBackToChat()
+                    },
+                    onPin = { vm.setPinned(chat.ref, it) },
+                    onMute = { vm.setMuted(chat.ref, it) },
+                    onMarkUnread = {
+                        vm.markUnread(chat.ref)
+                        if (wideNow) vm.closeChat(chat.ref)
+                        nav.popBackStack(Routes.HOME, inclusive = false)
+                    },
+                    onLoadMembers = vm::loadMembers,
+                    onShowMembers = { nav.navigate(Routes.MEMBERS) },
+                    onAddMembers = { nav.navigate(Routes.ADD_MEMBERS) },
+                    onOpenMember = { member ->
+                        val existing = state.threads.firstOrNull { it.kind == "user" && it.id == member.id }
+                        vm.openChat(existing ?: com.zalom3ui.app.data.ThreadSummary(id = member.id, kind = "user", name = member.name))
+                        goToChat()
+                    },
+                    onRenameGroup = vm::renameGroup,
+                    onLeaveGroup = { silent ->
+                        vm.leaveGroup(silent) {
+                            vm.closeChat(chat.ref)
+                            nav.popBackStack(Routes.HOME, inclusive = false)
+                        }
+                    },
+                    onDeleteConversation = {
+                        vm.deleteConversation(chat.ref)
+                        nav.popBackStack(Routes.HOME, inclusive = false)
+                    },
                 )
             }
         }
