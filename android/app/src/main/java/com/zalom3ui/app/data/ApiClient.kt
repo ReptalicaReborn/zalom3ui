@@ -14,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.HttpUrl
@@ -34,7 +35,7 @@ import okhttp3.WebSocketListener
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-class ApiException(message: String) : IOException(message)
+class ApiException(message: String, val code: Int = 0) : IOException(message)
 
 /** Talks to the Zalỏ server's REST API and WebSocket. */
 class ApiClient(serverUrl: String, private val token: String?) {
@@ -158,6 +159,23 @@ class ApiClient(serverUrl: String, private val token: String?) {
         post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/decline")
     }
 
+    /** Picks up a ringing call; the server joins the media server and sends a `connected` event. */
+    suspend fun answerCall(callId: String) {
+        post<Unit>("calls/${java.net.URLEncoder.encode(callId, "UTF-8")}/answer")
+    }
+
+    /** Ends the connected call. */
+    suspend fun hangUpCall() {
+        post<Unit>("calls/hangup")
+    }
+
+    /** The call being answered or connected on this account, or null when there is none. */
+    suspend fun currentCall(): CurrentCall? = try {
+        get<CurrentCall>("calls/current")
+    } catch (e: ApiException) {
+        if (e.code == 404) null else throw e
+    }
+
     /** The server's call log (JSON lines of the call events Zalo sent). */
     suspend fun callLog(): String = withContext(Dispatchers.IO) {
         val builder = Request.Builder().url(url("debug/call-log")).get()
@@ -279,7 +297,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
         awaitClose { socket.close(1000, null) }
     }
 
-    private fun parseEvent(text: String): ServerEvent? {
+    internal fun parseEvent(text: String): ServerEvent? {
         val obj = json.parseToJsonElement(text).jsonObject
         return when (obj["type"]?.jsonPrimitive?.content) {
             "status" -> ServerEvent.Status(json.decodeFromJsonElement(SessionStatus.serializer(), obj.getValue("status")))
@@ -294,6 +312,13 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 when (call.string("type")) {
                     "incoming" -> ServerEvent.CallIncoming(json.decodeFromJsonElement(IncomingCall.serializer(), call.getValue("call")))
                     "ended" -> ServerEvent.CallEnded(call.string("callId"))
+                    "connected" -> ServerEvent.CallConnected(
+                        callId = call.string("callId"),
+                        callerId = call.string("callerId"),
+                        callerName = call.string("callerName"),
+                        video = call["video"]?.jsonPrimitive?.booleanOrNull == true,
+                        connectedAt = call["connectedAt"]?.jsonPrimitive?.longOrNull ?: 0L,
+                    )
                     else -> null
                 }
             }
@@ -331,7 +356,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
             if (!res.isSuccessful) {
                 val message = runCatching { json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.content }
                     .getOrNull()
-                throw ApiException(message ?: "HTTP ${res.code}")
+                throw ApiException(message ?: "HTTP ${res.code}", res.code)
             }
             if (T::class == Unit::class) Unit as T else json.decodeFromString<T>(body)
         }

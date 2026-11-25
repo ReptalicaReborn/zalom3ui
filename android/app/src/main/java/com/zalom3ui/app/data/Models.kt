@@ -238,6 +238,18 @@ data class IncomingCall(
     val groupName: String? = null,
 )
 
+/** `GET /calls/current`: the call this account is answering or on. [connectedAt] is epoch millis, 0 until connected. */
+@Serializable
+data class CurrentCall(
+    val callId: String = "",
+    val callerId: String = "",
+    val callerName: String = "",
+    val video: Boolean = false,
+    /** "connecting" or "connected". */
+    val state: String = "",
+    val connectedAt: Long = 0,
+)
+
 sealed interface ServerEvent {
     data class Status(val status: SessionStatus) : ServerEvent
     /** [notify]: the server thinks a phone should show it (not mine, not muted, not open, not old). */
@@ -247,6 +259,14 @@ sealed interface ServerEvent {
     data class CallIncoming(val call: IncomingCall) : ServerEvent
     /** The call stopped ringing (answered elsewhere, cancelled, ended); [callId] may be empty. */
     data class CallEnded(val callId: String) : ServerEvent
+    /** The call was answered and its media is up; [connectedAt] is epoch millis. */
+    data class CallConnected(
+        val callId: String,
+        val callerId: String,
+        val callerName: String,
+        val video: Boolean,
+        val connectedAt: Long,
+    ) : ServerEvent
     data class MessageUpdated(val message: ChatMessage) : ServerEvent
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent

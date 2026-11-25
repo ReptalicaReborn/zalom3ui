@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Voice calls: the microphone, a service that keeps it open, the lock-screen call screen, and speakerphone. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Only to save the login QR code to the gallery on Android 9 and older. -->
     <uses-permission
@@ -33,6 +38,12 @@
             android:exported="false"
             android:foregroundServiceType="remoteMessaging"
             android:process=":node" />
+
+        <!-- Keeps an answered call alive; main process, because it owns the microphone. -->
+        <service
+            android:name=".call.CallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <!-- "Reply" / "Mark as read" on message notifications; next to the server and its notifier. -->
         <receiver
@@ -75,5 +86,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The call screen; shown over the lock screen from the incoming-call notification. -->
+        <activity
+            android:name=".ui.call.CallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.App" />
     </application>
 </manifest>
