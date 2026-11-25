@@ -189,6 +189,8 @@ export const REACTIONS: Record<string, { code: string; emoji: string }> = {
 const REACTION_BY_CODE = new Map(Object.entries(REACTIONS).map(([key, r]) => [r.code, { key, emoji: r.emoji }]));
 
 const MAX_MESSAGES_PER_THREAD = 500;
+/** Per-chat limit once a history import has run: the phone's older messages would otherwise be evicted at once. */
+export const HISTORY_MESSAGES_PER_THREAD = 2000;
 
 const KIND_BY_MSG_TYPE: Record<string, AttachmentKind> = {
     "chat.photo": "photo",
@@ -400,6 +402,8 @@ type Snapshot = {
     pinned?: string[];
     mutedUntil?: Record<string, number>;
     markedUnread?: string[];
+    /** Per-chat message limit, raised by a history import. */
+    messageCap?: number;
 };
 
 /**
@@ -419,6 +423,7 @@ export class ChatStore {
     private index = new Map<string, string>();
     private saveTimer: NodeJS.Timeout | null = null;
     ownId: string | null = null;
+    private messageCap = MAX_MESSAGES_PER_THREAD;
 
     constructor(private readonly file: string | null = null) {
         this.load();
@@ -439,8 +444,19 @@ export class ChatStore {
         return this.threads.get(threadKey(kind, id));
     }
 
-    /** Adds a message; returns false if it was already stored. */
-    addMessage(msg: StoredMessage): boolean {
+    /** Lets chats keep up to `cap` messages (saved with the cache), for imported history. Never lowers the limit. */
+    allowMessages(cap: number): void {
+        if (cap > this.messageCap) {
+            this.messageCap = cap;
+            this.scheduleSave();
+        }
+    }
+
+    /**
+     * Adds a message; returns false if it was already stored. `history`: an imported old message, which changes no
+     * read state (see [settleHistory]).
+     */
+    addMessage(msg: StoredMessage, opts: { history?: boolean } = {}): boolean {
         if (this.index.has(msg.id)) return false;
         const key = threadKey(msg.threadKind, msg.threadId);
         const list = this.messages.get(key) ?? [];
@@ -451,8 +467,8 @@ export class ChatStore {
         list.splice(i, 0, msg);
         this.index.set(msg.id, key);
         let evictedSelf = false;
-        if (list.length > MAX_MESSAGES_PER_THREAD) {
-            for (const dropped of list.splice(0, list.length - MAX_MESSAGES_PER_THREAD)) {
+        if (list.length > this.messageCap) {
+            for (const dropped of list.splice(0, list.length - this.messageCap)) {
                 this.index.delete(dropped.id);
                 if (dropped.id === msg.id) evictedSelf = true;
             }
@@ -469,6 +485,10 @@ export class ChatStore {
                 avatar: "",
             });
         }
+        if (opts.history) {
+            this.scheduleSave();
+            return true;
+        }
         const prevReadUpTo = this.readUpTo.get(key) ?? 0;
         if (msg.isSelf) {
             if (msg.ts > prevReadUpTo) this.markRead(msg.threadKind, msg.threadId, msg.ts);
@@ -478,6 +498,23 @@ export class ChatStore {
         }
         this.scheduleSave();
         return true;
+    }
+
+    /**
+     * After importing old messages into a chat: marks them read, up to just before the first message that was there
+     * already and is unread, so history never shows up as new unread messages.
+     */
+    settleHistory(kind: ThreadKind, id: string, importedIds: ReadonlySet<string>): void {
+        const key = threadKey(kind, id);
+        const list = this.messages.get(key) ?? [];
+        const readTs = this.readUpTo.get(key) ?? 0;
+        const firstLiveUnread = list.find((m) => !importedIds.has(m.id) && !m.isSelf && m.ts > readTs)?.ts ?? Infinity;
+        let upTo = readTs;
+        for (const m of list) if (importedIds.has(m.id) && m.ts < firstLiveUnread && m.ts > upTo) upTo = m.ts;
+        if (upTo > readTs) {
+            this.readUpTo.set(key, upTo);
+            this.scheduleSave();
+        }
     }
 
     getMessage(msgId: string): StoredMessage | undefined {
@@ -691,6 +728,7 @@ export class ChatStore {
                 pinned: [...this.pinned],
                 mutedUntil: Object.fromEntries(this.mutedUntil),
                 markedUnread: [...this.markedUnread],
+                ...(this.messageCap > MAX_MESSAGES_PER_THREAD ? { messageCap: this.messageCap } : {}),
             };
             fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
             const tmp = `${this.file}.tmp`;
@@ -719,6 +757,7 @@ export class ChatStore {
             this.pinned = new Set(snapshot.pinned ?? []);
             this.mutedUntil = new Map(Object.entries(snapshot.mutedUntil ?? {}));
             this.markedUnread = new Set(snapshot.markedUnread ?? []);
+            if (typeof snapshot.messageCap === "number" && snapshot.messageCap > MAX_MESSAGES_PER_THREAD) this.messageCap = snapshot.messageCap;
             for (const [key, list] of this.messages) for (const m of list) this.index.set(m.id, key);
         } catch (err) {
             this.threads.clear();

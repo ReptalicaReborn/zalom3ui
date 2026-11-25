@@ -54,6 +54,13 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     suspend fun login(): SessionStatus = post("login")
 
+    /** Sync messages from the phone (docs/history-sync.md). */
+    suspend fun historySyncStatus(): HistorySyncStatus = get("history-sync", "status")
+
+    suspend fun startHistorySync(): HistorySyncStatus = post("history-sync", "start")
+
+    suspend fun cancelHistorySync(): HistorySyncStatus = post("history-sync", "cancel")
+
     suspend fun reconnect(): SessionStatus = post("reconnect")
 
     /** Retry a saved session that couldn't reach Zalo, without waiting for the next attempt. */
@@ -392,6 +399,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
             "typing" -> ServerEvent.Typing(obj.threadRef(), obj.string("uid"), obj.string("name"))
             "threads" -> ServerEvent.ThreadsChanged
             "poll" -> obj["pollId"]?.jsonPrimitive?.longOrNull?.let { ServerEvent.PollChanged(it) }
+            "history_sync" -> HistorySyncEvent(json.decodeFromJsonElement(HistorySyncStatus.serializer(), obj))
             else -> null
         }
     }
