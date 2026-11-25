@@ -1,8 +1,9 @@
 import dgram from "node:dgram";
 import crypto from "node:crypto";
-import { ReceiveStats, parseRtcp, receiverReport, sdesCname, senderReport } from "./rtcp.js";
+import { ReceiveStats, parseRtcp, pli, receiverReport, sdesCname, senderReport } from "./rtcp.js";
 import { SrtpContext, rtpHeader } from "./srtp.js";
 import * as zrtc from "./zrtc.js";
+import { MAX_CHUNK, VIDEO_DELTA_PT, VIDEO_KEY_PT, VideoAssembler, nalUnits, packetizeFrame, type VideoFrame } from "./video.js";
 
 /**
  * One call's connection to a Zalo media server (zrtc over UDP), as the person called: join the call (init call,
@@ -25,10 +26,17 @@ export function parseServer(address: string): MediaServer | null {
 export const OPUS_PT = 112;
 export const OPUS_CLOCK = 16000;
 export const FRAME_MS = 20;
-/** Video payload types in Zalo calls (zrtc::ConstParams): H.264 97, RED 118 wrapping it, ULPFEC 119. */
-export const H264_PT = 97;
-export const RED_PT = 118;
-export const ULPFEC_PT = 119;
+/** Video in 1:1 calls: H.264 payload type 97 (98 for key frames), 90 kHz clock, no RED (src/video.ts). */
+export const H264_PT = VIDEO_DELTA_PT;
+export const VIDEO_CLOCK = 90_000;
+/** Key-frame requests (PLI) go out at most this often. */
+const PLI_MIN_GAP_MS = 500;
+/** A key frame request from the other side reaches the app at most this often. */
+const KEYREQ_MIN_GAP_MS = 250;
+/** Without a key frame yet, ask again this often. */
+const PLI_RETRY_MS = 1000;
+/** How often the video assembler's reorder window is checked. */
+const VIDEO_TICK_MS = 50;
 
 /** A 20 ms Opus frame of silence (CELT, any decoder plays it as silence). */
 export const OPUS_SILENCE = Buffer.from([0xf8, 0xff, 0xfe]);
@@ -47,6 +55,10 @@ export type MediaCallOptions = {
     rtcpMs?: number;
     /** The other side's audio, decrypted: RTP sequence number, RTP timestamp and the Opus payload. */
     onAudio?: (seq: number, timestamp: number, opus: Buffer) => void;
+    /** The other side's video: one complete H.264 access unit (Annex B, SPS/PPS in front of key frames), 90 kHz timestamp. */
+    onVideo?: (frame: VideoFrame) => void;
+    /** The other side asked us for a key frame (RTCP PLI or FIR about our video stream). */
+    onKeyFrameRequest?: () => void;
 };
 
 export type MediaStats = {
@@ -68,10 +80,28 @@ export type MediaStats = {
     };
     controls: { kind: number; cmd: number; sub: number; error?: number }[];
     /**
-     * The other side's video (not played yet): what it looks like, for docs/video-calls.md. RTP payload types, the
-     * payload type inside RED (118) packets, and H.264 NAL unit types (1 slice, 5 IDR, 7 SPS, 8 PPS, 24 STAP-A, 28 FU-A).
+     * The other side's video: RTP packets and payload types, what the frame assembler made of them (frames, key
+     * frames, gaps = lost frames, dropped), H.264 NAL unit types in the finished frames (1 slice, 5 IDR, 7 SPS, 8 PPS),
+     * what we sent (frames, packets, payload bytes) and how many key-frame requests went out / came in.
      */
-    video: { packets: number; decrypted: number; failed: number; ssrcs: number; payloadTypes: Record<string, number>; redInner: Record<string, number>; nalTypes: Record<string, number>; bytes: number };
+    video: {
+        packets: number;
+        decrypted: number;
+        failed: number;
+        ssrcs: number;
+        payloadTypes: Record<string, number>;
+        nalTypes: Record<string, number>;
+        bytes: number;
+        frames: number;
+        keys: number;
+        gaps: number;
+        dropped: number;
+        sentFrames: number;
+        sentPackets: number;
+        sentBytes: number;
+        plisSent: number;
+        keyRequests: number;
+    };
     /** RTCP from the other side: packet types seen, and the last loss / jitter it reported about our audio. */
     rtcp: { packets: number; types: Record<string, number>; theirView?: { fractionLost: number; cumulativeLost: number; jitter: number } };
 };
@@ -86,9 +116,27 @@ export class MediaCall {
         audio: { packets: 0, decrypted: 0, failed: 0, payloadTypes: {}, ssrcs: 0, timestampSteps: [], opusToc: [], bytes: 0 },
         controls: [],
         rtcp: { packets: 0, types: {} },
-        video: { packets: 0, decrypted: 0, failed: 0, ssrcs: 0, payloadTypes: {}, redInner: {}, nalTypes: {}, bytes: 0 },
+        video: {
+            packets: 0, decrypted: 0, failed: 0, ssrcs: 0, payloadTypes: {}, nalTypes: {}, bytes: 0,
+            frames: 0, keys: 0, gaps: 0, dropped: 0, sentFrames: 0, sentPackets: 0, sentBytes: 0, plisSent: 0, keyRequests: 0,
+        },
     };
     private videoSsrcs = new Set<number>();
+    /** Our own video stream (a different SSRC from the audio's). */
+    private readonly videoSsrc = crypto.randomInt(0x8000_0000, 0xffff_ffff);
+    private vSeq = crypto.randomInt(0, 0x8000);
+    private readonly vTsBase = crypto.randomInt(0, 0x7fffffff);
+    private readonly vClock0 = process.hrtime.bigint();
+    private vSentPackets = 0;
+    private vSentOctets = 0;
+    private assembler: VideoAssembler;
+    /** Counts of assemblers replaced when the other side's video SSRC changed. */
+    private retiredFrames = { frames: 0, keys: 0, gaps: 0, dropped: 0 };
+    /** The other side's video stream: its SSRC (for PLI) and report statistics. */
+    private incomingVideo: ReceiveStats | null = null;
+    private videoStartedAt = 0;
+    private lastPliAt = 0;
+    private lastKeyReqAt = 0;
     token: number | null = null;
     natAddress: string | null = null;
     private readonly socket: dgram.Socket;
@@ -112,6 +160,7 @@ export class MediaCall {
 
     constructor(private readonly o: MediaCallOptions) {
         this.srtp = SrtpContext.fromSession(o.session);
+        this.assembler = this.newAssembler();
         this.socket = o.createSocket ? o.createSocket() : dgram.createSocket(o.server.host.includes(":") ? "udp6" : "udp4");
         this.socket.on("message", (msg, from) => {
             if (from.address === o.server.host || from.address.endsWith(o.server.host)) this.onPacket(msg);
@@ -153,6 +202,7 @@ export class MediaCall {
         const ping = () => this.send(zrtc.ping({ userId: this.o.userId, serverId: this.token ?? 0, session: this.o.session }), "ping");
         this.timers.push(setInterval(ping, this.o.pingMs ?? 2000));
         this.timers.push(setInterval(() => this.sendRtcp(), this.o.rtcpMs ?? RTCP_MS));
+        this.timers.push(setInterval(() => this.videoTick(), VIDEO_TICK_MS));
         return this.token;
     }
 
@@ -202,12 +252,118 @@ export class MediaCall {
                 ? senderReport({ ssrc: this.ssrc, nowMs: now, rtpTimestamp: this.ts, packets: this.sentPackets, octets: this.sentOctets, blocks })
                 : receiverReport({ ssrc: this.ssrc, blocks });
         this.send(zrtc.rtcp(this.token, Buffer.concat([report, sdesCname(this.ssrc, `zaloo-${this.ssrc.toString(16)}`)])), "rtcp");
+        this.sendVideoRtcp(now);
     }
 
-    private onRtcp(payload: Buffer): void {
+    /** Video sender report (receiver report before we've sent video) on kind 15; nothing while no video flows either way. */
+    private sendVideoRtcp(now: number): void {
+        if (this.token === null || (this.vSentPackets === 0 && !this.incomingVideo)) return;
+        const vblock = this.incomingVideo?.block(now);
+        const blocks = vblock ? [vblock] : [];
+        const report =
+            this.vSentPackets > 0
+                ? senderReport({ ssrc: this.videoSsrc, nowMs: now, rtpTimestamp: this.videoTimestamp(), packets: this.vSentPackets, octets: this.vSentOctets, blocks })
+                : receiverReport({ ssrc: this.videoSsrc, blocks });
+        this.send(zrtc.rtcp(this.token, Buffer.concat([report, sdesCname(this.videoSsrc, `zaloo-${this.ssrc.toString(16)}`)]), true), "rtcp_video");
+    }
+
+    /** RTP timestamp for "now": a 90 kHz clock that only moves forward. */
+    private videoTimestamp(): number {
+        const ms = Number((process.hrtime.bigint() - this.vClock0) / 1_000_000n);
+        return (this.vTsBase + ms * 90) >>> 0;
+    }
+
+    /**
+     * One encoded video frame from the app's camera (H.264 access unit, Annex B, SPS/PPS in front of key frames):
+     * chunked the way Zalo does, protected and sent as kind 13.
+     */
+    sendVideoFrame(frame: { key: boolean; data: Buffer }): void {
+        if (this.token === null || this.closed || frame.data.length === 0) return;
+        const chunks = packetizeFrame(frame.data, MAX_CHUNK);
+        const ts = this.videoTimestamp();
+        chunks.forEach((chunk, i) => {
+            const rtp = Buffer.alloc(12);
+            rtp[0] = 0x80;
+            rtp[1] = (frame.key ? VIDEO_KEY_PT : VIDEO_DELTA_PT) | (i === chunks.length - 1 ? 0x80 : 0);
+            rtp.writeUInt16BE(this.vSeq, 2);
+            rtp.writeUInt32BE(ts, 4);
+            rtp.writeUInt32BE(this.videoSsrc, 8);
+            this.vSeq = (this.vSeq + 1) & 0xffff;
+            this.vSentPackets++;
+            this.vSentOctets += chunk.length;
+            this.send(zrtc.video(this.token!, this.srtp.protect(Buffer.concat([rtp, chunk]))), "video");
+        });
+        const v = this.stats.video;
+        v.sentFrames++;
+        v.sentPackets += chunks.length;
+        v.sentBytes += frame.data.length;
+    }
+
+    /**
+     * Asks the other side for a key frame (RTCP PLI on kind 15), at most once per [minGapMs]. Until their video has
+     * been seen there is nobody to ask: the first packets (or the next tick) will.
+     */
+    requestKeyFrame(why: string, minGapMs = PLI_MIN_GAP_MS): void {
+        const target = this.incomingVideo?.ssrc;
+        const now = Date.now();
+        if (this.token === null || target === undefined || now - this.lastPliAt < minGapMs) return;
+        this.lastPliAt = now;
+        this.stats.video.plisSent++;
+        this.send(zrtc.rtcp(this.token, pli(this.videoSsrc, target), true), "pli");
+        if (this.stats.video.plisSent <= 10) this.o.log({ kind: "media_pli", why });
+    }
+
+    private newAssembler(): VideoAssembler {
+        return new VideoAssembler(
+            (frame) => this.onVideoFrame(frame),
+            Date.now,
+            (why) => this.requestKeyFrame(why),
+        );
+    }
+
+    private onVideoFrame(frame: VideoFrame): void {
+        const v = this.stats.video;
+        for (const u of nalUnits(frame.data)) v.nalTypes[u[0] & 0x1f] = (v.nalTypes[u[0] & 0x1f] ?? 0) + 1;
+        this.syncAssemblerStats();
+        this.o.onVideo?.(frame);
+    }
+
+    private syncAssemblerStats(): void {
+        const a = this.assembler.stats;
+        const r = this.retiredFrames;
+        const v = this.stats.video;
+        v.frames = a.frames + r.frames;
+        v.keys = a.keys + r.keys;
+        v.gaps = a.gaps + r.gaps;
+        v.dropped = a.dropped + r.dropped;
+    }
+
+    /** Lets the assembler's reorder window expire, and keeps asking for a key frame while none has come. */
+    private videoTick(): void {
+        if (!this.incomingVideo) return;
+        this.assembler.tick();
+        this.syncAssemblerStats();
+        if (this.assembler.waitingForKey && Date.now() - this.videoStartedAt >= 300) this.requestKeyFrame("waiting", PLI_RETRY_MS);
+    }
+
+    private onRtcp(payload: Buffer, video = false): void {
         const r = this.stats.rtcp;
         r.packets++;
         for (const p of parseRtcp(payload)) {
+            if (p.type === "PLI" || p.type === "FIR") {
+                // Only requests about our video stream count.
+                r.types[p.type] = (r.types[p.type] ?? 0) + 1;
+                if (p.mediaSsrc === this.videoSsrc) this.onKeyRequest(p.type);
+                continue;
+            }
+            if (video) {
+                const name = p.type === "other" ? String(p.packetType) : p.type;
+                r.types[name] = (r.types[name] ?? 0) + 1;
+                if (p.type === "SR" && this.incomingVideo && p.ssrc === this.incomingVideo.ssrc) {
+                    this.incomingVideo.onSenderReport(p.ntpSec, p.ntpFrac, Date.now());
+                }
+                continue;
+            }
             const name = p.type === "other" ? String(p.packetType) : p.type;
             r.types[name] = (r.types[name] ?? 0) + 1;
             if (p.type === "SR" && this.incoming && p.ssrc === this.incoming.ssrc) this.incoming.onSenderReport(p.ntpSec, p.ntpFrac, Date.now());
@@ -216,6 +372,15 @@ export class MediaCall {
                 if (about) r.theirView = { fractionLost: about.fractionLost, cumulativeLost: about.cumulativeLost, jitter: about.jitter };
             }
         }
+    }
+
+    private onKeyRequest(kind: string): void {
+        const now = Date.now();
+        this.stats.video.keyRequests++;
+        if (now - this.lastKeyReqAt < KEYREQ_MIN_GAP_MS) return;
+        this.lastKeyReqAt = now;
+        this.o.log({ kind: "media_key_request", by: kind });
+        this.o.onKeyFrameRequest?.();
     }
 
     /** Hangs up on the media server and closes the socket. */
@@ -264,6 +429,7 @@ export class MediaCall {
             this.count("received", `media_${p.kind}`);
             if (p.kind === zrtc.Kind.AudioIn) this.onAudio(p.payload);
             else if (p.kind === zrtc.Kind.AudioRtcp) this.onRtcp(p.payload);
+            else if (p.kind === zrtc.Kind.VideoRtcp) this.onRtcp(p.payload, true);
             else if (p.kind === zrtc.Kind.VideoIn) this.onVideo(p.payload);
             return;
         }
@@ -280,8 +446,7 @@ export class MediaCall {
             v.failed++;
             return;
         }
-        const bump = (m: Record<string, number>, k: number) => (m[k] = (m[k] ?? 0) + 1);
-        bump(v.payloadTypes, h.payloadType);
+        v.payloadTypes[h.payloadType] = (v.payloadTypes[h.payloadType] ?? 0) + 1;
         this.videoSsrcs.add(h.ssrc);
         v.ssrcs = this.videoSsrcs.size;
         const rtp = this.srtp.unprotect(payload);
@@ -290,13 +455,20 @@ export class MediaCall {
             return;
         }
         v.decrypted++;
-        let body = rtp.subarray(h.headerLength);
-        if (h.payloadType === RED_PT && body.length > 0) {
-            // RED (RFC 2198) as WebRTC sends it: one block, a 1-byte header with the inner payload type.
-            bump(v.redInner, body[0] & 0x7f);
-            body = body[0] & 0x80 ? Buffer.alloc(0) : body.subarray(1);
+        if (!this.incomingVideo || this.incomingVideo.ssrc !== h.ssrc) {
+            // A new stream (first packet, or the other side restarted its encoder): assemble afresh.
+            if (this.incomingVideo) {
+                this.syncAssemblerStats();
+                const a = this.assembler.stats;
+                for (const k of ["frames", "keys", "gaps", "dropped"] as const) this.retiredFrames[k] += a[k];
+                this.assembler = this.newAssembler();
+            }
+            this.incomingVideo = new ReceiveStats(h.ssrc, VIDEO_CLOCK);
+            this.videoStartedAt = Date.now();
         }
-        if (body.length > 0) bump(v.nalTypes, body[0] & 0x1f);
+        this.incomingVideo.onPacket(h.seq, h.timestamp, Date.now());
+        this.assembler.push({ seq: h.seq, timestamp: h.timestamp, payloadType: h.payloadType, marker: h.marker, payload: rtp.subarray(h.headerLength) });
+        this.syncAssemblerStats();
     }
 
     private onAudio(payload: Buffer) {
