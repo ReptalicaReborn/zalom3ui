@@ -68,6 +68,7 @@ export type AttachmentKind =
     | "contact"
     | "location"
     | "call"
+    | "poll"
     | "other";
 
 /** What a non-text message shows. Older cached messages only have title/href/thumb. */
@@ -90,6 +91,8 @@ export type Attachment = {
     userId?: string;
     /** Call log entries. */
     call?: { video: boolean; missed: boolean; outgoing: boolean };
+    /** Poll messages: details (options, votes) come from GET /api/polls/:pollId. */
+    poll?: { pollId: number; question: string; /** Set when the message reports a change (vote, close) rather than creation. */ event?: string };
 };
 
 /** Where the official client loads a sticker's picture from (its default `stickerUrl` config) by sticker id. */
@@ -212,6 +215,7 @@ const MSG_TYPE_LABELS: Record<string, string> = {
     "chat.ecard": "[Card]",
     "chat.todo": "[Task]",
     "chat.poll": "[Poll]",
+    "group.poll": "[Poll]",
 };
 
 export function threadKey(kind: ThreadKind, id: string): string {
@@ -277,6 +281,10 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
         msg.text = `[${attachment.title}]`;
         return msg;
     }
+    if (attachment?.kind === "poll") {
+        msg.text = `[Poll] ${attachment.title}`;
+        return msg;
+    }
     const label =
         attachment?.kind === "contact" ? "[Contact]" : (MSG_TYPE_LABELS[data.msgType] ?? "[Unsupported message]");
     // Photos and stickers have no useful title; files, links and cards are named by theirs.
@@ -313,6 +321,16 @@ export function parseAttachment(msgType: string, content: Record<string, unknown
         const catId = num(content.catId, content.cateId);
         if (id === undefined) return undefined;
         return { kind: "sticker", thumb: STICKER_IMAGE_URL + id, sticker: { id, catId: catId ?? 0, type: num(content.type) ?? 0 } };
+    }
+
+    // Poll: the id and question sit at the top level or in params, depending on the Zalo version.
+    if (msgType === "group.poll" || msgType === "chat.poll" || content.poll_id !== undefined || params.pollId !== undefined) {
+        const pollId = num(content.poll_id, content.pollId, params.pollId, params.poll_id);
+        if (pollId === undefined) return undefined;
+        const question = str(content.question) ?? str(params.question) ?? str(content.title) ?? str(params.title) ?? "Poll";
+        const act = str(content.action);
+        const event = act && act !== "create" && act !== "group.poll" && act !== "chat.poll" ? act : undefined;
+        return { kind: "poll", title: question, poll: { pollId, question, ...(event ? { event } : {}) } };
     }
 
     // Call log: params {calltype (1 = video), isCaller, reason (1 busy, 2 no answer, 3 declined, 4/5 cancelled), duration (s)}.

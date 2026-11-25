@@ -63,6 +63,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.AddCircleOutline
 import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Poll
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Group
@@ -1035,6 +1036,8 @@ private fun Composer(
     }
 
     var attachMenu by remember { mutableStateOf(false) }
+    var showCreatePoll by remember { mutableStateOf(false) }
+    if (showCreatePoll) CreatePollDialog(onDismiss = { showCreatePoll = false })
     Column(Modifier.background(colors.background).navigationBarsPadding().imePadding()) {
         if (uploading > 0) UploadingNote(uploading)
         if (suggestions.isNotEmpty()) {
@@ -1078,6 +1081,14 @@ private fun Composer(
                         attachMenu = false
                         keyboard?.hide()
                         onPickSticker()
+                    }
+                    // Polls are a group feature in Zalo; the dialog needs the app shell's Polls.
+                    if (isGroup && LocalPolls.current != null) {
+                        MenuEntry("Poll", Icons.Outlined.Poll) {
+                            attachMenu = false
+                            keyboard?.hide()
+                            showCreatePoll = true
+                        }
                     }
                 }
             }

@@ -65,7 +65,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /** Kinds drawn as their own content (picture, player, card) instead of a "[Photo]" label. */
-private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call")
+private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
 fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null)
@@ -174,6 +174,7 @@ fun AttachmentContent(a: Attachment, onOutgoing: Boolean, onOpenImage: (String) 
             onClick = null,
         )
         "call" -> CallCard(a, onOutgoing)
+        "poll" -> a.poll?.let { PollCard(it, onOutgoing) }
         "location" -> CardRow(
             icon = { Icon(Icons.Outlined.LocationOn, null, modifier = Modifier.size(32.dp)) },
             title = a.title ?: "Location",

@@ -24,6 +24,78 @@ data class CallInfo(
     val outgoing: Boolean = false,
 )
 
+/** A poll message's pointer to its poll; the options and votes come from [PollDetail]. */
+@Serializable
+data class PollRef(
+    val pollId: Long,
+    val question: String = "",
+    /** Set when the message reports a change (vote, close) rather than the poll's creation. */
+    val event: String? = null,
+)
+
+@Serializable
+data class PollVoter(val id: String, val name: String = "")
+
+@Serializable
+data class PollOption(
+    val id: Long,
+    val text: String,
+    val votes: Int = 0,
+    val voted: Boolean = false,
+    /** Empty for anonymous polls and while results are hidden. */
+    val voters: List<PollVoter> = emptyList(),
+)
+
+/** Mirrors `PollView` in the server's src/polls.ts. */
+@Serializable
+data class PollDetail(
+    val pollId: Long,
+    val question: String = "",
+    val creatorId: String = "",
+    val creatorName: String = "",
+    val closed: Boolean = false,
+    val expired: Boolean = false,
+    /** Epoch ms of the deadline, 0 for none. */
+    val expiresAt: Long = 0,
+    val createdAt: Long = 0,
+    val allowMultiple: Boolean = false,
+    val allowAddOptions: Boolean = false,
+    val anonymous: Boolean = false,
+    /** Counts and voters are hidden until you vote. */
+    val resultsHidden: Boolean = false,
+    val totalVotes: Int = 0,
+    val voterCount: Int = 0,
+    val myVotes: List<Long> = emptyList(),
+    val canVote: Boolean = true,
+    val canAddOptions: Boolean = false,
+    val canClose: Boolean = false,
+    val options: List<PollOption> = emptyList(),
+) {
+    /** Bar length for [option]: its share of all votes, 0..1. */
+    fun share(option: PollOption): Float =
+        if (resultsHidden || totalVotes <= 0) 0f else (option.votes.toFloat() / totalVotes).coerceIn(0f, 1f)
+
+    /** "5 votes", "1 vote", "No votes yet", or a hint while results are hidden. */
+    val votesLabel: String get() = when {
+        resultsHidden -> "Vote to see results"
+        totalVotes <= 0 -> "No votes yet"
+        totalVotes == 1 -> "1 vote"
+        else -> "$totalVotes votes"
+    }
+}
+
+/** What the create-poll dialog sends. [expiresAt] is epoch ms, 0 for no deadline. */
+data class CreatePollRequest(
+    val question: String,
+    val options: List<String>,
+    val allowMultiple: Boolean = false,
+    val allowAddOptions: Boolean = false,
+    val expiresAt: Long = 0,
+) {
+    /** Needs a question and at least two different non-blank options. */
+    val isValid: Boolean get() = question.isNotBlank() && options.map { it.trim() }.filter { it.isNotEmpty() }.toSet().size >= 2
+}
+
 @Serializable
 data class StickerRef(
     val id: Long,
@@ -34,7 +106,7 @@ data class StickerRef(
 /** Mirrors `Attachment` in the server's src/store.ts. Messages cached by older servers only have title/href/thumb. */
 @Serializable
 data class Attachment(
-    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location", "call" or "other". */
+    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll" or "other". */
     val kind: String? = null,
     val title: String? = null,
     val description: String? = null,
@@ -51,6 +123,8 @@ data class Attachment(
     val userId: String? = null,
     /** Call log entries ("Missed voice call", "Incoming video call"…). */
     val call: CallInfo? = null,
+    /** Poll messages. */
+    val poll: PollRef? = null,
 ) {
     /** The picture to show for a photo, GIF or sticker (the full image when there is no thumbnail). */
     val image: String? get() = when (kind) {
@@ -273,4 +347,6 @@ sealed interface ServerEvent {
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent
     data object ThreadsChanged : ServerEvent
+    /** A poll was created, voted on or closed: reload it if it is on screen. */
+    data class PollChanged(val pollId: Long) : ServerEvent
 }
