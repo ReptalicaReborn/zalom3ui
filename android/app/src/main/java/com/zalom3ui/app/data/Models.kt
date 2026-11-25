@@ -18,11 +18,38 @@ data class SessionStatus(
 }
 
 @Serializable
+data class StickerRef(
+    val id: Long,
+    val catId: Long = 0,
+    val type: Int = 0,
+)
+
+/** Mirrors `Attachment` in the server's src/store.ts. Messages cached by older servers only have title/href/thumb. */
+@Serializable
 data class Attachment(
+    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location" or "other". */
+    val kind: String? = null,
     val title: String? = null,
+    val description: String? = null,
     val href: String? = null,
     val thumb: String? = null,
-)
+    val width: Int? = null,
+    val height: Int? = null,
+    /** Video and voice length in ms. */
+    val duration: Long? = null,
+    /** File size in bytes. */
+    val size: Long? = null,
+    val fileExt: String? = null,
+    val sticker: StickerRef? = null,
+    val userId: String? = null,
+) {
+    /** The picture to show for a photo, GIF or sticker (the full image when there is no thumbnail). */
+    val image: String? get() = when (kind) {
+        "sticker" -> thumb
+        "photo", "gif" -> thumb ?: href
+        else -> null
+    }
+}
 
 @Serializable
 data class Quote(
@@ -111,6 +138,55 @@ data class GroupMember(
     val name: String,
 )
 
+/** A friend (`GET /friends`). */
+@Serializable
+data class Person(
+    val id: String,
+    val name: String,
+    val avatar: String = "",
+)
+
+/** Someone who asked to be my friend (`GET /friend-requests`). */
+@Serializable
+data class FriendRequest(
+    val id: String,
+    val name: String,
+    val avatar: String = "",
+    val message: String = "",
+    val time: Long = 0,
+)
+
+/** `GET /users/find?phone=`. */
+@Serializable
+data class FoundUser(
+    val id: String,
+    val name: String,
+    val avatar: String = "",
+    val isFriend: Boolean = false,
+    /** I already sent them a friend request. */
+    val requested: Boolean = false,
+)
+
+@Serializable
+data class StickerInfo(
+    val id: Long,
+    val catId: Long = 0,
+    val type: Int = 0,
+    val url: String,
+)
+
+@Serializable
+data class CreatedGroup(
+    val groupId: String,
+    /** People Zalo did not add (they blocked strangers, or are in too many groups). */
+    val failed: List<String> = emptyList(),
+)
+
+@Serializable
+data class AddMembersResult(
+    val failed: List<String> = emptyList(),
+)
+
 /** `GET /threads/:kind/:id/info`: last-online for users, members for groups. */
 @Serializable
 data class ThreadDetails(
@@ -142,7 +218,10 @@ enum class MuteOption(val apiValue: String, val label: String) {
 
 sealed interface ServerEvent {
     data class Status(val status: SessionStatus) : ServerEvent
-    data class Message(val message: ChatMessage) : ServerEvent
+    /** [notify]: the server thinks a phone should show it (not mine, not muted, not open, not old). */
+    data class Message(val message: ChatMessage, val notify: Boolean = false, val threadName: String = "") : ServerEvent
+    /** The chat was read (here or in another client): its notification can go. */
+    data class Read(val thread: ThreadRef) : ServerEvent
     data class MessageUpdated(val message: ChatMessage) : ServerEvent
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent

@@ -1,14 +1,20 @@
 package com.zalom3ui.app.ui
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatMessage
+import com.zalom3ui.app.data.FoundUser
+import com.zalom3ui.app.data.FriendRequest
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.Mention
 import com.zalom3ui.app.data.MuteOption
+import com.zalom3ui.app.data.Person
+import com.zalom3ui.app.data.StickerInfo
+import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.ServerSettings
 import com.zalom3ui.app.data.SessionStatus
@@ -17,13 +23,16 @@ import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.server.LocalServer
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class ChatState(
     val kind: String,
@@ -41,6 +50,8 @@ data class ChatState(
     val members: List<GroupMember>? = null,
     /** First message that was unread when the chat was opened, for the "unread messages" divider. */
     val firstUnreadId: String? = null,
+    /** Photos and files still uploading. */
+    val uploading: Int = 0,
 ) {
     val ref: ThreadRef get() = ThreadRef(kind, id)
 }
@@ -61,6 +72,19 @@ data class UiState(
     val typing: Map<String, TypingInfo> = emptyMap(),
     /** One-off error to show as a toast-like message. */
     val error: String? = null,
+    /** One-off confirmation ("Friend request sent"), shown the same way. */
+    val notice: String? = null,
+    val friends: List<Person> = emptyList(),
+    val friendRequests: List<FriendRequest>? = null,
+    val stickers: StickerSearch = StickerSearch(),
+    /** A chat to open, asked for by a tapped notification. */
+    val openRequest: ThreadRef? = null,
+)
+
+data class StickerSearch(
+    val query: String = "",
+    val results: List<StickerInfo> = emptyList(),
+    val loading: Boolean = false,
 )
 
 const val TYPING_TIMEOUT_MS = 6_000L
@@ -72,6 +96,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private var client: ApiClient? = null
     private var liveJob: Job? = null
+    private var presenceJob: Job? = null
     private var visible = false
     private var lastTypingSent = 0L
     /** When the live loop last (re)started the on-phone server; errors are expected while it boots. */
@@ -122,6 +147,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             LocalServer.start(getApplication())
             localStartedAt = System.currentTimeMillis()
         }
+        // Repeated while visible: the server forgets a chat nobody confirms is still open.
+        presenceJob?.cancel()
+        presenceJob = viewModelScope.launch {
+            while (true) {
+                runCatching { api.setPresence(_state.value.chat?.ref) }
+                delay(PRESENCE_REFRESH_MS)
+            }
+        }
         liveJob = viewModelScope.launch {
             while (true) {
                 val booting = onDevice && System.currentTimeMillis() - localStartedAt < LOCAL_BOOT_GRACE_MS
@@ -144,6 +177,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         visible = false
         liveJob?.cancel()
         liveJob = null
+        presenceJob?.cancel()
+        presenceJob = null
+        // Out of sight: messages of the open chat notify again.
+        val api = client ?: return
+        viewModelScope.launch { withContext(NonCancellable) { runCatching { api.setPresence(null) } } }
     }
 
     fun login() = launchApi { api ->
@@ -166,10 +204,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(error = null) }
     }
 
+    fun clearNotice() {
+        _state.update { it.copy(notice = null) }
+    }
+
+    /** A tapped notification asks for this chat; the navigation opens it once the chat list is there. */
+    fun requestOpen(ref: ThreadRef) {
+        _state.update { it.copy(openRequest = ref) }
+    }
+
+    fun consumeOpenRequest(): ThreadSummary? {
+        val ref = _state.value.openRequest ?: return null
+        val thread = _state.value.threads.firstOrNull { it.ref == ref } ?: return null
+        _state.update { it.copy(openRequest = null) }
+        return thread
+    }
+
     // ---- Chat ----
 
     fun openChat(thread: ThreadSummary) {
         _state.update { it.copy(chat = ChatState(thread.kind, thread.id, thread.name)) }
+        if (visible) viewModelScope.launch { runCatching { client?.setPresence(thread.ref) } }
         launchApi { api ->
             val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
             val unread = _state.value.threads.firstOrNull { it.ref == thread.ref }?.unread ?: thread.unread
@@ -191,7 +246,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Closes the open chat, unless another one was opened since [ref] was. */
     fun closeChat(ref: ThreadRef? = null) {
+        val closing = _state.value.chat?.ref
         _state.update { if (ref == null || it.chat?.ref == ref) it.copy(chat = null) else it }
+        if (closing != null && _state.value.chat == null) viewModelScope.launch { runCatching { client?.setPresence(null) } }
     }
 
     fun loadEarlier() {
@@ -233,6 +290,160 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (now - lastTypingSent < 3_000) return
         lastTypingSent = now
         viewModelScope.launch { runCatching { client?.typing(chat.kind, chat.id) } }
+    }
+
+    // ---- Photos, files and stickers ----
+
+    /** Sends picked photos / files to the open chat, one by one, in the order picked. */
+    fun sendFiles(uris: List<Uri>) {
+        val chat = _state.value.chat ?: return
+        if (uris.isEmpty()) return
+        val app = getApplication<Application>()
+        updateChat(chat.ref) { it.copy(uploading = it.uploading + uris.size) }
+        viewModelScope.launch {
+            for (uri in uris) {
+                try {
+                    val api = client ?: break
+                    val file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
+                    api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    _state.update { it.copy(error = e.message ?: "Couldn't send the file") }
+                } finally {
+                    updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
+                }
+            }
+        }
+    }
+
+    fun searchStickers(query: String) {
+        val q = query.trim()
+        _state.update { it.copy(stickers = it.stickers.copy(query = q, loading = q.isNotEmpty())) }
+        if (q.isEmpty()) return
+        launchApi(onDone = { _state.update { s -> if (s.stickers.query == q) s.copy(stickers = s.stickers.copy(loading = false)) else s } }) { api ->
+            val results = api.stickers(q)
+            _state.update { s -> if (s.stickers.query == q) s.copy(stickers = s.stickers.copy(results = results)) else s }
+        }
+    }
+
+    fun sendSticker(sticker: StickerInfo) {
+        val chat = _state.value.chat ?: return
+        launchApi { api -> api.sendSticker(chat.kind, chat.id, sticker.id) }
+    }
+
+    // ---- Friends ----
+
+    fun loadFriends() = launchApi { api ->
+        val friends = api.friends()
+        _state.update { it.copy(friends = friends) }
+    }
+
+    fun loadFriendRequests() = launchApi { api ->
+        val requests = api.friendRequests()
+        _state.update { it.copy(friendRequests = requests) }
+    }
+
+    fun acceptFriend(request: FriendRequest) = launchApi { api ->
+        api.acceptFriend(request.id)
+        _state.update { s -> s.copy(friendRequests = s.friendRequests?.filterNot { it.id == request.id }, notice = "You and ${request.name} are now friends") }
+        refreshThreads(api)
+        _state.update { it.copy(friends = runCatching { api.friends() }.getOrDefault(it.friends)) }
+    }
+
+    fun rejectFriend(request: FriendRequest) = launchApi { api ->
+        api.rejectFriend(request.id)
+        _state.update { s -> s.copy(friendRequests = s.friendRequests?.filterNot { it.id == request.id }) }
+    }
+
+    /** Looks someone up by phone; [onResult] gets null when nobody uses that number (the error says so). */
+    fun findUser(phone: String, onResult: (FoundUser?) -> Unit) = launchApi(onError = { onResult(null) }) { api ->
+        onResult(api.findUser(phone))
+    }
+
+    fun sendFriendRequest(user: FoundUser, message: String, onSent: () -> Unit) = launchApi { api ->
+        api.sendFriendRequest(user.id, message)
+        _state.update { it.copy(notice = "Friend request sent to ${user.name}") }
+        onSent()
+    }
+
+    fun undoFriendRequest(user: FoundUser, onDone: () -> Unit) = launchApi { api ->
+        api.undoFriendRequest(user.id)
+        onDone()
+    }
+
+    /** Opens the 1:1 chat with someone found by phone (it exists once a message is sent). */
+    fun openUserChat(user: FoundUser) {
+        val existing = _state.value.threads.firstOrNull { it.kind == "user" && it.id == user.id }
+        openChat(existing ?: ThreadSummary(id = user.id, kind = "user", name = user.name, avatar = user.avatar))
+    }
+
+    // ---- Groups ----
+
+    fun createGroup(name: String, members: List<String>, onCreated: (ThreadSummary) -> Unit) = launchApi { api ->
+        val created = api.createGroup(name, members)
+        refreshThreads(api)
+        val thread = _state.value.threads.firstOrNull { it.kind == "group" && it.id == created.groupId }
+            ?: ThreadSummary(id = created.groupId, kind = "group", name = name.ifBlank { "New group" })
+        if (created.failed.isNotEmpty()) {
+            _state.update { it.copy(notice = "${notAddedNames(created.failed)} couldn't be added") }
+        }
+        onCreated(thread)
+    }
+
+    fun addMembers(members: List<String>, onDone: () -> Unit) {
+        val chat = _state.value.chat ?: return
+        if (chat.kind != "group" || members.isEmpty()) return
+        launchApi { api ->
+            val result = api.addGroupMembers(chat.id, members)
+            val added = members.size - result.failed.size
+            _state.update {
+                it.copy(notice = if (result.failed.isEmpty()) "Added $added ${if (added == 1) "member" else "members"}" else "${notAddedNames(result.failed)} couldn't be added")
+            }
+            reloadMembers(api, chat.ref)
+            onDone()
+        }
+    }
+
+    fun removeMember(member: GroupMember) {
+        val chat = _state.value.chat ?: return
+        launchApi { api ->
+            api.removeGroupMember(chat.id, member.id)
+            updateChat(chat.ref) { it.copy(members = it.members?.filterNot { m -> m.id == member.id }) }
+            _state.update { it.copy(notice = "Removed ${member.name}") }
+        }
+    }
+
+    fun renameGroup(name: String) {
+        val chat = _state.value.chat ?: return
+        val trimmed = name.trim()
+        if (chat.kind != "group" || trimmed.isEmpty()) return
+        launchApi { api ->
+            api.renameGroup(chat.id, trimmed)
+            updateChat(chat.ref) { it.copy(name = trimmed) }
+        }
+    }
+
+    /** Leaves the open group; [onLeft] closes the chat (the server forgets it). */
+    fun leaveGroup(silent: Boolean, onLeft: () -> Unit) {
+        val chat = _state.value.chat ?: return
+        if (chat.kind != "group") return
+        launchApi { api ->
+            api.leaveGroup(chat.id, silent)
+            _state.update { it.copy(notice = "You left ${chat.name}") }
+            onLeft()
+            refreshThreads(api)
+        }
+    }
+
+    private fun notAddedNames(ids: List<String>): String {
+        val names = ids.map { id -> _state.value.friends.firstOrNull { it.id == id }?.name ?: _state.value.threads.firstOrNull { it.kind == "user" && it.id == id }?.name ?: id }
+        return if (names.size <= 3) names.joinToString(", ") else "${names.take(3).joinToString(", ")} and ${names.size - 3} more"
+    }
+
+    private suspend fun reloadMembers(api: ApiClient, ref: ThreadRef) {
+        val members = runCatching { api.details(ref.kind, ref.id).members }.getOrNull() ?: return
+        updateChat(ref) { it.copy(members = members) }
     }
 
     fun loadMembers() {
@@ -328,6 +539,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 refreshThreads(api)
             }
             is ServerEvent.Typing -> onTyping(event)
+            // Notifications are the service's business (MessageNotifier).
+            is ServerEvent.Read -> Unit
         }
     }
 
@@ -392,7 +605,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun launchApi(onDone: () -> Unit = {}, block: suspend (ApiClient) -> Unit) {
+    private fun launchApi(onDone: () -> Unit = {}, onError: () -> Unit = {}, block: suspend (ApiClient) -> Unit) {
         val api = client ?: return
         viewModelScope.launch {
             try {
@@ -401,6 +614,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Exception) {
                 _state.update { it.copy(error = e.message ?: "Something went wrong") }
+                onError()
             } finally {
                 onDone()
             }
@@ -409,6 +623,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val RECONNECT_DELAY_MS = 5_000L
+        private const val PRESENCE_REFRESH_MS = 30_000L
         private const val LOCAL_BOOT_GRACE_MS = 45_000L
         private const val LOCAL_BOOT_RETRY_MS = 1_000L
         private const val PAGE_SIZE = 30

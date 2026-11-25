@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -33,6 +34,9 @@ import com.zalom3ui.app.data.ThreadSummary
 
 private const val MAX_SEARCH_RESULTS = 300
 
+/** An entry above the list ("New group", "Add friend"…), with an optional count badge. */
+class PickerAction(val label: String, val icon: ImageVector, val badge: Int = 0, val onClick: () -> Unit)
+
 /** Pick any friend or group: starting a new chat, or choosing where to forward a message. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -41,6 +45,7 @@ fun ContactsScreen(
     threads: List<ThreadSummary>,
     onBack: () -> Unit,
     onPick: (ThreadSummary) -> Unit,
+    actions: List<PickerAction> = emptyList(),
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val folded = foldForSearch(query.trim())
@@ -62,6 +67,19 @@ fun ContactsScreen(
         },
     ) { padding ->
         LazyColumn(Modifier.fillMaxSize(), contentPadding = padding) {
+            items(actions, key = { "action-${it.label}" }) { action ->
+                Row(
+                    Modifier.fillMaxWidth().clickable(onClick = action.onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(action.icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 10.dp))
+                    Spacer(Modifier.width(16.dp))
+                    Text(action.label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    if (action.badge > 0) {
+                        CountBadge(action.badge.toString(), MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary)
+                    }
+                }
+            }
             item(key = "search") {
                 SearchPill(
                     query = query,

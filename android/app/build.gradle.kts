@@ -24,8 +24,8 @@ android {
         applicationId = "com.zalom3ui.app"
         minSdk = 26 // Android 8.0
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 1
+        versionName = "1.0.0"
 
         externalNativeBuild {
             cmake {
@@ -190,6 +190,8 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
 
     implementation("androidx.core:core-ktx:1.15.0")
+    // Rotation of picked photos, so they are sent with the size they are shown at.
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")

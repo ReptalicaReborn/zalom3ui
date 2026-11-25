@@ -1,6 +1,8 @@
 package com.zalom3ui.app
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -13,6 +15,7 @@ import androidx.activity.viewModels
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
 import com.zalom3ui.app.ui.AppViewModel
@@ -45,12 +48,27 @@ class MainActivity : ComponentActivity() {
             }
             AppTheme(state.appearance) { App(viewModel) }
         }
-        // Lets the on-phone server show its "connected" notification (Android 13+).
+        handleOpenChat(intent)
+        // Lets the on-phone server show its "connected" and message notifications (Android 13+).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleOpenChat(intent)
+    }
+
+    /** A tapped message notification names the chat to open. */
+    private fun handleOpenChat(intent: Intent?) {
+        val kind = intent?.getStringExtra(EXTRA_KIND) ?: return
+        val id = intent.getStringExtra(EXTRA_ID) ?: return
+        intent.removeExtra(EXTRA_KIND)
+        intent.removeExtra(EXTRA_ID)
+        viewModel.requestOpen(ThreadRef(kind, id))
     }
 
     override fun onStart() {
@@ -63,9 +81,18 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private companion object {
+    companion object {
+        private const val EXTRA_KIND = "open_kind"
+        private const val EXTRA_ID = "open_id"
+
+        fun openChatIntent(context: Context, ref: ThreadRef): Intent =
+            Intent(context, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(EXTRA_KIND, ref.kind)
+                .putExtra(EXTRA_ID, ref.id)
+
         // Same scrims androidx uses by default for 3-button navigation.
-        val LIGHT_SCRIM = Color.argb(0xe6, 0xFF, 0xFF, 0xFF)
-        val DARK_SCRIM = Color.argb(0x80, 0x1b, 0x1b, 0x1b)
+        private val LIGHT_SCRIM = Color.argb(0xe6, 0xFF, 0xFF, 0xFF)
+        private val DARK_SCRIM = Color.argb(0x80, 0x1b, 0x1b, 0x1b)
     }
 }

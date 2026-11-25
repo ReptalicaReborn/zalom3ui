@@ -8,18 +8,26 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
+import okio.source
+import java.io.InputStream
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -102,6 +110,94 @@ class ApiClient(serverUrl: String, private val token: String?) {
         post<Unit>("threads/$kind/$id/messages/$msgId/forward", body.toString())
     }
 
+    /**
+     * Sends one photo or file. [name] carries the extension that decides how Zalo sends it; photos need [width] and
+     * [height]. [open] is read once, as the upload streams.
+     */
+    suspend fun sendAttachment(
+        kind: String,
+        id: String,
+        name: String,
+        mimeType: String?,
+        length: Long,
+        width: Int? = null,
+        height: Int? = null,
+        open: () -> InputStream,
+    ) {
+        val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
+        val body = StreamBody(mimeType?.toMediaTypeOrNull() ?: OCTET_STREAM, length, open)
+        execute<Unit>(Request.Builder().url(url("threads/$kind/$id/attachments", *query.toTypedArray())).post(body), UPLOAD_HTTP)
+    }
+
+    suspend fun stickers(query: String): List<StickerInfo> = get("stickers", "q" to query)
+
+    suspend fun sendSticker(kind: String, id: String, stickerId: Long) {
+        post<Unit>("threads/$kind/$id/stickers", buildJsonObject { put("id", stickerId) }.toString())
+    }
+
+    /** Tells the server which chat is on screen (null: none), so it doesn't notify about it. */
+    suspend fun setPresence(ref: ThreadRef?) {
+        val body = buildJsonObject {
+            if (ref != null) {
+                put("kind", ref.kind)
+                put("id", ref.id)
+            }
+        }
+        httpPut("presence", body.toString())
+    }
+
+    // ---- Friends ----
+
+    suspend fun friends(): List<Person> = get("friends")
+
+    suspend fun friendRequests(): List<FriendRequest> = get("friend-requests")
+
+    suspend fun acceptFriend(userId: String) {
+        post<Unit>("friend-requests/$userId/accept")
+    }
+
+    suspend fun rejectFriend(userId: String) {
+        post<Unit>("friend-requests/$userId/reject")
+    }
+
+    suspend fun findUser(phone: String): FoundUser = get("users/find", "phone" to phone)
+
+    suspend fun sendFriendRequest(userId: String, message: String) {
+        post<Unit>("friend-requests", buildJsonObject {
+            put("userId", userId)
+            put("message", message)
+        }.toString())
+    }
+
+    suspend fun undoFriendRequest(userId: String) {
+        httpDelete("friend-requests/$userId")
+    }
+
+    // ---- Groups ----
+
+    suspend fun createGroup(name: String, members: List<String>): CreatedGroup =
+        post("groups", buildJsonObject {
+            put("name", name)
+            putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
+        }.toString())
+
+    suspend fun addGroupMembers(groupId: String, members: List<String>): AddMembersResult =
+        post("groups/$groupId/members", buildJsonObject {
+            putJsonArray("members") { members.forEach { add(JsonPrimitive(it)) } }
+        }.toString())
+
+    suspend fun removeGroupMember(groupId: String, userId: String) {
+        httpDelete("groups/$groupId/members/$userId")
+    }
+
+    suspend fun renameGroup(groupId: String, name: String) {
+        httpPut("groups/$groupId/name", buildJsonObject { put("name", name) }.toString())
+    }
+
+    suspend fun leaveGroup(groupId: String, silent: Boolean) {
+        post<Unit>("groups/$groupId/leave", buildJsonObject { put("silent", silent) }.toString())
+    }
+
     // ---- Conversations ----
 
     suspend fun details(kind: String, id: String): ThreadDetails = get("threads/$kind/$id/info")
@@ -161,7 +257,12 @@ class ApiClient(serverUrl: String, private val token: String?) {
         val obj = json.parseToJsonElement(text).jsonObject
         return when (obj["type"]?.jsonPrimitive?.content) {
             "status" -> ServerEvent.Status(json.decodeFromJsonElement(SessionStatus.serializer(), obj.getValue("status")))
-            "message" -> ServerEvent.Message(json.decodeFromJsonElement(ChatMessage.serializer(), obj.getValue("message")))
+            "message" -> ServerEvent.Message(
+                json.decodeFromJsonElement(ChatMessage.serializer(), obj.getValue("message")),
+                notify = obj["notify"]?.jsonPrimitive?.booleanOrNull == true,
+                threadName = obj.string("threadName"),
+            )
+            "read" -> ServerEvent.Read(obj.threadRef())
             "message_updated" ->
                 ServerEvent.MessageUpdated(json.decodeFromJsonElement(ChatMessage.serializer(), obj.getValue("message")))
             "message_deleted" -> ServerEvent.MessageDeleted(obj.threadRef(), obj.string("id"))
@@ -189,9 +290,9 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     private fun JsonObject.threadRef(): ThreadRef = ThreadRef(string("threadKind"), string("threadId"))
 
-    private suspend inline fun <reified T> execute(builder: Request.Builder): T = withContext(Dispatchers.IO) {
+    private suspend inline fun <reified T> execute(builder: Request.Builder, client: OkHttpClient = http): T = withContext(Dispatchers.IO) {
         token?.let { builder.header("Authorization", "Bearer $it") }
-        http.newCall(builder.build()).execute().use { res ->
+        client.newCall(builder.build()).execute().use { res ->
             val body = res.body?.string().orEmpty()
             if (!res.isSuccessful) {
                 val message = runCatching { json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.content }
@@ -209,14 +310,32 @@ class ApiClient(serverUrl: String, private val token: String?) {
             .apply { query.forEach { (k, v) -> addQueryParameter(k, v) } }
             .build()
 
+    /** Streams a picked photo or file from the content resolver instead of loading it into memory. */
+    private class StreamBody(private val type: MediaType, private val length: Long, private val open: () -> InputStream) : RequestBody() {
+        override fun contentType(): MediaType = type
+
+        override fun contentLength(): Long = length
+
+        override fun writeTo(sink: BufferedSink) {
+            open().source().use { sink.writeAll(it) }
+        }
+    }
+
     companion object {
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        private val OCTET_STREAM = "application/octet-stream".toMediaType()
 
         // Shared so the connection pool survives client rebuilds after settings changes.
         private val http = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .pingInterval(30, TimeUnit.SECONDS)
+            .build()
+
+        /** Uploads go to Zalo before the server answers: give them minutes, not seconds. */
+        private val UPLOAD_HTTP = http.newBuilder()
+            .writeTimeout(5, TimeUnit.MINUTES)
+            .readTimeout(5, TimeUnit.MINUTES)
             .build()
 
         /** Accepts "192.168.1.5:3000" or "https://zalo.example.com/" and returns a base URL. */

@@ -1,8 +1,12 @@
 package com.zalom3ui.app.ui
 
+import android.net.Uri
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
@@ -51,11 +55,19 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.outlined.Forward
+import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.automirrored.outlined.Reply
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.AddCircleOutline
+import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Group
+import androidx.compose.material.icons.outlined.Mood
+import androidx.compose.material.icons.outlined.PersonAdd
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -131,6 +143,7 @@ import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.QUICK_REACTIONS
+import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadSummary
 import kotlin.math.ceil
 import kotlin.math.roundToInt
@@ -151,7 +164,17 @@ class ChatActions(
     val onMute: (MuteOption?) -> Unit,
     val onMarkUnread: () -> Unit,
     val onDeleteConversation: () -> Unit,
+    val onSendFiles: (List<Uri>) -> Unit,
+    val onSearchStickers: (String) -> Unit,
+    val onSendSticker: (StickerInfo) -> Unit,
+    val onShowMembers: () -> Unit,
+    val onAddMembers: () -> Unit,
+    val onRenameGroup: (String) -> Unit,
+    val onLeaveGroup: (silent: Boolean) -> Unit,
 )
+
+/** Photos and videos picked at once from the system photo picker. */
+private const val MAX_PICKED_MEDIA = 20
 
 private enum class MessageAction { REPLY, COPY, FORWARD, RECALL, DELETE }
 
@@ -160,7 +183,7 @@ private const val GROUP_GAP_MS = 5 * 60_000L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, actions: ChatActions) {
+fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, stickers: StickerSearch, actions: ChatActions) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val colors = LocalChatColors.current
@@ -168,7 +191,15 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, act
     var replyTo by remember { mutableStateOf<ChatMessage?>(null) }
     var confirm by remember { mutableStateOf<Pair<MessageAction, ChatMessage>?>(null) }
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
+    var viewing by rememberSaveable { mutableStateOf<String?>(null) }
+    var showStickers by rememberSaveable { mutableStateOf(false) }
     val isGroup = chat.kind == "group"
+    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKED_MEDIA)) {
+        if (it.isNotEmpty()) actions.onSendFiles(it)
+    }
+    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
+        if (it.isNotEmpty()) actions.onSendFiles(it)
+    }
 
     val onAction: (ChatMessage, MessageAction) -> Unit = { msg, action ->
         menuFor = null
@@ -220,6 +251,11 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, act
                 actions = {
                     ChatMenu(
                         thread = thread,
+                        isGroup = isGroup,
+                        onMembers = actions.onShowMembers,
+                        onAddMembers = actions.onAddMembers,
+                        onRename = { dialog = "rename" },
+                        onLeave = { dialog = "leave" },
                         onPin = actions.onPin,
                         onMute = { dialog = "mute" },
                         onUnmute = { actions.onMute(null) },
@@ -234,6 +270,10 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, act
                 isGroup = isGroup,
                 members = chat.members,
                 sending = chat.sending,
+                uploading = chat.uploading,
+                onPickMedia = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                onPickFiles = { pickFiles.launch(arrayOf("*/*")) },
+                onPickSticker = { showStickers = true },
                 replyTo = replyTo,
                 onCancelReply = { replyTo = null },
                 onStartTyping = actions.onStartTyping,
@@ -261,6 +301,7 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, act
                 },
                 onSwipeReply = { replyTo = it },
                 onLoadEarlier = actions.onLoadEarlier,
+                onOpenImage = { viewing = it },
             )
             if (chat.loading && chat.messages.isEmpty()) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -299,12 +340,46 @@ fun ChatScreen(chat: ChatState, thread: ThreadSummary?, typing: TypingInfo?, act
                 actions.onDeleteConversation()
             },
         )
+        "rename" -> RenameGroupDialog(
+            current = chat.name,
+            onDismiss = { dialog = null },
+            onRename = {
+                dialog = null
+                actions.onRenameGroup(it)
+            },
+        )
+        "leave" -> LeaveGroupDialog(
+            name = chat.name,
+            onDismiss = { dialog = null },
+            onLeave = {
+                dialog = null
+                actions.onLeaveGroup(it)
+            },
+        )
+    }
+
+    viewing?.let { PhotoViewer(it, onDismiss = { viewing = null }) }
+    if (showStickers) {
+        StickerSheet(
+            search = stickers,
+            onSearch = actions.onSearchStickers,
+            onPick = {
+                showStickers = false
+                actions.onSendSticker(it)
+            },
+            onDismiss = { showStickers = false },
+        )
     }
 }
 
 @Composable
 private fun ChatMenu(
     thread: ThreadSummary?,
+    isGroup: Boolean,
+    onMembers: () -> Unit,
+    onAddMembers: () -> Unit,
+    onRename: () -> Unit,
+    onLeave: () -> Unit,
     onPin: (Boolean) -> Unit,
     onMute: () -> Unit,
     onUnmute: () -> Unit,
@@ -315,6 +390,21 @@ private fun ChatMenu(
     Box {
         IconButton(onClick = { open = true }) { Icon(Icons.Outlined.MoreVert, contentDescription = "Chat options") }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            if (isGroup) {
+                MenuEntry("Members", Icons.Outlined.Group) {
+                    open = false
+                    onMembers()
+                }
+                MenuEntry("Add members", Icons.Outlined.PersonAdd) {
+                    open = false
+                    onAddMembers()
+                }
+                MenuEntry("Rename group", Icons.Outlined.Edit) {
+                    open = false
+                    onRename()
+                }
+                HorizontalDivider()
+            }
             val pinned = thread?.pinned == true
             MenuEntry(if (pinned) "Unpin" else "Pin to top", if (pinned) Icons.Filled.PushPin else Icons.Outlined.PushPin) {
                 open = false
@@ -340,6 +430,12 @@ private fun ChatMenu(
                 open = false
                 onDelete()
             }
+            if (isGroup) {
+                MenuEntry("Leave group", Icons.AutoMirrored.Outlined.Logout, destructive = true) {
+                    open = false
+                    onLeave()
+                }
+            }
         }
     }
 }
@@ -355,6 +451,7 @@ private fun MessageList(
     onReact: (ChatMessage, String) -> Unit,
     onSwipeReply: (ChatMessage) -> Unit,
     onLoadEarlier: () -> Unit,
+    onOpenImage: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -415,6 +512,7 @@ private fun MessageList(
                         onAction = { onAction(msg, it) },
                         onReact = { onReact(msg, it) },
                         onSwipeReply = { onSwipeReply(msg) },
+                        onOpenImage = onOpenImage,
                     )
                 }
             }
@@ -479,6 +577,7 @@ private fun MessageRow(
     onAction: (MessageAction) -> Unit,
     onReact: (String) -> Unit,
     onSwipeReply: () -> Unit,
+    onOpenImage: (String) -> Unit,
 ) {
     val self = msg.isSelf
     val haptics = LocalHapticFeedback.current
@@ -540,7 +639,11 @@ private fun MessageRow(
                 modifier = Modifier.widthIn(max = maxBubble),
             ) {
                 Box {
-                    Bubble(msg, isGroup, firstOfRun, lastOfRun, onLongPress)
+                    if (msg.attachment?.kind == "sticker" && !msg.recalled) {
+                        StickerBubble(msg, isGroup, firstOfRun, onLongPress)
+                    } else {
+                        Bubble(msg, isGroup, firstOfRun, lastOfRun, onLongPress, onOpenImage)
+                    }
                     MessageMenu(expanded = menuOpen, msg = msg, onDismiss = onDismissMenu, onAction = onAction, onReact = onReact)
                 }
                 if (msg.reactions.isNotEmpty()) {
@@ -553,7 +656,14 @@ private fun MessageRow(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(msg: ChatMessage, isGroup: Boolean, firstOfRun: Boolean, lastOfRun: Boolean, onLongPress: () -> Unit) {
+private fun Bubble(
+    msg: ChatMessage,
+    isGroup: Boolean,
+    firstOfRun: Boolean,
+    lastOfRun: Boolean,
+    onLongPress: () -> Unit,
+    onOpenImage: (String) -> Unit,
+) {
     val self = msg.isSelf
     val colors = LocalChatColors.current
     val big = 18.dp
@@ -593,6 +703,7 @@ private fun Bubble(msg: ChatMessage, isGroup: Boolean, firstOfRun: Boolean, last
                     }
                 }
             }
+            val attachment = msg.attachment?.takeIf { !msg.recalled && it.isShown() }
             if (msg.recalled) {
                 TextWithFooter(
                     text = AnnotatedString("Message recalled"),
@@ -600,10 +711,46 @@ private fun Bubble(msg: ChatMessage, isGroup: Boolean, firstOfRun: Boolean, last
                     color = meta,
                     footer = footer,
                 )
+            } else if (attachment != null) {
+                AttachmentContent(attachment, onOutgoing = self, onOpenImage = onOpenImage)
+                Spacer(Modifier.height(4.dp))
+                TextWithFooter(
+                    text = AnnotatedString(attachment.caption().orEmpty()),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = content,
+                    footer = footer,
+                )
             } else {
                 TextWithFooter(text = messageText(msg), style = MaterialTheme.typography.bodyLarge, color = content, footer = footer)
             }
         }
+    }
+}
+
+/** A sticker stands on its own, without a bubble; the time sits under it. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun StickerBubble(msg: ChatMessage, isGroup: Boolean, firstOfRun: Boolean, onLongPress: () -> Unit) {
+    Column(
+        horizontalAlignment = if (msg.isSelf) Alignment.End else Alignment.Start,
+        modifier = Modifier.clip(RoundedCornerShape(12.dp)).combinedClickable(onClick = {}, onLongClick = onLongPress),
+    ) {
+        if (isGroup && !msg.isSelf && firstOfRun && msg.fromName.isNotBlank()) {
+            Text(
+                msg.fromName,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = senderNameColor(msg.fromId),
+                modifier = Modifier.padding(start = 4.dp, bottom = 2.dp),
+            )
+        }
+        StickerImage(msg.attachment?.thumb)
+        Text(
+            formatClock(msg.ts),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
     }
 }
 
@@ -749,7 +896,7 @@ private fun MessageMenu(
             }
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
             MenuEntry("Reply", Icons.AutoMirrored.Outlined.Reply) { onAction(MessageAction.REPLY) }
-            if (msg.text.isNotBlank()) MenuEntry("Copy text", Icons.Outlined.ContentCopy) { onAction(MessageAction.COPY) }
+            if (msg.text.isNotBlank() && msg.attachment == null) MenuEntry("Copy text", Icons.Outlined.ContentCopy) { onAction(MessageAction.COPY) }
             if (msg.isText) MenuEntry("Forward", Icons.AutoMirrored.Outlined.Forward) { onAction(MessageAction.FORWARD) }
             if (msg.isSelf) MenuEntry("Recall for everyone", Icons.AutoMirrored.Outlined.Undo) { onAction(MessageAction.RECALL) }
         }
@@ -796,6 +943,10 @@ private fun Composer(
     isGroup: Boolean,
     members: List<GroupMember>?,
     sending: Boolean,
+    uploading: Int,
+    onPickMedia: () -> Unit,
+    onPickFiles: () -> Unit,
+    onPickSticker: () -> Unit,
     replyTo: ChatMessage?,
     onCancelReply: () -> Unit,
     onStartTyping: () -> Unit,
@@ -854,7 +1005,9 @@ private fun Composer(
         value = TextFieldValue(value.text.removeRange(start, cursor), TextRange(start))
     }
 
+    var attachMenu by remember { mutableStateOf(false) }
     Column(Modifier.background(colors.background).navigationBarsPadding().imePadding()) {
+        if (uploading > 0) UploadingNote(uploading)
         if (suggestions.isNotEmpty()) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -876,9 +1029,29 @@ private fun Composer(
             }
         }
         Row(
-            Modifier.padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
+            Modifier.padding(start = 4.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
+            Box(Modifier.padding(bottom = 4.dp)) {
+                IconButton(onClick = { attachMenu = true }) {
+                    Icon(Icons.Outlined.AddCircleOutline, contentDescription = "Attach", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                    MenuEntry("Photos & videos", Icons.Outlined.PhotoLibrary) {
+                        attachMenu = false
+                        onPickMedia()
+                    }
+                    MenuEntry("File", Icons.Outlined.AttachFile) {
+                        attachMenu = false
+                        onPickFiles()
+                    }
+                    MenuEntry("Sticker", Icons.Outlined.Mood) {
+                        attachMenu = false
+                        keyboard?.hide()
+                        onPickSticker()
+                    }
+                }
+            }
             Surface(
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,

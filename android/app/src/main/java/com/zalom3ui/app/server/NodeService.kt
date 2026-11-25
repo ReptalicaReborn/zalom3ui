@@ -59,6 +59,8 @@ class NodeService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         runCatching { getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback) }
+        // New-message notifications, while the app is closed too.
+        MessageNotifier(this).start(scope)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

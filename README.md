@@ -1,6 +1,8 @@
-# watchhrept
+# Zalỏ
 
-A self-hosted, third-party client for a **personal Zalo account**. It is a small Node server built on
+**Zalỏ** is a third-party Android app (Material 3) for a **personal Zalo account**, started from the Zalo Lite app of
+[watchhrept](https://github.com/ReptalicaReborn/watchhrept) and extended with the media, notification, friend and group
+features it was missing. It is a small Node server built on
 [`zca-js`](https://github.com/RFS-ADRENO/zca-js), which logs in the same way Zalo Web does, plus a lightweight
 web UI, and an Android phone app (Material 3) that can run the whole thing on the phone itself.
 
@@ -12,7 +14,7 @@ web UI, and an Android phone app (Material 3) that can run the whole thing on th
 ## How it works
 
 ```
- browser / Android app ──HTTP + WebSocket──▶ watchhrept server ──zca-js──▶ Zalo Web endpoints
+ browser / Android app ──HTTP + WebSocket──▶ Zalỏ server ──zca-js──▶ Zalo Web endpoints
 ```
 
 - **Login**: scan a QR code with the Zalo app on your phone, the same way you log in to chat.zalo.me.
@@ -67,7 +69,7 @@ By default it **runs the Zalo server on the phone itself** (the same code as abo
 embedded Node.js from [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile)), so no computer is needed. It
 can also connect to a server you run elsewhere (*Settings → Zalo runs on → A server*).
 
-It covers text chat (no mini apps, stickers, media or calls):
+Zalỏ covers everyday chat (no mini apps or calls):
 
 | Feature | How in the app |
 |---|---|
@@ -85,14 +87,24 @@ It covers text chat (no mini apps, stickers, media or calls):
 | Last online | Under the name in 1:1 chats |
 | Pin, mute (1 h, 4 h, until 8 AM, until turned on), mark read/unread, delete conversation | Long-press the chat in the list, or ⋮ in the chat |
 | Older messages | Scroll up |
+| Photos, GIFs, stickers | Shown in the chat; tap a photo to see it full screen |
+| Videos, voice messages | Video thumbnail with its length (plays in your video app); voice messages play in the chat |
+| Files, links, contact cards, locations | Cards with name, size, preview; tap to open or download |
+| Send photos & videos, files | **+** next to the message field → *Photos & videos* or *File* (HEIC photos are sent as JPEG) |
+| Send stickers | **+** → *Sticker*: Zalo's sticker search, with suggested words |
+| Notifications | One per chat with its latest lines; **Reply** and **Mark as read** right from the notification. Muted chats and the chat you have open stay quiet |
+| Friend requests | Pencil button → *Friend requests*: accept or decline |
+| Add friend | Pencil button → *Add friend*: look someone up by phone number, send a request (or take it back), or message them |
+| Groups | Pencil button → *New group*; in a group, ⋮ → *Members* (remove someone), *Add members*, *Rename group*, *Leave group* (optionally silently) |
 
 ### Install
 
-1. Download `zalo-lite-debug-apk` from the latest **CI** run on GitHub. It holds one APK per CPU type; almost every
+1. Download `zalom3ui-debug-apk` from the latest **CI** run on GitHub. It holds one APK per CPU type; almost every
    current phone is `arm64-v8a` (check with `adb shell getprop ro.product.cpu.abi`).
 2. Copy `app-arm64-v8a-debug.apk` to the phone and open it (allow installing from that app when asked), or
    `adb install app-arm64-v8a-debug.apk`.
-3. Open **Zalo Lite** and log in (below).
+3. Open **Zalỏ** and log in (below). Zalỏ has its own app id (`com.zalom3ui.app`), so it installs next to Zalo Lite;
+   only one of them can be logged in to the same account at a time (one web session per account).
 
 ### Logging in
 
@@ -155,12 +167,26 @@ All endpoints are under `/api` and accept `Authorization: Bearer <token>` (or `?
 | `PUT` | `/threads/:kind/:id/pin` | `{ "pinned": true }` |
 | `PUT` | `/threads/:kind/:id/mute` | `{ "duration": "1h" \| "4h" \| "8am" \| "forever" \| null }` |
 | `DELETE` | `/threads/:kind/:id` | Delete the conversation |
+| `POST` | `/threads/:kind/:id/attachments?name=&width=&height=` | Send one photo or file (the raw request body); photos need their pixel size |
+| `GET` | `/stickers?q=` | Sticker search: `[{id, catId, type, url}]` |
+| `POST` | `/threads/:kind/:id/stickers` | Send a sticker: `{ "id" }` |
+| `PUT` | `/presence` | `{ "kind", "id" }` of the chat on screen (or `{}`), repeated while open, so it doesn't notify |
+| `GET` | `/friends` | Friends `[{id, name, avatar}]` |
+| `GET` | `/friend-requests` | Requests other people sent me |
+| `POST` | `/friend-requests/:userId/accept` · `/reject` | Answer a request |
+| `POST` | `/friend-requests` | Send one: `{ "userId", "message"? }`; `DELETE /friend-requests/:userId` takes it back |
+| `GET` | `/users/find?phone=` | `{id, name, avatar, isFriend, requested}` |
+| `POST` | `/groups` | Create: `{ "name"?, "members": [userId…] }` (2 or more) |
+| `POST` | `/groups/:id/members` | Add `{ "members": [userId…] }`; `DELETE /groups/:id/members/:userId` removes |
+| `PUT` | `/groups/:id/name` | `{ "name" }` |
+| `POST` | `/groups/:id/leave` | `{ "silent"?: true }` |
 
-`GET /ws` is a WebSocket that pushes `status`, `message`, `message_updated` (reactions, recalls, receipts),
-`message_deleted`, `typing` and `threads` events.
+`GET /ws` is a WebSocket that pushes `status`, `message` (with `notify` and `threadName` when a phone should show it),
+`message_updated` (reactions, recalls, receipts, sticker images), `message_deleted`, `read`, `typing` and `threads` events.
 The Android app uses this API; other clients can too.
 
 ## Not yet supported
 
-Sending photos, stickers, files or voice; calls; mini apps; editing your profile or friend requests. `zca-js`
-supports most of these, so they can be added to `src/session.ts` and exposed through the API.
+Recording and sending voice messages; sending GIFs (zca-js needs a file-path metadata reader for them); calls; mini
+apps; polls and reminders; editing your profile; searching inside a conversation. Notifications only work when Zalo runs
+on the phone (*Settings → Zalo runs on → This phone*), since the service that holds the connection posts them.
