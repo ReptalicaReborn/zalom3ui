@@ -158,7 +158,8 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   media server), `session_id`, and, because the call program always hands over its `extendData`
   (`CallController::getExtendData`: call type, platform 2 for PC, packet/SRTP/congestion modes, P2P candidates, media
   servers), `extendData` with `subCommand: 3`. Without those two, Zalo ended the call (accepting it on the phone
-  afterwards said "call ended") but neither the caller nor the other devices heard about it. Declining in the official app gives the same: the other devices get an `answer`
+  afterwards said "call ended") but neither the caller nor the other devices heard about it. **Works:** the caller's phone shows
+  "Người nhận từ chối cuộc gọi" (the recipient declined the call), as when declining in the official app. Declining in the official app gives the same: the other devices get an `answer`
   control with status 3. Two earlier tries used `/api/voicecall/cancel` (the caller giving up): Zalo accepted it but
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
