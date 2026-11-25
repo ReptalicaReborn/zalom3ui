@@ -129,7 +129,11 @@ class CallService : Service() {
             m.start()
         } catch (e: Exception) {
             m.stop()
-            finish("Couldn't start call audio: ${e.message}")
+            // Hang up too: otherwise the other side stays in a silent call until Zalo times it out.
+            scope.launch {
+                runCatching { api.hangUpCall() }
+                finish("Couldn't start call audio: ${e.message}")
+            }
             return
         }
         media = m

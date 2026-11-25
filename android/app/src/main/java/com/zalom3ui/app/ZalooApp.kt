@@ -6,9 +6,17 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import com.zalom3ui.app.call.CallMediaFactory
+import com.zalom3ui.app.call.EngineCallMedia
 
 /** Gives Coil animated image decoding, so stickers (animated WebP) and GIFs move as they do in Zalo. */
 class ZalooApp : Application(), ImageLoaderFactory {
+    override fun onCreate() {
+        super.onCreate()
+        // Calls get the real microphone/speaker/Opus engine (CallService asks the factory when a call connects).
+        CallMediaFactory.create = { context -> EngineCallMedia(context) }
+    }
+
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
             .components {
