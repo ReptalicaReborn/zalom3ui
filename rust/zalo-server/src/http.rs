@@ -134,8 +134,8 @@ pub fn build_router(config: Arc<Config>, session: Arc<ZaloSession>) -> Router {
         .route("/api/polls/{pollId}/options", post(post_add_poll_options))
         .route("/api/polls/{pollId}/lock", post(post_lock_poll))
         // Modular Track 1 & Track 2 sub-routers
-        .merge(routes::calls::router())
-        .merge(routes::history_sync::router())
+        .merge(routes::calls::router(state.clone()))
+        .merge(routes::history_sync::router(state.clone()))
         .layer(DefaultBodyLimit::max(MAX_JSON_BYTES));
 
     let mut router = Router::new()

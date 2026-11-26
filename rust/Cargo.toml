@@ -11,7 +11,6 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
 
 [workspace.dependencies]
 # Async & web
@@ -33,7 +32,9 @@ aes-gcm = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
 md-5 = "0.10"
+rsa = { version = "0.9", features = ["pem"] }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+lzma-rs = "0.3"
 subtle = "2.6"
 rand = "0.8"
 uuid = { version = "1.11", features = ["v4"] }

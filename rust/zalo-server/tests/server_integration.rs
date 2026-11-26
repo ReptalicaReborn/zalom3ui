@@ -250,7 +250,7 @@ async fn rest_endpoints_reactions_threads_search_presence_calls_and_history_sync
     let call_err: Value = resp.json().await.unwrap();
     assert_eq!(call_err["error"], "No active call");
 
-    // POST /api/calls/start -> 501 Track 1 stub
+    // POST /api/calls/start -> 409 when logged out (Calls implemented)
     let resp = client
         .post(format!("{}/api/calls/start", srv.base_url()))
         .header(AUTHORIZATION, &bearer)
@@ -258,7 +258,7 @@ async fn rest_endpoints_reactions_threads_search_presence_calls_and_history_sync
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // GET /api/history-sync/status -> 200 idle + log: []
     let resp = client
@@ -273,14 +273,14 @@ async fn rest_endpoints_reactions_threads_search_presence_calls_and_history_sync
     assert_eq!(sync_status["progress"], 0);
     assert_eq!(sync_status["log"], json!([]));
 
-    // POST /api/history-sync/start -> 501 Track 2 stub
+    // POST /api/history-sync/start -> 409 when logged out (History Sync implemented)
     let resp = client
         .post(format!("{}/api/history-sync/start", srv.base_url()))
         .header(AUTHORIZATION, &bearer)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // GET & DELETE /api/debug/call-log -> 200 text/plain & 204
     let resp = client
