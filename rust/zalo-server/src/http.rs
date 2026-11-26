@@ -80,6 +80,20 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
         .route("/api/retry", post(post_retry))
         .route("/api/logout", post(post_logout))
         .route("/api/reconnect", post(post_reconnect))
+        .route("/api/listener/pause", post(post_listener_pause))
+        .route("/api/listener/resume", post(post_listener_resume))
+        .route(
+            "/api/notify-window",
+            put(put_notify_window).delete(delete_notify_window),
+        )
+        .route(
+            "/api/debug/replay-log",
+            get(get_replay_log).delete(clear_replay_log),
+        )
+        .route(
+            "/api/debug/replay-mode",
+            get(get_replay_mode).put(put_replay_mode),
+        )
         .route("/api/reactions", get(get_reactions))
         // Conversations
         .route("/api/threads", get(list_threads))
@@ -476,6 +490,84 @@ async fn post_logout(State(state): State<AppState>) -> impl IntoResponse {
 async fn post_reconnect(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
     state.session.reconnect()?;
     Ok((StatusCode::ACCEPTED, Json(state.session.get_status())))
+}
+
+/// Pauses the chat listener (no auto-reconnect while paused); login and credentials stay.
+/// Does nothing when not logged in.
+async fn post_listener_pause(State(state): State<AppState>) -> impl IntoResponse {
+    state.session.pause();
+    Json(state.session.get_status())
+}
+
+/// Starts the chat listener again after a pause; the replay and its report follow `Connected`.
+async fn post_listener_resume(State(state): State<AppState>) -> impl IntoResponse {
+    state.session.resume();
+    (StatusCode::ACCEPTED, Json(state.session.get_status()))
+}
+
+/// Opens or extends the notify window: `{ "triggerTs": <epoch ms, default now>, "ttlMs": <default
+/// 60000, max 600000> }`. While open, replayed messages newer than the trigger minus 2 minutes
+/// can notify.
+async fn put_notify_window(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let val = parse_json_body(&body)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let trigger = match val.get("triggerTs").filter(|v| !v.is_null()) {
+        None => now,
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| HttpError::bad_request("triggerTs must be epoch milliseconds"))?,
+    };
+    let ttl = match val.get("ttlMs").filter(|v| !v.is_null()) {
+        None => 60_000,
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| HttpError::bad_request("ttlMs must be a number of milliseconds"))?,
+    };
+    let w = state.session.set_notify_window(trigger, ttl);
+    Ok(Json(json!({ "triggerTs": w.trigger_ts, "expiresAt": w.expires_at })))
+}
+
+async fn delete_notify_window(State(state): State<AppState>) -> StatusCode {
+    state.session.clear_notify_window();
+    StatusCode::NO_CONTENT
+}
+
+/// The replay reports as plain text, newest first (ids, counts and timestamps only).
+async fn get_replay_log(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        state.session.replay().render_text(),
+    )
+}
+
+async fn clear_replay_log(State(state): State<AppState>) -> StatusCode {
+    state.session.replay().clear();
+    StatusCode::NO_CONTENT
+}
+
+async fn get_replay_mode(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({ "mode": state.session.replay().mode().as_str() }))
+}
+
+/// `{ "mode": "null" | "newest" | "page" }` (or a JSON `null` for the default).
+async fn put_replay_mode(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let val = parse_json_body(&body)?;
+    let mode = val
+        .get("mode")
+        .and_then(crate::replay::ReplayMode::parse)
+        .ok_or_else(|| HttpError::bad_request("mode must be \"null\", \"newest\" or \"page\""))?;
+    state.session.replay().set_mode(mode);
+    Ok(Json(json!({ "mode": mode.as_str() })))
 }
 
 async fn get_reactions() -> impl IntoResponse {

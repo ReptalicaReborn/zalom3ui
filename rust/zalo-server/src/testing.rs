@@ -142,7 +142,7 @@ impl FakeZaloApi {
         self.lock().calls.clear();
     }
 
-    /// Listener control calls (`start`, `stop`, `request_old_messages:<kind>`,
+    /// Listener control calls (`start`, `stop`, `request_old_messages:<kind>:<lastId|null>`,
     /// `request_old_reactions:<kind>`), in order. Kept apart from [`Self::calls`].
     pub fn listener_log(&self) -> Vec<String> {
         self.lock().listener_log.clone()
@@ -229,8 +229,12 @@ fn kind_of(thread_type: ThreadType) -> &'static str {
 }
 
 impl ListenerControl for FakeListenerControl {
-    fn request_old_messages(&self, thread_type: ThreadType) {
-        self.log(format!("request_old_messages:{}", kind_of(thread_type)));
+    fn request_old_messages(&self, thread_type: ThreadType, last_id: Option<String>) {
+        self.log(format!(
+            "request_old_messages:{}:{}",
+            kind_of(thread_type),
+            last_id.as_deref().unwrap_or("null")
+        ));
     }
 
     fn request_old_reactions(&self, thread_type: ThreadType) {

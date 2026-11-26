@@ -27,7 +27,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Controls a running chat-socket listener (what the session needs from `ListenerHandle`).
 pub trait ListenerControl: Send + Sync {
-    fn request_old_messages(&self, thread_type: ThreadType);
+    /// Asks Zalo to replay old messages; `last_id` is the `lastId` of the request (`None`: null).
+    fn request_old_messages(&self, thread_type: ThreadType, last_id: Option<String>);
     fn request_old_reactions(&self, thread_type: ThreadType);
     /// Gracefully stops the listener (WebSocket close code 1000).
     fn stop(&self);
@@ -43,8 +44,8 @@ pub struct ListenerStart {
 pub struct ProtoListenerControl(pub ListenerHandle);
 
 impl ListenerControl for ProtoListenerControl {
-    fn request_old_messages(&self, thread_type: ThreadType) {
-        let _ = self.0.request_old_messages(thread_type, None);
+    fn request_old_messages(&self, thread_type: ThreadType, last_id: Option<String>) {
+        let _ = self.0.request_old_messages(thread_type, last_id);
     }
 
     fn request_old_reactions(&self, thread_type: ThreadType) {

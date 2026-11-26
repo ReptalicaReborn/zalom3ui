@@ -33,6 +33,7 @@ import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.server.LocalServer
+import com.zalom3ui.app.server.StayConnectedCoordinator
 import com.zalom3ui.app.server.ZaloCore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -331,6 +332,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             viewModelScope.launch(Dispatchers.IO) { ZaloCore.shutdown() }
         }
         localStartedAt = 0L
+        // "Stay connected" follows whether the app uses the phone's core at all.
+        StayConnectedCoordinator.refreshFromSettings(getApplication())
         _state.value = UiState(
             settings = settingsStore.load(),
             appearance = _state.value.appearance,
@@ -384,7 +387,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val api = client ?: return
         val onDevice = _state.value.settings.onDevice
         if (onDevice) {
-            val refused = LocalServer.start(getApplication())
+            // Only "Stay connected: Always" runs the foreground service; the other modes connect while the app is open.
+            val refused = if (settingsStore.loadStay().mode.keepsForegroundService) LocalServer.start(getApplication()) else null
             if (localStartedAt == 0L) localStartedAt = System.currentTimeMillis()
             _state.update {
                 it.copy(

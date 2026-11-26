@@ -358,3 +358,114 @@ async fn websocket_events_and_call_audio_close_code() {
 
     srv.stop().await;
 }
+
+#[tokio::test]
+async fn replay_debug_listener_pause_and_notify_window_endpoints() {
+    let srv = TestServer::start().await;
+    let client = reqwest::Client::new();
+    let bearer = format!("Bearer {}", srv.token);
+    let url = |p: &str| format!("{}{p}", srv.base_url());
+
+    // Replay log: plain text, deletable.
+    let resp = client
+        .get(url("/api/debug/replay-log"))
+        .header(AUTHORIZATION, &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+    assert!(resp.text().await.unwrap().contains("No replay reports"));
+    let resp = client
+        .delete(url("/api/debug/replay-log"))
+        .header(AUTHORIZATION, &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Replay mode: default null, settable, persisted, validated.
+    let mode: Value = client
+        .get(url("/api/debug/replay-mode"))
+        .header(AUTHORIZATION, &bearer)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mode, json!({ "mode": "null" }));
+    let resp = client
+        .put(url("/api/debug/replay-mode"))
+        .header(AUTHORIZATION, &bearer)
+        .json(&json!({ "mode": "page" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "mode": "page" }));
+    assert!(fs::read_to_string(srv.data_dir.join("replay-mode.json"))
+        .unwrap()
+        .contains("page"));
+    let resp = client
+        .put(url("/api/debug/replay-mode"))
+        .header(AUTHORIZATION, &bearer)
+        .json(&json!({ "mode": "everything" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = client
+        .put(url("/api/debug/replay-mode"))
+        .header(AUTHORIZATION, &bearer)
+        .json(&json!({ "mode": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "mode": "null" }));
+
+    // Pause and resume do nothing when logged out.
+    for path in ["/api/listener/pause", "/api/listener/resume"] {
+        let resp = client
+            .post(url(path))
+            .header(AUTHORIZATION, &bearer)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{path}");
+        assert_eq!(resp.json::<Value>().await.unwrap()["state"], "logged_out");
+    }
+
+    // Notify window: open (clamped ttl), bad input, close.
+    let resp = client
+        .put(url("/api/notify-window"))
+        .header(AUTHORIZATION, &bearer)
+        .json(&json!({ "triggerTs": 1_700_000_000_000i64, "ttlMs": 99_999_999 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let w: Value = resp.json().await.unwrap();
+    assert_eq!(w["triggerTs"], 1_700_000_000_000i64);
+    assert!(w["expiresAt"].as_i64().unwrap() > 0);
+    let resp = client
+        .put(url("/api/notify-window"))
+        .header(AUTHORIZATION, &bearer)
+        .json(&json!({ "triggerTs": "yesterday" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = client
+        .delete(url("/api/notify-window"))
+        .header(AUTHORIZATION, &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    srv.stop().await;
+}

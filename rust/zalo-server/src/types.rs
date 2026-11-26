@@ -600,6 +600,8 @@ pub enum SessionState {
     LoggingIn,
     Ready,
     Disconnected,
+    /// The chat listener is paused (`POST /api/listener/pause`); logged in, not connected.
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

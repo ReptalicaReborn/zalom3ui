@@ -70,6 +70,29 @@ class SettingsStore(context: Context) {
             .commit()
     }
 
+    /** The "Stay connected" settings; [StayConnected.UPGRADE_DEFAULT] until [ensureStayConnectedInitialised] has run. */
+    fun loadStay(): StaySettings = StaySettings(
+        mode = StayConnected.fromKey(prefs.getString(KEY_STAY_CONNECTED, null)) ?: StayConnected.UPGRADE_DEFAULT,
+        hideZaloNotifications = prefs.getBoolean(KEY_HIDE_ZALO_NOTIFICATIONS, true),
+    )
+
+    fun saveStay(stay: StaySettings) {
+        prefs.edit()
+            .putString(KEY_STAY_CONNECTED, stay.mode.key)
+            .putBoolean(KEY_HIDE_ZALO_NOTIFICATIONS, stay.hideZaloNotifications)
+            .commit()
+    }
+
+    /**
+     * Saves the starting "Stay connected" mode the first time this runs: [StayConnected.UPGRADE_DEFAULT] for an install
+     * that existed before the setting ([isUpgrade]), [StayConnected.NEW_INSTALL_DEFAULT] otherwise. Later runs keep
+     * whatever is saved, so changing the new-install default never changes an existing install.
+     */
+    fun ensureStayConnectedInitialised(isUpgrade: Boolean) {
+        if (prefs.contains(KEY_STAY_CONNECTED)) return
+        prefs.edit().putString(KEY_STAY_CONNECTED, StayConnected.initialFor(isUpgrade).key).apply()
+    }
+
     fun loadAppearance(): Appearance {
         val rawTheme = prefs.getString(KEY_THEME, null)
         val legacyGold = rawTheme == "REPTDOC_GOLD" || prefs.getString(KEY_COLOR_THEME, null) == "GOLD"
@@ -141,6 +164,8 @@ class SettingsStore(context: Context) {
     }
 
     internal companion object {
+        const val KEY_STAY_CONNECTED = "stay_connected"
+        const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
         const val KEY_ON_DEVICE = "on_device"
         const val KEY_URL = "server_url"
         const val KEY_TOKEN = "token"

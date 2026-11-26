@@ -395,6 +395,9 @@ fun SettingsScreen(
 
             if (current.onDevice) IncomingCallSettings()
 
+            // How long Zalo stays connected; only the on-phone core has this choice.
+            if (current.onDevice) StayConnectedSettings()
+
             if (current.onDevice || loggedIn) {
                 SectionHeader("Account")
                 val accountItems = buildList<@Composable () -> Unit> {
@@ -444,7 +447,7 @@ fun SettingsScreen(
             if (current.onDevice && loggedIn) {
                 SectionHeader("Developer")
                 ExpressiveSettingsGroup(
-                    items = listOf(
+                    items = listOf<@Composable () -> Unit>(
                         {
                             ListItem(
                                 modifier = Modifier.clickable(onClick = onShareCallLog),
@@ -464,7 +467,7 @@ fun SettingsScreen(
                                 headlineContent = { Text("Clear call log") },
                             )
                         },
-                    ),
+                    ) + replayDebugItems(),
                 )
             }
             Spacer(Modifier.height(28.dp))
