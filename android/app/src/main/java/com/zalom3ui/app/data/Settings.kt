@@ -124,8 +124,13 @@ class SettingsStore(context: Context) {
         }.apply()
     }
 
-    fun loadDrafts(): Map<String, String> =
-        decodeDrafts(prefs.getString(KEY_CHAT_DRAFTS, null))
+    /** The drafts JSON last read or written, with its decoded map, so saving one draft doesn't decode them all again. */
+    private var draftsCache: Pair<String?, Map<String, String>>? = null
+
+    fun loadDrafts(): Map<String, String> = synchronized(this) {
+        val raw = prefs.getString(KEY_CHAT_DRAFTS, null)
+        draftsCache?.takeIf { it.first == raw }?.second ?: decodeDrafts(raw).also { draftsCache = raw to it }
+    }
 
     fun saveDraft(threadKey: String, text: String) = synchronized(this) {
         val updated = loadDrafts().toMutableMap()
@@ -134,8 +139,10 @@ class SettingsStore(context: Context) {
         } else {
             updated[threadKey] = text
         }
+        val raw = if (updated.isEmpty()) null else encodeDrafts(updated)
+        draftsCache = raw to updated
         prefs.edit().apply {
-            if (updated.isEmpty()) remove(KEY_CHAT_DRAFTS) else putString(KEY_CHAT_DRAFTS, encodeDrafts(updated))
+            if (raw == null) remove(KEY_CHAT_DRAFTS) else putString(KEY_CHAT_DRAFTS, raw)
         }.apply()
     }
 
