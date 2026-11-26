@@ -39,10 +39,12 @@ The app runs in **one Android process**. The Rust core is loaded into it as a li
   - `HttpTransport` (*Settings → Zalo runs on → Remote server*) sends the same requests to a server over HTTP, with its
     address and token.
   - `ApiClient.onDevice(context)` and `ApiClient.forSettings(context, settings)` pick the right one.
-- **`ZaloService`** is a foreground service ("Connected to Zalo"). It keeps the process alive while the app is closed,
-  runs `MessageNotifier` (new-message notifications), and calls `POST /api/retry` whenever Android reports that a
-  network came back. `BootReceiver` starts it after a reboot. It no longer owns the core: stopping it does not stop Zalo
-  for an open screen.
+- **`ZaloService`** is a foreground service ("Connected to Zalo"), used in *Stay connected → Always* (section 6). It
+  keeps the process alive while the app is closed, runs `MessageNotifier` (new-message notifications), and calls
+  `POST /api/retry` whenever Android reports that a network came back. `BootReceiver` starts it after a reboot. It no
+  longer owns the core: stopping it does not stop Zalo for an open screen.
+- **`StayConnectedCoordinator`** connects and disconnects the core in the other two modes, and
+  **`ZaloNotificationListener`** is the notification bridge (section 6).
 - **`CallService`** is a second foreground service (microphone, and camera for video) that runs while a call is active.
 - **`NotificationActionReceiver`** and **`CallActionReceiver`** handle *Reply*, *Mark as read* and *Decline* from
   notifications.
@@ -99,7 +101,8 @@ not replayed history.
 ## 5. The connection to Zalo
 
 `ZaloSession` (`rust/zalo-server/src/session.rs`) is the logged-in account. Its state is one of `logged_out`,
-`awaiting_qr_scan`, `logging_in`, `ready` and `disconnected`.
+`awaiting_qr_scan`, `logging_in`, `ready`, `disconnected` and `paused` (logged in, but deliberately not connected:
+`POST /api/listener/pause`; `POST /api/listener/resume` connects again).
 
 - **Login.** `POST /api/login` starts a QR login (`zalo-proto/src/login.rs`): the QR image is in `GET /api/status`
   until you scan it and confirm in the official app. The session cookies and device id are then saved to
@@ -108,7 +111,16 @@ not replayed history.
   retries (5 s growing to 60 s); `POST /api/retry` retries at once. Only a session Zalo rejects asks for a new QR code.
 - **The chat WebSocket.** Once logged in, the core opens Zalo's chat socket (`zalo-proto/src/listener.rs`). On every
   `Connected` it asks Zalo to replay the messages and reactions it missed (`request_old_messages` /
-  `request_old_reactions`, 1:1 and groups). Replayed messages are stored as history and do not notify.
+  `request_old_reactions`, 1:1 and groups). Replayed messages are stored as history and do not notify (except inside
+  a notification-bridge window, section 6).
+- **Replay report.** Each connect writes a report (`rust/zalo-server/src/replay.rs`): how long the listener was
+  offline (kept on disk, so it survives the process being killed), the newest message stored per kind before the
+  replay, every batch Zalo sent back (count, oldest and newest time and id, how many were already stored), and a
+  verdict per kind: `covered` (the replay reaches back to what we had, so no gap), `possible_gap` (a full batch that
+  doesn't reach back), `nothing_missed` or `unknown`. `GET /api/debug/replay-log` shows the last 50. No message text.
+- **Replay mode** (`PUT /api/debug/replay-mode`), for the replay test: `null` asks once with `lastId: null` (what Zalo
+  Web is assumed to do, and the default); `newest` sends the newest stored message id as `lastId`; `page` asks again
+  with the oldest id of a full batch that doesn't overlap, up to 5 times.
 - **Drops.** If the socket closes unexpectedly, the session reconnects with one tracked task: 5 s, doubling up to
   5 minutes, with a little jitter, reset after a successful connect. `POST /api/retry` (sent by the app when the network
   comes back) skips the wait. Logout, a new login and `POST /api/reconnect` cancel it.
@@ -120,7 +132,45 @@ not replayed history.
   it, and feeds both the call manager and history sync. If the chat socket gets kicked while the poll runs, the poll
   is turned off until the next logout, in case it caused the kick.
 
-## 6. The message store
+## 6. Stay connected
+
+*Settings → Stay connected* (`android/.../data/StayConnected.kt`, `server/StayConnectedCoordinator.kt`) decides when the
+core holds the chat socket. It only applies when Zalo runs on the phone.
+
+- **Always** (the default, and what existing installs get): `ZaloService` runs in the foreground and `BootReceiver`
+  starts it after a reboot. Section 2.
+- **While open:** no foreground service and no boot start. The coordinator follows the app's foreground state
+  (`ProcessLifecycleOwner`): when the app comes to the front it starts the core and calls `listener/resume`, and the
+  replay brings in what was missed. A minute after the app leaves the front it calls `listener/pause`. It never pauses
+  while a call is ringing or active, while `CallService` runs, or while an attachment or voice upload is in flight; it
+  checks again every few seconds. While connected, `MessageNotifier` runs, so messages and calls still notify.
+- **While open + notification bridge:** as *While open*, plus `ZaloNotificationListener`, a
+  `NotificationListenerService` that sees the official Zalo app's (`com.zing.zalo`) notifications. The component is
+  disabled in the manifest and only enabled in this mode, and Android binds it only after you grant notification
+  access. When Zalo posts a message notification, the coordinator:
+  1. takes a short partial wake lock;
+  2. starts the core;
+  3. opens a **notify window** (`PUT /api/notify-window`): for its duration, replayed messages newer than the Zalo
+     notification (minus 2 minutes) notify, as long as they are unread, not muted, not yours and not on screen. This is
+     because here the replay *is* the news;
+  4. starts the notifier, then resumes the listener;
+  5. pauses again after a minute without another Zalo notification (a burst extends the window).
+
+  With *Hide Zalo's notifications* on, Zalo's notification for that chat is cancelled once Zalỏ has posted its own.
+  Notifications that are calls (category call or missed call, alarm, or a full-screen intent) are never touched. The
+  startup log records only the package, category and classification of Zalo's notifications, never their text. All of
+  this runs inside the listener service Android keeps bound; it never starts a foreground service from the background.
+
+The decisions (when to pause or resume, coalescing, which Zalo notifications count) are in plain Kotlin classes
+(`ListenerGate`, `BusyCheck`, `ZaloNotificationRules`) with their own unit tests. The default for new installs is one
+constant (`StayConnected.NEW_INSTALL_DEFAULT`), to change once the replay test ([replay-test.md](replay-test.md))
+shows that *While open* doesn't lose 1:1 history.
+
+What only a real phone can show: whether the bridge gets network access in Doze when Zalo's notification arrives (the
+biggest open risk; nothing exempts Zalỏ from Doze), whether Zalo's notifications are classified and matched to chats
+correctly, and whether a bridge connect disconnects Zalo Web/PC.
+
+## 7. The message store
 
 Everything is in the app's private storage under `files/zalo/` (on a server: `DATA_DIR`).
 
@@ -130,12 +180,13 @@ Everything is in the app's private storage under `files/zalo/` (on a server: `DA
 | `messages/meta.json` | The chat list: names, avatars, pinned, muted, unread marks, read positions |
 | `messages/threads/<hex>.json` | One file per chat, named by the hex of `kind:id` (e.g. `user:100`); the last 500 messages, up to 2,000 with history synced from the phone |
 | `call-trace.jsonl` | A redacted log of call signalling, for *Settings → Developer → Share call log* |
+| `replay-log.json`, `replay-mode.json`, `listener-state.json` | The last 50 replay reports, the replay mode, and when the listener was last connected |
 | `server.log`, `startup.log` | The core's log (rotated) and the app's startup steps, for *Share log* |
 
 `ChatStore` saves only the chats that changed, each file written atomically. A file that can't be read is set aside
 and the rest still loads. Search (`GET /api/search`) folds case and Vietnamese diacritics ("duc" finds "Đức").
 
-## 7. Calls
+## 8. Calls
 
 1:1 voice and video calls. The core does the signalling and the network; the app does the audio and video hardware.
 
@@ -159,7 +210,7 @@ and the rest still loads. Search (`GET /api/search`) folds case and Vietnamese d
 
 Group calls are not supported. Protocol notes: [calls.md](calls.md), [video-calls.md](video-calls.md).
 
-## 8. History sync from the phone
+## 9. History sync from the phone
 
 Zalo PC can ask the official Zalo app to send its chat history. Zalỏ does the same
 (`rust/zalo-server/src/routes/history_sync.rs`): it sends a public key, the phone asks you to allow it, uploads an
@@ -167,32 +218,34 @@ encrypted backup, and the core downloads, decrypts (`zalo-media/src/sync/zdb.rs`
 SQLite database directly (`sqliteread.rs`, no libsqlite3) and imports the messages. *Settings → Sync messages from
 phone*. It follows Zalo PC's protocol but has **not been tried against a real phone yet** ([history-sync.md](history-sync.md)).
 
-## 9. Remote-server mode and the standalone server
+## 10. Remote-server mode and the standalone server
 
 `zalom3ui-server` (`rust/zalo-cli`) runs the same core over TCP. Because it is on the network, it adds what the
 in-process path leaves out: Host and Origin checks, an access token (required unless it listens on loopback),
 security headers and a CSP for the web UI. The app talks to it with `HttpTransport` and the `/ws` and `/ws/call-audio`
 WebSockets. The web UI in `public/` is optional (`PUBLIC_DIR`).
 
-## 10. Building and testing
+## 11. Building and testing
 
 - **Build.** `cd android && ./gradlew assembleRelease`. The Gradle task `buildRustCore<Variant>` runs
   `cargo build --release --target aarch64-linux-android -p zalo-android` with the NDK's clang and packs
   `libzalocore.so` into the APK. The Opus codec (`libzaloopus.so`) is built from C with CMake. The app is arm64-only.
   The release APK is about 5.7 MB.
-- **Rust tests** (`cd rust && cargo test --workspace`, 189 tests):
+- **Rust tests** (`cd rust && cargo test --workspace`, 222 tests):
   - protocol and media units (encryption, frames, SRTP, RTCP, H.264, LZMA, SQLite and ZDB against real fixtures in
     `rust/fixtures/`);
   - the store (persistence, migration, corrupt files, search);
   - the session against a **fake Zalo client** (`rust/zalo-server/src/testing.rs`, `testing` feature): it records every
     call the session makes and lets a test script Zalo's answers, push socket events and drive the login, so login
-    races, receipts, recalls, the reconnect backoff and the control poll are tested without a Zalo account;
+    races, receipts, recalls, the reconnect backoff, the control poll, the replay report and modes, pause/resume and
+    the notify window are tested without a Zalo account;
   - the HTTP router, the WebSocket and call-audio sockets, and the embedded core (in-process requests, events, the
     audio link, starting again after shutdown).
-- **Android tests** (`./gradlew testDebugUnitTest`, 156 JVM tests): models, formatting, the transports over a fake native
-  layer, the call-audio link, jitter buffer, voice recorder, layout and gesture logic.
+- **Android tests** (`./gradlew testDebugUnitTest`, 189 JVM tests): models, formatting, the transports over a fake native
+  layer, the call-audio link, jitter buffer, voice recorder, layout and gesture logic, and the *Stay connected*
+  decisions (pause/resume timing, busy checks, which Zalo notifications count).
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
   APKs, checks the native libraries are inside, and uploads the APKs.
 
-What only a real phone and account can check: the JNI path end to end, call audio and video quality, history sync, and
-how much history Zalo replays after time offline.
+What only a real phone and account can check: the JNI path end to end, call audio and video quality, history sync, the
+notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).

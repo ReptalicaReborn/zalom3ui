@@ -31,10 +31,10 @@ the phone.
   standalone server uses, but in memory: no port, no token, nothing listening on the phone.
 - **Login:** scan a QR code with the official Zalo app, as for chat.zalo.me. The session is kept in the app's private
   storage, so restarts log back in on their own, also after the phone was offline.
-- **Real-time:** the core holds Zalo's chat WebSocket. A foreground service ("Connected to Zalo") keeps it open while the
-  app is closed and starts it again after a reboot, so notifications and incoming calls work and 1:1 messages keep
-  landing in the history. If the connection drops, it retries with a growing delay (5 s up to 5 min), and right away when
-  the network comes back.
+- **Real-time:** the core holds Zalo's chat WebSocket. By default a foreground service ("Connected to Zalo") keeps it
+  open while the app is closed and starts it again after a reboot, so notifications and incoming calls work and 1:1
+  messages keep landing in the history (*Settings → Stay connected* can change that, below). If the connection drops,
+  it retries with a growing delay (5 s up to 5 min), and right away when the network comes back.
 - **History:** Zalo Web has no history endpoint for 1:1 chats, so the core keeps its own cache: the last 500 messages
   per chat (2,000 for history synced from the phone). On every reconnect it asks Zalo to replay what it missed. Group
   chats also pull recent history from Zalo when opened. *Sync messages from phone* can ask the official Zalo app to
@@ -96,6 +96,21 @@ The details (how a request travels, events, calls, storage, the connection lifec
 
 *Settings → Restart Zalo service* restarts the core if it gets stuck; *Log out of Zalo* removes the session and the
 message cache from the phone.
+
+### Stay connected
+
+*Settings → Stay connected* (when Zalo runs on this phone) decides when Zalỏ holds the connection to Zalo:
+
+| Mode | What happens | Trade-off |
+|---|---|---|
+| **Always** (default) | Connected all the time, through the "Connected to Zalo" notification, also after a reboot | Notifications and incoming calls while the app is closed. Zalo Web/PC can't stay connected at the same time |
+| **While open** | Connects when you open the app; disconnects a minute after you leave it (never during a call or an upload) | No notifications or calls while closed; missed messages arrive when you open it. Zalo Web/PC works while Zalỏ is closed |
+| **While open + notification bridge** | As *While open*, but when the official Zalo app on this phone shows a message notification, Zalỏ connects for about a minute, posts its own notification and disconnects again. Needs notification access; can hide Zalo's own notification. Zalo's call notifications are never touched | Notifications without a permanent connection; calls still ring in Zalo. Each bridge connect briefly takes the one web slot, so it can disconnect Zalo Web/PC |
+
+*While open* is only safe for your 1:1 history if Zalo replays everything you missed while disconnected, and how much
+it replays is not known yet. That is why **Always** stays the default until the replay test
+([docs/replay-test.md](docs/replay-test.md)) shows otherwise. *Settings → Developer → Replay log* records, for every
+reconnect, how long Zalỏ was offline and what Zalo sent back (ids, counts and times only, no message text).
 
 ## Running Zalo somewhere else (optional)
 
@@ -176,6 +191,8 @@ The standalone server, and the core inside the app, answer the same API. All end
 | `POST` | `/retry` | Retry now: a saved session waiting to log back in, or a dropped connection waiting to reconnect |
 | `POST` | `/logout` | Log out and delete saved data |
 | `POST` | `/reconnect` | Restart the real-time connection |
+| `POST` | `/listener/pause` · `/listener/resume` | Disconnect from Zalo without logging out (state `paused`), and connect again (used by *Stay connected*) |
+| `PUT` | `/notify-window` | `{ "triggerTs"?, "ttlMs"? }`: for a while, replayed messages newer than the trigger notify (the notification bridge); `DELETE` closes it |
 | `GET` | `/threads` | Chats and contacts: pinned first, then most recent; unread counts, `pinned`, `mutedUntil` |
 | `GET` | `/threads/:kind/:id/info` | `{lastOnline}` for users, `{members}` for groups |
 | `GET` | `/threads/:kind/:id/messages?before=&limit=` | Messages (`kind` is `user` or `group`) |
@@ -206,6 +223,8 @@ The standalone server, and the core inside the app, answer the same API. All end
 | `POST` | `/calls/hangup` · `/calls/mute` · `/calls/camera` | End the call · `{ "muted" }` · `{ "on" }` |
 | `GET` | `/calls/current` | The active call, or 404 |
 | `GET` | `/debug/call-log` | Call signalling log (redacted); `DELETE` clears it |
+| `GET` | `/debug/replay-log` | What Zalo replayed after each reconnect (no message content); `DELETE` clears it |
+| `GET` · `PUT` | `/debug/replay-mode` | `{ "mode": "null" \| "newest" \| "page" }`: how the replay is requested, for the replay test |
 | `POST` | `/history-sync/start` · `/cancel` | Ask the phone's Zalo app for its chat history ([docs/history-sync.md](docs/history-sync.md)) |
 | `GET` | `/history-sync/status` | State, progress and a log of what the phone sent (no message content) |
 
