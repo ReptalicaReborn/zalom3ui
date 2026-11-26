@@ -28,7 +28,8 @@ pub fn rig() -> Rig {
 }
 
 pub fn rig_with(read_receipts: bool) -> Rig {
-    let dir = std::env::temp_dir().join(format!("zalo-session-test-{:016x}", rand::random::<u64>()));
+    let dir =
+        std::env::temp_dir().join(format!("zalo-session-test-{:016x}", rand::random::<u64>()));
     let store = ChatStore::in_memory();
     let session = Arc::new(ZaloSession::with_login(
         store.clone(),
@@ -38,7 +39,10 @@ pub fn rig_with(read_receipts: bool) -> Rig {
     ));
     let api = FakeZaloApi::new("me");
     // The TS setup's defaults.
-    api.respond("send_message", json!({ "message": { "msgId": 999 }, "attachment": [] }));
+    api.respond(
+        "send_message",
+        json!({ "message": { "msgId": 999 }, "attachment": [] }),
+    );
     session.testing_attach(api.clone());
     let events = session.subscribe_events();
     Rig {
@@ -53,7 +57,9 @@ pub fn rig_with(read_receipts: bool) -> Rig {
 impl Rig {
     /// Feeds one chat message through the listener's message handler.
     pub async fn ingest(&self, raw: RawWsMessage) {
-        self.session.testing_dispatch(WsEvent::Messages(vec![raw])).await;
+        self.session
+            .testing_dispatch(WsEvent::Messages(vec![raw]))
+            .await;
     }
 
     /// Everything broadcast since the last call (status, message, threads... events).
@@ -95,7 +101,11 @@ pub fn incoming(id: &str, ts: i64, extra: Value, group: bool) -> RawWsMessage {
         }
     }
     RawWsMessage {
-        thread_type: if group { ThreadType::Group } else { ThreadType::User },
+        thread_type: if group {
+            ThreadType::Group
+        } else {
+            ThreadType::User
+        },
         thread_id: if group { "g1" } else { "100" }.to_string(),
         is_self: data["uidFrom"] == "me",
         data,

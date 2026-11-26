@@ -42,13 +42,23 @@ async fn advance(d: Duration) {
 fn backoff_schedule_doubles_from_5s_to_a_5_minute_cap() {
     let secs: Vec<u64> = (0..10).map(|n| reconnect_base_delay(n).as_secs()).collect();
     assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300, 300, 300]);
-    assert_eq!(reconnect_base_delay(u32::MAX).as_secs(), 300, "no overflow far out");
+    assert_eq!(
+        reconnect_base_delay(u32::MAX).as_secs(),
+        300,
+        "no overflow far out"
+    );
     for attempt in 0..10 {
         let base = reconnect_base_delay(attempt);
         for _ in 0..200 {
             let d = reconnect_delay(attempt);
-            assert!(d <= base, "jitter never lengthens the delay past the schedule");
-            assert!(d >= base.mul_f64(0.9), "jitter is at most 10%: {d:?} vs {base:?}");
+            assert!(
+                d <= base,
+                "jitter never lengthens the delay past the schedule"
+            );
+            assert!(
+                d >= base.mul_f64(0.9),
+                "jitter is at most 10%: {d:?} vs {base:?}"
+            );
         }
     }
 }
@@ -62,7 +72,11 @@ async fn an_unexpected_close_reconnects_with_growing_delays_until_connected() {
     drop_connection(&api).await;
     assert_eq!(session.get_status().state, SessionState::Disconnected);
     advance(Duration::from_millis(4_400)).await;
-    assert_eq!(api.listener_starts(), 1, "not before the shortest jittered delay");
+    assert_eq!(
+        api.listener_starts(),
+        1,
+        "not before the shortest jittered delay"
+    );
     advance(Duration::from_millis(700)).await;
     assert_eq!(api.listener_starts(), 2);
 
@@ -98,10 +112,18 @@ async fn the_delay_stops_growing_at_five_minutes() {
         let upper = reconnect_base_delay(n);
         // It has not fired just before the shortest jittered delay...
         advance(upper.mul_f64(0.9) - Duration::from_millis(100)).await;
-        assert_eq!(api.listener_starts(), 1 + n as usize, "attempt {n} fired early");
+        assert_eq!(
+            api.listener_starts(),
+            1 + n as usize,
+            "attempt {n} fired early"
+        );
         // ...and has by the schedule's value.
         advance(upper.mul_f64(0.1) + Duration::from_millis(200)).await;
-        assert_eq!(api.listener_starts(), 2 + n as usize, "attempt {n} did not fire");
+        assert_eq!(
+            api.listener_starts(),
+            2 + n as usize,
+            "attempt {n} did not fire"
+        );
     }
 }
 
@@ -113,13 +135,20 @@ async fn closes_never_pile_up_overlapping_reconnects() {
     drop_connection(&api).await;
     drop_connection(&api).await;
     advance(Duration::from_secs(60)).await;
-    assert_eq!(api.listener_starts(), 2, "one tracked reconnect, one restart");
+    assert_eq!(
+        api.listener_starts(),
+        2,
+        "one tracked reconnect, one restart"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_kicked_close_is_not_reconnected() {
     let (session, api, _dir) = session_with_listener();
-    for code in [CloseReason::DuplicateConnection, CloseReason::KickConnection] {
+    for code in [
+        CloseReason::DuplicateConnection,
+        CloseReason::KickConnection,
+    ] {
         assert!(api.emit(closed(code as u16)));
         settle().await;
         assert_eq!(session.get_status().state, SessionState::Disconnected);
@@ -167,9 +196,17 @@ async fn a_manual_reconnect_replaces_the_pending_one_and_resets_the_backoff() {
     let (session, api, _dir) = session_with_listener();
     drop_connection(&api).await;
     session.reconnect().unwrap();
-    assert_eq!(api.listener_starts(), 2, "manual reconnect starts the listener right away");
+    assert_eq!(
+        api.listener_starts(),
+        2,
+        "manual reconnect starts the listener right away"
+    );
     advance(Duration::from_secs(600)).await;
-    assert_eq!(api.listener_starts(), 2, "the pending automatic reconnect was cancelled");
+    assert_eq!(
+        api.listener_starts(),
+        2,
+        "the pending automatic reconnect was cancelled"
+    );
 
     // Build the backoff up to ~10 s, then reset it with a manual reconnect.
     let (session2, api2, _dir2) = session_with_listener();
@@ -204,7 +241,11 @@ async fn an_early_retry_now_is_not_banked_for_a_later_close() {
     session.retry_now();
     settle().await;
     drop_connection(&api).await;
-    assert_eq!(api.listener_starts(), 1, "the earlier retry must not skip this backoff");
+    assert_eq!(
+        api.listener_starts(),
+        1,
+        "the earlier retry must not skip this backoff"
+    );
     advance(Duration::from_millis(5_100)).await;
     assert_eq!(api.listener_starts(), 2);
 }
@@ -218,7 +259,11 @@ async fn a_listener_that_cannot_start_is_retried_with_backoff() {
     assert_eq!(api.listener_starts(), 1);
     api.fail_listener_start(false);
     advance(Duration::from_millis(5_000)).await;
-    assert_eq!(api.listener_starts(), 1, "second try waits longer than the first");
+    assert_eq!(
+        api.listener_starts(),
+        1,
+        "second try waits longer than the first"
+    );
     advance(Duration::from_millis(5_100)).await;
     assert_eq!(api.listener_starts(), 2);
     assert_eq!(session.get_status().state, SessionState::Disconnected);

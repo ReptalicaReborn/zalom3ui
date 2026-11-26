@@ -64,7 +64,8 @@ struct TestApp {
 
 impl TestApp {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("zalo-search-voice-{:016x}", rand::random::<u64>()));
+        let dir =
+            std::env::temp_dir().join(format!("zalo-search-voice-{:016x}", rand::random::<u64>()));
         let store = ChatStore::in_memory();
         store.set_own_id(Some("me".into()));
         let session = Arc::new(ZaloSession::with_login(
@@ -131,15 +132,36 @@ impl Drop for TestApp {
 }
 
 #[test]
-fn chat_store_search_messages_matches_diacritics_dj_case_attachments_skips_recalled_sorts_newest_first() {
+fn chat_store_search_messages_matches_diacritics_dj_case_attachments_skips_recalled_sorts_newest_first(
+) {
     let store = ChatStore::in_memory();
     store.set_own_id(Some("me".into()));
     store.upsert_thread(thread("100", ThreadKind::User, "Minh", "https://a/100.jpg"));
-    store.upsert_thread(thread("g1", ThreadKind::Group, "Team Dev", "https://a/g1.jpg"));
+    store.upsert_thread(thread(
+        "g1",
+        ThreadKind::Group,
+        "Team Dev",
+        "https://a/g1.jpg",
+    ));
 
-    store.add_message(make_msg("1", 1000, json!({ "content": "Đi uống Cà Phê Sữa Đá nhé!" }), false));
-    store.add_message(make_msg("2", 2000, json!({ "content": "ĐẶT lịch họp tiếng Việt" }), true));
-    store.add_message(make_msg("3", 3000, json!({ "content": "Cà phê sáng nay bị thu hồi" }), false));
+    store.add_message(make_msg(
+        "1",
+        1000,
+        json!({ "content": "Đi uống Cà Phê Sữa Đá nhé!" }),
+        false,
+    ));
+    store.add_message(make_msg(
+        "2",
+        2000,
+        json!({ "content": "ĐẶT lịch họp tiếng Việt" }),
+        true,
+    ));
+    store.add_message(make_msg(
+        "3",
+        3000,
+        json!({ "content": "Cà phê sáng nay bị thu hồi" }),
+        false,
+    ));
     store.apply_undo("3");
     store.add_message(make_msg(
         "4",
@@ -191,24 +213,46 @@ fn chat_store_search_messages_matches_diacritics_dj_case_attachments_skips_recal
 
     // Attachment title (Latin diacritics) & description (Vietnamese đ/Đ)
     assert_eq!(ids(&store.search_messages("cafe ha noi", None)), vec!["4"]);
-    assert_eq!(ids(&store.search_messages("dien bien phu", None)), vec!["4"]);
-    assert_eq!(ids(&store.search_messages("bao_cao_quy_4", None)), vec!["5"]);
+    assert_eq!(
+        ids(&store.search_messages("dien bien phu", None)),
+        vec!["4"]
+    );
+    assert_eq!(
+        ids(&store.search_messages("bao_cao_quy_4", None)),
+        vec!["5"]
+    );
 
     // Broad match across threads is sorted newest-first
-    store.add_message(make_msg("6", 1500, json!({ "content": "duong pho" }), false));
+    store.add_message(make_msg(
+        "6",
+        1500,
+        json!({ "content": "duong pho" }),
+        false,
+    ));
     store.add_message(make_msg("7", 6000, json!({ "content": "Đường lớn" }), true));
-    assert_eq!(ids(&store.search_messages("duong", None)), vec!["7", "4", "6"]);
+    assert_eq!(
+        ids(&store.search_messages("duong", None)),
+        vec!["7", "4", "6"]
+    );
 }
 
 #[test]
 fn chat_store_search_messages_respects_limit_and_clamps_to_1_100() {
     let store = ChatStore::in_memory();
     for i in 1..=120i64 {
-        store.add_message(make_msg(&i.to_string(), i * 1000, json!({ "content": format!("item {i}") }), false));
+        store.add_message(make_msg(
+            &i.to_string(),
+            i * 1000,
+            json!({ "content": format!("item {i}") }),
+            false,
+        ));
     }
     assert_eq!(store.search_messages("item", None).len(), 50);
     assert_eq!(store.search_messages("item", Some(5)).len(), 5);
-    assert_eq!(ids(&store.search_messages("item", Some(3))), vec!["120", "119", "118"]);
+    assert_eq!(
+        ids(&store.search_messages("item", Some(3))),
+        vec!["120", "119", "118"]
+    );
     assert_eq!(store.search_messages("item", Some(0)).len(), 1);
     assert_eq!(store.search_messages("item", Some(500)).len(), 100);
     // The TS test also passes -10; a negative limit cannot be expressed as a usize here, and the
@@ -218,15 +262,38 @@ fn chat_store_search_messages_respects_limit_and_clamps_to_1_100() {
 #[tokio::test]
 async fn get_api_search_validates_q_and_limit_and_returns_search_results() {
     let app = TestApp::new();
-    app.store.upsert_thread(thread("100", ThreadKind::User, "Lan", "https://a/lan.jpg"));
-    app.store.add_message(make_msg("1", 1000, json!({ "content": "Chào buổi sáng" }), false));
-    app.store.add_message(make_msg("2", 2000, json!({ "content": "Chào buổi tối" }), false));
+    app.store
+        .upsert_thread(thread("100", ThreadKind::User, "Lan", "https://a/lan.jpg"));
+    app.store.add_message(make_msg(
+        "1",
+        1000,
+        json!({ "content": "Chào buổi sáng" }),
+        false,
+    ));
+    app.store.add_message(make_msg(
+        "2",
+        2000,
+        json!({ "content": "Chào buổi tối" }),
+        false,
+    ));
 
     assert_eq!(app.get("/api/search").await.0, StatusCode::BAD_REQUEST);
-    assert_eq!(app.get("/api/search?q=%20%20").await.0, StatusCode::BAD_REQUEST);
-    assert_eq!(app.get("/api/search?q=chao&limit=0").await.0, StatusCode::BAD_REQUEST);
-    assert_eq!(app.get("/api/search?q=chao&limit=abc").await.0, StatusCode::BAD_REQUEST);
-    assert_eq!(app.get("/api/search?q=chao&limit=-3").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        app.get("/api/search?q=%20%20").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.get("/api/search?q=chao&limit=0").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.get("/api/search?q=chao&limit=abc").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.get("/api/search?q=chao&limit=-3").await.0,
+        StatusCode::BAD_REQUEST
+    );
 
     let (status, body) = app.get("/api/search?q=chao%20buoi&limit=1").await;
     assert_eq!(status, StatusCode::OK);
@@ -251,7 +318,8 @@ fn uploaded_voice() -> Value {
 }
 
 #[tokio::test]
-async fn zalo_session_send_voice_uploads_audio_normalizes_extension_validates_file_url_and_calls_send_voice() {
+async fn zalo_session_send_voice_uploads_audio_normalizes_extension_validates_file_url_and_calls_send_voice(
+) {
     let app = TestApp::new();
     app.api.respond("upload_attachment", uploaded_voice());
     app.api.respond("send_voice", json!({ "msgId": "900" }));
@@ -275,7 +343,10 @@ async fn zalo_session_send_voice_uploads_audio_normalizes_extension_validates_fi
         ]
     );
     assert_eq!(calls[1].method, "send_voice");
-    assert_eq!(calls[1].args, vec![json!(voice_url), json!(null), json!("100"), json!("User")]);
+    assert_eq!(
+        calls[1].args,
+        vec![json!(voice_url), json!(null), json!("100"), json!("User")]
+    );
 
     // Existing audio extension is preserved for group threads
     app.session
@@ -291,7 +362,10 @@ async fn zalo_session_send_voice_uploads_audio_normalizes_extension_validates_fi
             json!("Group"),
         ]
     );
-    assert_eq!(calls[3].args, vec![json!(voice_url), json!(null), json!("g1"), json!("Group")]);
+    assert_eq!(
+        calls[3].args,
+        vec![json!(voice_url), json!(null), json!("g1"), json!("Group")]
+    );
 
     // Empty buffer rejected before calling API
     let before = app.api.call_count();
@@ -379,6 +453,10 @@ async fn zalo_session_send_voice_fails_with_502_if_upload_attachment_returns_no_
         .await
         .unwrap_err();
     assert_eq!(err.status, 502);
-    assert!(err.message.contains("Failed to upload voice recording"), "{}", err.message);
+    assert!(
+        err.message.contains("Failed to upload voice recording"),
+        "{}",
+        err.message
+    );
     assert_eq!(app.api.methods(), vec!["upload_attachment"]);
 }

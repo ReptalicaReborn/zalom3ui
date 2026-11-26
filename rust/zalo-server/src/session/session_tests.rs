@@ -43,7 +43,11 @@ async fn replying_with_a_quote_sends_the_quoted_messages_raw_fields() {
             "ttl": 0,
         })
     );
-    assert_eq!(content["mentions"], json!([]), "mentions are only sent to groups");
+    assert_eq!(
+        content["mentions"],
+        json!([]),
+        "mentions are only sent to groups"
+    );
 }
 
 #[tokio::test]
@@ -99,7 +103,8 @@ async fn reacting_calls_add_reaction_and_updates_the_message_immediately() {
 async fn recall_is_limited_to_own_messages() {
     let r = rig();
     r.ingest(incoming("1", 1000, json!({}), false)).await;
-    r.ingest(incoming("2", 2000, json!({ "uidFrom": "me" }), false)).await;
+    r.ingest(incoming("2", 2000, json!({ "uidFrom": "me" }), false))
+        .await;
 
     let err = r
         .session
@@ -115,7 +120,11 @@ async fn recall_is_limited_to_own_messages() {
     assert_eq!(last.method, "undo");
     assert_eq!(
         last.args,
-        vec![json!({ "msg_id": "2", "cli_msg_id": "c2" }), json!("100"), json!("User")]
+        vec![
+            json!({ "msg_id": "2", "cli_msg_id": "c2" }),
+            json!("100"),
+            json!("User")
+        ]
     );
     assert!(r.store.get_message("2").unwrap().recalled);
 }
@@ -133,7 +142,10 @@ async fn incoming_recall_records_and_undo_events_mark_messages_recalled() {
     ))
     .await;
     assert!(r.store.get_message("1").unwrap().recalled);
-    assert!(r.store.get_message("u1").is_none(), "the recall record itself is not shown");
+    assert!(
+        r.store.get_message("u1").is_none(),
+        "the recall record itself is not shown"
+    );
 
     r.session
         .testing_dispatch(WsEvent::Undo(RawWsMessage {
@@ -213,7 +225,12 @@ async fn forward_splits_targets_by_thread_type_and_only_forwards_text() {
     );
     let err = r
         .session
-        .forward_message(ThreadKind::User, "100", "2", &[(ThreadKind::User, "a".to_string())])
+        .forward_message(
+            ThreadKind::User,
+            "100",
+            "2",
+            &[(ThreadKind::User, "a".to_string())],
+        )
         .await
         .unwrap_err();
     assert!(err.message.contains("Only text"), "{}", err.message);
@@ -264,7 +281,8 @@ async fn read_receipts_can_be_turned_off() {
 #[tokio::test]
 async fn group_mentions_are_passed_through_reactions_and_receipts_from_the_listener_apply() {
     let r = rig();
-    r.ingest(incoming("m1", 1000, json!({ "uidFrom": "me" }), true)).await;
+    r.ingest(incoming("m1", 1000, json!({ "uidFrom": "me" }), true))
+        .await;
 
     r.session
         .send_text(
@@ -301,7 +319,10 @@ async fn group_mentions_are_passed_through_reactions_and_receipts_from_the_liste
         })
         .await;
 
-    let m = r.store.get_messages(ThreadKind::Group, "g1", None, None).remove(0);
+    let m = r
+        .store
+        .get_messages(ThreadKind::Group, "g1", None, None)
+        .remove(0);
     assert_eq!(
         m.reactions,
         vec![ReactionInfo {
@@ -338,12 +359,18 @@ async fn pin_mute_and_mark_unread_update_zalo_and_the_local_summary() {
     r.session.mark_read(ThreadKind::User, "100").await.unwrap();
     r.api.clear_calls();
 
-    r.session.set_pinned(ThreadKind::User, "100", true).await.unwrap();
+    r.session
+        .set_pinned(ThreadKind::User, "100", true)
+        .await
+        .unwrap();
     r.session
         .set_muted(ThreadKind::User, "100", Some(MuteOption::Forever))
         .await
         .unwrap();
-    r.session.mark_unread(ThreadKind::User, "100").await.unwrap();
+    r.session
+        .mark_unread(ThreadKind::User, "100")
+        .await
+        .unwrap();
     assert_eq!(
         r.api.methods(),
         vec!["set_pinned_conversations", "set_mute", "add_unread_mark"]
@@ -401,7 +428,8 @@ fn normalize_message_output_for_a_self_message_from_another_device() {
 #[tokio::test]
 async fn on_seen_guards_missing_seen_uids_in_groups_and_handles_is_self_in_1to1_chats() {
     let mut r = rig();
-    r.ingest(incoming("g1m", 1000, json!({ "uidFrom": "me" }), true)).await;
+    r.ingest(incoming("g1m", 1000, json!({ "uidFrom": "me" }), true))
+        .await;
     // No seenUids: must not panic or change anything.
     r.session
         .testing_dispatch(WsEvent::Seen {
@@ -412,7 +440,8 @@ async fn on_seen_guards_missing_seen_uids_in_groups_and_handles_is_self_in_1to1_
 
     // 1:1 chat: self seen from another device clears unread instead of marking our own msg as seen by peer.
     r.ingest(incoming("u1", 1000, json!({}), false)).await;
-    r.ingest(incoming("u2", 2000, json!({ "uidFrom": "me" }), false)).await;
+    r.ingest(incoming("u2", 2000, json!({ "uidFrom": "me" }), false))
+        .await;
     r.ingest(incoming("u3", 3000, json!({}), false)).await;
     let unread = |r: &super::test_support::Rig| {
         r.store
@@ -456,21 +485,29 @@ async fn logout_clears_all_in_memory_caches_call_trace_own_id_and_flushes_store(
         json!([{ "userId": "100", "displayName": "Alice", "zaloName": "Alice", "avatar": "" }]),
     );
     api.respond("get_stickers", json!([1]));
-    api.respond("get_stickers_detail", json!([{ "id": 1, "cateId": 1, "type": 1 }]));
+    api.respond(
+        "get_stickers_detail",
+        json!([{ "id": 1, "cateId": 1, "type": 1 }]),
+    );
     session.testing_attach(api.clone());
 
     // Populate every cache: friends, stickers, presence, call trace, messages.
     session.accept_friend_request("100").await.unwrap();
     session.search_stickers("x").await.unwrap();
     session.set_presence(Some(ThreadKind::User), Some("100"));
-    session.call_trace().record(&json!({ "kind": "control", "source": "poll", "act": "cancel" }));
+    session
+        .call_trace()
+        .record(&json!({ "kind": "control", "source": "poll", "act": "cancel" }));
     let raw = incoming("1", now_ms(), json!({}), false);
     let msg = normalize_message(&raw.data, ThreadKind::User, "100", false, Some("me"));
     store.add_message(msg.clone());
     store.flush();
     assert!(!session.call_trace().read().is_empty());
     assert_eq!(session.friends().len(), 1);
-    assert!(!session.should_notify(&store.to_public(&msg), false), "viewing this chat");
+    assert!(
+        !session.should_notify(&store.to_public(&msg), false),
+        "viewing this chat"
+    );
 
     session.logout().await;
     assert_eq!(session.friends().len(), 0);
@@ -483,9 +520,15 @@ async fn logout_clears_all_in_memory_caches_call_trace_own_id_and_flushes_store(
     );
     // The sticker cache is gone too: signing in again has to look the sticker up.
     let again = FakeZaloApi::new("me");
-    again.respond("get_stickers_detail", json!([{ "id": 1, "cateId": 1, "type": 1 }]));
+    again.respond(
+        "get_stickers_detail",
+        json!([{ "id": 1, "cateId": 1, "type": 1 }]),
+    );
     session.testing_attach(again.clone());
-    session.send_sticker(ThreadKind::User, "100", 1).await.unwrap();
+    session
+        .send_sticker(ThreadKind::User, "100", 1)
+        .await
+        .unwrap();
     assert_eq!(again.calls_to("get_stickers_detail").len(), 1);
     // Flushed synchronously to disk as empty.
     assert!(ChatStore::open(&dir).list_threads().is_empty());
@@ -514,11 +557,17 @@ async fn sticker_cache_is_capped_at_500_entries_and_evicts_oldest() {
 
     // 11 and 510 are still cached (no lookup); 1 and 10 were evicted (looked up again).
     for id in [510, 11] {
-        r.session.send_sticker(ThreadKind::User, "100", id).await.unwrap();
+        r.session
+            .send_sticker(ThreadKind::User, "100", id)
+            .await
+            .unwrap();
     }
     assert!(r.api.calls_to("get_stickers_detail").is_empty());
     for id in [1, 10] {
-        r.session.send_sticker(ThreadKind::User, "100", id).await.unwrap();
+        r.session
+            .send_sticker(ThreadKind::User, "100", id)
+            .await
+            .unwrap();
     }
     assert_eq!(
         r.api.calls_to("get_stickers_detail"),
@@ -554,7 +603,10 @@ async fn stale_on_logged_in_and_load_friends_drop_results_after_logout() {
     );
     api.respond("get_all_groups", json!({ "gridVerMap": {} }));
     api.respond("get_pin_conversations", json!({ "conversations": [] }));
-    api.respond("get_mute", json!({ "chatEntries": [], "groupChatEntries": [] }));
+    api.respond(
+        "get_mute",
+        json!({ "chatEntries": [], "groupChatEntries": [] }),
+    );
 
     let generation = session.inner.read().unwrap().generation;
     let login = {

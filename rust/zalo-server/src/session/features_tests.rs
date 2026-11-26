@@ -121,10 +121,17 @@ async fn sticker_search_returns_images_and_a_found_sticker_can_be_sent() {
             },
         ]
     );
-    r.session.send_sticker(ThreadKind::User, "100", 6).await.unwrap();
+    r.session
+        .send_sticker(ThreadKind::User, "100", 6)
+        .await
+        .unwrap();
     assert_eq!(
         r.api.calls_to("send_sticker"),
-        vec![vec![json!({ "id": 6, "cateId": 60, "type": 7 }), json!("100"), json!("User")]]
+        vec![vec![
+            json!({ "id": 6, "cateId": 60, "type": 7 }),
+            json!("100"),
+            json!("User")
+        ]]
     );
 }
 
@@ -139,7 +146,13 @@ async fn a_received_sticker_shows_its_picture_right_away_with_no_lookup() {
     ))
     .await;
     assert_eq!(
-        r.store.get_message("1").unwrap().attachment.unwrap().thumb.as_deref(),
+        r.store
+            .get_message("1")
+            .unwrap()
+            .attachment
+            .unwrap()
+            .thumb
+            .as_deref(),
         Some(format!("{STICKER_URL}9").as_str())
     );
     assert_eq!(r.api.call_count(), 0);
@@ -174,7 +187,10 @@ async fn notifications_not_mine_not_muted_not_the_open_chat_not_old_history() {
         ..msg.clone()
     };
     assert!(!session.should_notify_at(&stale, false, now));
-    assert!(!session.should_notify_at(&msg, true, now), "old history never notifies");
+    assert!(
+        !session.should_notify_at(&msg, true, now),
+        "old history never notifies"
+    );
 }
 
 #[tokio::test]
@@ -216,7 +232,10 @@ async fn friend_requests_only_received_ones_are_listed_accepting_reloads_friends
         }]
     );
     r.session.accept_friend_request("7").await.unwrap();
-    assert_eq!(r.api.calls_to("accept_friend_request"), vec![vec![json!("7")]]);
+    assert_eq!(
+        r.api.calls_to("accept_friend_request"),
+        vec![vec![json!("7")]]
+    );
     assert_eq!(
         r.session.friends(),
         vec![Person {
@@ -257,8 +276,9 @@ async fn sent_friend_requests_are_listed_newest_first_and_none_is_not_an_error()
         ]
     );
     let none = features_rig();
-    none.api
-        .fail("get_sent_friend_request", || ProtoError::InvalidArg("none".into()));
+    none.api.fail("get_sent_friend_request", || {
+        ProtoError::InvalidArg("none".into())
+    });
     assert_eq!(none.session.sent_friend_requests().await.unwrap(), vec![]);
 }
 
@@ -269,8 +289,10 @@ async fn finding_someone_by_phone_says_whether_they_are_a_friend_or_already_aske
         "find_user",
         json!({ "uid": "42", "display_name": "Chi", "zalo_name": "chi", "avatar": "a42" }),
     );
-    r.api
-        .respond("get_sent_friend_request", json!({ "42": { "userId": "42" } }));
+    r.api.respond(
+        "get_sent_friend_request",
+        json!({ "42": { "userId": "42" } }),
+    );
     assert_eq!(
         r.session.find_user("0901234567").await.unwrap(),
         FoundUser {
@@ -297,12 +319,19 @@ async fn groups_create_with_2_plus_people_add_members_rename_leave_removes_the_c
         "create_group",
         json!({ "groupId": "555", "sucessMembers": ["2", "3"], "errorMembers": ["4"], "groupType": 0, "error_data": {} }),
     );
+    r.api.respond(
+        "add_user_to_group",
+        json!({ "errorMembers": [], "error_data": {} }),
+    );
     r.api
-        .respond("add_user_to_group", json!({ "errorMembers": [], "error_data": {} }));
-    r.api.respond("get_group_info", json!({ "gridInfoMap": {} }));
+        .respond("get_group_info", json!({ "gridInfoMap": {} }));
     let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    let err = r.session.create_group("x", &ids(&["2", "me"])).await.unwrap_err();
+    let err = r
+        .session
+        .create_group("x", &ids(&["2", "me"]))
+        .await
+        .unwrap_err();
     assert!(err.message.contains("at least 2"), "{}", err.message);
     assert_eq!(
         r.session
@@ -313,12 +342,20 @@ async fn groups_create_with_2_plus_people_add_members_rename_leave_removes_the_c
     );
     assert_eq!(
         r.api.calls_to("create_group"),
-        vec![vec![json!({ "name": "Nhóm bạn", "members": ["2", "3", "4"] })]]
+        vec![vec![
+            json!({ "name": "Nhóm bạn", "members": ["2", "3", "4"] })
+        ]]
     );
-    assert_eq!(r.store.get_thread(ThreadKind::Group, "555").unwrap().name, "Nhóm bạn");
+    assert_eq!(
+        r.store.get_thread(ThreadKind::Group, "555").unwrap().name,
+        "Nhóm bạn"
+    );
 
     assert_eq!(
-        r.session.add_group_members("555", &ids(&["5", "me"])).await.unwrap(),
+        r.session
+            .add_group_members("555", &ids(&["5", "me"]))
+            .await
+            .unwrap(),
         Vec::<String>::new()
     );
     assert_eq!(
@@ -331,10 +368,16 @@ async fn groups_create_with_2_plus_people_add_members_rename_leave_removes_the_c
         r.api.calls_to("change_group_name"),
         vec![vec![json!("Tên mới"), json!("555")]]
     );
-    assert_eq!(r.store.get_thread(ThreadKind::Group, "555").unwrap().name, "Tên mới");
+    assert_eq!(
+        r.store.get_thread(ThreadKind::Group, "555").unwrap().name,
+        "Tên mới"
+    );
 
     r.session.leave_group("555", true).await.unwrap();
-    assert_eq!(r.api.calls_to("leave_group"), vec![vec![json!("555"), json!(true)]]);
+    assert_eq!(
+        r.api.calls_to("leave_group"),
+        vec![vec![json!("555"), json!(true)]]
+    );
     assert!(r.store.get_thread(ThreadKind::Group, "555").is_none());
 }
 
@@ -345,5 +388,9 @@ async fn removing_a_member_zalo_refuses_says_why() {
         .respond("remove_user_from_group", json!({ "errorMembers": ["5"] }));
     let err = r.session.remove_group_member("555", "5").await.unwrap_err();
     assert_eq!(err.status, 403);
-    assert!(err.message.contains("owner and deputies"), "{}", err.message);
+    assert!(
+        err.message.contains("owner and deputies"),
+        "{}",
+        err.message
+    );
 }

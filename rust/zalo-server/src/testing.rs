@@ -22,8 +22,8 @@ use zalo_proto::{
     AddPollOptionsInput, AvatarSize, CreateGroupOptions, CreatePollInput, Credentials,
     DeleteMessageTarget, DestType, ForwardMessagePayload, LastMessageInfo, LoginQrEvent,
     MuteAction, MuteDuration, NoisedIdsReply, ProtoError, ReactionTarget, Result as ProtoResult,
-    SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType, UndoTarget,
-    UploadResult, UploadSource, WsEvent, ZaloClient,
+    SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType,
+    UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient,
 };
 
 use crate::api::{BoxFuture, ListenerControl, ListenerStart, ZaloApi, ZaloLogin};
@@ -79,7 +79,11 @@ impl FakeZaloApi {
     }
 
     /// Always fails `method` with the error `make` builds.
-    pub fn fail(&self, method: &'static str, make: impl Fn() -> ProtoError + Send + Sync + 'static) {
+    pub fn fail(
+        &self,
+        method: &'static str,
+        make: impl Fn() -> ProtoError + Send + Sync + 'static,
+    ) {
         self.on(method, move |_| Err(make()));
     }
 
@@ -162,7 +166,11 @@ impl FakeZaloApi {
             .is_some_and(|l| l.tx.send(event).is_ok())
     }
 
-    fn dispatch(&self, method: &'static str, args: Vec<Value>) -> BoxFuture<'static, ProtoResult<Value>> {
+    fn dispatch(
+        &self,
+        method: &'static str,
+        args: Vec<Value>,
+    ) -> BoxFuture<'static, ProtoResult<Value>> {
         let handler = {
             let mut st = self.lock();
             st.calls.push(Call {
@@ -300,7 +308,10 @@ pub struct LoginStep {
 impl LoginStep {
     pub fn cookie<F>(f: F) -> Self
     where
-        F: Fn(Credentials) -> BoxFuture<'static, ProtoResult<Arc<dyn ZaloApi>>> + Send + Sync + 'static,
+        F: Fn(Credentials) -> BoxFuture<'static, ProtoResult<Arc<dyn ZaloApi>>>
+            + Send
+            + Sync
+            + 'static,
     {
         Self {
             cookie: Some(Arc::new(f)),
@@ -362,12 +373,17 @@ impl FakeLogin {
 
     fn step(&self) -> Option<LoginStep> {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
-        self.steps.get(n.min(self.steps.len().saturating_sub(1))).cloned()
+        self.steps
+            .get(n.min(self.steps.len().saturating_sub(1)))
+            .cloned()
     }
 }
 
 impl ZaloLogin for FakeLogin {
-    fn login_cookie(&self, credentials: Credentials) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>> {
+    fn login_cookie(
+        &self,
+        credentials: Credentials,
+    ) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>> {
         let f = self.step().and_then(|s| s.cookie);
         Box::pin(async move {
             match f {

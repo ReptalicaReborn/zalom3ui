@@ -17,10 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use zalo_proto::{
     AddPollOptionsInput, AvatarSize, CreateGroupOptions, CreatePollInput, Credentials,
-    DeleteMessageTarget, DestType, ForwardMessagePayload, ListenerHandle, LastMessageInfo,
+    DeleteMessageTarget, DestType, ForwardMessagePayload, LastMessageInfo, ListenerHandle,
     LoginQrEvent, MuteAction, MuteDuration, NoisedIdsReply, ReactionTarget, Result as ProtoResult,
-    SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType, UndoTarget,
-    UploadResult, UploadSource, WsEvent, ZaloClient, ZaloHttp,
+    SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType,
+    UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient, ZaloHttp,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -180,7 +180,10 @@ with_api_methods!(define_api_trait);
 /// Logs in to Zalo, from saved credentials or a QR code.
 pub trait ZaloLogin: Send + Sync {
     /// Logs in with saved credentials.
-    fn login_cookie(&self, credentials: Credentials) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>>;
+    fn login_cookie(
+        &self,
+        credentials: Credentials,
+    ) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>>;
 
     /// Runs a QR-code login, reporting progress on `event_tx` until `abort_rx` fires or it ends.
     fn login_qr(
@@ -194,7 +197,10 @@ pub trait ZaloLogin: Send + Sync {
 pub struct ProtoLogin;
 
 impl ZaloLogin for ProtoLogin {
-    fn login_cookie(&self, credentials: Credentials) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>> {
+    fn login_cookie(
+        &self,
+        credentials: Credentials,
+    ) -> BoxFuture<'_, ProtoResult<Arc<dyn ZaloApi>>> {
         Box::pin(async move {
             let client = zalo_proto::login_cookie(credentials).await?;
             Ok(Arc::new(ProtoApi::new(Arc::new(client))) as Arc<dyn ZaloApi>)
@@ -209,7 +215,10 @@ impl ZaloLogin for ProtoLogin {
         Box::pin(async move {
             let http = ZaloHttp::new()?;
             let (creds, client) = zalo_proto::login_qr(http, None, event_tx, abort_rx).await?;
-            Ok((creds, Arc::new(ProtoApi::new(Arc::new(client))) as Arc<dyn ZaloApi>))
+            Ok((
+                creds,
+                Arc::new(ProtoApi::new(Arc::new(client))) as Arc<dyn ZaloApi>,
+            ))
         })
     }
 }

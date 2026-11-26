@@ -96,8 +96,14 @@ async fn is_transient_error_tells_network_failures_from_rejected_sessions() {
 
 #[tokio::test]
 async fn describe_error_explains_fetch_failures() {
-    assert_eq!(describe_proto_error(&dns_failure()), "no internet connection");
-    assert_eq!(describe_proto_error(&refused_http_error().await), "connection refused");
+    assert_eq!(
+        describe_proto_error(&dns_failure()),
+        "no internet connection"
+    );
+    assert_eq!(
+        describe_proto_error(&refused_http_error().await),
+        "connection refused"
+    );
     assert_eq!(
         describe_proto_error(&ProtoError::Io(io::Error::from(io::ErrorKind::TimedOut))),
         "connection timed out"
@@ -121,11 +127,17 @@ async fn a_saved_session_that_cant_reach_zalo_is_retried_not_logged_out() {
     assert_eq!(s.state, SessionState::LoggingIn);
     assert!(s.retrying);
     assert!(
-        s.error.as_deref().unwrap_or("").contains("no internet connection"),
+        s.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no internet connection"),
         "{:?}",
         s.error
     );
-    assert!(dir.join("credentials.json").exists(), "credentials are kept");
+    assert!(
+        dir.join("credentials.json").exists(),
+        "credentials are kept"
+    );
 
     session.retry_now();
     settle().await;
@@ -134,7 +146,10 @@ async fn a_saved_session_that_cant_reach_zalo_is_retried_not_logged_out() {
     assert_eq!(s.state, SessionState::LoggedOut);
     assert!(!s.retrying);
     assert!(
-        s.error.as_deref().unwrap_or("").contains("session has ended"),
+        s.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("session has ended"),
         "{:?}",
         s.error
     );
@@ -184,7 +199,11 @@ async fn declining_on_the_phone_says_so_instead_of_cancelled() {
     settle().await;
     let s = session.get_status();
     assert_eq!(s.state, SessionState::LoggedOut);
-    assert!(s.error.as_deref().unwrap_or("").contains("declined"), "{:?}", s.error);
+    assert!(
+        s.error.as_deref().unwrap_or("").contains("declined"),
+        "{:?}",
+        s.error
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -296,7 +315,10 @@ async fn got_login_info_writes_credentials_atomically_with_mode_0600() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&cred_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&cred_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
     let _ = fs::remove_dir_all(&dir);
 }
