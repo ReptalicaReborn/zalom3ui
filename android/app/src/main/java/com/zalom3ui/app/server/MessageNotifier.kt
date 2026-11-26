@@ -37,10 +37,15 @@ import kotlinx.coroutines.launch
 
 /**
  * Shows a notification for each new message the on-phone server flags (`notify`: not mine, not muted, not the chat on
- * screen, not replayed history), one per chat with its recent lines, and removes it once the chat is read anywhere.
- * Runs in [ZaloService], so it works while the app is closed.
+ * screen, not replayed history unless the bridge's notify window is open), one per chat with its recent lines, and
+ * removes it once the chat is read anywhere. Runs in [ZaloService] ("Always"), or while Zalỏ is online in the other
+ * "Stay connected" modes (see [StayConnectedCoordinator]).
  */
-class MessageNotifier(private val context: Context) {
+class MessageNotifier(
+    private val context: Context,
+    /** Called after a message notification for the chat was posted, with the chat's title (the bridge hides Zalo's own). */
+    private val onPosted: (ThreadRef, String) -> Unit = { _, _ -> },
+) {
     private val history = object : LinkedHashMap<String, ArrayDeque<Line>>(MAX_THREADS, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArrayDeque<Line>>?): Boolean =
             size > MAX_THREADS
@@ -144,7 +149,8 @@ class MessageNotifier(private val context: Context) {
             .addAction(markRead)
             .build()
         if (canNotify(context)) {
-            runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
+            val posted = runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
+            if (posted.isSuccess) runCatching { onPosted(ref, threadName) }
         }
     }
 

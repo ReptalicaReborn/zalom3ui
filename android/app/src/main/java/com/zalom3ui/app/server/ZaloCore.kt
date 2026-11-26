@@ -25,6 +25,9 @@ object ZaloCore : CoreNatives {
     @Volatile
     private var started = false
 
+    /** The core is running in this process (without starting it, unlike [ensureStarted]). */
+    val isStarted: Boolean get() = started
+
     /**
      * Starts the core if it is not running. Blocks for a moment on the first call (it opens the message store), so call
      * it from a background thread. False if it could not start; the reason is in the startup log.
@@ -42,6 +45,8 @@ object ZaloCore : CoreNatives {
             val code = start(dataDir.absolutePath, StartupLog.serverLog(app).absolutePath)
             started = code == 0
             StartupLog.write(app, if (started) "core: started" else "core: failed to start (code $code)")
+            // In the "While open" modes, a start from anywhere but the screen is paused again after a grace period.
+            if (started) StayConnectedCoordinator.onCoreStarted()
             started
         } catch (e: Throwable) {
             Log.e(TAG, "Could not start the Zalo core", e)

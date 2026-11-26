@@ -62,6 +62,20 @@
             android:name=".server.NotificationActionReceiver"
             android:exported="false" />
 
+        <!-- "While open + notification bridge": watches the official Zalo app's notifications to bring the core online for
+             a minute. Off unless that mode is chosen (the app enables it), and only bound once the user grants
+             notification access. -->
+        <service
+            android:name=".server.ZaloNotificationListener"
+            android:enabled="false"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <!-- "Decline" on incoming call notifications. -->
         <receiver
             android:name=".server.CallActionReceiver"

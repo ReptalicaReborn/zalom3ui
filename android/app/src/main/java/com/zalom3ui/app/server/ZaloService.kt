@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import com.zalom3ui.app.MainActivity
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.ApiClient
+import com.zalom3ui.app.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -58,6 +59,13 @@ class ZaloService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         StartupLog.write(this, "service: start command")
         if (!promoteToForeground()) {
+            return START_NOT_STICKY
+        }
+        // A start left over from before "Stay connected" was switched away from Always: Android needs the notification
+        // above to have been posted, then the service has no business running.
+        if (!SettingsStore(this).loadStay().mode.keepsForegroundService) {
+            StartupLog.write(this, "service: not wanted in this Stay connected mode, stopping")
+            stopSelf()
             return START_NOT_STICKY
         }
         // Idempotent: the core may already be running because the app started it.

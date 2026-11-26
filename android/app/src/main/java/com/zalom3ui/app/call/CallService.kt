@@ -638,6 +638,9 @@ class CallService : Service() {
         val notice: StateFlow<String?> = _notice.asStateFlow()
 
         private var activeInstance: CallService? = null
+
+        /** The call service is running (a call is being placed, answered or held). "Stay connected" never pauses then. */
+        val isRunning: Boolean get() = synchronized(mediaLock) { activeInstance != null }
         private var activeMedia: CallMedia? = null
 
         // The screen's surfaces outlive the media (they exist while connecting), so they are kept here.
