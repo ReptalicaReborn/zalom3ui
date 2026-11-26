@@ -3312,3 +3312,7 @@ mod tests {
 
 #[cfg(test)]
 mod reconnect_tests;
+#[cfg(test)]
+mod session_tests;
+#[cfg(test)]
+mod test_support;
