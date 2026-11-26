@@ -427,6 +427,7 @@ impl CallManager {
         self.stop_control_poller();
         if let Ok(mut s) = self.inner.lock() {
             s.ctrl_poll_off = false;
+            s.handled_controls.clear();
         }
         let active_id = self
             .inner
@@ -3332,6 +3333,31 @@ mod tests {
             .call_trace()
             .read()
             .contains("chat socket closed (3003) while polling"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `logout()` in `src/session.ts` clears both the ringing calls and the handled-control keys.
+    #[tokio::test]
+    async fn logout_forgets_ringing_calls_and_handled_controls() {
+        let (_session, mgr, _transport, dir) = make_manager(0);
+        mgr.on_voip_control(&ring_control(0, "777000001", false), "socket", now_ms(), false);
+        mgr.on_voip_control(
+            &json!({ "act": "cancel", "data": { "callId": "777000002" }, "raw": {} }),
+            "socket",
+            now_ms(),
+            false,
+        );
+        {
+            let s = mgr.inner.lock().unwrap();
+            assert_eq!(s.ringing.len(), 1);
+            assert!(s.handled_controls.contains_key("cancel:777000002"));
+        }
+
+        mgr.on_logout();
+        let s = mgr.inner.lock().unwrap();
+        assert!(s.ringing.is_empty());
+        assert!(s.handled_controls.is_empty(), "stale dedupe keys survived the logout");
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 
