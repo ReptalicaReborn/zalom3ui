@@ -299,7 +299,7 @@ pub struct QuoteInput {
     pub ttl: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UploadSource {
     pub filename: String,
     pub data: Vec<u8>,
@@ -307,7 +307,7 @@ pub struct UploadSource {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SendMessageOptions {
     pub msg: String,
     pub attachments: Vec<UploadSource>,
@@ -444,13 +444,13 @@ pub struct SeenMessageInput {
     pub ts: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MuteAction {
     Mute = 1,
     Unmute = 3,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MuteDuration {
     OneHour,
     FourHours,
@@ -469,7 +469,7 @@ pub struct LastMessageInfo {
     pub global_msg_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateGroupOptions {
     pub name: Option<String>,
     pub members: Vec<String>,

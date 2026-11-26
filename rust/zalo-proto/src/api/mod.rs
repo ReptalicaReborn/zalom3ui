@@ -24,7 +24,8 @@ pub const PROFILE_SERVICE_FALLBACK: &str = "https://tt-profile-wpa.chat.zalo.me"
 pub const MAX_BACKUP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Reply from `/api/znoise` mapping plain mobile user/group IDs to Zalo Web noised IDs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NoisedIdsReply {
     pub users: HashMap<String, String>,
     pub groups: HashMap<String, String>,

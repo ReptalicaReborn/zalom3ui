@@ -32,8 +32,9 @@ use zalo_proto::{
 };
 
 use crate::errors::{ApiResult, HttpError};
+use crate::routes::history_sync::sync_control_of;
 use crate::routes::AppState;
-use crate::session::ZaloSession;
+use crate::session::{ListenerClosed, ZaloSession};
 use crate::types::{
     CallEvent, CallState, CurrentCall, IncomingCall as ServerIncomingCall, SessionState, ThreadKind,
 };
@@ -302,6 +303,9 @@ struct CallStateInner {
     ctrl_poll_client: Option<Weak<ZaloClient>>,
     ctrl_poll_handle: Option<ControlPollerHandle>,
     ctrl_poll_task: Option<JoinHandle<()>>,
+    /// Set when the chat socket was kicked while polling; stays set until logout, so the poller
+    /// is not restarted (`ctrlPollOff` in `src/session.ts`).
+    ctrl_poll_off: bool,
 }
 
 impl Default for CallStateInner {
@@ -314,6 +318,7 @@ impl Default for CallStateInner {
             ctrl_poll_client: None,
             ctrl_poll_handle: None,
             ctrl_poll_task: None,
+            ctrl_poll_off: false,
         }
     }
 }
@@ -374,6 +379,7 @@ impl CallManager {
         let session = Arc::clone(&self.session);
         let mut voip_rx = session.subscribe_voip_controls();
         let mut events_rx = session.subscribe_events();
+        let mut closed_rx = session.subscribe_listener_closed();
 
         // Start ControlPoller immediately if already logged in.
         self.sync_control_poller();
@@ -381,6 +387,18 @@ impl CallManager {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // Close codes are sent before the matching status event, so this arm must win
+                    // when both are ready: the poller has to be off before a status event
+                    // would restart it.
+                    biased;
+                    ev = closed_rx.recv() => {
+                        let Some(mgr) = weak.upgrade() else { break };
+                        match ev {
+                            Ok(closed) => mgr.on_listener_closed(&closed),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
                     ev = voip_rx.recv() => {
                         let Some(mgr) = weak.upgrade() else { break };
                         match ev {
@@ -449,6 +467,10 @@ impl CallManager {
 
     fn on_logout(self: &Arc<Self>) {
         self.stop_control_poller();
+        if let Ok(mut s) = self.inner.lock() {
+            s.ctrl_poll_off = false;
+            s.handled_controls.clear();
+        }
         let active_id = self
             .inner
             .lock()
@@ -464,6 +486,31 @@ impl CallManager {
                 }
             }
         }
+    }
+
+    /// The chat socket closed. If Zalo kicked it (another web session, or maybe our own poll)
+    /// while the control poller runs, stop the poller for good (until logout) and leave a note in
+    /// the call log, like `listener.on("closed")` in `src/session.ts`.
+    fn on_listener_closed(&self, closed: &ListenerClosed) {
+        if !closed.kicked {
+            return;
+        }
+        {
+            let Ok(mut s) = self.inner.lock() else { return };
+            let Some(mut handle) = s.ctrl_poll_handle.take() else {
+                return;
+            };
+            handle.stop();
+            if let Some(t) = s.ctrl_poll_task.take() {
+                t.abort();
+            }
+            s.ctrl_poll_client = None;
+            s.ctrl_poll_off = true;
+        }
+        self.session.call_trace().record(&json!({
+            "kind": "ctrl_poll_off",
+            "reason": format!("chat socket closed ({}) while polling", closed.code),
+        }));
     }
 
     fn stop_control_poller(&self) {
@@ -490,6 +537,9 @@ impl CallManager {
         }
         {
             let Ok(s) = self.inner.lock() else { return };
+            if s.ctrl_poll_off {
+                return;
+            }
             if let Some(ref existing) = s.ctrl_poll_client {
                 if let Some(existing_arc) = existing.upgrade() {
                     if Arc::ptr_eq(&existing_arc, &client) {
@@ -594,34 +644,8 @@ impl CallManager {
                 {
                     break;
                 }
-                match ev {
-                    ControlPollEvent::Controls(controls) => {
-                        for ctrl in extract_voip_controls(&controls) {
-                            mgr.on_voip_control(&ctrl, "poll", now_ms(), true);
-                        }
-                    }
-                    ControlPollEvent::Refused { code, message } => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_refused",
-                            "code": code,
-                            "message": message,
-                        }));
-                        break;
-                    }
-                    ControlPollEvent::Error { message, failures } => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_error",
-                            "error": message,
-                            "failures": failures,
-                        }));
-                    }
-                    ControlPollEvent::Unavailable(reason) => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_unavailable",
-                            "reason": reason,
-                        }));
-                        break;
-                    }
+                if !mgr.on_control_poll_event(ev) {
+                    break;
                 }
             }
         });
@@ -630,6 +654,48 @@ impl CallManager {
             s.ctrl_poll_client = Some(Arc::downgrade(&client));
             s.ctrl_poll_handle = Some(handle);
             s.ctrl_poll_task = Some(task);
+        }
+    }
+
+    /// Handles one [`ControlPollEvent`] from the control poller. Returns `false` when the poller
+    /// is finished (refused or unavailable) and its task should stop.
+    ///
+    /// `Controls` feed both the call state machine (VoIP controls) and the history-sync manager
+    /// (`syncmsgmb` and friends), like `onControls` in `src/session.ts`.
+    fn on_control_poll_event(self: &Arc<Self>, ev: ControlPollEvent) -> bool {
+        match ev {
+            ControlPollEvent::Controls(controls) => {
+                for ctrl in extract_sync_controls(&controls) {
+                    self.session.publish_history_sync_control(ctrl);
+                }
+                for ctrl in extract_voip_controls(&controls) {
+                    self.on_voip_control(&ctrl, "poll", now_ms(), true);
+                }
+                true
+            }
+            ControlPollEvent::Refused { code, message } => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_refused",
+                    "code": code,
+                    "message": message,
+                }));
+                false
+            }
+            ControlPollEvent::Error { message, failures } => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_error",
+                    "error": message,
+                    "failures": failures,
+                }));
+                true
+            }
+            ControlPollEvent::Unavailable(reason) => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_unavailable",
+                    "reason": reason,
+                }));
+                false
+            }
         }
     }
 
@@ -2327,6 +2393,23 @@ fn extract_voip_controls(controls: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Extracts history-sync controls from raw `ControlPoller` entries, in the shape the chat-socket
+/// path publishes (`{ actType, act, data, raw }`, see `ZaloSession::subscribe_history_sync_controls`).
+fn extract_sync_controls(controls: &[Value]) -> Vec<Value> {
+    controls
+        .iter()
+        .filter_map(|control| {
+            let sync = sync_control_of(control)?;
+            Some(json!({
+                "actType": sync.act_type,
+                "act": sync.act,
+                "data": Value::Object(sync.data),
+                "raw": control,
+            }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3290,6 +3373,220 @@ mod tests {
         );
 
         srv_handle.abort();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A real protocol client whose control server refuses connections, so the poller starts and
+    /// idles without any network.
+    fn polling_client() -> Arc<ZaloClient> {
+        use zalo_proto::{ZaloContext, ZaloCookieJar, ZaloHttp};
+        let ctx = ZaloContext {
+            uid: "me".into(),
+            imei: "imei".into(),
+            user_agent: "ua".into(),
+            language: "vi".into(),
+            api_type: 30,
+            api_version: 645,
+            secret_key: "c2VjcmV0".into(),
+            service_map: HashMap::new(),
+            ws_urls: Vec::new(),
+            ctrs_urls: vec!["https://127.0.0.1:1".into()],
+            settings: json!({}),
+            extra_ver: json!({}),
+            login_info: json!({ "zpw_ctrs_new": ["https://127.0.0.1:1"] }),
+            cookies: Arc::new(std::sync::RwLock::new(ZaloCookieJar::new())),
+            upload_callbacks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        Arc::new(ZaloClient::new(Arc::new(ctx), ZaloHttp::new().unwrap()))
+    }
+
+    fn poller_running(mgr: &CallManager) -> bool {
+        mgr.inner.lock().unwrap().ctrl_poll_handle.is_some()
+    }
+
+    fn kicked(code: u16) -> ListenerClosed {
+        ListenerClosed { code, kicked: true }
+    }
+
+    #[tokio::test]
+    async fn a_kicked_chat_socket_turns_the_control_poller_off_until_logout() {
+        use crate::api::ProtoApi;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        // An ordinary drop leaves the poller alone.
+        mgr.on_listener_closed(&ListenerClosed {
+            code: 1006,
+            kicked: false,
+        });
+        assert!(poller_running(&mgr));
+        assert!(!session.call_trace().read().contains("ctrl_poll_off"));
+
+        // A kick stops it, and says why in the call log.
+        mgr.on_listener_closed(&kicked(3000));
+        assert!(!poller_running(&mgr));
+        let trace = session.call_trace().read();
+        assert!(trace.contains("\"kind\":\"ctrl_poll_off\""), "{trace}");
+        assert!(trace.contains("chat socket closed (3000) while polling"), "{trace}");
+
+        // It is not restarted by the status changes that follow...
+        mgr.sync_control_poller();
+        assert!(!poller_running(&mgr));
+
+        // ...until the user logs out and in again.
+        mgr.on_logout();
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        mgr.stop_control_poller();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_kick_while_not_polling_leaves_no_off_switch() {
+        use crate::api::ProtoApi;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        // No poller running yet.
+        mgr.on_listener_closed(&kicked(3003));
+        assert!(!session.call_trace().read().contains("ctrl_poll_off"));
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr), "the poller can still start");
+        mgr.stop_control_poller();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_session_close_signal_stops_the_poller_before_status_changes_restart_it() {
+        use crate::api::ProtoApi;
+        use crate::testing::settle;
+        use zalo_proto::WsEvent;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        mgr.spawn_background();
+        assert!(poller_running(&mgr), "started when already logged in");
+
+        session
+            .testing_dispatch(WsEvent::Closed {
+                code: 3003,
+                reason: "kicked".into(),
+            })
+            .await;
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(session.get_status().state, SessionState::Disconnected);
+        assert!(!poller_running(&mgr), "the poller stays off after the disconnected status");
+        assert!(session
+            .call_trace()
+            .read()
+            .contains("chat socket closed (3003) while polling"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `logout()` in `src/session.ts` clears both the ringing calls and the handled-control keys.
+    #[tokio::test]
+    async fn logout_forgets_ringing_calls_and_handled_controls() {
+        let (_session, mgr, _transport, dir) = make_manager(0);
+        mgr.on_voip_control(&ring_control(0, "777000001", false), "socket", now_ms(), false);
+        mgr.on_voip_control(
+            &json!({ "act": "cancel", "data": { "callId": "777000002" }, "raw": {} }),
+            "socket",
+            now_ms(),
+            false,
+        );
+        {
+            let s = mgr.inner.lock().unwrap();
+            assert_eq!(s.ringing.len(), 1);
+            assert!(s.handled_controls.contains_key("cancel:777000002"));
+        }
+
+        mgr.on_logout();
+        let s = mgr.inner.lock().unwrap();
+        assert!(s.ringing.is_empty());
+        assert!(s.handled_controls.is_empty(), "stale dedupe keys survived the logout");
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_sync_controls_uses_the_socket_shape() {
+        let entries = [
+            json!({ "content": { "act_type": "voip", "act": "request", "data": "{}" } }),
+            json!({
+                "controlId": "c9",
+                "content": { "act_type": "syncmsgmb", "act": "user_confirm", "data": r#"{"user_action":1}"# }
+            }),
+        ];
+        let out = extract_sync_controls(&entries);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["actType"], "syncmsgmb");
+        assert_eq!(out[0]["act"], "user_confirm");
+        assert_eq!(out[0]["data"]["user_action"], 1, "data string is parsed like the socket path");
+        assert_eq!(out[0]["raw"], entries[1]);
+        // The history-sync manager's parser accepts it.
+        assert!(sync_control_of(&out[0]).is_some());
+    }
+
+    /// Regression: history-sync controls arriving via the control poller used to be dropped.
+    #[tokio::test]
+    async fn poll_delivered_sync_control_reaches_history_sync_manager() {
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = temp_dir("zalo-calls-poll-sync");
+        let store = ChatStore::open(dir.clone());
+        let session = Arc::new(ZaloSession::new(store.clone(), dir.clone(), true));
+        let state = AppState {
+            config: Arc::new(Config::from_lookup(|_| None).unwrap()),
+            session: Arc::clone(&session),
+            store,
+        };
+        let app = crate::routes::history_sync::router(state.clone()).with_state(state);
+        let mgr = CallManager::new(Arc::clone(&session));
+
+        let keep_going = mgr.on_control_poll_event(ControlPollEvent::Controls(vec![json!({
+            "controlId": "c1",
+            "content": {
+                "act_type": "syncmsgmb",
+                "act": "user_confirm",
+                "data": r#"{"user_action":1,"pc_name":"x"}"#,
+            }
+        })]));
+        assert!(keep_going);
+
+        let mut seen = false;
+        for _ in 0..50 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/history-sync/status")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+            let log = body["log"].as_array().cloned().unwrap_or_default();
+            if log
+                .iter()
+                .filter_map(|l| l.as_str())
+                .any(|l| l.contains("control act_type=syncmsgmb act=user_confirm"))
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "the manager never saw the polled syncmsgmb control");
         let _ = fs::remove_dir_all(&dir);
     }
 }
