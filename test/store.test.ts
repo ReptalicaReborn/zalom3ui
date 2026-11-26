@@ -421,3 +421,110 @@ test("unnamedThreads lists chats still named by their id", () => {
     store.upsertThread({ id: "3", kind: "group", name: "3", avatar: "" });
     assert.deepEqual(store.unnamedThreads().map((t) => t.id).sort(), ["1", "3"]);
 });
+
+/** listThreads' unread counts and searchMessages computed the slow way, from the store's own state. */
+function reference(store: ChatStore) {
+    const s = store as unknown as {
+        threads: Map<string, { id: string; name: string; avatar: string }>;
+        messages: Map<string, StoredMessage[]>;
+        readUpTo: Map<string, number>;
+        markedUnread: Set<string>;
+    };
+    const fold = (t: string) => t.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/g, "d").replace(/Đ/g, "D").toLowerCase();
+    return {
+        unread: Object.fromEntries(
+            [...s.threads.keys()].map((key) => {
+                const readTs = s.readUpTo.get(key) ?? 0;
+                const n = (s.messages.get(key) ?? []).filter((m) => !m.isSelf && m.ts > readTs).length;
+                return [key, Math.max(n, s.markedUnread.has(key) ? 1 : 0)];
+            }),
+        ),
+        search(query: string): string[] {
+            const needle = fold(query.trim());
+            if (!needle) return [];
+            const hits: StoredMessage[] = [];
+            for (const list of s.messages.values()) {
+                for (const m of list) {
+                    if (m.recalled) continue;
+                    const hit =
+                        fold(m.text).includes(needle) ||
+                        (m.attachment?.title !== undefined && fold(m.attachment.title).includes(needle)) ||
+                        (m.attachment?.description !== undefined && fold(m.attachment.description).includes(needle));
+                    if (hit) hits.push(m);
+                }
+            }
+            return hits
+                .sort((a, b) => b.ts - a.ts)
+                .slice(0, 50)
+                .map((m) => m.id);
+        },
+    };
+}
+
+test("cached unread counts and search text match recomputing them on every call", () => {
+    const store = new ChatStore();
+    const queries = ["cà phê", "ca phe", "DUONG", "báo cáo", "recalled", "hẹn", "tin tuc", "x"];
+    const check = (step: string) => {
+        const ref = reference(store);
+        const unread = Object.fromEntries(store.listThreads(1_000).map((t) => [`${t.kind}:${t.id}`, t.unread]));
+        assert.deepEqual(unread, ref.unread, `unread after ${step}`);
+        for (const q of queries) {
+            assert.deepEqual(
+                store.searchMessages(q).map((h) => h.message.id),
+                ref.search(q),
+                `search "${q}" after ${step}`,
+            );
+        }
+    };
+    const inThread = (id: string, ts: number, threadId: string, extra: Partial<StoredMessage> = {}) =>
+        msg(id, ts, { threadId, fromId: threadId, ...extra });
+
+    store.addMessage(inThread("a1", 1000, "a", { text: "Cà phê sữa đá nhé" }));
+    store.addMessage(inThread("a2", 2000, "a", { text: "Đường Điện Biên Phủ" }));
+    store.addMessage(inThread("a3", 3000, "a", { text: "ok", isSelf: true }));
+    store.addMessage(inThread("a4", 4000, "a", { text: "hẹn gặp" }));
+    store.addMessage(
+        inThread("b1", 1500, "b", { text: "[Link] Tin tức", attachment: { kind: "link", title: "Tin tức", description: "Cà phê Hà Nội" } }),
+    );
+    store.addMessage(inThread("b2", 2500, "b", { text: "[File] Báo cáo.pdf", attachment: { kind: "file", title: "Báo cáo.pdf" } }));
+    check("adding");
+
+    store.markRead("user", "a", 2000);
+    check("markRead");
+    store.markUnread("user", "b");
+    store.markRead("user", "b", 1500);
+    check("markUnread then markRead");
+    store.applyReaction("a4", "x", "/-heart");
+    store.recall("a1");
+    check("react and recall");
+    store.removeMessage("a4");
+    check("remove");
+    store.addMessage(inThread("a0", 500, "a", { text: "older cà phê" }));
+    check("older message");
+
+    // A plain-id history thread merged into its real thread.
+    store.addMessage(inThread("p1", 1200, "123", { text: "đường cũ", fromName: "", raw: undefined }), { history: true });
+    store.addMessage(inThread("p2", 5000, "123", { text: "hẹn mai", fromName: "", raw: undefined }), { history: true });
+    check("history");
+    store.settleHistory("user", "123", new Set(["p1"]));
+    check("settleHistory");
+    assert.equal(store.migrateThread("user", "123", "b"), true);
+    check("migrateThread");
+
+    // Filling a chat past the limit evicts its oldest messages.
+    for (let i = 0; i < 505; i++) {
+        store.addMessage(inThread(`c${i}`, 10_000 + i, "c", { text: i % 2 ? "x đường" : "y", isSelf: i % 3 === 0 }));
+    }
+    check("eviction");
+    store.markRead("user", "c", 10_300);
+    check("markRead after eviction");
+    assert.equal(store.addMessage(inThread("c-old", 1, "c")), false);
+    check("evicting the new message at once");
+
+    store.clearThreadMessages("user", "a");
+    check("clearThreadMessages");
+    store.removeThread("user", "b");
+    check("removeThread");
+    store.clear();
+    check("clear");
+});

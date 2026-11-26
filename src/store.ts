@@ -600,6 +600,16 @@ type Snapshot = {
     messageCap?: number;
 };
 
+/** A message's text, title and description folded for search, with the strings they were folded from. */
+type SearchText = {
+    text: string;
+    title: string | undefined;
+    description: string | undefined;
+    foldedText: string;
+    foldedTitle: string | undefined;
+    foldedDescription: string | undefined;
+};
+
 /**
  * In-memory cache of threads and messages, snapshotted to disk.
  *
@@ -618,6 +628,10 @@ export class ChatStore {
     private saveTimer: NodeJS.Timeout | null = null;
     ownId: string | null = null;
     private messageCap = MAX_MESSAGES_PER_THREAD;
+    /** Unread incoming messages per thread at the read marker they were counted at; dropped when the thread's messages change. */
+    private unreadCounts = new Map<string, { readTs: number; count: number }>();
+    /** Folded search text per message, so a search does not fold every message again. Never saved. */
+    private searchText = new WeakMap<StoredMessage, SearchText>();
 
     constructor(private readonly file: string | null = null) {
         this.load();
@@ -663,6 +677,7 @@ export class ChatStore {
             if (this.index.get(m.id) === key) this.index.delete(m.id);
         }
         this.messages.delete(key);
+        this.threadChanged(key);
         this.threads.delete(key);
         this.readUpTo.delete(key);
         this.markedUnread.delete(key);
@@ -710,6 +725,7 @@ export class ChatStore {
             }
         }
         if (targetList.length > 0) this.messages.set(toKey, targetList);
+        this.threadChanged(toKey);
         if (!targetInfo) {
             this.threads.set(toKey, { id: toId, kind, name: toId, avatar: "" });
         }
@@ -718,6 +734,7 @@ export class ChatStore {
         if (mergedRead > 0) this.readUpTo.set(toKey, mergedRead);
 
         this.messages.delete(fromKey);
+        this.threadChanged(fromKey);
         this.threads.delete(fromKey);
         this.readUpTo.delete(fromKey);
         this.markedUnread.delete(fromKey);
@@ -750,13 +767,17 @@ export class ChatStore {
         list.splice(i, 0, msg);
         this.index.set(msg.id, key);
         let evictedSelf = false;
+        let evictedOthers = false;
         if (list.length > this.messageCap) {
             for (const dropped of list.splice(0, list.length - this.messageCap)) {
                 this.index.delete(dropped.id);
                 if (dropped.id === msg.id) evictedSelf = true;
+                else evictedOthers = true;
             }
         }
         this.messages.set(key, list);
+        // Only this message falling off at once leaves the list as it was.
+        if (!evictedSelf || evictedOthers) this.threadChanged(key);
         if (evictedSelf) return false;
 
         const existingThread = this.threads.get(key);
@@ -828,10 +849,11 @@ export class ChatStore {
             const thread = this.threads.get(key);
             for (const m of list) {
                 if (m.recalled) continue;
+                const s = this.searchTextOf(m);
                 const hit =
-                    foldForSearch(m.text).includes(needle) ||
-                    (m.attachment?.title !== undefined && foldForSearch(m.attachment.title).includes(needle)) ||
-                    (m.attachment?.description !== undefined && foldForSearch(m.attachment.description).includes(needle));
+                    s.foldedText.includes(needle) ||
+                    (s.foldedTitle !== undefined && s.foldedTitle.includes(needle)) ||
+                    (s.foldedDescription !== undefined && s.foldedDescription.includes(needle));
                 if (hit) matches.push({ thread, msg: m });
             }
         }
@@ -870,9 +892,10 @@ export class ChatStore {
         const key = this.index.get(msgId);
         const list = key ? this.messages.get(key) : undefined;
         const i = list?.findIndex((m) => m.id === msgId) ?? -1;
-        if (!list || i < 0) return undefined;
+        if (!key || !list || i < 0) return undefined;
         const [removed] = list.splice(i, 1);
         this.index.delete(msgId);
+        this.threadChanged(key);
         this.scheduleSave();
         return removed;
     }
@@ -961,6 +984,7 @@ export class ChatStore {
         const key = threadKey(kind, id);
         for (const m of this.messages.get(key) ?? []) this.index.delete(m.id);
         this.messages.delete(key);
+        this.threadChanged(key);
         this.markedUnread.delete(key);
         this.scheduleSave();
     }
@@ -984,8 +1008,7 @@ export class ChatStore {
         const out: ThreadSummary[] = [];
         for (const [key, info] of this.threads) {
             const list = this.messages.get(key) ?? [];
-            const readTs = this.readUpTo.get(key) ?? 0;
-            const unread = list.filter((m) => !m.isSelf && m.ts > readTs).length;
+            const unread = this.unreadCount(key, list);
             const last = list.at(-1);
             const summary: ThreadSummary = {
                 ...info,
@@ -1027,6 +1050,7 @@ export class ChatStore {
         this.mutedUntil.clear();
         this.markedUnread.clear();
         this.index.clear();
+        this.unreadCounts.clear();
         this.scheduleSave();
     }
 
@@ -1059,8 +1083,43 @@ export class ChatStore {
         const m = this.getMessage(msgId);
         if (!m) return undefined;
         fn(m);
+        this.searchText.delete(m);
         this.scheduleSave();
         return m;
+    }
+
+    /** The thread's messages changed (added, removed, moved or evicted). */
+    private threadChanged(key: string): void {
+        this.unreadCounts.delete(key);
+    }
+
+    /** Incoming messages after the read marker, as `list.filter((m) => !m.isSelf && m.ts > readTs).length`, cached. */
+    private unreadCount(key: string, list: StoredMessage[]): number {
+        const readTs = this.readUpTo.get(key) ?? 0;
+        const cached = this.unreadCounts.get(key);
+        if (cached && cached.readTs === readTs) return cached.count;
+        let count = 0;
+        for (const m of list) if (!m.isSelf && m.ts > readTs) count++;
+        this.unreadCounts.set(key, { readTs, count });
+        return count;
+    }
+
+    private searchTextOf(m: StoredMessage): SearchText {
+        const title = m.attachment?.title;
+        const description = m.attachment?.description;
+        let s = this.searchText.get(m);
+        if (!s || s.text !== m.text || s.title !== title || s.description !== description) {
+            s = {
+                text: m.text,
+                title,
+                description,
+                foldedText: foldForSearch(m.text),
+                foldedTitle: title === undefined ? undefined : foldForSearch(title),
+                foldedDescription: description === undefined ? undefined : foldForSearch(description),
+            };
+            this.searchText.set(m, s);
+        }
+        return s;
     }
 
     private load(): void {
@@ -1083,6 +1142,7 @@ export class ChatStore {
             this.mutedUntil.clear();
             this.markedUnread.clear();
             this.index.clear();
+            this.unreadCounts.clear();
             const backup = `${this.file}.corrupt.${Date.now()}`;
             try {
                 fs.renameSync(this.file, backup);
