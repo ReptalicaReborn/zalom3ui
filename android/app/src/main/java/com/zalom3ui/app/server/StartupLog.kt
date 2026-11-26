@@ -9,8 +9,8 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * What happened while the on-phone Zalo server started: the app asking for the service, the service starting Node,
- * Node exiting, and any error on the way. Written by both processes (UI and ":node") to one small file, so a phone that
+ * What happened while the on-phone Zalo core started: the app asking for the service, the core starting, and any
+ * error on the way. Written by the app, the service and the notification receivers to one small file, so a phone that
  * stays on "Starting Zalo…" can share why. Holds no tokens or messages.
  */
 object StartupLog {
@@ -19,7 +19,7 @@ object StartupLog {
 
     fun file(context: Context): File = File(File(context.filesDir, "zalo").apply { mkdirs() }, "startup.log")
 
-    /** The server's own output (Node's console), see LOG_FILE in src/index.ts. */
+    /** The core's own log output (written by libzalocore.so, see the `logFile` argument of its start). */
     fun serverLog(context: Context): File = File(File(context.filesDir, "zalo").apply { mkdirs() }, "server.log")
 
     @Synchronized
@@ -51,12 +51,11 @@ object StartupLog {
         write(context, "$what: ${e.javaClass.name}: ${e.message}\n" + e.stackTrace.take(8).joinToString("\n") { "    at $it" })
     }
 
-    /** Everything worth sending when the server doesn't start: phone, app, startup steps and the server's output. */
+    /** Everything worth sending when the core doesn't start: phone, app, startup steps and the core's output. */
     fun report(context: Context): String = buildString {
         val info = runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull()
         appendLine("Zalỏ ${info?.versionName} (${context.packageName})")
         appendLine("Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.SUPPORTED_ABIS.joinToString()}")
-        appendLine("Local port: ${LocalServer.port(context)}")
         appendLine()
         appendLine("== startup.log")
         append(runCatching { readTail(file(context), MAX_BYTES) }.getOrDefault("(none)\n"))

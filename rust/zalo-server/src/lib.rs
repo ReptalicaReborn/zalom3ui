@@ -1,14 +1,20 @@
 //! Core Zalỏ server library: configuration, errors, logging, wire types, persistent `ChatStore`,
 //! `ZaloSession`, and Axum HTTP/WebSocket server.
 
+pub mod api;
 pub mod config;
+pub mod embedded;
 pub mod errors;
 pub mod http;
 pub mod log;
+pub mod replay;
 pub mod routes;
 pub mod session;
 pub mod store;
 pub mod types;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -45,17 +51,10 @@ pub async fn serve_on_listener(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let local_addr = listener.local_addr()?;
-    let store = ChatStore::open(&config.data_dir);
-    let session = Arc::new(ZaloSession::new(
-        store.clone(),
-        config.data_dir.clone(),
-        config.read_receipts,
-    ));
+    let (config, store, session) = open_core(config);
 
-    let router = http::build_router(Arc::new(config), Arc::clone(&session));
+    let router = http::build_router(config, Arc::clone(&session));
     info!("Zalỏ server listening on http://{local_addr}");
 
     session.start();
@@ -64,8 +63,29 @@ pub async fn serve_on_listener(
         .with_graceful_shutdown(shutdown)
         .await;
 
-    session.shutdown();
-    store.flush();
+    stop_core(&session, &store);
 
     serve_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+/// Setup shared by the TCP server and the in-process [`embedded`] core: installs the rustls ring
+/// crypto provider (no-op if already installed), opens `ChatStore` and creates (but does not
+/// start) the `ZaloSession`. Nothing here is process-global beyond the crypto provider, so it can
+/// run again in the same process after [`stop_core`].
+pub(crate) fn open_core(config: Config) -> (Arc<Config>, ChatStore, Arc<ZaloSession>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let store = ChatStore::open(&config.data_dir);
+    let session = Arc::new(ZaloSession::new(
+        store.clone(),
+        config.data_dir.clone(),
+        config.read_receipts,
+    ));
+    (Arc::new(config), store, session)
+}
+
+/// Stops the session's background tasks and flushes the store to disk.
+pub(crate) fn stop_core(session: &ZaloSession, store: &ChatStore) {
+    session.shutdown();
+    store.flush();
 }

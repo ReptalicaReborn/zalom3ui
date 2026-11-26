@@ -3,7 +3,7 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- The on-phone Zalo server runs as a foreground service. -->
+    <!-- The on-phone Zalo core stays connected through a foreground service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -44,31 +44,42 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.App">
 
-        <!-- Separate process: Node.js can only start once per process. -->
+        <!-- Keeps the app's process, and the Zalo core in it, alive in the background. One process for everything. -->
         <service
-            android:name=".server.NodeService"
+            android:name=".server.ZaloService"
             android:exported="false"
-            android:foregroundServiceType="remoteMessaging"
-            android:process=":node" />
+            android:foregroundServiceType="remoteMessaging" />
 
-        <!-- Keeps an answered call alive; main process, because it owns the microphone (and the camera on video calls;
+        <!-- Keeps an answered call alive; it owns the microphone (and the camera on video calls;
              the camera type is only declared at run time once the permission is granted). -->
         <service
             android:name=".call.CallService"
             android:exported="false"
             android:foregroundServiceType="microphone|camera" />
 
-        <!-- "Reply" / "Mark as read" on message notifications; next to the server and its notifier. -->
+        <!-- "Reply" / "Mark as read" on message notifications; next to the notifier. -->
         <receiver
             android:name=".server.NotificationActionReceiver"
-            android:exported="false"
-            android:process=":node" />
+            android:exported="false" />
+
+        <!-- "While open + notification bridge": watches the official Zalo app's notifications to bring the core online for
+             a minute. Off unless that mode is chosen (the app enables it), and only bound once the user grants
+             notification access. -->
+        <service
+            android:name=".server.ZaloNotificationListener"
+            android:enabled="false"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <!-- "Decline" on incoming call notifications. -->
         <receiver
             android:name=".server.CallActionReceiver"
-            android:exported="false"
-            android:process=":node" />
+            android:exported="false" />
 
         <receiver
             android:name=".server.BootReceiver"

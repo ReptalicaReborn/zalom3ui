@@ -22,8 +22,6 @@ import androidx.core.content.ContextCompat
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ServerEvent
-import com.zalom3ui.app.data.SettingsStore
-import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.ui.call.CallActivity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -83,7 +81,7 @@ class CallService : Service() {
     private var cameraWanted = false
     private val main = Handler(Looper.getMainLooper())
 
-    private val api: ApiClient get() = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
+    private val api: ApiClient get() = ApiClient.onDevice(this)
 
     override fun onCreate() {
         super.onCreate()
@@ -640,6 +638,9 @@ class CallService : Service() {
         val notice: StateFlow<String?> = _notice.asStateFlow()
 
         private var activeInstance: CallService? = null
+
+        /** The call service is running (a call is being placed, answered or held). "Stay connected" never pauses then. */
+        val isRunning: Boolean get() = synchronized(mediaLock) { activeInstance != null }
         private var activeMedia: CallMedia? = null
 
         // The screen's surfaces outlive the media (they exist while connecting), so they are kept here.

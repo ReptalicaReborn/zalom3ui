@@ -4,6 +4,5 @@ local.properties
 .idea/
 *.iml
 .kotlin/
-.nodejs-mobile/
-# CMake output of the native Node bridge
+# CMake output (the Opus codec)
 .cxx/

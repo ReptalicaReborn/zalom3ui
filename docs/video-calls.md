@@ -57,7 +57,7 @@ H.264 (payload 97).
 | V5 | both | Answer video calls with video (our `extendData.video` codec list, `callType` 1), camera on/off, front/back switch, speaker on by default. |
 | V6 | both | Outgoing calls, voice and video: `requestcall` → servers, session, config → init call as caller (command 11) → `request` with our media server → wait for `answer`. |
 
-**Status:** V1–V5 are built (server: `src/video.ts`, `src/zrtcclient.ts`; app: `call/VideoDecoder.kt`,
+**Status:** V1–V5 are built (server: `rust/zalo-media/src/call/video.rs`, `rust/zalo-media/src/call/zrtcclient.rs`; app: `call/VideoDecoder.kt`,
 `call/CameraVideoSender.kt`, `ui/call/VideoCallLayout.kt`) and tested against fakes; not yet on a real call. Each stream
 has its own SRTP context (Zalo's apps send audio and video under one SSRC, their user id; ours is ours). V6
 (outgoing calls) is next.
@@ -67,7 +67,7 @@ real phone to check the other side sees us.
 
 ## Server side, as built (V1 and V4)
 
-`src/video.ts` (frame assembler, packetizer), `MediaCall` in `src/zrtcclient.ts` (`onVideo`, `onKeyFrameRequest`,
+`rust/zalo-media/src/call/video.rs` (frame assembler, packetizer), `MediaCall` in `rust/zalo-media/src/call/zrtcclient.rs` (`onVideo`, `onKeyFrameRequest`,
 `sendVideoFrame`, `requestKeyFrame`), the socket messages in `docs/call-audio.md` §3. Things the app should know:
 
 - Frames to the app carry the other side's raw 90 kHz RTP timestamp (it starts at a random value: use differences).

@@ -25,7 +25,6 @@ import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
-import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.call.CallActivity
 import kotlinx.coroutines.CancellationException
@@ -38,10 +37,15 @@ import kotlinx.coroutines.launch
 
 /**
  * Shows a notification for each new message the on-phone server flags (`notify`: not mine, not muted, not the chat on
- * screen, not replayed history), one per chat with its recent lines, and removes it once the chat is read anywhere.
- * Runs in the ":node" process next to the server, so it works while the app is closed.
+ * screen, not replayed history unless the bridge's notify window is open), one per chat with its recent lines, and
+ * removes it once the chat is read anywhere. Runs in [ZaloService] ("Always"), or while Zalỏ is online in the other
+ * "Stay connected" modes (see [StayConnectedCoordinator]).
  */
-class MessageNotifier(private val context: Context) {
+class MessageNotifier(
+    private val context: Context,
+    /** Called after a message notification for the chat was posted, with the chat's title (the bridge hides Zalo's own). */
+    private val onPosted: (ThreadRef, String) -> Unit = { _, _ -> },
+) {
     private val history = object : LinkedHashMap<String, ArrayDeque<Line>>(MAX_THREADS, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArrayDeque<Line>>?): Boolean =
             size > MAX_THREADS
@@ -58,7 +62,7 @@ class MessageNotifier(private val context: Context) {
         scope.launch {
             while (isActive) {
                 try {
-                    val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
+                    val api = ApiClient.onDevice(context)
                     api.events().collect { onEvent(it) }
                 } catch (e: CancellationException) {
                     throw e
@@ -145,7 +149,8 @@ class MessageNotifier(private val context: Context) {
             .addAction(markRead)
             .build()
         if (canNotify(context)) {
-            runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
+            val posted = runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
+            if (posted.isSuccess) runCatching { onPosted(ref, threadName) }
         }
     }
 
@@ -229,7 +234,7 @@ class MessageNotifier(private val context: Context) {
         if (!poppedUp.add(callId)) return
         while (poppedUp.size > 20) poppedUp.remove(poppedUp.first())
         scope.launch {
-            val current = runCatching { ApiClient(LocalServer.url(context), SettingsStore(context).localToken()).currentCall() }.getOrNull()
+            val current = runCatching { ApiClient.onDevice(context).currentCall() }.getOrNull()
             // Another call in progress, or this one already answered from the notification.
             if (current != null && (current.callId != callId || current.state != "ringing")) return@launch
             if (callTag(callId) !in ringing) return@launch
@@ -333,7 +338,7 @@ class CallActionReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
+                val api = ApiClient.onDevice(context)
                 if (answering) api.answerCallTest(callId) else api.declineCall(callId)
                 NotificationManagerCompat.from(context).cancel(tag, MessageNotifier.CALL_NOTIFICATION_ID)
             } catch (e: Exception) {
@@ -387,7 +392,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val api = ApiClient(LocalServer.url(context), SettingsStore(context).localToken())
+                val api = ApiClient.onDevice(context)
                 if (intent.action == ACTION_REPLY && !text.isNullOrEmpty()) api.send(ref.kind, ref.id, text)
                 // Replying reads the chat, as in the official app; the server's "read" event removes the notification.
                 api.markRead(ref.kind, ref.id)

@@ -3,6 +3,10 @@ name = "zalo-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Recording fake Zalo client and login backend (`zalo_server::testing`) for tests.
+testing = []
+
 [dependencies]
 zalo-proto.workspace = true
 zalo-media.workspace = true
@@ -28,5 +32,8 @@ rand.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
+# Enables the `testing` feature for integration tests.
+zalo-server = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
 reqwest.workspace = true
 tokio-tungstenite.workspace = true

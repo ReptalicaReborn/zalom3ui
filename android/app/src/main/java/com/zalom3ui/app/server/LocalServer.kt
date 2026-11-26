@@ -3,20 +3,14 @@ package com.zalom3ui.app.server
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
-import com.zalom3ui.app.data.SettingsStore
 
-/** Starts and stops the Zalo server that runs on the phone itself. */
+/** Starts and stops the foreground service that keeps the on-phone Zalo core alive in the background. */
 object LocalServer {
-    /** Loopback port the on-phone server listens on: this install's own (see [SettingsStore.localPort]). */
-    fun port(context: Context): Int = SettingsStore(context).localPort()
-
-    fun url(context: Context): String = "http://127.0.0.1:${port(context)}"
-
-    /** Asks Android for the server's service. Phones that block it (battery savers, autostart rules) are logged. */
+    /** Asks Android for the service. Phones that block it (battery savers, autostart rules) are logged. */
     fun start(context: Context): Throwable? {
-        StartupLog.write(context, "app: start service requested (port ${port(context)})")
+        StartupLog.write(context, "app: start service requested")
         return try {
-            ContextCompat.startForegroundService(context, Intent(context, NodeService::class.java))
+            ContextCompat.startForegroundService(context, Intent(context, ZaloService::class.java))
             null
         } catch (e: Exception) {
             StartupLog.error(context, "app: Android refused to start the service", e)
@@ -24,8 +18,8 @@ object LocalServer {
         }
     }
 
-    /** Stops the server; its process exits, since Node can only start once per process. */
+    /** Stops the service. The process, and the core in it, keep running; see [ZaloCore.shutdown] to stop the core. */
     fun stop(context: Context) {
-        context.stopService(Intent(context, NodeService::class.java))
+        context.stopService(Intent(context, ZaloService::class.java))
     }
 }

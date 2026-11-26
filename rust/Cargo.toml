@@ -14,10 +14,10 @@ edition = "2021"
 
 [workspace.dependencies]
 # Async & web
-tokio = { version = "1.43", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal", "fs"] }
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws", "multipart", "json"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "limit"] }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "gzip", "deflate", "brotli", "multipart", "json", "stream"] }
@@ -69,5 +69,7 @@ zalo-server = { path = "zalo-server" }
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind (not abort): the core runs inside the app process, so a panic must stay catchable at the JNI
+# boundary (catch_unwind) and inside one tokio task, instead of killing the whole app.
+panic = "unwind"
 strip = "symbols"

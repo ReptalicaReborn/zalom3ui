@@ -32,21 +32,33 @@ class ApiClientTest {
 
     @Test
     fun eventsRequest_usesAuthorizationHeaderInsteadOfQueryParam() {
-        val withToken = ApiClient("https://zalo.example.com", "secret-123").eventsRequest()
+        val withToken = HttpTransport("https://zalo.example.com", "secret-123").eventsRequest()
         assertEquals("Bearer secret-123", withToken.header("Authorization"))
         assertNull(withToken.url.queryParameter("token"))
         assertEquals("/ws", withToken.url.encodedPath)
 
-        val withoutToken = ApiClient("http://127.0.0.1:45000", null).eventsRequest()
+        val withoutToken = HttpTransport("http://127.0.0.1:45000", null).eventsRequest()
         assertNull(withoutToken.header("Authorization"))
         assertNull(withoutToken.url.queryParameter("token"))
     }
 
     @Test
     fun url_encodesEachSegmentWithoutSplittingOrDoubleEncoding() {
-        val api = ApiClient("http://127.0.0.1:45000", "tok")
-        val built = api.url("calls", "a/b c%20d", "answer")
+        val path = ApiClient.path("calls", "a/b c%20d", "answer")
+        assertEquals("/api/calls/a%2Fb%20c%2520d/answer", path)
+        val built = HttpTransport("http://127.0.0.1:45000", "tok").url(path)
         assertEquals("http://127.0.0.1:45000/api/calls/a%2Fb%20c%2520d/answer", built.toString())
+    }
+
+    @Test
+    fun path_encodesQueryParametersAndKeepsAServerPathPrefix() {
+        assertEquals(
+            "/api/search?q=h%E1%BB%8Fi%20%26%20%2B&limit=5",
+            ApiClient.path("search", query = listOf("q" to "hỏi & +", "limit" to "5")),
+        )
+        assertEquals("/api/status", ApiClient.path("status"))
+        val prefixed = HttpTransport("https://example.com/zalo/", null).url("/api/status")
+        assertEquals("https://example.com/zalo/api/status", prefixed.toString())
     }
 
     @Test
@@ -87,12 +99,12 @@ class ApiClientTest {
 
     @Test
     fun sendVoiceRequest_buildsMultipartAudioMp4Post() {
-        val api = ApiClient("http://127.0.0.1:45000", "tok")
+        val transport = HttpTransport("http://127.0.0.1:45000", "tok")
         val tmp = File.createTempFile("note-", ".m4a").apply {
             writeBytes(byteArrayOf(1, 2, 3, 4))
             deleteOnExit()
         }
-        val req = api.sendVoiceRequest(ThreadRef("group", "g42"), tmp).build()
+        val req = transport.buildRequest("POST", ApiClient.path("threads", "group", "g42", "voice"), ApiBody.VoiceFile(tmp, "audio/mp4")).build()
         assertEquals("POST", req.method)
         assertEquals("http://127.0.0.1:45000/api/threads/group/g42/voice", req.url.toString())
         val body = req.body as MultipartBody

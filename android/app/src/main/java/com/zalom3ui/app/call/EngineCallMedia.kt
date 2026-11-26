@@ -2,8 +2,6 @@ package com.zalom3ui.app.call
 
 import android.content.Context
 import android.view.Surface
-import com.zalom3ui.app.data.SettingsStore
-import com.zalom3ui.app.server.LocalServer
 
 /**
  * The call's real audio (docs/call-audio.md): microphone and speaker through [CallAudioEngine] with Opus, frames to and
@@ -36,16 +34,15 @@ class EngineCallMedia(private val context: Context) : CallMedia {
     @Synchronized
     override fun start() {
         if (engine != null) return
-        val l = CallAudioLink(
-            LocalServer.url(context),
-            SettingsStore(context).localToken(),
+        val l = CallAudioLink.forSettings(
+            context,
             onAudio = { seq, timestamp, opus -> engine?.onPacket(seq, timestamp, opus) },
-            // The server closes the socket when the call ends; CallService hears about the end from the event socket.
+            // The core closes the link when the call ends; CallService hears about the end from the event stream.
             onClosed = { },
-            // Video shares the socket (one per call).
+            // Video shares the link (one per call).
             onVideo = { key, timestamp, au -> decoder?.submit(key, timestamp, au) },
             onKeyFrameWanted = { sender?.requestKeyFrame() },
-        )
+        ) ?: throw IllegalStateException("No Zalo server is set up")
         val e = CallAudioEngine(context.applicationContext, OpusFrameCodec(), send = { opus -> l.send(opus) })
         e.muted = muted
         e.speakerOn = speakerOn

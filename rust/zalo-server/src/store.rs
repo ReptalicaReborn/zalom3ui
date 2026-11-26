@@ -1764,6 +1764,40 @@ impl ChatStore {
         }
     }
 
+    /// The newest stored message of a conversation kind, as `(ts, id)` (ties go to the later
+    /// stored one). Used by the replay report to see where our history ends.
+    pub fn newest_message_of_kind(&self, kind: ThreadKind) -> Option<(i64, String)> {
+        let s = self.inner.state.read().ok()?;
+        let mut best: Option<(i64, &str)> = None;
+        for list in s.messages.values() {
+            let Some(last) = list.last() else { continue };
+            if last.thread_kind != kind {
+                continue;
+            }
+            if best.is_none_or(|(ts, _)| last.ts >= ts) {
+                best = Some((last.ts, last.id.as_str()));
+            }
+        }
+        best.map(|(ts, id)| (ts, id.to_string()))
+    }
+
+    /// Whether a message with this id is stored.
+    pub fn has_message(&self, msg_id: &str) -> bool {
+        self.inner
+            .state
+            .read()
+            .is_ok_and(|s| s.index.contains_key(msg_id))
+    }
+
+    /// Whether the conversation's read marker already covers a message sent at `ts`.
+    pub fn is_read_at(&self, kind: ThreadKind, id: &str, ts: i64) -> bool {
+        let Ok(s) = self.inner.state.read() else {
+            return false;
+        };
+        let key = thread_key(kind, id);
+        s.read_up_to.get(&key).is_some_and(|&read| ts <= read)
+    }
+
     /// Looks up a stored message by its message id (includes server-side `raw` fields).
     pub fn find_message(&self, msg_id: &str) -> Option<StoredMessage> {
         let s = self.inner.state.read().ok()?;

@@ -80,7 +80,7 @@ P2P binding, TCP fallback).
 ### zrtc packets (mapped)
 
 Worked out from Zalo PC's call program (arm64) and checked by running its own packet functions in an emulator:
-`src/zrtc.ts` builds and parses them, and `test/zrtc.test.ts` holds byte strings that the official functions
+`rust/zalo-media/src/call/zrtc.rs` builds and parses them, and its tests holds byte strings that the official functions
 produced. Numbers are little-endian; strings carry a 16-bit length (some forwards use 32-bit).
 
 Byte 0 is the kind:
@@ -140,10 +140,10 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
 
 ## What Zalỏ does already
 
-- **Who is calling:** Zalỏ's server reads the realtime `voip` controls itself (`src/calls.ts`: frame header, AES-GCM +
+- **Who is calling:** Zalỏ's server reads the realtime `voip` controls itself (`rust/zalo-server/src/routes/calls.rs`: frame header, AES-GCM +
   zlib/gzip payload, big ids kept as text), from two places:
   - the chat WebSocket zca-js opens (`zpw_ws`). In the first test call it carried nothing about the call;
-  - Zalo's **control channel**, which Zalo PC keeps apart from chat (`src/ctrlpoll.ts`). Zalo PC reads it over a
+  - Zalo's **control channel**, which Zalo PC keeps apart from chat (`rust/zalo-proto/src/api/ctrlpoll.rs`). Zalo PC reads it over a
     socket or, with `enable_ctrl_socket` off, by long polling the control servers of the login answer
     (`zpw_ctrs_new`): `GET <server>/?zpw_ver=…&zpw_type=…&params=<lastActionId>,<lastActionIdOther>,<ids>&ts=<unix>`,
     held up to `zpw_conf.lp_ctl_timeout` seconds (30), answered `{error_code, data}` with `data` AES-CBC encrypted
@@ -178,7 +178,7 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   `callId` / `session`; the reply's second number is the **token** every audio packet carries and the server id pings
   carry), then `/api/voicecall/answer` with status 0, codec Opus 16 kHz mono (payload 112), that media server, our
   `extendData` and `subCommand: 3`. Audio then flows as described in `docs/call-audio.md`: the server decrypts the
-  caller's SRTP (key = the session's first 30 characters; `src/srtp.ts`, checked against libsrtp) and hands the Opus
+  caller's SRTP (key = the session's first 30 characters; `rust/zalo-media/src/call/srtp.rs`, checked against libsrtp) and hands the Opus
   frames to the app, which plays them and sends the microphone back (silence fills any gap); pings every 2 s; Hang up
   sends `/api/voicecall/endcall` and the zrtc end call. The call log records the media server's replies and a
   `call_done` line with what the audio looked like: packet counts per kind, how many decrypted, RTP payload types,

@@ -180,6 +180,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    // ProcessLifecycleOwner: the app coming to and leaving the foreground, for "Stay connected: While open".
+    implementation("androidx.lifecycle:lifecycle-process:2.8.7")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")

@@ -23,7 +23,6 @@ import com.zalom3ui.app.call.CallState
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
-import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.server.MessageNotifier
 import com.zalom3ui.app.ui.AppTheme
 import kotlinx.coroutines.CancellationException
@@ -184,7 +183,7 @@ class CallActivity : ComponentActivity() {
 
     private suspend fun watchRingingCall(ringingCallId: String) {
         if (ringingCallId.isEmpty()) return
-        val api = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
+        val api = ApiClient.onDevice(this)
         val ended = withTimeoutOrNull(RINGING_TIMEOUT_MS) {
             while (isActive) {
                 val current = runCatching { api.currentCall() }.getOrNull()
@@ -381,7 +380,7 @@ class CallActivity : ComponentActivity() {
         // Outlives Activity rotation so answering completes instead of aborting mid-flight.
         callActionScope.launch {
             try {
-                ApiClient(LocalServer.url(appContext), SettingsStore(appContext).localToken()).answerCall(id)
+                ApiClient.onDevice(appContext).answerCall(id)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -394,7 +393,7 @@ class CallActivity : ComponentActivity() {
         val id = callId
         val appContext = applicationContext
         NotificationManagerCompat.from(this).cancel(MessageNotifier.callTag(id), MessageNotifier.CALL_NOTIFICATION_ID)
-        val api = ApiClient(LocalServer.url(appContext), SettingsStore(appContext).localToken())
+        val api = ApiClient.onDevice(appContext)
         // Outlives the screen: the request should finish even though we close right away.
         callActionScope.launch { runCatching { api.declineCall(id) } }
         CallService.reset()

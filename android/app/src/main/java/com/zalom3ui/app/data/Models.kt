@@ -15,7 +15,11 @@ data class SessionStatus(
     /** A saved session couldn't reach Zalo and is being retried; a QR login can replace it. */
     val retrying: Boolean = false,
 ) {
-    val isLoggedIn: Boolean get() = state == "ready" || state == "disconnected"
+    /** Logged in, whether or not the chat listener is connected (a paused session is still logged in). */
+    val isLoggedIn: Boolean get() = state == "ready" || state == "disconnected" || state == "paused"
+
+    /** The chat listener was stopped on purpose ("Stay connected"); not an error, and not "opened somewhere else". */
+    val isPaused: Boolean get() = state == "paused"
 }
 
 @Serializable
