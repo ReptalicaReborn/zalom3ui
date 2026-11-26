@@ -131,4 +131,30 @@ class ChatExpressiveTest {
         assertEquals(listOf("c2", "c3"), unreadGroup.calls.map { it.id })
         assertTrue(unreadGroup.firstUnreadAnchor)
     }
+
+    @Test
+    fun extractChatPhotoUrlsCollectsNonRecalledPhotosAndGifsInOrder() {
+        val messages = listOf(
+            msg("m1", "plain text", 1),
+            msg("p1", "", 2, attachment = Attachment(kind = "photo", thumb = "https://cdn/t1.jpg", href = "https://cdn/full1.jpg")),
+            msg("p2", "", 3, recalled = true, attachment = Attachment(kind = "photo", href = "https://cdn/recalled.jpg")),
+            msg("v1", "", 4, attachment = Attachment(kind = "video", thumb = "https://cdn/vthumb.jpg", href = "https://cdn/video.mp4")),
+            msg("s1", "", 5, attachment = Attachment(kind = "sticker", thumb = "https://cdn/sticker.webp")),
+            msg("g1", "", 6, attachment = Attachment(kind = "gif", thumb = "https://cdn/g1.gif")),
+            msg("p3", "", 7, attachment = Attachment(kind = "photo", href = "   ", thumb = "   ")),
+            msg("p4", "", 8, attachment = Attachment(kind = "photo", href = "https://cdn/full1.jpg")),
+        )
+
+        assertEquals(
+            listOf("https://cdn/full1.jpg", "https://cdn/g1.gif", "https://cdn/full1.jpg"),
+            extractChatPhotoUrls(messages),
+        )
+
+        val entries = extractChatPhotoEntries(messages)
+        // Duplicate URLs resolve to the exact message tapped when msgId is provided.
+        assertEquals(0, findChatPhotoIndex(entries, "p1", "https://cdn/full1.jpg"))
+        assertEquals(2, findChatPhotoIndex(entries, "p4", "https://cdn/full1.jpg"))
+        assertEquals(1, findChatPhotoIndex(entries, null, "https://cdn/g1.gif"))
+        assertEquals(-1, findChatPhotoIndex(entries, "missing", "https://cdn/missing.jpg"))
+    }
 }

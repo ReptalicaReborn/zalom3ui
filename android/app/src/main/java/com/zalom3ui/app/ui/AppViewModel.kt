@@ -6,27 +6,32 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ApiException
-import com.zalom3ui.app.data.CreatePollRequest
-import com.zalom3ui.app.data.PollDetail
 import com.zalom3ui.app.data.Appearance
+import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.ChatMessage
+import com.zalom3ui.app.data.CreatePollRequest
 import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.FriendRequest
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.HistorySyncEvent
 import com.zalom3ui.app.data.HistorySyncStatus
 import com.zalom3ui.app.data.Mention
+import com.zalom3ui.app.data.MessageSearchHit
 import com.zalom3ui.app.data.MuteOption
+import com.zalom3ui.app.data.PendingMessage
+import com.zalom3ui.app.data.PendingShare
 import com.zalom3ui.app.data.Person
 import com.zalom3ui.app.data.PickedFile
-import com.zalom3ui.app.data.StickerInfo
-import com.zalom3ui.app.data.readPickedFile
+import com.zalom3ui.app.data.PollDetail
+import com.zalom3ui.app.data.Quote
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.ServerSettings
 import com.zalom3ui.app.data.SessionStatus
 import com.zalom3ui.app.data.SettingsStore
+import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
+import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.server.LocalServer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +46,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 data class ChatState(
     val kind: String,
@@ -60,6 +67,8 @@ data class ChatState(
     val firstUnreadId: String? = null,
     /** Photos and files still uploading. */
     val uploading: Int = 0,
+    /** Optimistic outgoing messages waiting for server confirmation or user retry. */
+    val pending: List<PendingMessage> = emptyList(),
 ) {
     val ref: ThreadRef get() = ThreadRef(kind, id)
 }
@@ -95,6 +104,20 @@ data class UiState(
     /** "Sync messages from phone": the server's progress, and whether its dialog is open (ui/HistorySync.kt). */
     val historySync: HistorySyncStatus = HistorySyncStatus(),
     val historySyncShown: Boolean = false,
+    /** Per-chat draft text, keyed by [ThreadRef.key]. */
+    val drafts: Map<String, String> = emptyMap(),
+    /** Per-chat accent color overrides, keyed by [ThreadRef.key]. */
+    val chatAccents: Map<String, ChatAccent> = emptyMap(),
+    /** Content shared into Zalỏ from another app, waiting for the user to pick a target chat. */
+    val pendingShare: PendingShare? = null,
+    /** Global message search query, hits, and loading state. */
+    val messageSearchQuery: String = "",
+    val messageSearchResults: List<MessageSearchHit> = emptyList(),
+    val messageSearchBusy: Boolean = false,
+    /** Message id to scroll to after opening a chat from search results. */
+    val scrollToMsgId: String? = null,
+    /** Multiple messages queued for batch forwarding. */
+    val forwardingMany: List<ChatMessage> = emptyList(),
 )
 
 data class StickerSearch(
@@ -107,7 +130,14 @@ const val TYPING_TIMEOUT_MS = 6_000L
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val settingsStore = SettingsStore(app)
-    private val _state = MutableStateFlow(UiState(settings = settingsStore.load(), appearance = settingsStore.loadAppearance()))
+    private val _state = MutableStateFlow(
+        UiState(
+            settings = settingsStore.load(),
+            appearance = settingsStore.loadAppearance(),
+            drafts = settingsStore.loadDrafts(),
+            chatAccents = settingsStore.loadChatAccents(),
+        ),
+    )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
@@ -136,10 +166,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var refreshThreadsJob: Job? = null
     private var refreshThreadsPending = false
     private var restartJob: Job? = null
+    private var messageSearchJob: Job? = null
     private var visible = false
     private var lastTypingSent = 0L
     /** When the live loop last (re)started the on-phone server; errors are expected while it boots. */
     private var localStartedAt = 0L
+    private val pendingSeq = AtomicLong(0L)
 
     init {
         rebuildClient()
@@ -150,6 +182,101 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(appearance = appearance) }
     }
 
+    fun setDraft(ref: ThreadRef, text: String) {
+        val key = ref.key
+        val current = _state.value.drafts[key].orEmpty()
+        if (current == text || (current.isEmpty() && text.isBlank())) return
+        settingsStore.saveDraft(key, text)
+        _state.update { s ->
+            val updated = if (text.isBlank()) s.drafts - key else s.drafts + (key to text)
+            s.copy(drafts = updated)
+        }
+    }
+
+    fun setChatAccent(ref: ThreadRef, accent: ChatAccent?) {
+        val key = ref.key
+        settingsStore.saveChatAccent(key, accent)
+        _state.update { s ->
+            val updated = if (accent == null) s.chatAccents - key else s.chatAccents + (key to accent)
+            s.copy(chatAccents = updated)
+        }
+    }
+
+    fun setPendingShare(share: PendingShare?) {
+        val normalized = share?.takeIf { !it.text.isNullOrBlank() || it.uris.isNotEmpty() }
+        _state.update { it.copy(pendingShare = normalized) }
+    }
+
+    fun deliverPendingShare(ref: ThreadRef, name: String, onOpened: () -> Unit) {
+        val share = _state.value.pendingShare ?: return
+        _state.update { it.copy(pendingShare = null) }
+        val existing = _state.value.threads.firstOrNull { it.ref == ref }
+        openChat(existing ?: ThreadSummary(id = ref.id, kind = ref.kind, name = name))
+        val text = share.text?.trim()
+        if (!text.isNullOrEmpty()) {
+            send(text)
+        }
+        if (share.uris.isNotEmpty()) {
+            sendFiles(share.uris)
+        }
+        onOpened()
+    }
+
+    fun searchAllMessages(query: String) {
+        messageSearchJob?.cancel()
+        messageSearchJob = null
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) {
+            _state.update {
+                it.copy(
+                    messageSearchQuery = query,
+                    messageSearchResults = emptyList(),
+                    messageSearchBusy = false,
+                )
+            }
+            return
+        }
+        _state.update { it.copy(messageSearchQuery = query, messageSearchBusy = true) }
+        messageSearchJob = viewModelScope.launch {
+            delay(MESSAGE_SEARCH_DEBOUNCE_MS)
+            val api = client
+            if (api == null) {
+                _state.update { it.copy(messageSearchBusy = false) }
+                return@launch
+            }
+            try {
+                val results = api.searchMessages(trimmed)
+                _state.update { s ->
+                    if (s.messageSearchQuery.trim() == trimmed) {
+                        s.copy(messageSearchResults = results, messageSearchBusy = false)
+                    } else {
+                        s
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { s ->
+                    if (s.messageSearchQuery.trim() == trimmed) {
+                        s.copy(messageSearchBusy = false, error = e.message ?: "Search failed")
+                    } else {
+                        s
+                    }
+                }
+            }
+        }
+    }
+
+    fun openChatAtMessage(ref: ThreadRef, name: String, msgId: String) {
+        val existing = _state.value.threads.firstOrNull { it.ref == ref }
+        _state.update { it.copy(scrollToMsgId = msgId) }
+        openChat(existing ?: ThreadSummary(id = ref.id, kind = ref.kind, name = name))
+    }
+
+    fun clearScrollToMsgId() {
+        _state.update { it.copy(scrollToMsgId = null) }
+    }
+
     fun saveSettings(settings: ServerSettings) {
         val wasOnWatch = _state.value.settings.onDevice
         restartJob?.cancel()
@@ -157,7 +284,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         settingsStore.save(settings)
         if (wasOnWatch && !settings.onDevice) LocalServer.stop(getApplication())
         localStartedAt = 0L
-        _state.value = UiState(settings = settingsStore.load(), appearance = _state.value.appearance)
+        _state.value = UiState(
+            settings = settingsStore.load(),
+            appearance = _state.value.appearance,
+            drafts = _state.value.drafts,
+            chatAccents = _state.value.chatAccents,
+            pendingShare = _state.value.pendingShare,
+        )
         rebuildClient()
         if (visible) startLiveUpdates()
     }
@@ -317,7 +450,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Closes the open chat, unless another one was opened since [ref] was. */
     fun closeChat(ref: ThreadRef? = null) {
         val closing = _state.value.chat?.ref
-        _state.update { if (ref == null || it.chat?.ref == ref) it.copy(chat = null) else it }
+        _state.update { if (ref == null || it.chat?.ref == ref) it.copy(chat = null, scrollToMsgId = null) else it }
         if (closing != null && _state.value.chat == null) viewModelScope.launch { runCatching { client?.setPresence(null) } }
     }
 
@@ -335,21 +468,79 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Sends [text], optionally as a reply to [quote]. Each of [mentioned] whose "@Name" still appears in
-     * the text becomes an @mention (groups only). [onSent] runs once the server accepted it, so the
-     * input keeps the draft if sending fails.
+     * Optimistically appends [text] to [ChatState.pending], invokes [onSent] immediately, clears the
+     * thread draft, and sends via the server. On failure the pending bubble stays in the list with
+     * `failed = true` so the user can retry or dismiss it.
      */
     fun send(text: String, quote: ChatMessage? = null, mentioned: List<GroupMember> = emptyList(), onSent: () -> Unit = {}) {
         val chat = _state.value.chat ?: return
         val body = text.trim()
         if (body.isEmpty()) return
         val mentions = if (chat.kind == "group") findMentions(body, mentioned) else emptyList()
+        val now = System.currentTimeMillis()
+        val item = PendingMessage(
+            localId = "pending-$now-${pendingSeq.incrementAndGet()}",
+            text = body,
+            ts = now,
+            quote = quote?.let { Quote(msgId = it.id, fromId = it.fromId, fromName = it.fromName, text = it.text) },
+            quoteId = quote?.id,
+            mentions = mentions,
+        )
+        updateChat(chat.ref) { it.copy(pending = it.pending + item) }
+        setDraft(chat.ref, "")
+        onSent()
+        sendPending(chat.ref, item)
+    }
 
-        updateChat(chat.ref) { it.copy(sending = true) }
-        launchApi(onDone = { updateChat(chat.ref) { it.copy(sending = false) } }) { api ->
-            // The sent message comes back over the WebSocket like any other.
-            api.send(chat.kind, chat.id, body, quoteId = quote?.id, mentions = mentions)
-            onSent()
+    fun retryPending(localId: String) {
+        val chat = _state.value.chat ?: return
+        val item = chat.pending.firstOrNull { it.localId == localId } ?: return
+        val retrying = item.copy(failed = false, error = null, ts = System.currentTimeMillis())
+        updateChat(chat.ref) { c ->
+            c.copy(pending = c.pending.map { if (it.localId == localId) retrying else it })
+        }
+        sendPending(chat.ref, retrying)
+    }
+
+    fun dismissPending(localId: String) {
+        val chat = _state.value.chat ?: return
+        updateChat(chat.ref) { c ->
+            c.copy(pending = c.pending.filterNot { it.localId == localId })
+        }
+    }
+
+    private fun sendPending(ref: ThreadRef, item: PendingMessage) {
+        val api = client
+        if (api == null) {
+            markPendingFailed(ref, item.localId, "Not connected to the server")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                api.send(ref.kind, ref.id, item.text, quoteId = item.quoteId, mentions = item.mentions)
+                val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
+                updateChat(ref) { chat ->
+                    val updatedMessages = if (res != null) merge(chat.messages, res.messages) else chat.messages
+                    chat.copy(
+                        messages = updatedMessages,
+                        pending = chat.pending.filterNot { it.localId == item.localId },
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                markPendingFailed(ref, item.localId, e.message ?: "Failed to send")
+            }
+        }
+    }
+
+    private fun markPendingFailed(ref: ThreadRef, localId: String, error: String) {
+        updateChat(ref) { chat ->
+            chat.copy(
+                pending = chat.pending.map { p ->
+                    if (p.localId == localId) p.copy(failed = true, error = error) else p
+                },
+            )
         }
     }
 
@@ -435,6 +626,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (remaining > 0) {
                     updateChat(chat.ref) { it.copy(uploading = (it.uploading - remaining).coerceAtLeast(0)) }
                 }
+            }
+        }
+    }
+
+    /** Uploads a recorded voice message to the open chat, refreshes messages, and deletes the temp file. */
+    fun sendVoice(file: File) {
+        val chat = _state.value.chat
+        if (chat == null) {
+            viewModelScope.launch(Dispatchers.IO) { runCatching { file.delete() } }
+            return
+        }
+        updateChat(chat.ref) { it.copy(uploading = it.uploading + 1) }
+        viewModelScope.launch {
+            try {
+                val api = client ?: throw ApiException("Not connected to the server")
+                api.sendVoice(chat.ref, file)
+                val res = runCatching { api.messages(chat.kind, chat.id, PAGE_SIZE) }.getOrNull()
+                if (res != null) {
+                    updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages)) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message ?: "Couldn't send voice message") }
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) { runCatching { file.delete() } }
+                updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
             }
         }
     }
@@ -604,7 +822,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Message actions ----
 
     fun select(message: ChatMessage) {
-        _state.update { it.copy(selected = message) }
+        _state.update { it.copy(selected = message, forwardingMany = emptyList()) }
     }
 
     /** Tapping the reaction we already gave removes it, as in the official app. */
@@ -619,6 +837,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteForMe(message: ChatMessage) = launchApi { api ->
         api.deleteForMe(message.threadKind, message.threadId, message.id)
+    }
+
+    fun deleteMessages(messages: List<ChatMessage>) {
+        if (messages.isEmpty()) return
+        launchApi { api ->
+            var firstError: Exception? = null
+            val deletedByThread = mutableMapOf<ThreadRef, MutableSet<String>>()
+            for (msg in messages) {
+                try {
+                    api.deleteForMe(msg.threadKind, msg.threadId, msg.id)
+                    deletedByThread.getOrPut(ThreadRef(msg.threadKind, msg.threadId)) { mutableSetOf() }.add(msg.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (firstError == null) firstError = e
+                }
+            }
+            for ((ref, ids) in deletedByThread) {
+                updateChat(ref) { chat -> chat.copy(messages = chat.messages.filterNot { it.id in ids }) }
+            }
+            if (firstError != null) throw firstError
+        }
+    }
+
+    fun selectManyForForward(messages: List<ChatMessage>) {
+        _state.update { it.copy(forwardingMany = messages) }
+    }
+
+    fun forwardSelectedMany(targets: List<ThreadRef>, onDone: () -> Unit) {
+        val messages = _state.value.forwardingMany
+        if (messages.isEmpty() || targets.isEmpty()) {
+            _state.update { it.copy(forwardingMany = emptyList()) }
+            return
+        }
+        _state.update { it.copy(forwardingMany = emptyList()) }
+        launchApi { api ->
+            for (msg in messages.sortedBy { it.ts }) {
+                api.forward(msg.threadKind, msg.threadId, msg.id, targets)
+            }
+            onDone()
+        }
     }
 
     fun forward(message: ChatMessage, target: ThreadSummary, onDone: () -> Unit) = launchApi { api ->
@@ -813,6 +1072,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val PRESENCE_REFRESH_MS = 30_000L
         private const val LOCAL_BOOT_GRACE_MS = 45_000L
         private const val LOCAL_BOOT_RETRY_MS = 1_000L
+        private const val MESSAGE_SEARCH_DEBOUNCE_MS = 250L
         private const val PAGE_SIZE = 30
         private const val MAX_CHAT_MESSAGES = 300
 

@@ -2,6 +2,7 @@ package com.zalom3ui.app.ui
 
 import com.zalom3ui.app.data.ThreadSummary
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -71,5 +72,29 @@ class ThreadListFilterTest {
         assertTrue(filterChats(readDirects, ChatFilter.UNREAD).isEmpty())
         assertTrue(filterChats(readDirects, ChatFilter.GROUPS).isEmpty())
         assertEquals(2, filterChats(readDirects, ChatFilter.ALL).size)
+    }
+
+    @Test
+    fun formatDraftSnippet_nullOrBlank_returnsNull() {
+        assertNull(formatDraftSnippet(null))
+        assertNull(formatDraftSnippet(""))
+        assertNull(formatDraftSnippet("   "))
+        assertNull(formatDraftSnippet("\n\t  \r\n "))
+    }
+
+    @Test
+    fun formatDraftSnippet_trimsAndCollapsesNewlinesAndWhitespace() {
+        assertEquals("Hello world", formatDraftSnippet("Hello world"))
+        assertEquals("Hello world", formatDraftSnippet("  Hello world  "))
+        assertEquals("Line one Line two Line three", formatDraftSnippet("Line one\nLine two\r\n\nLine three"))
+        assertEquals("a b c", formatDraftSnippet("\t a   \n  b\t\tc \n"))
+    }
+
+    @Test
+    fun findHighlightRanges_caseAndDiacriticInsensitive() {
+        assertEquals(listOf(4..8, 16..20), findHighlightRanges("Say Hello again hello!", "HELLO"))
+        assertEquals(listOf(5..7), findHighlightRanges("Chào Đức nhé", "duc"))
+        assertTrue(findHighlightRanges("Hello world", "   ").isEmpty())
+        assertTrue(findHighlightRanges("Hello world", "xyz").isEmpty())
     }
 }

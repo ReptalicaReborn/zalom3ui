@@ -56,6 +56,7 @@ private object Routes {
     const val ADD_FRIEND = "add_friend"
     const val CHAT = "chat"
     const val FORWARD = "forward"
+    const val SHARE = "share"
     const val SETTINGS = "settings"
     const val CHAT_INFO = "chat_info"
 }
@@ -157,6 +158,15 @@ private fun AppNav(vm: AppViewModel) {
                     nav.popBackStack(Routes.HOME, inclusive = false)
                 }
             },
+            onDraftChange = { vm.setDraft(chat.ref, it) },
+            onSendVoice = vm::sendVoice,
+            onRetryPending = vm::retryPending,
+            onDismissPending = vm::dismissPending,
+            onDeleteMany = vm::deleteMessages,
+            onForwardMany = { msgs ->
+                vm.selectManyForForward(msgs)
+                nav.navigate(Routes.FORWARD)
+            },
         )
     // A tapped notification: open its chat once the chat list knows it.
     val openState by vm.state.collectAsStateWithLifecycle()
@@ -165,6 +175,14 @@ private fun AppNav(vm: AppViewModel) {
         val thread = vm.consumeOpenRequest() ?: return@LaunchedEffect
         vm.openChat(thread)
         goToChat()
+    }
+    // Content shared into Zalỏ from another app: pick a target chat once ready.
+    LaunchedEffect(openState.pendingShare, openState.status?.state) {
+        if (openState.pendingShare != null && openState.status?.state == "ready") {
+            if (nav.currentDestination?.route != Routes.SHARE) {
+                nav.navigate(Routes.SHARE) { launchSingleTop = true }
+            }
+        }
     }
     val signedIn = openState.status?.isLoggedIn == true
     LaunchedEffect(signedIn) { if (signedIn) vm.loadFriendRequests() }
@@ -235,6 +253,11 @@ private fun AppNav(vm: AppViewModel) {
                             actions = chatActions(chat, onBack = { vm.closeChat(chat.ref) }),
                             initialSearch = pendingSearch,
                             onSearchConsumed = { pendingSearch = false },
+                            initialDraft = state.drafts[chat.ref.key].orEmpty(),
+                            chatAccentOverride = state.chatAccents[chat.ref.key],
+                            appearance = state.appearance,
+                            scrollToMsgId = state.scrollToMsgId,
+                            onScrolledToMsg = vm::clearScrollToMsgId,
                         )
                     },
                 ) { selectedKey -> ThreadListScreen(
@@ -255,6 +278,11 @@ private fun AppNav(vm: AppViewModel) {
                         onMarkRead = { vm.markThreadRead(it.ref) },
                         onMarkUnread = { vm.markUnread(it.ref) },
                         onDelete = { vm.deleteConversation(it.ref) },
+                        onSearchMessages = vm::searchAllMessages,
+                        onOpenSearchHit = { hit ->
+                            vm.openChatAtMessage(hit.ref, hit.threadName, hit.message.id)
+                            goToChat()
+                        },
                     ),
                 ) }
             }
@@ -394,6 +422,11 @@ private fun AppNav(vm: AppViewModel) {
                     actions = chatActions(chat, onBack = { nav.popBackStack() }),
                     initialSearch = pendingSearch,
                     onSearchConsumed = { pendingSearch = false },
+                    initialDraft = state.drafts[chat.ref.key].orEmpty(),
+                    chatAccentOverride = state.chatAccents[chat.ref.key],
+                    appearance = state.appearance,
+                    scrollToMsgId = state.scrollToMsgId,
+                    onScrolledToMsg = vm::clearScrollToMsgId,
                 )
             }
         }
@@ -437,23 +470,59 @@ private fun AppNav(vm: AppViewModel) {
                         vm.deleteConversation(chat.ref)
                         nav.popBackStack(Routes.HOME, inclusive = false)
                     },
+                    chatAccent = state.chatAccents[chat.ref.key],
+                    onSetChatAccent = { accent -> vm.setChatAccent(chat.ref, accent) },
                 )
             }
         }
-        composable(Routes.FORWARD) {
+        composable(Routes.FORWARD) { entry ->
             val state by vm.state.collectAsStateWithLifecycle()
+            val many = state.forwardingMany
             val msg = state.selected
+            LaunchedEffect(entry) {
+                entry.lifecycle.addObserver(LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_DESTROY) vm.selectManyForForward(emptyList())
+                })
+            }
             ContactsScreen(
-                title = "Forward to",
+                title = if (many.size > 1) "Forward ${many.size} messages to" else "Forward to",
                 threads = state.threads,
-                onBack = { nav.popBackStack() },
+                onBack = {
+                    vm.selectManyForForward(emptyList())
+                    nav.popBackStack()
+                },
                 onPick = { target ->
-                    if (msg != null) {
+                    if (many.isNotEmpty()) {
+                        val count = many.size
+                        vm.forwardSelectedMany(listOf(target.ref)) {
+                            val label = if (count == 1) "Forwarded to ${target.name}" else "Forwarded $count messages to ${target.name}"
+                            Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
+                        }
+                    } else if (msg != null) {
                         vm.forward(msg, target, onDone = {
                             Toast.makeText(context, "Forwarded to ${target.name}", Toast.LENGTH_SHORT).show()
                         })
                     }
                     nav.popBackToChat()
+                },
+            )
+        }
+        composable(Routes.SHARE) { entry ->
+            val state by vm.state.collectAsStateWithLifecycle()
+            LaunchedEffect(entry) {
+                entry.lifecycle.addObserver(LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_DESTROY) vm.setPendingShare(null)
+                })
+            }
+            ContactsScreen(
+                title = "Share to…",
+                threads = state.threads,
+                onBack = {
+                    vm.setPendingShare(null)
+                    nav.popBackStack()
+                },
+                onPick = { thread ->
+                    vm.deliverPendingShare(thread.ref, thread.name) { goToChat() }
                 },
             )
         }

@@ -1,13 +1,18 @@
 package com.zalom3ui.app.ui
 
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -18,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,6 +42,7 @@ import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -62,16 +69,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
+import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.ThreadSummary
@@ -101,13 +114,15 @@ fun ChatInfoScreen(
     onRenameGroup: (String) -> Unit,
     onLeaveGroup: (silent: Boolean) -> Unit,
     onDeleteConversation: () -> Unit,
+    chatAccent: ChatAccent? = null,
+    onSetChatAccent: (ChatAccent?) -> Unit = {},
 ) {
     val context = LocalContext.current
     val isGroup = chat.kind == "group"
     val pinned = thread?.pinned == true
     val muted = thread?.isMuted == true
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
-    var viewing by rememberSaveable { mutableStateOf<String?>(null) }
+    var viewingPhotoIndex by rememberSaveable { mutableStateOf<Int?>(null) }
 
     LaunchedEffect(chat.ref, isGroup) {
         if (isGroup && chat.members == null) onLoadMembers()
@@ -122,6 +137,12 @@ fun ChatInfoScreen(
             val full = a.href ?: thumb
             SharedMediaItem(id = msg.id, thumbUrl = thumb, fullUrl = full, isVideo = a.kind == "video")
         }
+    }
+    val sharedPhotos = remember(sharedMedia) {
+        sharedMedia.filterNot { it.isVideo }
+    }
+    val sharedPhotoUrls = remember(sharedPhotos) {
+        sharedPhotos.map { it.fullUrl }
     }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
@@ -296,7 +317,8 @@ fun ChatInfoScreen(
                                             if (item.isVideo) {
                                                 openExternally(context, item.fullUrl, "video/*")
                                             } else {
-                                                viewing = item.fullUrl
+                                                val idx = sharedPhotos.indexOfFirst { it.id == item.id }
+                                                if (idx >= 0) viewingPhotoIndex = idx
                                             }
                                         },
                                 ) {
@@ -402,7 +424,16 @@ fun ChatInfoScreen(
                         }
                     }
                 }
+            }
 
+            item(key = "chat_color") {
+                ChatAccentCard(
+                    selected = chatAccent,
+                    onSelect = onSetChatAccent,
+                )
+            }
+
+            if (isGroup) {
                 item(key = "group_settings") {
                     InfoSectionCard {
                         InfoActionRow(
@@ -470,7 +501,153 @@ fun ChatInfoScreen(
         )
     }
 
-    viewing?.let { PhotoViewer(it, onDismiss = { viewing = null }) }
+    viewingPhotoIndex?.let { index ->
+        if (sharedPhotoUrls.isNotEmpty()) {
+            PhotoViewer(
+                photos = sharedPhotoUrls,
+                initialIndex = index.coerceIn(0, sharedPhotoUrls.lastIndex),
+                onDismiss = { viewingPhotoIndex = null },
+            )
+        } else {
+            viewingPhotoIndex = null
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChatAccentCard(
+    selected: ChatAccent?,
+    onSelect: (ChatAccent?) -> Unit,
+) {
+    InfoSectionCard {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 18.dp, end = 18.dp, top = 16.dp, bottom = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                "Chat color",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                selected?.label ?: "Using app default",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            val isDefault = selected == null
+            val defaultCorner by animateDpAsState(
+                targetValue = if (isDefault) 14.dp else 22.dp,
+                animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+                label = "chatDefaultAccentCorner",
+            )
+            val defaultShape = RoundedCornerShape(defaultCorner)
+            Surface(
+                shape = defaultShape,
+                color = if (isDefault) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceContainerHigh
+                },
+                contentColor = if (isDefault) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                border = if (isDefault) {
+                    BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+                } else {
+                    BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                },
+                modifier = Modifier.height(44.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .semantics {
+                            contentDescription = "Default"
+                            this.selected = isDefault
+                        }
+                        .clickable(
+                            role = Role.RadioButton,
+                            onClick = { onSelect(null) },
+                        )
+                        .padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (isDefault) {
+                        Icon(
+                            Icons.Rounded.Check,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                    Text(
+                        "Default",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+
+            ChatAccent.entries.forEach { accent ->
+                val isSelected = selected == accent
+                val cornerRadius by animateDpAsState(
+                    targetValue = if (isSelected) 14.dp else 22.dp,
+                    animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+                    label = "chatAccentCorner",
+                )
+                val shape = RoundedCornerShape(cornerRadius)
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(shape)
+                        .background(accentSwatchColor(accent), shape)
+                        .semantics {
+                            contentDescription = accent.label
+                            this.selected = isSelected
+                        }
+                        .clickable(
+                            role = Role.RadioButton,
+                            onClick = { onSelect(if (isSelected) null else accent) },
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    val checkScale by animateFloatAsState(
+                        targetValue = if (isSelected) 1f else 0f,
+                        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+                        label = "chatAccentCheck",
+                    )
+                    if (checkScale > 0.01f) {
+                        Icon(
+                            Icons.Rounded.Check,
+                            contentDescription = null,
+                            tint = if (accent == ChatAccent.REPTDOC_GOLD) Color(0xFF1A1206) else Color.White,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .graphicsLayer {
+                                    scaleX = checkScale
+                                    scaleY = checkScale
+                                    alpha = checkScale.coerceIn(0f, 1f)
+                                },
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** 92.dp hero avatar: circular for 1:1 conversations, expressive squircle for groups. */

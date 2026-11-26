@@ -134,6 +134,14 @@ export type ThreadSummary = ThreadInfo & {
     mutedUntil?: number;
 };
 
+export type MessageSearchHit = {
+    threadId: string;
+    threadKind: ThreadKind;
+    threadName: string;
+    threadAvatar: string;
+    message: ChatMessage;
+};
+
 /** Shape of a raw zca-js message (UserMessage/GroupMessage), kept loose on purpose. */
 export type RawMessage = {
     type: number;
@@ -623,6 +631,36 @@ export class ChatStore {
         return list.slice(-limit).map((m) => this.toPublic(m));
     }
 
+    /**
+     * Searches cached messages across all conversations with diacritic-insensitive, case-insensitive matching.
+     * Skips recalled messages and returns hits sorted newest-first, capped to [1, 100].
+     */
+    searchMessages(query: string, limit = 50): MessageSearchHit[] {
+        const needle = foldForSearch(query.trim());
+        if (!needle) return [];
+        const cap = Math.min(Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 50), 100);
+        const matches: { thread: ThreadInfo | undefined; msg: StoredMessage }[] = [];
+        for (const [key, list] of this.messages) {
+            const thread = this.threads.get(key);
+            for (const m of list) {
+                if (m.recalled) continue;
+                const hit =
+                    foldForSearch(m.text).includes(needle) ||
+                    (m.attachment?.title !== undefined && foldForSearch(m.attachment.title).includes(needle)) ||
+                    (m.attachment?.description !== undefined && foldForSearch(m.attachment.description).includes(needle));
+                if (hit) matches.push({ thread, msg: m });
+            }
+        }
+        matches.sort((a, b) => b.msg.ts - a.msg.ts);
+        return matches.slice(0, cap).map(({ thread, msg }) => ({
+            threadId: msg.threadId,
+            threadKind: msg.threadKind,
+            threadName: thread?.name || msg.threadId,
+            threadAvatar: thread?.avatar ?? "",
+            message: this.toPublic(msg),
+        }));
+    }
+
     /** Sets (or with an empty code, clears) one user's reaction. Returns the updated message. */
     applyReaction(msgId: string, uid: string, code: string): StoredMessage | undefined {
         return this.update(msgId, (m) => {
@@ -876,6 +914,10 @@ export class ChatStore {
         this.saveTimer = setTimeout(() => this.flush(), 2000);
         this.saveTimer.unref();
     }
+}
+
+function foldForSearch(text: string): string {
+    return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/Đ/g, "D").toLowerCase();
 }
 
 function union(a: string[] | undefined, b: string[] | undefined): string[] {
