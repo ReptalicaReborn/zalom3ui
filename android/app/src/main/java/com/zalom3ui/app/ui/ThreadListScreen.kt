@@ -378,7 +378,7 @@ fun ThreadListScreen(
                 val groupHits = matches.filter { it.lastMessage == null && drafts[it.ref.key].isNullOrBlank() && it.kind == "group" }.sortedBy { foldForSearch(it.name) }
                 val messageHits = messageSearchResults
                 if (matches.isEmpty() && !messageSearchBusy && messageHits.isEmpty()) {
-                    item(key = "no-results") {
+                    item(key = "no-results", contentType = "no-results") {
                         Text(
                             "No results for “${query.trim()}”",
                             style = MaterialTheme.typography.bodyLarge,
@@ -388,8 +388,8 @@ fun ThreadListScreen(
                     }
                 }
                 if (chatHits.isNotEmpty()) {
-                    item(key = "h-chat-hits") { SectionHeader("Chats") }
-                    items(chatHits, key = { it.key }) { thread ->
+                    item(key = "h-chat-hits", contentType = "header") { SectionHeader("Chats") }
+                    items(chatHits, key = { it.key }, contentType = { "thread" }) { thread ->
                         ConversationRow(
                             thread = thread,
                             selected = thread.key == selectedKey,
@@ -403,20 +403,21 @@ fun ThreadListScreen(
                     }
                 }
                 if (contactHits.isNotEmpty()) {
-                    item(key = "h-contact-hits") { SectionHeader("Contacts") }
-                    items(contactHits.take(MAX_RESULTS), key = { it.key }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
+                    item(key = "h-contact-hits", contentType = "header") { SectionHeader("Contacts") }
+                    items(contactHits.take(MAX_RESULTS), key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
                 }
                 if (groupHits.isNotEmpty()) {
-                    item(key = "h-group-hits") { SectionHeader("Groups") }
-                    items(groupHits.take(MAX_RESULTS), key = { it.key }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
+                    item(key = "h-group-hits", contentType = "header") { SectionHeader("Groups") }
+                    items(groupHits.take(MAX_RESULTS), key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
                 }
                 if (messageSearchBusy || messageHits.isNotEmpty()) {
-                    item(key = "h-message-hits") {
+                    item(key = "h-message-hits", contentType = "message-hits-header") {
                         MessagesSectionHeader(busy = messageSearchBusy)
                     }
                     items(
                         items = messageHits,
                         key = { hit -> "msg:${hit.ref.key}:${hit.message.id}:${hit.message.ts}" },
+                        contentType = { "message-hit" },
                     ) { hit ->
                         MessageSearchHitRow(
                             hit = hit,
@@ -430,7 +431,7 @@ fun ThreadListScreen(
                 }
             } else {
                 if (status?.state == "disconnected" || connectionError != null) {
-                    item(key = "banner") {
+                    item(key = "banner", contentType = "banner") {
                         StatusBanner(
                             text = connectionError ?: status?.error ?: "Disconnected from Zalo",
                             action = if (status?.state == "disconnected") "Reconnect" else null,
@@ -439,7 +440,7 @@ fun ThreadListScreen(
                     }
                 }
                 if (!searching && chats.isNotEmpty()) {
-                    item(key = "filter-bar") {
+                    item(key = "filter-bar", contentType = "filter-bar") {
                         ChatFilterBar(
                             selected = filter,
                             unreadCount = unreadChatCount,
@@ -448,9 +449,9 @@ fun ThreadListScreen(
                     }
                 }
                 if (chats.isEmpty()) {
-                    item(key = "empty") { EmptyChats() }
+                    item(key = "empty", contentType = "empty") { EmptyChats() }
                 } else if (visibleChats.isEmpty()) {
-                    item(key = "empty-filtered") {
+                    item(key = "empty-filtered", contentType = "empty") {
                         val (title, subtitle) = when (filter) {
                             ChatFilter.UNREAD -> "All caught up" to "No unread conversations right now."
                             ChatFilter.GROUPS -> "No group chats" to "Group conversations you join or create appear here."
@@ -467,8 +468,8 @@ fun ThreadListScreen(
                     val pinned = visibleChats.filter { it.pinned }
                     val others = visibleChats.filterNot { it.pinned }
                     if (pinned.isNotEmpty()) {
-                        item(key = "h-pinned") { SectionHeader("Pinned") }
-                        items(pinned, key = { it.key }) { thread ->
+                        item(key = "h-pinned", contentType = "header") { SectionHeader("Pinned") }
+                        items(pinned, key = { it.key }, contentType = { "thread" }) { thread ->
                             ConversationRow(
                                 thread = thread,
                                 selected = thread.key == selectedKey,
@@ -480,9 +481,9 @@ fun ThreadListScreen(
                                 onAction = { onRowAction(thread, it) },
                             )
                         }
-                        if (others.isNotEmpty()) item(key = "h-chats") { SectionHeader("Chats") }
+                        if (others.isNotEmpty()) item(key = "h-chats", contentType = "header") { SectionHeader("Chats") }
                     }
-                    items(others, key = { it.key }) { thread ->
+                    items(others, key = { it.key }, contentType = { "thread" }) { thread ->
                         ConversationRow(
                             thread = thread,
                             selected = thread.key == selectedKey,

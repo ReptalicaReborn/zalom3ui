@@ -73,7 +73,7 @@ fun ContactsScreen(
         },
     ) { padding ->
         LazyColumn(Modifier.fillMaxSize(), contentPadding = padding) {
-            items(actions, key = { "action-${it.label}" }) { action ->
+            items(actions, key = { "action-${it.label}" }, contentType = { "action" }) { action ->
                 Row(
                     Modifier.fillMaxWidth().clickable(onClick = action.onClick).padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -86,7 +86,7 @@ fun ContactsScreen(
                     }
                 }
             }
-            item(key = "search") {
+            item(key = "search", contentType = "search") {
                 SearchPill(
                     query = query,
                     onQuery = { query = it },
@@ -95,7 +95,7 @@ fun ContactsScreen(
                 )
             }
             if (contacts.isEmpty() && groups.isEmpty()) {
-                item(key = "empty") {
+                item(key = "empty", contentType = "empty") {
                     Text(
                         if (threads.isEmpty()) "Your contacts are still loading…" else "No matches",
                         style = MaterialTheme.typography.bodyLarge,
@@ -105,12 +105,12 @@ fun ContactsScreen(
                 }
             }
             if (contacts.isNotEmpty()) {
-                item(key = "h-contacts") { SectionHeader("Contacts") }
-                items(contacts, key = { it.key }) { ContactRow(it, onClick = { onPick(it) }) }
+                item(key = "h-contacts", contentType = "header") { SectionHeader("Contacts") }
+                items(contacts, key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { onPick(it) }) }
             }
             if (groups.isNotEmpty()) {
-                item(key = "h-groups") { SectionHeader("Groups") }
-                items(groups, key = { it.key }) { ContactRow(it, onClick = { onPick(it) }) }
+                item(key = "h-groups", contentType = "header") { SectionHeader("Groups") }
+                items(groups, key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { onPick(it) }) }
             }
         }
     }

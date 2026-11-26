@@ -1098,6 +1098,8 @@ private fun MessageList(
     // Newest at the bottom: reverseLayout keeps the view pinned to the latest message.
     val items = remember(chat.messages, chat.firstUnreadId) { buildChatItems(chat.messages, chat.firstUnreadId) }
     val reversedItems = remember(items) { items.asReversed() }
+    // The list reads each row's content type on every measure pass, so a row is classified once per list.
+    val rowTypes = remember(reversedItems) { arrayOfNulls<String>(reversedItems.size) }
     val reversedPending = remember(chat.pending) { chat.pending.asReversed() }
     val bottomOffset = (if (typing != null) 1 else 0) + reversedPending.size
     val isGroup = chat.kind == "group"
@@ -1199,9 +1201,13 @@ private fun MessageList(
             modifier = Modifier.fillMaxSize(),
         ) {
             if (typing != null) {
-                item(key = "typing") { TypingBubble(isGroup, typing) }
+                item(key = "typing", contentType = "typing") { TypingBubble(isGroup, typing) }
             }
-            items(reversedPending.size, key = { "pending:${reversedPending[it].localId}" }) { i ->
+            items(
+                reversedPending.size,
+                key = { "pending:${reversedPending[it].localId}" },
+                contentType = { "pending" },
+            ) { i ->
                 val pending = reversedPending[i]
                 PendingMessageRow(
                     pending = pending,
@@ -1210,7 +1216,11 @@ private fun MessageList(
                     onDismiss = { onDismissPending(pending.localId) },
                 )
             }
-            items(reversedItems.size, key = { reversedItems[it].key }) { i ->
+            items(
+                reversedItems.size,
+                key = { reversedItems[it].key },
+                contentType = { i -> rowTypes[i] ?: chatItemContentType(reversedItems[i]).also { rowTypes[i] = it } },
+            ) { i ->
                 val item = reversedItems[i]
                 val olderItem = reversedItems.getOrNull(i + 1)
                 val newerItem = reversedItems.getOrNull(i - 1)
@@ -1285,7 +1295,7 @@ private fun MessageList(
                 }
             }
             if (chat.loadingMore) {
-                item(key = "loading") { LinearWavyProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp)) }
+                item(key = "loading", contentType = "loading") { LinearWavyProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp)) }
             }
         }
 
@@ -1520,6 +1530,19 @@ internal sealed interface ChatItem {
 private fun isCallLogMessage(msg: ChatMessage): Boolean = !msg.recalled && msg.attachment?.kind == "call"
 
 private fun isSystemLikeRow(msg: ChatMessage): Boolean = isCallLogMessage(msg) || systemMessageLabel(msg) != null
+
+/**
+ * Lazy-list content type of a chat row. It follows the same branches the row renders (call group, call log row,
+ * system info row, message bubble), so a recycled row is only reused for a row of the same kind.
+ */
+private fun chatItemContentType(item: ChatItem): String = when (item) {
+    is ChatItem.CallGroup -> "call-group"
+    is ChatItem.Single -> when {
+        isCallLogMessage(item.msg) -> "call"
+        systemMessageLabel(item.msg) != null -> "system"
+        else -> "message"
+    }
+}
 
 /** Groups consecutive same-day call log entries within [windowMs] without crossing [firstUnreadId]. */
 internal fun buildChatItems(

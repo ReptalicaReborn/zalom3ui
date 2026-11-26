@@ -126,7 +126,7 @@ fun FriendPickerScreen(
     ) { modifier ->
         LazyColumn(modifier.fillMaxSize()) {
             if (askName) {
-                item(key = "name") {
+                item(key = "name", contentType = "name") {
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it.take(100) },
@@ -136,10 +136,10 @@ fun FriendPickerScreen(
                     )
                 }
             }
-            item(key = "search") {
+            item(key = "search", contentType = "search") {
                 SearchPill(query = query, onQuery = { query = it }, placeholder = "Search friends", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
             }
-            item(key = "count") {
+            item(key = "count", contentType = "count") {
                 Text(
                     when {
                         picked.isEmpty() && minPicks > 1 -> "Pick at least $minPicks friends"
@@ -152,9 +152,9 @@ fun FriendPickerScreen(
                 )
             }
             if (friends.isEmpty()) {
-                item(key = "empty") { Text("Your friends are still loading…", modifier = Modifier.padding(24.dp)) }
+                item(key = "empty", contentType = "empty") { Text("Your friends are still loading…", modifier = Modifier.padding(24.dp)) }
             }
-            items(shown, key = { it.id }) { person ->
+            items(shown, key = { it.id }, contentType = { "friend" }) { person ->
                 val member = person.id in exclude
                 val checked = member || person.id in picked
                 Row(
@@ -209,7 +209,7 @@ fun FriendsScreen(
     val searching = query.isNotBlank()
     PeopleScaffold(title = "Contacts", onBack = onBack) { modifier ->
         LazyColumn(modifier.fillMaxSize()) {
-            item(key = "add") {
+            item(key = "add", contentType = "add") {
                 FilledTonalButton(
                     onClick = onAddFriend,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth(),
@@ -220,8 +220,8 @@ fun FriendsScreen(
                 }
             }
             if (!received.isNullOrEmpty() && !searching) {
-                item(key = "h-received") { SectionHeader("Friend requests (${received.size})") }
-                items(received, key = { "r-${it.id}" }) { r ->
+                item(key = "h-received", contentType = "header") { SectionHeader("Friend requests (${received.size})") }
+                items(received, key = { "r-${it.id}" }, contentType = { "received" }) { r ->
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(r.name, r.avatar, key = "user:${r.id}", isGroup = false, size = 48.dp)
                         Spacer(Modifier.width(12.dp))
@@ -239,8 +239,8 @@ fun FriendsScreen(
                 }
             }
             if (!sent.isNullOrEmpty() && !searching) {
-                item(key = "h-sent") { SectionHeader("Sent requests (${sent.size})") }
-                items(sent, key = { "s-${it.id}" }) { r ->
+                item(key = "h-sent", contentType = "header") { SectionHeader("Sent requests (${sent.size})") }
+                items(sent, key = { "s-${it.id}" }, contentType = { "sent" }) { r ->
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(r.name, r.avatar, key = "user:${r.id}", isGroup = false, size = 40.dp)
                         Spacer(Modifier.width(12.dp))
@@ -252,19 +252,19 @@ fun FriendsScreen(
                     }
                 }
             }
-            item(key = "search") {
+            item(key = "search", contentType = "search") {
                 SearchPill(query = query, onQuery = { query = it }, placeholder = "Search friends", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
             }
             if (friends.isEmpty()) {
-                item(key = "empty") {
+                item(key = "empty", contentType = "empty") {
                     Text("Your friends are still loading…", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(24.dp))
                 }
             } else if (shown.isEmpty()) {
-                item(key = "none") { Text("No matches", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(24.dp)) }
+                item(key = "none", contentType = "empty") { Text("No matches", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(24.dp)) }
             }
             grouped.forEach { (letter, people) ->
-                item(key = "h-$letter") { SectionHeader(letter) }
-                items(people, key = { "f-${it.id}" }) { person ->
+                item(key = "h-$letter", contentType = "header") { SectionHeader(letter) }
+                items(people, key = { "f-${it.id}" }, contentType = { "friend" }) { person ->
                     Row(
                         Modifier.fillMaxWidth().clickable { onMessage(person) }.padding(horizontal = 16.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -382,8 +382,8 @@ fun GroupMembersScreen(
             return@PeopleScaffold
         }
         LazyColumn(modifier.fillMaxSize()) {
-            item(key = "count") { SectionHeader("${members.size + 1} members (you included)") }
-            items(members, key = { it.id }) { m ->
+            item(key = "count", contentType = "header") { SectionHeader("${members.size + 1} members (you included)") }
+            items(members, key = { it.id }, contentType = { "member" }) { m ->
                 Row(
                     Modifier.fillMaxWidth().clickable { onOpen(m) }.padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
