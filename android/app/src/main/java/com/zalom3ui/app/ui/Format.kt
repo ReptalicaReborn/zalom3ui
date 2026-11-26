@@ -7,7 +7,38 @@ import android.util.Base64
 import com.zalom3ui.app.data.ChatMessage
 import java.text.DateFormat
 import java.text.Normalizer
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.DecimalStyle
 import java.util.Calendar
+import java.util.Locale
+
+/** Built once rather than on every row and recomposition. */
+private val SPACE_RUN_REGEX = Regex("\\s+")
+private val COMBINING_MARKS_REGEX = Regex("\\p{Mn}+")
+
+/**
+ * A fixed date pattern built once per locale instead of on every row. java.time formatters are immutable and
+ * thread-safe. The locale's digits are kept so the text matches SimpleDateFormat, and the zone is read on every
+ * call so a time zone change still applies.
+ */
+private class PatternFormatter(private val pattern: String) {
+    private class Entry(val locale: Locale, val formatter: DateTimeFormatter)
+
+    @Volatile private var cached: Entry? = null
+
+    fun format(ms: Long): String {
+        val locale = Locale.getDefault()
+        val entry = cached?.takeIf { it.locale == locale }
+            ?: Entry(locale, DateTimeFormatter.ofPattern(pattern, locale).withDecimalStyle(DecimalStyle.of(locale)))
+                .also { cached = it }
+        return entry.formatter.format(Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()))
+    }
+}
+
+private val WEEKDAY_FORMAT = PatternFormatter("EEE")
+private val MONTH_DAY_FORMAT = PatternFormatter("MMM d")
 
 fun initial(name: String): String = name.trim().firstOrNull()?.uppercase() ?: "?"
 
@@ -19,7 +50,7 @@ fun formatListTime(ts: Long, now: Long = System.currentTimeMillis()): String {
         then.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR)
     return when {
         sameDay -> DateFormat.getTimeInstance(DateFormat.SHORT).format(ts)
-        now - ts < 6 * DateUtils.DAY_IN_MILLIS -> java.text.SimpleDateFormat("EEE", java.util.Locale.getDefault()).format(ts)
+        now - ts < 6 * DateUtils.DAY_IN_MILLIS -> WEEKDAY_FORMAT.format(ts)
         else -> DateFormat.getDateInstance(DateFormat.SHORT).format(ts)
     }
 }
@@ -65,8 +96,7 @@ fun formatPresence(lastOnline: Long, now: Long = System.currentTimeMillis()): St
     if (hours < 24) return "Active ${hours}h ago"
     val days = diff / DAY_MS
     if (days < 7) return "Active ${days}d ago"
-    val date = java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(ms)
-    return "Active $date"
+    return "Active ${MONTH_DAY_FORMAT.format(ms)}"
 }
 
 private const val MINUTE_MS = 60_000L
@@ -99,7 +129,7 @@ private val LEFT_GROUP_REGEX = Regex("^(.+?)\\s+đã rời khỏi nhóm$", Regex
 fun systemMessageLabel(msg: ChatMessage): String? {
     if (msg.recalled) return null
     if (msg.attachment?.kind == "call") return null
-    val raw = msg.text.replace(Regex("\\s+"), " ").trim()
+    val raw = msg.text.replace(SPACE_RUN_REGEX, " ").trim()
     val lowered = raw.lowercase()
     val folded = foldForSearch(raw)
     if (msg.msgType == "chat.call.feedback" || folded.contains("am thanh cuoc goi co van de")) {
@@ -135,7 +165,7 @@ fun systemMessageLabel(msg: ChatMessage): String? {
 /** Lowercase and strip Vietnamese diacritics so "duc" finds "Đức". */
 fun foldForSearch(s: String): String =
     Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD)
-        .replace(Regex("\\p{Mn}+"), "")
+        .replace(COMBINING_MARKS_REGEX, "")
         .replace('đ', 'd')
 
 fun decodeDataUrl(dataUrl: String): Bitmap? = runCatching {
@@ -164,7 +194,7 @@ fun preview(msg: ChatMessage?): String {
     if (msg.recalled) return "Message recalled"
     systemMessageLabel(msg)?.let { return it }
     val raw = msg.text.ifBlank { msg.attachment?.let { "📎 " + (it.title?.takeIf(String::isNotBlank) ?: "Attachment") }.orEmpty() }
-    val body = raw.replace(Regex("\\s+"), " ").trim()
+    val body = raw.replace(SPACE_RUN_REGEX, " ").trim()
     return when {
         msg.threadKind != "group" -> body
         msg.isSelf -> "You: $body"
