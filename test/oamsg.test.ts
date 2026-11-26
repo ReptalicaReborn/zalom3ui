@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractDroppedMessages } from "../src/oamsg.js";
+import { extractDroppedMessages, messageFrameShape } from "../src/oamsg.js";
 import { extractOtpCode, normalizeMessage, parseAttachment, type RawMessage } from "../src/store.js";
 
 function frameOf(cmd: number, subCmd: number, payload: unknown): Buffer {
@@ -99,4 +99,39 @@ test("extractOtpCode extracts 4-8 digit OTPs and ignores 10-digit account/phone 
     assert.equal(extractOtpCode("739201 là mã xác nhận giao dịch"), "739201");
     assert.equal(extractOtpCode("Bạn đang yêu cầu cài đặt lại mã PIN tài khoản Giang với mã tài khoản 0378795621 tại The 1."), undefined);
     assert.equal(extractOtpCode("Hẹn gặp lúc 14:30 nhé"), undefined);
+});
+
+test("messageFrameShape logs where unusual messages arrive, never their ids, text or codes", () => {
+    const otpFrame = frameOf(501, 0, {
+        data: {
+            msgs: [{ msgId: "1", msgType: "webchat", uidFrom: "friend1", idTo: "0", ts: "1", content: "hi" }],
+            znsMsgs: [
+                {
+                    msgId: "2",
+                    msgType: "chat.webcontent.v2",
+                    uidFrom: "oa_bank",
+                    idTo: "0",
+                    ts: "2",
+                    content: { title: "Mã OTP", description: "Mã xác thực của bạn là 482913", params: "{}" },
+                },
+            ],
+            delivereds: [{ msgId: "9", seenUids: ["x"] }],
+        },
+    });
+    const shape = messageFrameShape(otpFrame, undefined);
+    assert.ok(shape);
+    assert.equal(shape.cmd, 501);
+    assert.deepEqual(shape.keys, ["msgs", "znsMsgs", "delivereds"]);
+    assert.deepEqual(shape.lists, [
+        { name: "msgs", count: 1, msgTypes: ["webchat"], content: ["text"] },
+        { name: "znsMsgs", count: 1, msgTypes: ["chat.webcontent.v2"], content: ["description,params,title"] },
+    ]);
+    const logged = JSON.stringify(shape);
+    for (const secret of ["482913", "oa_bank", "friend1", "Mã OTP", "hi\""]) assert.ok(!logged.includes(secret), secret);
+
+    // Plain text in the lists zca-js reads is the normal case: nothing to log.
+    const plain = frameOf(521, 0, { data: { groupMsgs: [{ msgId: "3", msgType: "webchat", uidFrom: "a", idTo: "g", ts: "3", content: "yo" }] } });
+    assert.equal(messageFrameShape(plain, undefined), null);
+    // Not a message frame.
+    assert.equal(messageFrameShape(frameOf(601, 0, { data: { controls: [] } }), undefined), null);
 });

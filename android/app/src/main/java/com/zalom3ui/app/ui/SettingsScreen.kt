@@ -452,7 +452,7 @@ fun SettingsScreen(
                                 leadingContent = { Icon(Icons.Outlined.Share, null) },
                                 headlineContent = { Text("Share call log") },
                                 supportingContent = {
-                                    Text("Call events Zalo sent (call ids, server addresses; no messages), to help debug calls")
+                                    Text("Call events and the types of unusual messages Zalo sent (call ids, server addresses; never message text), to help debug calls and missing messages")
                                 },
                             )
                         },

@@ -72,28 +72,38 @@ function toRawMessage(item: unknown, isGroup: boolean, ownId: string): RawMessag
     };
 }
 
-/** Extracts OA (`pageMsgs`) and offline/re-push messages from a raw Zalo WebSocket frame. */
-export function extractDroppedMessages(frame: Buffer, cipherKey: string | undefined, ownId: string): RawMessage[] {
-    const header = frameHeader(frame);
-    if (!header || header.version !== 1 || !PAGE_MSG_CMDS.has(header.cmd)) return [];
-    const text = frame.subarray(4).toString("utf8");
-    if (!text) return [];
+/** Message-bearing frame commands (the ones zca-js reads plus the offline/re-push ones it ignores). */
+const MESSAGE_CMDS = new Set([...PAGE_MSG_CMDS, 502, 511, 521, 522]);
+/** Lists zca-js reads itself; only other lists, or non-text messages in these, are worth a trace line. */
+const HANDLED_LISTS = new Set(["msgs", "groupMsgs"]);
 
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        return [];
-    }
+/** The decoded `data` of a message frame, or null when it isn't one (or can't be read). */
+function decodeMessageFrame(
+    frame: Buffer,
+    cipherKey: string | undefined,
+    cmds: Set<number>,
+): { cmd: number; subCmd: number; data: Record<string, unknown> } | null {
+    const header = frameHeader(frame);
+    if (!header || header.version !== 1 || !cmds.has(header.cmd)) return null;
+    const text = frame.subarray(4).toString("utf8");
+    if (!text) return null;
     let decoded: unknown;
     try {
-        decoded = decodeEventPayload(parsed as { data?: unknown; encrypt?: unknown }, cipherKey);
+        decoded = decodeEventPayload(JSON.parse(text) as { data?: unknown; encrypt?: unknown }, cipherKey);
     } catch {
-        return [];
+        return null;
     }
-    if (!decoded || typeof decoded !== "object") return [];
+    if (!decoded || typeof decoded !== "object") return null;
     const outer = decoded as Record<string, unknown>;
     const data = outer.data && typeof outer.data === "object" ? (outer.data as Record<string, unknown>) : outer;
+    return { cmd: header.cmd, subCmd: header.subCmd, data };
+}
+
+/** Extracts OA (`pageMsgs`) and offline/re-push messages from a raw Zalo WebSocket frame. */
+export function extractDroppedMessages(frame: Buffer, cipherKey: string | undefined, ownId: string): RawMessage[] {
+    const decoded = decodeMessageFrame(frame, cipherKey, PAGE_MSG_CMDS);
+    if (!decoded) return [];
+    const { cmd, data } = decoded;
 
     const out: RawMessage[] = [];
     const pushList = (list: unknown, isGroup: boolean) => {
@@ -108,10 +118,49 @@ export function extractDroppedMessages(frame: Buffer, cipherKey: string | undefi
     pushList(data.pageMsgs, false);
 
     // For offline/re-push commands zca-js ignores completely, also capture standard 1:1 and group arrays.
-    if (OFFLINE_PUSH_CMDS.has(header.cmd)) {
+    if (OFFLINE_PUSH_CMDS.has(cmd)) {
         pushList(data.msgs, false);
         pushList(data.groupMsgs, true);
     }
 
     return out;
+}
+
+/** One message list of a frame, for the debug log: its name, size, message types and content field names. */
+export type MessageListShape = { name: string; count: number; msgTypes: string[]; content: string[] };
+
+/**
+ * What a message frame carries, for the debug log, when it is anything but plain text in the lists zca-js reads: a
+ * list under another name (where OA/ZNS/OTP messages may arrive) or a non-text message type. Only names, counts,
+ * message types and content field names are kept: never ids, text or codes. Null when there is nothing unusual.
+ */
+export function messageFrameShape(
+    frame: Buffer,
+    cipherKey: string | undefined,
+): { cmd: number; subCmd: number; keys: string[]; lists: MessageListShape[] } | null {
+    const decoded = decodeMessageFrame(frame, cipherKey, MESSAGE_CMDS);
+    if (!decoded) return null;
+    const { cmd, subCmd, data } = decoded;
+    const lists: MessageListShape[] = [];
+    let unusual = false;
+    for (const [name, value] of Object.entries(data)) {
+        if (!Array.isArray(value)) continue;
+        const items = value.filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v));
+        // A message list: its items have a type or content (receipts and the like have neither).
+        if (!items.some((m) => "msgType" in m || "content" in m)) continue;
+        const msgTypes = [...new Set(items.map((m) => String(m.msgType ?? "?").slice(0, 60)))].slice(0, 10);
+        const content = [...new Set(items.map((m) => contentShape(m.content)))].slice(0, 10);
+        lists.push({ name: name.slice(0, 40), count: value.length, msgTypes, content });
+        if (!HANDLED_LISTS.has(name) || msgTypes.some((t) => t !== "webchat")) unusual = true;
+    }
+    if (!unusual) return null;
+    return { cmd, subCmd, keys: Object.keys(data).slice(0, 30), lists };
+}
+
+/** "text" for a string, else the content object's field names: never the values. */
+function contentShape(content: unknown): string {
+    if (typeof content === "string") return "text";
+    if (!content || typeof content !== "object") return typeof content;
+    if (Array.isArray(content)) return "array";
+    return Object.keys(content).sort().join(",").slice(0, 120);
 }

@@ -35,7 +35,7 @@ import {
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
 import { HistorySync, backupDownloader, fileServiceCaller, noisedIdsResolver, type HistorySyncStatus } from "./historysync.js";
-import { extractDroppedMessages } from "./oamsg.js";
+import { extractDroppedMessages, messageFrameShape } from "./oamsg.js";
 import {
     acceptCall,
     answerAck,
@@ -748,6 +748,10 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             this.historySync.onFrame(data, l.cipherKey);
             const dropped = extractDroppedMessages(data, l.cipherKey, this.status.ownId ?? "");
             for (const raw of dropped) this.ingest(raw as unknown as Message);
+            // Where OA/ZNS/OTP messages arrive is still unknown: log the shape (never the text) of any message frame
+            // that isn't plain text in the lists zca-js reads, and how many of its messages were picked up here.
+            const shape = messageFrameShape(data, l.cipherKey);
+            if (shape) this.callTrace.record({ kind: "msg_frame", ...shape, captured: dropped.length });
             let info: FrameInfo | null;
             try {
                 info = inspectFrame(data, l.cipherKey);
