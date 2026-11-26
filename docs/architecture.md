@@ -47,7 +47,7 @@ The app runs in **one Android process**. The Rust core is loaded into it as a li
   **`ZaloNotificationListener`** is the notification bridge (section 6).
 - **`CallService`** is a second foreground service (microphone, and camera for video) that runs while a call is active.
 - **`NotificationActionReceiver`** and **`CallActionReceiver`** handle *Reply*, *Mark as read* and *Decline* from
-  notifications.
+  notifications. **`OtpCopyReceiver`** handles *Copy 482910* (section 12).
 
 Before the Rust port, the core was Node.js in a separate `:node` process, reached over a loopback port with a random
 token. Node could only start once per process, which forced that split. With Rust it is gone: there is no port, no
@@ -96,7 +96,8 @@ attaching Rust threads to the JVM and holding references to Kotlin objects.
 
 A message event carries `notify: true` (and the chat name) when the phone should show a notification: not your own
 message, not a muted chat, not the chat you have open (`PUT /api/presence`, refreshed while a chat is on screen), and
-not replayed history.
+not replayed history. An incoming message also carries `otp` (a code from its card, or found in its plain text; the
+detector is `extract_otp_code` in `store.rs`, mirrored by `extractOtpCode` in `ui/OtpCode.kt` with the same test vectors).
 
 ## 5. The connection to Zalo
 
@@ -161,8 +162,13 @@ core holds the chat socket. It only applies when Zalo runs on the phone.
   startup log records only the package, category and classification of Zalo's notifications, never their text. All of
   this runs inside the listener service Android keeps bound; it never starts a foreground service from the background.
 
-The decisions (when to pause or resume, coalescing, which Zalo notifications count) are in plain Kotlin classes
-(`ListenerGate`, `BusyCheck`, `ZaloNotificationRules`) with their own unit tests. The default for new installs is one
+`ZaloNotificationListener` has a second, independent job, **Codes from Zalo's notifications** (a separate setting, off by
+default, section 12). The component is enabled when the bridge mode wants it *or* that setting is on
+(`ListenerJobs.componentEnabled`), and each job is gated on its own setting (`ListenerJobs.jobsFor`): the bridge only in
+its mode, the code rescue in any mode, and the rescue never brings the core online.
+
+The decisions (when to pause or resume, coalescing, which Zalo notifications count, which listener job runs) are in plain
+Kotlin classes (`ListenerGate`, `BusyCheck`, `ZaloNotificationRules`, `ListenerJobs`) with their own unit tests. The default for new installs is one
 constant (`StayConnected.NEW_INSTALL_DEFAULT`), to change once the replay test ([replay-test.md](replay-test.md))
 shows that *While open* doesn't lose 1:1 history.
 
@@ -181,6 +187,7 @@ Everything is in the app's private storage under `files/zalo/` (on a server: `DA
 | `messages/threads/<hex>.json` | One file per chat, named by the hex of `kind:id` (e.g. `user:100`); the last 500 messages, up to 2,000 with history synced from the phone |
 | `call-trace.jsonl` | A redacted log of call signalling, for *Settings → Developer → Share call log* |
 | `replay-log.json`, `replay-mode.json`, `listener-state.json` | The last 50 replay reports, the replay mode, and when the listener was last connected |
+| `socket-log.jsonl` | The last 500 WebSocket frames, structure only (no message text) |
 | `server.log`, `startup.log` | The core's log (rotated) and the app's startup steps, for *Share log* |
 
 `ChatStore` saves only the chats that changed, each file written atomically. A file that can't be read is set aside
@@ -225,7 +232,51 @@ in-process path leaves out: Host and Origin checks, an access token (required un
 security headers and a CSP for the web UI. The app talks to it with `HttpTransport` and the `/ws` and `/ws/call-audio`
 WebSockets. The web UI in `public/` is optional (`PUBLIC_DIR`).
 
-## 11. Building and testing
+## 11. One-time codes and the socket log
+
+**Frames.** `dispatch_frame` (`zalo-proto/src/listener.rs`) reads `pageMsgs` (Official Account, ZNS and OTP messages) on
+501 and 510 whatever the subCmd, as the TypeScript version did, and on the offline re-push commands (504, 513, 514, 524,
+534, 551, 570). `msgs` / `groupMsgs` are only read where they were before, so nothing is emitted twice. A 501 `pageMsgs`
+is live (`Messages`); on 510/1 it is part of the paged replay (`OldMessages`), and on 510 with another subCmd it is
+history outside the paged replay (`OldPageMessages`: stored, never notifies). The normalizer follows the TS `toRawMessage`
+(a null id falls through to the next id field, a numeric `msgType` is kept as a string, an unusable `ts` becomes now).
+
+**Socket log.** Each decoded frame produces a structure-only `FrameReport` (`zalo-proto/src/framelog.rs`) that the
+listener sends as `WsEvent::Frame` before the frame's other events; `ZaloSession` keeps the last 500 in
+`socket_log.rs` and appends them to `socket-log.jsonl` (compacted, so it survives a restart). One entry has: time,
+version, cmd, subCmd, whether a handler consumed the frame (`handled`) or it fell through to `RawFrame`, the top-level
+and `data` key names, every array with its length and whether any handler reads it, for control frames the
+`act_type/act`, and per message item the `msgType`, the keys of `content` (or `string`, `string>{keys}` for JSON in a
+string, `number`, ...), whether `uidFrom` is 0 / own / other, and the outcome: message, undo or dropped with the reason
+(`no msgId`, `thread id empty/0`, `undo content`, `not an object`, `own message (selfListen off)`). Message text, content
+values, names and phone numbers are never recorded; every string from the wire is reduced to `[A-Za-z0-9._:-]`.
+`GET /api/debug/socket-log` renders it (newest first), `DELETE` clears it; *Settings → Developer → Socket log* views,
+copies, shares and clears it.
+
+## 12. Codes in notifications
+
+- **Detection** (`extract_otp_code` / `extractOtpCode`): on folded lowercase text, per line: a strong keyword (OTP, mã xác
+  thực, verification code, ...) followed in the same sentence by the first code-like number; or a weak keyword directly
+  followed by the code (`code: 123456`, `mã: 123456`, `mã của bạn là 1234`); or a code-like number right before a keyword
+  (`739201 là mã xác nhận`, `123456 is your verification code`, `G-123456 is your Google verification code`); or a line
+  that is only a code under a keyword line. Code-like means 4-8 digits, or two groups of three (`482 910`, `482-910`,
+  returned as `482910`). Amounts, dates, times, 9+ digit numbers, numbers after tk/stk/sdt/hotline, and a year after
+  "năm" are skipped.
+- **Chat notifications.** `MessageNotifier` shows a message that carries a code with the code first, a **Copy 482910**
+  action and the lock-screen privacy (`VISIBILITY_PRIVATE` with a public version that says only "New code received").
+- **Copy.** The action is a broadcast to `OtpCopyReceiver`, which writes the clipboard with
+  `ClipDescription.EXTRA_IS_SENSITIVE` (Android 13+; the same key is set on older versions, where it is ignored). It
+  never reads the clipboard and never starts an activity, so Android 10+'s background-clipboard rule (reading only) and
+  Android 12+'s notification-trampoline rule do not apply, on any API level. Android 13+ shows its own "copied"
+  confirmation; Zalỏ adds a toast on 12 and older.
+- **Codes from Zalo's notifications** (`OtpLogic.kt`, `OtpNotifications.kt`, `ZaloNotificationListener.kt`): for a Zalo
+  message notification, the listener reads the title, text, big text, inbox lines and the recent MessagingStyle messages in
+  memory, finds a code the same way, and posts "Code 482910 · title" with Copy on its own channel. `OtpDedupe` skips a code
+  Zalỏ announced itself in the last 2 minutes, and a code already rescued in the last 10 minutes (Zalo re-posting a
+  notification with more lines). The text and the code are never logged or stored; the startup log says only "otp
+  rescued from zalo notification".
+
+## 13. Building and testing
 
 - **Build.** `cd android && ./gradlew assembleRelease`. The Gradle task `buildRustCore<Variant>` runs
   `cargo build --release --target aarch64-linux-android -p zalo-android` with the NDK's clang and packs
@@ -241,9 +292,10 @@ WebSockets. The web UI in `public/` is optional (`PUBLIC_DIR`).
     the notify window are tested without a Zalo account;
   - the HTTP router, the WebSocket and call-audio sockets, and the embedded core (in-process requests, events, the
     audio link, starting again after shutdown).
-- **Android tests** (`./gradlew testDebugUnitTest`, 189 JVM tests): models, formatting, the transports over a fake native
+- **Android tests** (`./gradlew testDebugUnitTest`, 209 JVM tests): models, formatting, the transports over a fake native
   layer, the call-audio link, jitter buffer, voice recorder, layout and gesture logic, and the *Stay connected*
-  decisions (pause/resume timing, busy checks, which Zalo notifications count).
+  decisions (pause/resume timing, busy checks, which Zalo notifications count), the code detector (same vectors as
+  Rust), code de-duplication and which notification-listener job runs.
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
   APKs, checks the native libraries are inside, and uploads the APKs.
 

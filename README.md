@@ -70,9 +70,10 @@ The details (how a request travels, events, calls, storage, the connection lifec
 | Voice messages | Hold the mic button to record; voice messages play in the chat |
 | Stickers | **+** → *Sticker*: Zalo's sticker search, with suggested words |
 | Polls (groups) | Create, vote, add options, close |
-| Official accounts, ZNS, OTP messages | Shown as cards with their buttons; one tap copies an OTP code |
+| Official accounts, ZNS, OTP messages | Shown as cards with their buttons. One-time codes (in cards and in plain text) get a one-tap copy button in the chat and a **Copy 482910** action in the notification, which keeps the code off the lock screen |
 | Calls | 1:1 voice and video calls, incoming calls with a pop-up or full screen on the lock screen (*Settings → Incoming calls*) |
 | Notifications | One per chat with its latest lines; **Reply** and **Mark as read** from the notification. Muted chats and the chat you have open stay quiet |
+| Codes from Zalo's notifications | *Settings → Codes from Zalo's notifications* (off by default): if the official Zalo app is on this phone, Zalỏ reads one-time codes from its notifications and shows them with a Copy button, in case Zalo never sends them to Zalỏ |
 | Friends | Friend requests (accept, decline, sent), add a friend by phone number |
 | Groups | Create, add or remove members, rename, leave (optionally silently) |
 | Appearance | Light, dark or system theme, wallpaper colors (Android 12+), tinted chat background, per-chat colors |
@@ -111,6 +112,20 @@ message cache from the phone.
 it replays is not known yet. That is why **Always** stays the default until the replay test
 ([docs/replay-test.md](docs/replay-test.md)) shows otherwise. *Settings → Developer → Replay log* records, for every
 reconnect, how long Zalỏ was offline and what Zalo sent back (ids, counts and times only, no message text).
+
+### Codes from Zalo's notifications
+
+*Settings → Codes from Zalo's notifications* (off by default, any *Stay connected* mode) is for one-time codes that
+services and banks send through Zalo. If Zalo does not deliver those to Zalỏ's connection, the official Zalo app on the
+same phone still shows them in its notification. With this on, Zalỏ reads the notification text (in memory only; nothing
+is stored or logged) and posts its own "Code 482910 · title" notification with a **Copy** action, and hides the code on
+the lock screen. It needs notification access (the same switch the notification bridge uses, offered right in that
+group when it is already allowed), never brings Zalỏ online, never touches Zalo's call notifications, and stays quiet
+when Zalỏ already announced the same code in the last two minutes.
+
+*Settings → Developer → Socket log* shows what Zalo sent over the connection, frame by frame (command numbers, key
+names, array lengths, which messages were kept or dropped and why; never message text). It answers whether a code reaches
+Zalỏ at all.
 
 ## Running Zalo somewhere else (optional)
 
@@ -224,6 +239,7 @@ The standalone server, and the core inside the app, answer the same API. All end
 | `GET` | `/calls/current` | The active call, or 404 |
 | `GET` | `/debug/call-log` | Call signalling log (redacted); `DELETE` clears it |
 | `GET` | `/debug/replay-log` | What Zalo replayed after each reconnect (no message content); `DELETE` clears it |
+| `GET` | `/debug/socket-log` | The last 500 WebSocket frames, structure only (cmd, key names, array lengths, kept or dropped messages and why; no text), newest first, plain text; `DELETE` clears it |
 | `GET` · `PUT` | `/debug/replay-mode` | `{ "mode": "null" \| "newest" \| "page" }`: how the replay is requested, for the replay test |
 | `POST` | `/history-sync/start` · `/cancel` | Ask the phone's Zalo app for its chat history ([docs/history-sync.md](docs/history-sync.md)) |
 | `GET` | `/history-sync/status` | State, progress and a log of what the phone sent (no message content) |
