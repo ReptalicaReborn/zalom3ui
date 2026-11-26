@@ -367,7 +367,7 @@ mod tests {
         for i in 0..(COMPACT_AT as u16 + 5) {
             log.record(report(i));
         }
-        let lines = fs::read_to_string(&dir.join(FILE_NAME)).unwrap().lines().count();
+        let lines = fs::read_to_string(dir.join(FILE_NAME)).unwrap().lines().count();
         assert!(lines < COMPACT_AT, "{lines}");
         log.clear();
         assert!(log.is_empty());
