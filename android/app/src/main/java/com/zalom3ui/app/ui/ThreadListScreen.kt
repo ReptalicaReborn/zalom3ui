@@ -94,6 +94,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.Key
@@ -122,7 +123,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.MessageSearchHit
 import com.zalom3ui.app.data.MuteOption
@@ -895,15 +896,16 @@ private fun ConversationRow(
                             null
                         }
                         if (thumb != null) {
-                            SubcomposeAsyncImage(
+                            val thumbPlaceholder = remember(colors.surfaceContainerHigh) { ColorPainter(colors.surfaceContainerHigh) }
+                            AsyncImage(
                                 model = thumb,
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
                                     .size(20.dp)
                                     .clip(RoundedCornerShape(4.dp)),
-                                loading = { Box(Modifier.fillMaxSize().background(colors.surfaceContainerHigh)) },
-                                error = { Box(Modifier.fillMaxSize().background(colors.surfaceContainerHigh)) },
+                                placeholder = thumbPlaceholder,
+                                error = thumbPlaceholder,
                             )
                             Spacer(Modifier.width(6.dp))
                         }

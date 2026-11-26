@@ -204,7 +204,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.ChatMessage
@@ -863,7 +863,7 @@ private fun MediaPreviewSheet(
                         .background(MaterialTheme.colorScheme.surfaceContainerHighest),
                     contentAlignment = Alignment.Center,
                 ) {
-                    SubcomposeAsyncImage(
+                    AsyncImage(
                         model = uris.first(),
                         contentDescription = "Selected photo",
                         contentScale = ContentScale.Fit,
@@ -883,7 +883,7 @@ private fun MediaPreviewSheet(
                                 .clip(RoundedCornerShape(16.dp))
                                 .background(MaterialTheme.colorScheme.surfaceContainerHighest),
                         ) {
-                            SubcomposeAsyncImage(
+                            AsyncImage(
                                 model = uri,
                                 contentDescription = "Selected photo",
                                 contentScale = ContentScale.Crop,

@@ -65,7 +65,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.MuteOption
 
@@ -98,14 +99,19 @@ fun Avatar(name: String, url: String, key: String, isGroup: Boolean, size: Dp = 
     if (url.isBlank()) {
         Box(modifier) { fallback() }
     } else {
-        SubcomposeAsyncImage(
-            model = url,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = modifier.size(size).clip(shape),
-            loading = { fallback() },
-            error = { fallback() },
-        )
+        // Plain AsyncImage over the initials (no subcomposition per chat row). The initials hide once the picture
+        // is in, so transparent pictures don't show them through.
+        var loaded by remember(url) { mutableStateOf(false) }
+        Box(modifier.size(size).clip(shape)) {
+            if (!loaded) fallback()
+            AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.matchParentSize(),
+                onState = { loaded = it is AsyncImagePainter.State.Success },
+            )
+        }
     }
 }
 

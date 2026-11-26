@@ -114,7 +114,8 @@ import androidx.core.content.FileProvider
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.Coil
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
@@ -321,13 +322,15 @@ fun AttachmentContent(
 fun StickerImage(url: String?, modifier: Modifier = Modifier) {
     Box(modifier.size(128.dp), contentAlignment = Alignment.Center) {
         if (url != null) {
-            SubcomposeAsyncImage(
+            // Placeholder under the sticker while it loads or if it fails; stickers are transparent, so it hides once in.
+            var loaded by remember(url) { mutableStateOf(false) }
+            if (!loaded) StickerPlaceholder()
+            AsyncImage(
                 model = url,
                 contentDescription = "Sticker",
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize(),
-                loading = { StickerPlaceholder() },
-                error = { StickerPlaceholder() },
+                onState = { loaded = it is AsyncImagePainter.State.Success },
             )
         } else {
             StickerPlaceholder()
@@ -385,19 +388,28 @@ private fun MediaFrame(
             .heightIn(max = 360.dp)
             .clip(RoundedCornerShape(12.dp))
     }
-    SubcomposeAsyncImage(
-        model = activeUrl,
-        contentDescription = "Photo",
-        contentScale = ContentScale.Crop,
-        onError = {
-            if (fallbackUrl != null && activeUrl != fallbackUrl) {
-                activeUrl = fallbackUrl
-            }
-        },
-        modifier = frameMod.clickable(onClick = onClick),
-        loading = { MediaPlaceholder() },
-        error = { MediaUnavailablePlaceholder() },
-    )
+    // Placeholder under the photo (no subcomposition per bubble): the loading one, or "unavailable" if it fails.
+    // Hidden once the photo is in.
+    var loadState by remember(activeUrl) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+    Box(frameMod.clickable(onClick = onClick)) {
+        when (loadState) {
+            is AsyncImagePainter.State.Success -> {}
+            is AsyncImagePainter.State.Error -> MediaUnavailablePlaceholder()
+            else -> MediaPlaceholder()
+        }
+        AsyncImage(
+            model = activeUrl,
+            contentDescription = "Photo",
+            contentScale = ContentScale.Crop,
+            onState = { state ->
+                loadState = state
+                if (state is AsyncImagePainter.State.Error && fallbackUrl != null && activeUrl != fallbackUrl) {
+                    activeUrl = fallbackUrl
+                }
+            },
+            modifier = Modifier.matchParentSize(),
+        )
+    }
 }
 
 @Composable
@@ -554,12 +566,11 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
             .then(if (onClick != null && a.actionLabel == null) Modifier.clickable(onClick = onClick) else Modifier),
     ) {
         a.remoteThumb?.let {
-            SubcomposeAsyncImage(
+            AsyncImage(
                 model = it,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxWidth().height(140.dp),
-                error = {},
             )
         }
         Column(Modifier.padding(12.dp)) {
@@ -1296,11 +1307,10 @@ fun PhotoViewer(
                             )
                         },
                 ) {
-                    SubcomposeAsyncImage(
-                        model = pageUrl,
-                        contentDescription = "Photo",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
+                    // The zoom/dismiss transform is on the wrapper, so the loading and error states move with it too.
+                    var pageState by remember(pageUrl) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+                    Box(
+                        Modifier
                             .fillMaxSize()
                             .graphicsLayer {
                                 if (isCurrentPage) {
@@ -1310,13 +1320,17 @@ fun PhotoViewer(
                                     translationY = offset.y + dismissOffsetY
                                 }
                             },
-                        loading = {
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                LoadingIndicator(color = Color.White)
-                            }
-                        },
-                        error = {
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    ) {
+                        AsyncImage(
+                            model = pageUrl,
+                            contentDescription = "Photo",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize(),
+                            onState = { pageState = it },
+                        )
+                        when (pageState) {
+                            is AsyncImagePainter.State.Success -> {}
+                            is AsyncImagePainter.State.Error -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Icon(
                                     Icons.Outlined.Image,
                                     contentDescription = "Couldn't load photo",
@@ -1324,8 +1338,11 @@ fun PhotoViewer(
                                     modifier = Modifier.size(48.dp),
                                 )
                             }
-                        },
-                    )
+                            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                LoadingIndicator(color = Color.White)
+                            }
+                        }
+                    }
                 }
             }
 
