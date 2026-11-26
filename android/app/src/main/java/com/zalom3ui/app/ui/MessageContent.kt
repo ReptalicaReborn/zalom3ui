@@ -57,6 +57,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Link
@@ -111,6 +112,7 @@ import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
+import com.zalom3ui.app.data.isLocalMediaUri
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.abs
@@ -128,10 +130,19 @@ import kotlinx.coroutines.withContext
 private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
-fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null)
+fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null || kind in setOf("photo", "gif", "video"))
 
-/** Caption under a photo or video, when the sender wrote one. */
-fun Attachment.caption(): String? = title?.takeIf { kind in setOf("photo", "gif", "video") && it.isNotBlank() }
+/** Whether a photo, GIF, or video has a remote URL that can be rendered frameless. */
+fun Attachment.hasRenderableMedia(): Boolean = when (kind) {
+    "photo", "gif" -> image != null
+    "video" -> remoteThumb != null || remoteHref != null
+    else -> false
+}
+
+/** Caption under a photo or video, when the sender wrote one (ignoring local phone content/file URIs). */
+fun Attachment.caption(): String? = title?.takeIf {
+    kind in setOf("photo", "gif", "video") && it.isNotBlank() && !isLocalMediaUri(it)
+}
 
 /** "4:05" for a voice or video length in ms. */
 fun formatDuration(ms: Long): String {
@@ -194,17 +205,39 @@ fun AttachmentContent(
     val context = LocalContext.current
     when (a.kind) {
         "photo", "gif" -> {
-            val image = a.image ?: return
-            MediaFrame(image, mediaAspect(a.width, a.height), edgeToEdge = edgeToEdge, onClick = { onOpenImage(a.href ?: image) })
+            val image = a.image
+            if (image == null) {
+                UnavailableMediaRow(
+                    label = if (a.kind == "gif") "GIF unavailable" else "Photo unavailable",
+                    isVideo = false,
+                    onOutgoing = onOutgoing,
+                )
+                return
+            }
+            val fullUrl = a.remoteHref ?: image
+            val fallback = fullUrl.takeIf { it != image }
+            MediaFrame(
+                url = image,
+                aspect = mediaAspect(a.width, a.height),
+                edgeToEdge = edgeToEdge,
+                fallbackUrl = fallback,
+                onClick = { onOpenImage(fullUrl) },
+            )
         }
         "video" -> {
+            val thumb = a.remoteThumb
+            val videoUrl = a.remoteHref
+            if (thumb == null && videoUrl == null) {
+                UnavailableMediaRow(label = "Video unavailable", isVideo = true, onOutgoing = onOutgoing)
+                return
+            }
             Box(contentAlignment = Alignment.Center) {
-                if (a.thumb != null) {
+                if (thumb != null) {
                     MediaFrame(
-                        a.thumb,
-                        mediaAspect(a.width, a.height),
+                        url = thumb,
+                        aspect = mediaAspect(a.width, a.height),
                         edgeToEdge = edgeToEdge,
-                        onClick = { a.href?.let { openExternally(context, it, "video/*") } },
+                        onClick = { videoUrl?.let { openExternally(context, it, "video/*") } },
                     )
                 } else {
                     val placeholderMod = if (edgeToEdge) {
@@ -222,8 +255,8 @@ fun AttachmentContent(
                         placeholderMod
                             .background(Color.Black)
                             .then(
-                                if (a.href != null) {
-                                    Modifier.clickable { openExternally(context, a.href, "video/*") }
+                                if (videoUrl != null) {
+                                    Modifier.clickable { openExternally(context, videoUrl, "video/*") }
                                 } else {
                                     Modifier
                                 },
@@ -301,20 +334,62 @@ private fun StickerPlaceholder() {
 }
 
 @Composable
-private fun MediaFrame(url: String, aspect: Float, edgeToEdge: Boolean = false, onClick: () -> Unit) {
-    SubcomposeAsyncImage(
-        model = url,
-        contentDescription = "Photo",
-        contentScale = ContentScale.Crop,
-        modifier = Modifier
-            .widthIn(max = if (edgeToEdge) 280.dp else 260.dp)
+private fun UnavailableMediaRow(label: String, isVideo: Boolean, onOutgoing: Boolean) {
+    val content = LocalContentColor.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(vertical = 2.dp),
+    ) {
+        Icon(
+            if (isVideo) Icons.Outlined.Videocam else Icons.Outlined.BrokenImage,
+            contentDescription = null,
+            tint = content.copy(alpha = 0.72f),
+            modifier = Modifier.size(20.dp),
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = content.copy(alpha = 0.80f),
+        )
+    }
+}
+
+@Composable
+private fun MediaFrame(
+    url: String,
+    aspect: Float,
+    edgeToEdge: Boolean = false,
+    fallbackUrl: String? = null,
+    onClick: () -> Unit,
+) {
+    var activeUrl by remember(url, fallbackUrl) { mutableStateOf(url) }
+    val frameMod = if (edgeToEdge) {
+        val frameHeight = (280.dp / aspect).coerceIn(140.dp, 340.dp)
+        Modifier
+            .widthIn(max = 280.dp)
+            .fillMaxWidth()
+            .height(frameHeight)
+    } else {
+        Modifier
+            .widthIn(max = 260.dp)
             .fillMaxWidth()
             .aspectRatio(aspect)
             .heightIn(max = 360.dp)
-            .then(if (edgeToEdge) Modifier else Modifier.clip(RoundedCornerShape(12.dp)))
-            .clickable(onClick = onClick),
+            .clip(RoundedCornerShape(12.dp))
+    }
+    SubcomposeAsyncImage(
+        model = activeUrl,
+        contentDescription = "Photo",
+        contentScale = ContentScale.Crop,
+        onError = {
+            if (fallbackUrl != null && activeUrl != fallbackUrl) {
+                activeUrl = fallbackUrl
+            }
+        },
+        modifier = frameMod.clickable(onClick = onClick),
         loading = { MediaPlaceholder() },
-        error = { MediaPlaceholder() },
+        error = { MediaUnavailablePlaceholder() },
     )
 }
 
@@ -324,6 +399,28 @@ private fun MediaPlaceholder() {
         Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) { Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+}
+
+@Composable
+private fun MediaUnavailablePlaceholder() {
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest).padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            Icons.Outlined.BrokenImage,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+            modifier = Modifier.size(28.dp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Media unavailable",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+        )
+    }
 }
 
 @Composable

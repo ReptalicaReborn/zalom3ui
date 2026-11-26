@@ -382,13 +382,27 @@ export function parseAttachment(msgType: string, content: Record<string, unknown
         const action = str(content.action) ?? "";
         kind = action === "recommened.user" ? "contact" : action === "recommened.link" ? "link" : "other";
     }
+    const isLocalUri = (s: string) => /^(content:\/\/|file:\/\/|\/(?:storage|sdcard|data|mnt)\/)/i.test(s.trim());
+    const isMedia = kind === "photo" || kind === "gif" || kind === "video";
+    const remoteStr = (v: unknown) => {
+        const s = str(v);
+        return s && !isLocalUri(s) ? s : undefined;
+    };
+    const rawTitle = str(content.title);
     const attachment: Attachment = {
         kind,
-        title: str(content.title),
+        title: isMedia && rawTitle && isLocalUri(rawTitle) ? undefined : rawTitle,
         description: str(content.description),
-        // A photo's "hd" copy is the full-size one when Zalo sends it.
-        href: (kind === "photo" ? str(params.hd) : undefined) ?? str(content.href),
-        thumb: str(content.thumb),
+        // A photo's "hd" copy is the full-size one when Zalo sends it; ignore local phone URIs from history backups.
+        href: isMedia
+            ? (kind === "photo" ? remoteStr(params.hd) : undefined) ??
+              remoteStr(content.href) ??
+              remoteStr(params.oriUrl) ??
+              remoteStr(params.origUrl) ??
+              remoteStr(params.normalUrl) ??
+              remoteStr(params.url)
+            : str(content.href),
+        thumb: isMedia ? remoteStr(content.thumb) ?? remoteStr(params.thumbUrl) ?? remoteStr(params.thumb) : str(content.thumb),
         width: num(params.width, params.video_width, params.w),
         height: num(params.height, params.video_height, params.h),
         duration: num(params.duration),

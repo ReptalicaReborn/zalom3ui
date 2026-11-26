@@ -320,9 +320,10 @@ function typeName(t: number): string {
     }
 }
 
-/** "[Photo]"-style captions the phone writes for non-text messages. */
+/** "[Photo]"-style captions or local phone URIs/paths the phone writes into MsgContent for media rows. */
 function isPlaceholderCaption(s: string): boolean {
-    return /^\[[^\]]{1,24}\]$/.test(s.trim());
+    const trimmed = s.trim();
+    return /^\[[^\]]{1,24}\]$/.test(trimmed) || /^(content:\/\/|file:\/\/|\/(?:storage|sdcard|data|mnt)\/)/i.test(trimmed);
 }
 
 function jsonObject(raw: string): Record<string, unknown> {

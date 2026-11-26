@@ -1976,7 +1976,7 @@ private fun Bubble(
     val content = if (self) colors.onOutgoing else colors.onIncoming
     val meta = content.copy(alpha = 0.75f)
     val attachment = msg.attachment?.takeIf { !msg.recalled && it.isShown() }
-    val isFramelessMedia = attachment != null && attachment.kind in setOf("photo", "gif", "video")
+    val isFramelessMedia = attachment != null && attachment.hasRenderableMedia()
 
     val footer: @Composable () -> Unit = {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1998,7 +1998,7 @@ private fun Bubble(
         if (isFramelessMedia && attachment != null) {
             val caption = attachment.caption()
             val showHeader = (isGroup && !self && firstOfRun && msg.fromName.isNotBlank()) || msg.quote != null
-            Column {
+            Column(Modifier.widthIn(max = 280.dp)) {
                 if (showHeader) {
                     Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp)) {
                         if (isGroup && !self && firstOfRun && msg.fromName.isNotBlank()) {

@@ -127,12 +127,30 @@ data class Attachment(
     /** Poll messages. */
     val poll: PollRef? = null,
 ) {
-    /** The picture to show for a photo, GIF or sticker (the full image when there is no thumbnail). */
+    /** The picture to show for a photo, GIF or sticker (ignoring local phone URIs from history backups). */
     val image: String? get() = when (kind) {
-        "sticker" -> thumb
-        "photo", "gif" -> thumb ?: href
+        "sticker" -> remoteThumb
+        "photo", "gif" -> remoteThumb ?: remoteHref
         else -> null
     }
+
+    val remoteThumb: String? get() = thumb?.takeIf(::isRemoteMediaUrl)
+    val remoteHref: String? get() = href?.takeIf(::isRemoteMediaUrl)
+}
+
+internal fun isLocalMediaUri(value: String?): Boolean {
+    val s = value?.trim() ?: return false
+    return s.startsWith("content://", ignoreCase = true) ||
+        s.startsWith("file://", ignoreCase = true) ||
+        s.startsWith("/storage/", ignoreCase = true) ||
+        s.startsWith("/sdcard/", ignoreCase = true) ||
+        s.startsWith("/data/", ignoreCase = true) ||
+        s.startsWith("/mnt/", ignoreCase = true)
+}
+
+internal fun isRemoteMediaUrl(value: String?): Boolean {
+    val s = value?.trim() ?: return false
+    return s.startsWith("http://", ignoreCase = true) || s.startsWith("https://", ignoreCase = true)
 }
 
 @Serializable

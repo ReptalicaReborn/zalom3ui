@@ -133,8 +133,8 @@ fun ChatInfoScreen(
             if (msg.recalled) return@mapNotNull null
             val a = msg.attachment ?: return@mapNotNull null
             if (a.kind !in setOf("photo", "gif", "video")) return@mapNotNull null
-            val thumb = a.image ?: a.thumb ?: return@mapNotNull null
-            val full = a.href ?: thumb
+            val thumb = a.image ?: a.remoteThumb ?: return@mapNotNull null
+            val full = a.remoteHref ?: thumb
             SharedMediaItem(id = msg.id, thumbUrl = thumb, fullUrl = full, isVideo = a.kind == "video")
         }
     }
