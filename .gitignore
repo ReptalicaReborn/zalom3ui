@@ -3,3 +3,5 @@ dist/
 # Zalo session credentials and cached messages: never commit
 /data/
 .env
+rust/target/
+

@@ -5,7 +5,7 @@
 }
 -keep,includedescriptorclasses class com.zalom3ui.app.data.**$$serializer { *; }
 
-# JNI native entry points: keep class names and native method signatures for libnodebridge.so and libzaloopus.so.
+# JNI native entry points: keep class names and native method signatures for libzalocore.so and libzaloopus.so.
 -keep,includedescriptorclasses class com.zalom3ui.app.server.NodeRuntime {
     native <methods>;
 }

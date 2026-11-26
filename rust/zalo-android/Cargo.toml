@@ -1,0 +1,17 @@
+[package]
+name = "zalo-android"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "zalocore"
+crate-type = ["cdylib"]
+
+[dependencies]
+zalo-server.workspace = true
+tokio.workspace = true
+jni.workspace = true
+android_logger.workspace = true
+log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

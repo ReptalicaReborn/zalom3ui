@@ -1,0 +1,32 @@
+[package]
+name = "zalo-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zalo-proto.workspace = true
+zalo-media.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+subtle.workspace = true
+base64.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+regex.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+rand.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
