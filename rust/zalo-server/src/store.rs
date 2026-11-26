@@ -154,90 +154,218 @@ pub fn fold_for_search(s: &str) -> String {
 }
 
 // ---- OTP extraction ----
+//
+// The same algorithm (and the same test vectors) lives in Kotlin: `extractOtpCode` in
+// `ui/MessageContent.kt`. Keep them in step. It works on diacritic-folded lowercase text, one line
+// at a time, and never uses look-around (the `regex` crate has none).
+//
+//  1. a strong keyword (OTP, "ma xac thuc", "verification code", ...) followed, in the same
+//     sentence and within 100 characters, by the first *code-like* number;
+//  2. a weak keyword that must be directly followed by the code ("code: 123456", "your code is
+//     123456", "ma: 123456", "ma cua ban la 1234");
+//  3. a code-like number directly before a keyword ("739201 la ma xac nhan", "123456 is your
+//     verification code", "G-123456 is your Google verification code");
+//  4. a line that is only a code, right under a line with a strong keyword.
+//
+// A code-like number is 4-8 plain digits ("482910") or two groups of three ("482 910", "482-910",
+// returned as "482910"). Amounts ("5.000.000", "5000d"), dates, times, 9+ digit numbers (phone and
+// account numbers), numbers after tk/stk/sdt/hotline/..., and a year after "nam"/"year" are not.
 
-fn otp_keyword_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b",
-        )
-        .expect("valid OTP keyword regex")
-    })
+const OTP_STRONG: &str = r"\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|mat\s*khau\s*(?:dung\s*)?mot\s*lan|one[- ]time(?:\s*(?:code|password|pin))?)\b";
+const OTP_WEAK: &str = r"(?:^|[.!?:;,]\s*|\byour\s+|\bur\s+|\bsms\s+|\bthe\s+)code\s*(?::|\bis\b)\s*(?:g-)?|\bma\s*:\s*(?:g-)?|\bma\s+cua\s+(?:ban|quy\s+khach|minh)\s*(?:\bla\b|:)\s*(?:g-)?";
+const OTP_BEFORE: &str = r"\b(?:(?:la|is)\s+(?:your|the)\s+(?:[a-z]+\s+)?(?:(?:verification|security|login|confirmation|authentication)\s+)?code|(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)|la\s+ma\s+cua\s+ban)\b";
+const OTP_TOKEN: &str = r"[0-9]+(?:[.,/:\-][0-9]+)*";
+const OTP_UNIT_AFTER: &str = r"^\s*(?:d|vnd|dong|usd|eur|k|tr|trieu|nghin|ngan|ty|%)(?:[^a-z0-9]|$)";
+const OTP_ACCOUNT_BEFORE: &str = r"\b(?:tk|stk|sdt|hotline|tel|phone|account|acc|a/c|card|cmnd|cccd|mst|tai\s+khoan|so\s+tk|so\s+the)\s*(?:so\b|no\b|number\b)?\s*[:#.]?\s*$";
+const OTP_YEAR_BEFORE: &str = r"\b(?:nam|year)\s*$";
+const OTP_SENTENCE_END: &str = r"[.!?](?:\s|$)";
+const OTP_WINDOW: usize = 100;
+const OTP_BEFORE_WINDOW: usize = 24;
+
+fn otp_re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
+    cell.get_or_init(|| Regex::new(pattern).expect("valid OTP regex"))
 }
 
-fn otp_before_keyword_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)\b",
-        )
-        .expect("valid OTP before-keyword regex")
-    })
+/// A numeric token (`[0-9]+` with `.,/:-` joins) in a folded line.
+struct OtpToken {
+    start: usize,
+    end: usize,
 }
 
-/// Extracts a 4–8 digit OTP / verification code when accompanied by an OTP keyword (Vietnamese or
-/// English). Ignores 9+ digit phone numbers / account IDs (e.g. `0378795621`).
-pub fn extract_otp_code(text: &str) -> Option<String> {
-    let folded = fold_diacritics(text);
-    let kw_re = otp_keyword_re();
-    if !kw_re.is_match(&folded) {
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The code a token stands for, or `None` if it is not code-like (see the section comment).
+fn otp_candidate(line: &str, toks: &[OtpToken], i: usize) -> Option<String> {
+    static UNIT: OnceLock<Regex> = OnceLock::new();
+    static ACCOUNT: OnceLock<Regex> = OnceLock::new();
+    static YEAR: OnceLock<Regex> = OnceLock::new();
+    let t = &toks[i];
+    let text = &line[t.start..t.end];
+    let prefix = &line[..t.start];
+    let bytes = line.as_bytes();
+
+    // Glued to letters ("abc1234", "1234abc"): not a standalone code.
+    if t.start > 0 && bytes[t.start - 1].is_ascii_alphabetic() {
+        return None;
+    }
+    if t.end < line.len() && bytes[t.end].is_ascii_alphabetic() {
+        return None;
+    }
+    if prefix.ends_with('$') {
         return None;
     }
 
-    // 1. Keyword followed by up to 40 non-digit, non-newline chars, then a standalone 4–8 digit run.
-    for m in kw_re.find_iter(&folded) {
-        let rest = &folded[m.end()..];
-        let mut non_digits = 0usize;
-        for (byte_idx, ch) in rest.char_indices() {
-            if ch == '\n' {
+    let code = if all_digits(text) && (4..=8).contains(&text.len()) {
+        text.to_string()
+    } else if text.len() == 7 && text.as_bytes()[3] == b'-' && all_digits(&text.replace('-', "")) && text.split('-').all(|g| g.len() == 3) {
+        text.replace('-', "")
+    } else if all_digits(text) && text.len() == 3 {
+        // "482 910": two groups of three, one space apart, and not part of a longer chain.
+        let next = toks.get(i + 1)?;
+        let gap_ok = next.start == t.end + 1 && bytes[t.end] == b' ';
+        let next_text = &line[next.start..next.end];
+        if !(gap_ok && all_digits(next_text) && next_text.len() == 3) {
+            return None;
+        }
+        let chained_before = i > 0 && {
+            let p = &toks[i - 1];
+            p.end + 1 == t.start && bytes[p.end] == b' ' && all_digits(&line[p.start..p.end]) && p.end - p.start <= 3
+        };
+        let chained_after = toks.get(i + 2).is_some_and(|n| {
+            n.start == next.end + 1 && bytes[next.end] == b' ' && all_digits(&line[n.start..n.end]) && n.end - n.start == 3
+        });
+        if chained_before || chained_after {
+            return None;
+        }
+        format!("{text}{next_text}")
+    } else {
+        return None;
+    };
+
+    // The token that ends the code (the second group for "482 910").
+    let end = if text.len() == 3 && all_digits(text) { toks[i + 1].end } else { t.end };
+    if end < line.len() && bytes[end].is_ascii_alphabetic() {
+        return None;
+    }
+    if end < line.len() && matches!(bytes[end], b'.' | b',') && end + 1 < line.len() && bytes[end + 1].is_ascii_digit() {
+        return None;
+    }
+    if otp_re(&UNIT, OTP_UNIT_AFTER).is_match(&line[end..]) {
+        return None;
+    }
+    if otp_re(&ACCOUNT, OTP_ACCOUNT_BEFORE).is_match(prefix) {
+        return None;
+    }
+    if code.len() == 4
+        && (code.starts_with("19") || code.starts_with("20"))
+        && otp_re(&YEAR, OTP_YEAR_BEFORE).is_match(prefix)
+    {
+        return None;
+    }
+    Some(code)
+}
+
+fn otp_clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut e = max;
+    while !s.is_char_boundary(e) {
+        e -= 1;
+    }
+    &s[..e]
+}
+
+fn otp_in_line(line: &str) -> Option<String> {
+    static STRONG: OnceLock<Regex> = OnceLock::new();
+    static WEAK: OnceLock<Regex> = OnceLock::new();
+    static BEFORE: OnceLock<Regex> = OnceLock::new();
+    static TOKEN: OnceLock<Regex> = OnceLock::new();
+    static SENTENCE: OnceLock<Regex> = OnceLock::new();
+    let strong = otp_re(&STRONG, OTP_STRONG);
+    let weak = otp_re(&WEAK, OTP_WEAK);
+    let before = otp_re(&BEFORE, OTP_BEFORE);
+    let sentence = otp_re(&SENTENCE, OTP_SENTENCE_END);
+    let toks: Vec<OtpToken> = otp_re(&TOKEN, OTP_TOKEN)
+        .find_iter(line)
+        .map(|m| OtpToken { start: m.start(), end: m.end() })
+        .collect();
+    if toks.is_empty() {
+        return None;
+    }
+
+    // 1. strong keyword, then the first code-like number in the same sentence.
+    for m in strong.find_iter(line) {
+        let limit = otp_clip(&line[m.end()..], OTP_WINDOW).len() + m.end();
+        for (i, t) in toks.iter().enumerate() {
+            if t.start < m.end() || t.start > limit {
+                continue;
+            }
+            if sentence.is_match(&line[m.end()..t.start]) {
                 break;
             }
-            if ch.is_ascii_digit() {
-                let digits_slice = &rest[byte_idx..];
-                let digit_len = digits_slice
-                    .bytes()
-                    .take_while(|b| b.is_ascii_digit())
-                    .count();
-                if (4..=8).contains(&digit_len) {
-                    return Some(digits_slice[..digit_len].to_string());
-                }
-                // `[^\d\n]` cannot cross a digit run, so stop scanning after this keyword.
-                break;
-            }
-            non_digits += 1;
-            if non_digits > 40 {
-                break;
+            if let Some(code) = otp_candidate(line, &toks, i) {
+                return Some(code);
             }
         }
     }
 
-    // 2. Standalone 4–8 digit run followed by up to 24 non-digit, non-newline chars and keyword.
-    for m in otp_before_keyword_re().find_iter(&folded) {
-        let prefix = &folded[..m.start()];
-        let mut non_digits = 0usize;
-        for (byte_idx, ch) in prefix.char_indices().rev() {
-            if ch == '\n' {
-                break;
-            }
-            if ch.is_ascii_digit() {
-                let end = byte_idx + ch.len_utf8();
-                let mut start = byte_idx;
-                while start > 0 && prefix.as_bytes()[start - 1].is_ascii_digit() {
-                    start -= 1;
-                }
-                let digit_len = end - start;
-                if (4..=8).contains(&digit_len) {
-                    return Some(prefix[start..end].to_string());
-                }
-                break;
-            }
-            non_digits += 1;
-            if non_digits > 24 {
-                break;
+    // 2. weak keyword directly followed by the code.
+    for m in weak.find_iter(line) {
+        if let Some(i) = toks.iter().position(|t| t.start == m.end()) {
+            if let Some(code) = otp_candidate(line, &toks, i) {
+                return Some(code);
             }
         }
     }
 
+    // 3. a code directly before a keyword.
+    for m in before.find_iter(line) {
+        let Some(i) = toks.iter().rposition(|t| t.end <= m.start()) else {
+            continue;
+        };
+        // "482 910 la ..." ends on the second group; step back to the first.
+        let first = if i > 0 && toks[i].end - toks[i].start == 3 && toks[i - 1].end + 1 == toks[i].start { i - 1 } else { i };
+        let t = &toks[i];
+        let gap = &line[t.end..m.start()];
+        if gap.chars().count() > OTP_BEFORE_WINDOW || sentence.is_match(gap) {
+            continue;
+        }
+        if let Some(code) = otp_candidate(line, &toks, first) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// Extracts a one-time code (4-8 digits) from message or notification text; see the section
+/// comment for the rules. Returns the digits only ("482 910" -> "482910").
+pub fn extract_otp_code(text: &str) -> Option<String> {
+    static STRONG: OnceLock<Regex> = OnceLock::new();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let folded = fold_for_search(text);
+    let strong = otp_re(&STRONG, OTP_STRONG);
+    let mut prev_strong = false;
+    for line in folded.lines() {
+        let line = line.trim();
+        if let Some(code) = otp_in_line(line) {
+            return Some(code);
+        }
+        // A line that is only a code, under a line with a strong keyword.
+        if prev_strong {
+            let toks = [OtpToken { start: 0, end: line.len() }];
+            if all_digits(line) {
+                if let Some(code) = otp_candidate(line, &toks, 0) {
+                    return Some(code);
+                }
+            }
+        }
+        prev_strong = strong.is_match(line);
+    }
     None
 }
 
@@ -1077,6 +1205,16 @@ pub fn to_public_message(m: &StoredMessage, own_id: Option<&str>) -> ChatMessage
         (None, None)
     };
 
+    // Incoming messages only: the card's code, else one found in the plain text.
+    let otp = if m.is_self || m.recalled {
+        None
+    } else {
+        m.attachment
+            .as_ref()
+            .and_then(|a| a.otp.clone())
+            .or_else(|| extract_otp_code(&m.text))
+    };
+
     ChatMessage {
         id: m.id.clone(),
         cli_msg_id: m.cli_msg_id.clone(),
@@ -1096,6 +1234,7 @@ pub fn to_public_message(m: &StoredMessage, own_id: Option<&str>) -> ChatMessage
         mentions_me,
         status,
         seen_count,
+        otp,
     }
 }
 
@@ -2760,27 +2899,78 @@ mod tests {
         normalize_message(&data, ThreadKind::User, thread_id, is_self, Some("me"))
     }
 
+    // The same vectors are in android/.../ui/MediaTest.kt (`extractOtpCode...`). Keep them in step.
+    const OTP_POSITIVE: &[(&str, &str)] = &[
+        ("Mã xác thực OTP của bạn là: 482910 (hiệu lực 2 phút)", "482910"),
+        ("Your verification code is 9912", "9912"),
+        ("739201 là mã xác nhận giao dịch", "739201"),
+        (
+            "Mã OTP xác thực giao dịch chuyển khoản 5.000.000đ đến TK 0123456789 là 482910",
+            "482910",
+        ),
+        ("Mã OTP của bạn là 482 910", "482910"),
+        ("Mã OTP: 482-910 (không chia sẻ)", "482910"),
+        ("Your code is 123456", "123456"),
+        ("code: 123456", "123456"),
+        ("Your OTP: 5566. Do not share.", "5566"),
+        ("mã: 123456", "123456"),
+        ("Mã của bạn là 1234", "1234"),
+        ("123456 is your verification code", "123456"),
+        ("G-123456 is your Google verification code", "123456"),
+        ("123 456 is your code", "123456"),
+        ("Mã OTP giao dịch ngày 12/05/2024 là 482910", "482910"),
+        ("Mã OTP xác thực giao dịch năm 2024 là 482910", "482910"),
+        ("Mã xác thực OTP\n849201", "849201"),
+        ("Mã OTP là 2024", "2024"),
+    ];
+
+    const OTP_NEGATIVE: &[&str] = &[
+        "Hẹn gặp lúc 14:30 nhé",
+        "Chiều nay 17:30 đi ăn nhé",
+        "gọi 0901234567",
+        "Mã OTP là 0901234567",
+        "Chuyển cho mình 5.000.000 nhé",
+        "Mã giao dịch 5.000.000đ",
+        "Mã OTP 123456789",
+        "Mã OTP giao dịch ngày 12/05/2024",
+        "Mã OTP hết hạn năm 2025",
+        "Sinh nhật mình 12/05/2024",
+        "Tôi đi mà 1234 người đến",
+        "Đây là mã 123456",
+        "Số tài khoản 12345678 của mình",
+        "OTP hotline 1900",
+        "Mã OTP của bạn đã hết hạn. Gọi 1900 để được hỗ trợ",
+        "Bạn đang yêu cầu cài đặt lại mã PIN tài khoản Giang với mã tài khoản 0378795621 tại The 1.",
+        "zip code is 70000",
+        "Mã OTP 5 000 000đ",
+    ];
+
     #[test]
-    fn extract_otp_code_vietnamese_english_and_ignores_phone_numbers() {
-        assert_eq!(
-            extract_otp_code("Mã xác thực OTP của bạn là: 482910 (hiệu lực 2 phút)").as_deref(),
-            Some("482910")
-        );
-        assert_eq!(
-            extract_otp_code("Your verification code is 9912").as_deref(),
-            Some("9912")
-        );
-        assert_eq!(
-            extract_otp_code("739201 là mã xác nhận giao dịch").as_deref(),
-            Some("739201")
-        );
-        assert_eq!(
-            extract_otp_code(
-                "Bạn đang yêu cầu cài đặt lại mã PIN tài khoản Giang với mã tài khoản 0378795621 tại The 1."
-            ),
-            None
-        );
-        assert_eq!(extract_otp_code("Hẹn gặp lúc 14:30 nhé"), None);
+    fn extract_otp_code_positive_vectors() {
+        for (text, code) in OTP_POSITIVE {
+            assert_eq!(extract_otp_code(text).as_deref(), Some(*code), "{text}");
+        }
+    }
+
+    #[test]
+    fn extract_otp_code_negative_vectors() {
+        for text in OTP_NEGATIVE {
+            assert_eq!(extract_otp_code(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn plain_text_otp_is_on_the_public_message_but_not_for_own_or_recalled() {
+        let msg = make_msg("o1", 1000, "u1", "Mã OTP của bạn là 482910", false);
+        let public = to_public_message(&msg, Some("me"));
+        assert_eq!(public.otp.as_deref(), Some("482910"));
+        let own = make_msg("o2", 1001, "u1", "Mã OTP của bạn là 482910", true);
+        assert_eq!(to_public_message(&own, Some("me")).otp, None);
+        let plain = make_msg("o3", 1002, "u1", "Hẹn gặp lúc 14:30", false);
+        assert_eq!(to_public_message(&plain, Some("me")).otp, None);
+        let mut recalled = msg.clone();
+        recalled.recalled = true;
+        assert_eq!(to_public_message(&recalled, Some("me")).otp, None);
     }
 
     #[test]

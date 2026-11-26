@@ -105,6 +105,20 @@ class ApiClient internal constructor(private val transport: Transport) {
         httpDelete("debug", "replay-log")
     }
 
+    /**
+     * The socket log, newest first: one structure-only entry per decoded WebSocket frame (cmd, handler, key names, array
+     * lengths, message item types and drop reasons). No message text.
+     */
+    suspend fun socketLog(): String {
+        val (code, body) = transport.execute("GET", path("debug", "socket-log")).let { it.code to it.body }
+        if (code !in 200..299) throw ApiException("HTTP $code", code)
+        return body
+    }
+
+    suspend fun clearSocketLog() {
+        httpDelete("debug", "socket-log")
+    }
+
     /** `"null"`, `"newest"` or `"page"`: which `lastId` the replay requests carry. */
     suspend fun replayMode(): String {
         val body = transport.execute("GET", path("debug", "replay-mode")).let { it.body }

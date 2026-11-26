@@ -74,12 +74,14 @@ class SettingsStore(context: Context) {
     fun loadStay(): StaySettings = StaySettings(
         mode = StayConnected.fromKey(prefs.getString(KEY_STAY_CONNECTED, null)) ?: StayConnected.UPGRADE_DEFAULT,
         hideZaloNotifications = prefs.getBoolean(KEY_HIDE_ZALO_NOTIFICATIONS, true),
+        otpFromZaloNotifications = prefs.getBoolean(KEY_OTP_FROM_ZALO_NOTIFICATIONS, false),
     )
 
     fun saveStay(stay: StaySettings) {
         prefs.edit()
             .putString(KEY_STAY_CONNECTED, stay.mode.key)
             .putBoolean(KEY_HIDE_ZALO_NOTIFICATIONS, stay.hideZaloNotifications)
+            .putBoolean(KEY_OTP_FROM_ZALO_NOTIFICATIONS, stay.otpFromZaloNotifications)
             .commit()
     }
 
@@ -166,6 +168,7 @@ class SettingsStore(context: Context) {
     internal companion object {
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
+        const val KEY_OTP_FROM_ZALO_NOTIFICATIONS = "otp_from_zalo_notifications"
         const val KEY_ON_DEVICE = "on_device"
         const val KEY_URL = "server_url"
         const val KEY_TOKEN = "token"
