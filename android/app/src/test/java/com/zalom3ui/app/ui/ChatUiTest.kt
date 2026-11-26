@@ -43,6 +43,7 @@ class ChatUiTest {
         assertEquals("You: hi", preview(msg(isSelf = true, kind = "group")))
         assertEquals("An: hi", preview(msg(isSelf = false, kind = "group")))
         assertEquals("Message recalled", preview(msg(recalled = true)))
+        assertEquals("hello world", preview(msg(isSelf = false).copy(text = "  hello\n   world  ")))
         assertEquals("", preview(null))
     }
 

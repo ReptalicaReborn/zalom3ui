@@ -261,7 +261,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
         },
     ) { padding ->
         LazyColumn(
-            contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 96.dp),
+            contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 120.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             if (searching && folded.isNotEmpty()) {
@@ -770,7 +770,7 @@ private fun ConversationRow(
                                 else -> colors.onSurfaceVariant
                             },
                             fontStyle = if (typing == null && last?.recalled == true) FontStyle.Italic else FontStyle.Normal,
-                            maxLines = 2,
+                            maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
                         )

@@ -770,32 +770,41 @@ private fun MessageList(
         lastSeenNewestId = newestId
     }
 
-    val topVisibleTs by remember(reversed, typing != null) {
+    val floatingDateTs by remember(reversed, typing != null) {
         derivedStateOf {
+            if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
             val offset = if (typing != null) 1 else 0
-            val topItem = listState.layoutInfo.visibleItemsInfo
+            val layout = listState.layoutInfo
+            val topItem = layout.visibleItemsInfo
                 .lastOrNull { it.index >= offset && (it.index - offset) < reversed.size }
-            topItem?.let { reversed.getOrNull(it.index - offset)?.ts }
+                ?: return@derivedStateOf null
+            val topIndex = topItem.index - offset
+            val msg = reversed.getOrNull(topIndex) ?: return@derivedStateOf null
+            val older = reversed.getOrNull(topIndex + 1)
+            val hasInlineDayHeader = older == null || !sameDay(older.ts, msg.ts)
+            // If this day's inline header is already visible at the top of the viewport, don't duplicate it with a pill.
+            val inlineHeaderVisible = hasInlineDayHeader && (topItem.offset + topItem.size) <= layout.viewportEndOffset
+            if (inlineHeaderVisible) null else msg.ts
         }
     }
     var showDatePill by remember { mutableStateOf(false) }
-    LaunchedEffect(listState.isScrollInProgress) {
-        if (listState.isScrollInProgress) {
+    LaunchedEffect(listState.isScrollInProgress, floatingDateTs) {
+        if (listState.isScrollInProgress && floatingDateTs != null) {
             showDatePill = true
         } else if (showDatePill) {
-            delay(1200)
+            delay(800)
             showDatePill = false
         }
     }
     var lastTopTs by remember { mutableStateOf<Long?>(null) }
-    topVisibleTs?.let { lastTopTs = it }
+    floatingDateTs?.let { lastTopTs = it }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val maxBubble = maxWidth * 0.78f
         LazyColumn(
             state = listState,
             reverseLayout = true,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 12.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             if (typing != null) {
@@ -834,7 +843,7 @@ private fun MessageList(
         }
 
         AnimatedVisibility(
-            visible = showDatePill && lastTopTs != null,
+            visible = showDatePill && floatingDateTs != null && lastTopTs != null,
             enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()),
             exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),

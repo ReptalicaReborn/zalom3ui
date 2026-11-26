@@ -85,7 +85,8 @@ fun muteLabel(mutedUntil: Long?): String = when {
 fun preview(msg: ChatMessage?): String {
     if (msg == null) return ""
     if (msg.recalled) return "Message recalled"
-    val body = msg.text.ifBlank { msg.attachment?.let { "📎 " + (it.title?.takeIf(String::isNotBlank) ?: "Attachment") }.orEmpty() }
+    val raw = msg.text.ifBlank { msg.attachment?.let { "📎 " + (it.title?.takeIf(String::isNotBlank) ?: "Attachment") }.orEmpty() }
+    val body = raw.replace(Regex("\\s+"), " ").trim()
     return when {
         msg.threadKind != "group" -> body
         msg.isSelf -> "You: $body"
