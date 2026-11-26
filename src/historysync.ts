@@ -1,8 +1,9 @@
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { API } from "zca-js";
-import { decodeEventPayload, frameHeader, jsonObject } from "./calls.js";
+import { decodeEventPayload, frameHeader, jsonObject, parseJsonKeepingBigInts } from "./calls.js";
 import { HttpError } from "./errors.js";
-import { importConversation, readConversation, type ImportCounts, type ImportSink } from "./syncimport.js";
+import { importConversation, isOutgoing, readConversation, type BackupConversation, type BackupIdMap, type ImportCounts, type ImportSink } from "./syncimport.js";
 import { BackupError, backupKeyText, conversationFiles, generateSyncKeyPair, rsaDecryptPkcs1, unpackBackup, type SyncKeyPair } from "./zdb.js";
 import { HISTORY_MESSAGES_PER_THREAD } from "./store.js";
 
@@ -116,6 +117,13 @@ export class DownloadError extends Error {
     }
 }
 
+export type NoisedIdsReply = {
+    users: Map<string, string>;
+    groups: Map<string, string>;
+    /** Shape/keys of the server answer for the sync log (never contains ids). */
+    replyShape?: string;
+};
+
 export type HistorySyncDeps = {
     ownId(): string | null;
     /** Zalo's device id, sent with the requests. */
@@ -126,9 +134,13 @@ export type HistorySyncDeps = {
     call(endpoint: string, params: Record<string, unknown>): Promise<unknown>;
     /** Downloads the backup. Throws [DownloadError] for an HTTP error. */
     download(url: string, onProgress: (received: number, total: number) => void, signal: AbortSignal): Promise<Buffer>;
+    /** Maps plain mobile user/group ids to Zalo Web's noised ids via `/api/znoise` (in batches of 100). */
+    resolveNoisedIds?(userIds: string[], groupIds: string[]): Promise<NoisedIdsReply>;
     sink: ImportSink & { allowMessages(cap: number): void };
     /** A name for a user id (used for the sender of imported messages), or "". */
     nameOf?(userId: string): string;
+    /** Called before a conversation is imported, so [nameOf] can know the names of its senders (best effort). */
+    prepare?(conversationId: string, isGroup: boolean): Promise<void>;
     keyPair?: () => SyncKeyPair;
     /** Waits between download attempts; tests pass a fake. */
     sleep?: (ms: number) => Promise<void>;
@@ -139,6 +151,7 @@ export type HistorySyncDeps = {
 const CONFIRM_TIMEOUT_MS = 3 * 60_000;
 const BACKUP_TIMEOUT_MS = 30 * 60_000;
 const DOWNLOAD_STALL_MS = 2 * 60_000;
+const NOISE_BATCH = 100;
 /** Zalo's answer when the phone's Zalo uses the newer "sync v2" (iPhone), which isn't implemented here. */
 const CODE_CLIENT_NOT_SUPPORTED = 211;
 const LOG_LINES = 200;
@@ -347,35 +360,110 @@ export class HistorySync extends EventEmitter<Events> {
 
         this.deps.sink.allowMessages(HISTORY_MESSAGES_PER_THREAD);
         const ownId = this.deps.ownId() ?? "";
+        const myPlainUid = typeof data.uid === "string" || typeof data.uid === "number" ? String(data.uid).trim() : "";
         const total: ImportCounts = { imported: 0, duplicates: 0, skipped: 0, recalled: 0 };
-        let done = 0;
+
+        // Read every conversation first so we can map all plain user/group ids through /api/znoise in batches.
+        const parsed: BackupConversation[] = [];
+        let unreadable = 0;
         for (const file of conversations) {
             if (gen !== this.generation) return;
-            let conv;
             try {
-                conv = readConversation(file.data, file.id, file.isGroup);
+                const conv = readConversation(file.data, file.id, file.isGroup);
+                if (conv && conv.rows.length) parsed.push(conv);
             } catch (err) {
                 // One damaged conversation shouldn't lose the rest.
+                unreadable++;
                 this.log(`conversation unreadable: ${err instanceof Error ? err.constructor.name : "error"}`);
+            }
+        }
+        this.log(`parsed conversations=${parsed.length} unreadable=${unreadable} hasMyPlainUid=${Boolean(myPlainUid)}`);
+
+        let idMap: BackupIdMap | undefined = myPlainUid ? { myPlainUid } : undefined;
+        if (this.deps.resolveNoisedIds && parsed.length > 0) {
+            const plainUsers = new Set<string>();
+            const plainGroups = new Set<string>();
+            const addPlainUser = (id: string) => {
+                if (id && id !== "0" && id !== myPlainUid && /^\d+$/.test(id)) plainUsers.add(id);
+            };
+            for (const conv of parsed) {
+                if (conv.isGroup) plainGroups.add(conv.id);
+                else addPlainUser(conv.id);
+                for (const row of conv.rows) {
+                    addPlainUser(row.senderId);
+                    if (row.bin.quote?.ownerId) addPlainUser(row.bin.quote.ownerId);
+                    for (const m of row.bin.mentions) addPlainUser(m.uid);
+                }
+            }
+            const userList = [...plainUsers];
+            const groupList = [...plainGroups];
+            const mappedUsers = new Map<string, string>();
+            const mappedGroups = new Map<string, string>();
+            this.set({ state: "importing", progress: 58, detail: "Matching contacts with Zalo..." });
+            for (let i = 0; i < Math.max(userList.length, groupList.length); i += NOISE_BATCH) {
+                if (gen !== this.generation) return;
+                const u = userList.slice(i, i + NOISE_BATCH);
+                const g = groupList.slice(i, i + NOISE_BATCH);
+                if (u.length === 0 && g.length === 0) continue;
+                try {
+                    const res = await this.deps.resolveNoisedIds(u, g);
+                    if (gen !== this.generation) return;
+                    for (const [k, v] of res.users) mappedUsers.set(k, v);
+                    for (const [k, v] of res.groups) mappedGroups.set(k, v);
+                    this.log(
+                        `znoise asked users=${u.length} groups=${g.length} mapped users=${res.users.size} groups=${res.groups.size}${res.replyShape ? ` reply=${res.replyShape}` : ""}`,
+                    );
+                } catch (err) {
+                    this.log(`znoise failed: ${err instanceof Error ? err.message : "error"}`);
+                }
+            }
+            if (mappedUsers.size === 0 && mappedGroups.size === 0 && userList.length + groupList.length > 0) {
+                throw new BackupError("could not match chats with Zalo");
+            }
+            idMap = { users: mappedUsers, groups: mappedGroups, myPlainUid };
+        }
+
+        let done = 0;
+        let importedChats = 0;
+        let unmappedChats = 0;
+        const totalConvs = Math.max(parsed.length, 1);
+        for (const conv of parsed) {
+            if (gen !== this.generation) return;
+            const targetId = idMap?.users || idMap?.groups
+                ? (conv.isGroup ? idMap.groups?.get(conv.id) : idMap.users?.get(conv.id)) ?? ""
+                : conv.id;
+            if (!targetId) {
+                unmappedChats++;
+                total.skipped += conv.rows.length + (conv.sourceRows - conv.rows.length);
                 done++;
                 continue;
             }
-            if (conv && conv.rows.length) {
-                const c = importConversation(conv, ownId, this.deps.sink, this.deps.nameOf);
-                total.imported += c.imported;
-                total.duplicates += c.duplicates;
-                total.skipped += c.skipped + (conv.sourceRows - conv.rows.length);
-                total.recalled += c.recalled;
+            if (done === 0 && conv.columns) this.log(`schema columns=${conv.columns.join(",")}`);
+            if (done < 3) this.log(`senders ${describeSenders(conv, ownId, myPlainUid)}`);
+            if (targetId !== conv.id) {
+                // Free message ids from any earlier sync that imported this chat under its raw plain id.
+                this.deps.sink.dropPlainThread?.(conv.isGroup ? "group" : "user", conv.id);
             }
+            await this.deps.prepare?.(targetId, conv.isGroup).catch(() => {});
+            if (gen !== this.generation) return;
+            const c = importConversation(conv, ownId, this.deps.sink, this.deps.nameOf, idMap);
+            total.imported += c.imported;
+            total.duplicates += c.duplicates;
+            total.skipped += c.skipped + (conv.sourceRows - conv.rows.length);
+            total.recalled += c.recalled;
+            if (c.imported > 0 || c.duplicates > 0) importedChats++;
             done++;
-            this.set({ state: "importing", progress: 60 + Math.floor((39 * done) / conversations.length), detail: `Importing messages (${done}/${conversations.length} chats)...` });
+            this.set({ state: "importing", progress: 60 + Math.floor((39 * done) / totalConvs), detail: `Importing messages (${done}/${parsed.length} chats)...` });
             await this.tick();
         }
-        this.log(`import done imported=${total.imported} duplicates=${total.duplicates} skipped=${total.skipped} recalled=${total.recalled}`);
+        const chatCount = importedChats || parsed.length - unmappedChats;
+        this.log(
+            `import done imported=${total.imported} duplicates=${total.duplicates} skipped=${total.skipped} recalled=${total.recalled} chats=${chatCount} unmapped=${unmappedChats}`,
+        );
         this.finish(
             gen,
-            { ...total, conversations: conversations.length },
-            `Added ${total.imported} messages from ${conversations.length} chats${total.duplicates ? `; ${total.duplicates} were already here` : ""}.`,
+            { ...total, conversations: chatCount },
+            `Added ${total.imported} messages from ${chatCount} chats${total.duplicates ? `; ${total.duplicates} were already here` : ""}.`,
         );
     }
 
@@ -607,4 +695,132 @@ export function backupDownloader(api: API): HistorySyncDeps["download"] {
     }
     const get = (api as unknown as Record<string, (p: { url: string; signal: AbortSignal; onProgress: (got: number, total: number) => void }) => Promise<Buffer>>)[name];
     return (url, onProgress, signal) => get({ url, signal, onProgress });
+}
+
+const PROFILE_SERVICE_FALLBACK = "https://tt-profile-wpa.chat.zalo.me";
+
+/** Decrypts a standard Zalo AES-CBC response payload (base64 key, 16 zero-byte IV, URL-encoded base64 ciphertext). */
+export function decodeZaloAes(secretKey: string, data: string): string | null {
+    const key = Buffer.from(secretKey, "base64");
+    const algo = key.length === 16 ? "aes-128-cbc" : key.length === 24 ? "aes-192-cbc" : key.length === 32 ? "aes-256-cbc" : null;
+    if (!algo) return null;
+    const iv = Buffer.alloc(16, 0);
+    let candidate = data;
+    for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+            candidate = decodeURIComponent(candidate);
+        } catch {
+            // Already decoded or non-URI characters.
+        }
+        try {
+            const decipher = crypto.createDecipheriv(algo, key, iv);
+            const plain = Buffer.concat([decipher.update(Buffer.from(candidate, "base64")), decipher.final()]).toString("utf8");
+            if (plain) return plain;
+        } catch {
+            // Try another decodeURIComponent pass, matching zca-js's decodeAES.
+        }
+    }
+    return null;
+}
+
+/** Reads `/api/znoise`'s `fids` and `gids` fields, supporting both parallel arrays and `{ plain: noised }` maps. */
+export function parseNoisedIdsReply(askedUsers: string[], askedGroups: string[], data: unknown): NoisedIdsReply {
+    const users = new Map<string, string>();
+    const groups = new Map<string, string>();
+    const maybeParse = (v: unknown): unknown => {
+        if (typeof v !== "string") return v;
+        const trimmed = v.trim();
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return v;
+        try {
+            return parseJsonKeepingBigInts(trimmed);
+        } catch {
+            return v;
+        }
+    };
+    const unpacked = maybeParse(data);
+    const obj = unpacked && typeof unpacked === "object" && !Array.isArray(unpacked) ? (unpacked as Record<string, unknown>) : {};
+    const apply = (asked: string[], rawAnswer: unknown, out: Map<string, string>) => {
+        const answer = maybeParse(rawAnswer);
+        if (Array.isArray(answer)) {
+            if (answer.length !== asked.length) return;
+            for (let i = 0; i < answer.length; i++) {
+                const noised = answer[i] !== null && answer[i] !== undefined ? String(answer[i]).trim() : "";
+                if (noised && noised !== "0") out.set(asked[i], noised);
+            }
+        } else if (answer && typeof answer === "object") {
+            const map = answer as Record<string, unknown>;
+            for (const plain of asked) {
+                const v = map[plain];
+                const noised = v !== null && v !== undefined ? String(v).trim() : "";
+                if (noised && noised !== "0") out.set(plain, noised);
+            }
+        }
+    };
+    apply(askedUsers, obj.fids, users);
+    apply(askedGroups, obj.gids, groups);
+    const kindOf = (v: unknown) => (Array.isArray(v) ? `arr(${v.length})` : v && typeof v === "object" ? `obj(${Object.keys(v).length})` : typeof v);
+    const replyShape = `{${Object.keys(obj)
+        .sort()
+        .map((k) => `${k}:${kindOf(obj[k])}`)
+        .join(",")}}`;
+    return { users, groups, replyShape };
+}
+
+/**
+ * Calls `/api/znoise` on the profile service to translate plain mobile user/group ids into the noised ids Zalo Web
+ * (zca-js) uses. Decrypts and parses the JSON with `parseJsonKeepingBigInts` so 19-digit numeric ids never lose digits.
+ */
+export function noisedIdsResolver(api: API): NonNullable<HistorySyncDeps["resolveNoisedIds"]> {
+    const name = "zalooZnoise";
+    if (!(name in api)) {
+        api.custom<NoisedIdsReply, { fids: string[]; gids: string[] }>(name, async ({ ctx, utils, props }) => {
+            const map = (api as unknown as { zpwServiceMap?: { profile?: unknown } }).zpwServiceMap?.profile;
+            const first = Array.isArray(map) ? map[0] : map;
+            const base = typeof first === "string" && /^https:\/\//.test(first) ? first.replace(/\/+$/, "") : PROFILE_SERVICE_FALLBACK;
+            const params = utils.encodeAES(JSON.stringify({ fids: props.fids, gids: props.gids }));
+            if (!params) throw new Error("Could not encrypt znoise request");
+            const response = await utils.request(utils.makeURL(`${base}/api/znoise`, { params }), { method: "GET" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const outerText = await response.text();
+            const outer = parseJsonKeepingBigInts(outerText) as Record<string, unknown> | null;
+            if (!outer || typeof outer !== "object") throw new Error("Invalid znoise response");
+            if (Number(outer.error_code ?? -1) !== 0) {
+                throw new Error(String(outer.error_message ?? `code ${outer.error_code}`));
+            }
+            const secretKey = (ctx as unknown as { secretKey?: string | null }).secretKey;
+            let payload: unknown = outer.data;
+            if (typeof outer.data === "string" && secretKey) {
+                const plain = decodeZaloAes(secretKey, outer.data);
+                if (!plain) throw new Error("Could not decrypt znoise response");
+                const inner = parseJsonKeepingBigInts(plain) as Record<string, unknown> | null;
+                if (!inner || typeof inner !== "object") throw new Error("Invalid decrypted znoise response");
+                if (Number(inner.error_code ?? -1) !== 0) {
+                    throw new Error(String(inner.error_message ?? `code ${inner.error_code}`));
+                }
+                payload = inner.data;
+            }
+            return parseNoisedIdsReply(props.fids, props.gids, payload);
+        });
+    }
+    const resolve = (api as unknown as Record<string, (p: { fids: string[]; gids: string[] }) => Promise<NoisedIdsReply>>)[name];
+    return (userIds, groupIds) => resolve({ fids: userIds, gids: groupIds });
+}
+
+/** Counts of how a conversation's rows were classified, with no ids (for the sync log). */
+function describeSenders(conv: BackupConversation, ownId: string, myPlainUid = ""): string {
+    let zero = 0;
+    let empty = 0;
+    let peer = 0;
+    let own = 0;
+    let other = 0;
+    let sent = 0;
+    for (const r of conv.rows) {
+        if (r.senderId === "0") zero++;
+        else if (r.senderId === "") empty++;
+        else if (r.senderId === conv.id) peer++;
+        else if ((myPlainUid !== "" && r.senderId === myPlainUid) || (ownId !== "" && r.senderId === ownId)) own++;
+        else other++;
+        if (isOutgoing(r, conv, ownId, myPlainUid)) sent++;
+    }
+    return `${conv.isGroup ? "group" : "chat"} rows=${conv.rows.length} sender0=${zero} empty=${empty} peer=${peer} own=${own} other=${other} direction=${conv.rows.some((r) => r.outgoing !== undefined)} sent=${sent}`;
 }

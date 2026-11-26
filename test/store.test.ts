@@ -404,3 +404,20 @@ test("loadConfig refuses a public host without a token", () => {
     assert.equal(loadConfig({}).readReceipts, true);
     assert.equal(loadConfig({ READ_RECEIPTS: "false" }).readReceipts, false);
 });
+
+test("normalizeMessage shows the text of notices of an unmodelled type instead of a placeholder", () => {
+    const m = normalizeMessage(
+        raw({ msgType: "chat.webcontent", content: { title: "Đăng nhập Zalo trên máy tính thành công", href: "https://zalo.me" } }),
+    );
+    assert.equal(m.text, "Đăng nhập Zalo trên máy tính thành công");
+    const empty = normalizeMessage(raw({ msgType: "chat.something.new", content: {} }));
+    assert.equal(empty.text, "[Unsupported message]");
+});
+
+test("unnamedThreads lists chats still named by their id", () => {
+    const store = new ChatStore();
+    store.upsertThread({ id: "1", kind: "user", name: "", avatar: "" });
+    store.upsertThread({ id: "2", kind: "user", name: "An", avatar: "" });
+    store.upsertThread({ id: "3", kind: "group", name: "3", avatar: "" });
+    assert.deepEqual(store.unnamedThreads().map((t) => t.id).sort(), ["1", "3"]);
+});

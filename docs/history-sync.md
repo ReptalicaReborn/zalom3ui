@@ -114,8 +114,9 @@ Zalos reads rows `WHERE MsgStatus > 0 AND CliMsgId NOT NULL ORDER BY TimeStamp`;
 is a small read-only SQLite file reader, because the phone's embedded Node 18 has no SQLite).
 
 - **Sender**: `"0"` means sent from this account (as in live messages), else the plain user id.
-- **Ids**: Zalos maps plain ids to Zalo PC's "noised" ids through `/api/znoise` before importing. Zalo Web (zca-js) uses
-  plain ids everywhere, so we don't (guess; if imported messages land in the wrong chats this is the first suspect).
+- **Ids**: The phone backup uses plain 8–9 digit ids, whereas Zalo Web (`zca-js`) and Zalo PC use 18–19 digit
+  "noised" ids everywhere. Before importing, we map plain user/group ids (`fids`/`gids`) via `GET /api/znoise` on the
+  profile service (in batches of 100), and use `syncmsg_info.data.uid` as our own plain id.
 - **`BinNet`**: a flat TLV box, `key u32, length u32, value`, byte order unknown per blob (Zalos parses both and keeps
   the one that scores more known tags). Tags: `0x0b` text, `0x0a` data source, `0x09` quote status, `0x06` attachment
   (repeats; inside: `0x28` type, `0x29` catId, `0x2a` id, `0x2b` extInfo, `0x2d` action, `0x2e` params, `0x2f` title,
