@@ -292,6 +292,13 @@ impl ZaloSession {
         self.history_sync_tx.subscribe()
     }
 
+    /// Publishes one history-sync control (`{ actType, act, data, raw }`) to subscribers of
+    /// [`Self::subscribe_history_sync_controls`]. Used for controls that arrive over the control
+    /// poller rather than the chat socket.
+    pub fn publish_history_sync_control(&self, control: Value) {
+        let _ = self.history_sync_tx.send(control);
+    }
+
     // ---- Lifecycle: start / resume / QR login / retry / reconnect / logout / shutdown ----
 
     /// Attempts to resume from saved `<data_dir>/credentials.json` with offline-resilient backoff

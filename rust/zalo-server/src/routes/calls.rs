@@ -32,6 +32,7 @@ use zalo_proto::{
 };
 
 use crate::errors::{ApiResult, HttpError};
+use crate::routes::history_sync::sync_control_of;
 use crate::routes::AppState;
 use crate::session::ZaloSession;
 use crate::types::{
@@ -552,34 +553,8 @@ impl CallManager {
                 {
                     break;
                 }
-                match ev {
-                    ControlPollEvent::Controls(controls) => {
-                        for ctrl in extract_voip_controls(&controls) {
-                            mgr.on_voip_control(&ctrl, "poll", now_ms(), true);
-                        }
-                    }
-                    ControlPollEvent::Refused { code, message } => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_refused",
-                            "code": code,
-                            "message": message,
-                        }));
-                        break;
-                    }
-                    ControlPollEvent::Error { message, failures } => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_error",
-                            "error": message,
-                            "failures": failures,
-                        }));
-                    }
-                    ControlPollEvent::Unavailable(reason) => {
-                        mgr.session.call_trace().record(&json!({
-                            "kind": "ctrl_poll_unavailable",
-                            "reason": reason,
-                        }));
-                        break;
-                    }
+                if !mgr.on_control_poll_event(ev) {
+                    break;
                 }
             }
         });
@@ -588,6 +563,48 @@ impl CallManager {
             s.ctrl_poll_client = Some(Arc::downgrade(&client));
             s.ctrl_poll_handle = Some(handle);
             s.ctrl_poll_task = Some(task);
+        }
+    }
+
+    /// Handles one [`ControlPollEvent`] from the control poller. Returns `false` when the poller
+    /// is finished (refused or unavailable) and its task should stop.
+    ///
+    /// `Controls` feed both the call state machine (VoIP controls) and the history-sync manager
+    /// (`syncmsgmb` and friends), like `onControls` in `src/session.ts`.
+    fn on_control_poll_event(self: &Arc<Self>, ev: ControlPollEvent) -> bool {
+        match ev {
+            ControlPollEvent::Controls(controls) => {
+                for ctrl in extract_sync_controls(&controls) {
+                    self.session.publish_history_sync_control(ctrl);
+                }
+                for ctrl in extract_voip_controls(&controls) {
+                    self.on_voip_control(&ctrl, "poll", now_ms(), true);
+                }
+                true
+            }
+            ControlPollEvent::Refused { code, message } => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_refused",
+                    "code": code,
+                    "message": message,
+                }));
+                false
+            }
+            ControlPollEvent::Error { message, failures } => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_error",
+                    "error": message,
+                    "failures": failures,
+                }));
+                true
+            }
+            ControlPollEvent::Unavailable(reason) => {
+                self.session.call_trace().record(&json!({
+                    "kind": "ctrl_poll_unavailable",
+                    "reason": reason,
+                }));
+                false
+            }
         }
     }
 
@@ -2281,6 +2298,23 @@ fn extract_voip_controls(controls: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Extracts history-sync controls from raw `ControlPoller` entries, in the shape the chat-socket
+/// path publishes (`{ actType, act, data, raw }`, see `ZaloSession::subscribe_history_sync_controls`).
+fn extract_sync_controls(controls: &[Value]) -> Vec<Value> {
+    controls
+        .iter()
+        .filter_map(|control| {
+            let sync = sync_control_of(control)?;
+            Some(json!({
+                "actType": sync.act_type,
+                "act": sync.act,
+                "data": Value::Object(sync.data),
+                "raw": control,
+            }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3137,6 +3171,82 @@ mod tests {
         );
 
         srv_handle.abort();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_sync_controls_uses_the_socket_shape() {
+        let entries = [
+            json!({ "content": { "act_type": "voip", "act": "request", "data": "{}" } }),
+            json!({
+                "controlId": "c9",
+                "content": { "act_type": "syncmsgmb", "act": "user_confirm", "data": r#"{"user_action":1}"# }
+            }),
+        ];
+        let out = extract_sync_controls(&entries);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["actType"], "syncmsgmb");
+        assert_eq!(out[0]["act"], "user_confirm");
+        assert_eq!(out[0]["data"]["user_action"], 1, "data string is parsed like the socket path");
+        assert_eq!(out[0]["raw"], entries[1]);
+        // The history-sync manager's parser accepts it.
+        assert!(sync_control_of(&out[0]).is_some());
+    }
+
+    /// Regression: history-sync controls arriving via the control poller used to be dropped.
+    #[tokio::test]
+    async fn poll_delivered_sync_control_reaches_history_sync_manager() {
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = temp_dir("zalo-calls-poll-sync");
+        let store = ChatStore::open(dir.clone());
+        let session = Arc::new(ZaloSession::new(store.clone(), dir.clone(), true));
+        let state = AppState {
+            config: Arc::new(Config::from_lookup(|_| None).unwrap()),
+            session: Arc::clone(&session),
+            store,
+        };
+        let app = crate::routes::history_sync::router(state.clone()).with_state(state);
+        let mgr = CallManager::new(Arc::clone(&session));
+
+        let keep_going = mgr.on_control_poll_event(ControlPollEvent::Controls(vec![json!({
+            "controlId": "c1",
+            "content": {
+                "act_type": "syncmsgmb",
+                "act": "user_confirm",
+                "data": r#"{"user_action":1,"pc_name":"x"}"#,
+            }
+        })]));
+        assert!(keep_going);
+
+        let mut seen = false;
+        for _ in 0..50 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/history-sync/status")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+            let log = body["log"].as_array().cloned().unwrap_or_default();
+            if log
+                .iter()
+                .filter_map(|l| l.as_str())
+                .any(|l| l.contains("control act_type=syncmsgmb act=user_confirm"))
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "the manager never saw the polled syncmsgmb control");
         let _ = fs::remove_dir_all(&dir);
     }
 }
