@@ -454,6 +454,90 @@ export class ChatStore {
         return [...this.threads.values()].filter((t) => !t.name || t.name === t.id);
     }
 
+    /** True when the thread has no live messages (every message came from a history import, or it is empty). */
+    hasOnlyHistory(kind: ThreadKind, id: string): boolean {
+        const list = this.messages.get(threadKey(kind, id));
+        return !list || list.every((m) => !m.raw);
+    }
+
+    /**
+     * Removes an unnamed thread that holds only imported history (e.g. from an earlier sync before plain ids were
+     * mapped to noised ids), freeing its message ids in the dedupe index so a fresh import into the real thread wins.
+     */
+    dropPlainThread(kind: ThreadKind, plainId: string): boolean {
+        const key = threadKey(kind, plainId);
+        const info = this.threads.get(key);
+        if (!info || (info.name && info.name !== info.id)) return false;
+        if (!this.hasOnlyHistory(kind, plainId)) return false;
+        const list = this.messages.get(key) ?? [];
+        for (const m of list) {
+            if (this.index.get(m.id) === key) this.index.delete(m.id);
+        }
+        this.messages.delete(key);
+        this.threads.delete(key);
+        this.readUpTo.delete(key);
+        this.markedUnread.delete(key);
+        this.pinned.delete(key);
+        this.mutedUntil.delete(key);
+        this.scheduleSave();
+        return true;
+    }
+
+    /**
+     * Moves messages from an unnamed plain-id history thread into its real noised-id thread and removes the old thread.
+     * Preserves read state so migrated history never becomes unread.
+     */
+    migrateThread(kind: ThreadKind, fromId: string, toId: string): boolean {
+        if (!fromId || !toId || fromId === toId) return false;
+        const fromKey = threadKey(kind, fromId);
+        const toKey = threadKey(kind, toId);
+        const oldInfo = this.threads.get(fromKey);
+        if (!oldInfo || (oldInfo.name && oldInfo.name !== oldInfo.id)) return false;
+        if (!this.hasOnlyHistory(kind, fromId)) return false;
+
+        const oldList = this.messages.get(fromKey) ?? [];
+        const targetInfo = this.threads.get(toKey);
+        const targetList = this.messages.get(toKey) ?? [];
+        const existingIds = new Set(targetList.map((m) => m.id));
+
+        for (const m of oldList) {
+            if (this.index.get(m.id) === fromKey) this.index.delete(m.id);
+            if (existingIds.has(m.id) || this.index.has(m.id)) continue;
+            const moved: StoredMessage = {
+                ...m,
+                threadId: toId,
+                ...(kind === "user" && !m.isSelf
+                    ? { fromId: toId, fromName: m.fromName || (targetInfo && targetInfo.name !== toId ? targetInfo.name : "") }
+                    : {}),
+            };
+            targetList.push(moved);
+            existingIds.add(moved.id);
+            this.index.set(moved.id, toKey);
+        }
+        targetList.sort((a, b) => a.ts - b.ts);
+        if (targetList.length > this.messageCap) {
+            for (const dropped of targetList.splice(0, targetList.length - this.messageCap)) {
+                if (this.index.get(dropped.id) === toKey) this.index.delete(dropped.id);
+            }
+        }
+        if (targetList.length > 0) this.messages.set(toKey, targetList);
+        if (!targetInfo) {
+            this.threads.set(toKey, { id: toId, kind, name: toId, avatar: "" });
+        }
+
+        const mergedRead = Math.max(this.readUpTo.get(toKey) ?? 0, this.readUpTo.get(fromKey) ?? 0);
+        if (mergedRead > 0) this.readUpTo.set(toKey, mergedRead);
+
+        this.messages.delete(fromKey);
+        this.threads.delete(fromKey);
+        this.readUpTo.delete(fromKey);
+        this.markedUnread.delete(fromKey);
+        this.pinned.delete(fromKey);
+        this.mutedUntil.delete(fromKey);
+        this.scheduleSave();
+        return true;
+    }
+
     /** Lets chats keep up to `cap` messages (saved with the cache), for imported history. Never lowers the limit. */
     allowMessages(cap: number): void {
         if (cap > this.messageCap) {

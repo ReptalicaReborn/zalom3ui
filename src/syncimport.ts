@@ -344,14 +344,24 @@ function pickId(o: Record<string, unknown>, keys: string[]): string {
 }
 
 /**
- * Whether this account sent the row. The sender column is "0" or our id for messages we sent on most phones, but the
- * phone's schema is only partly known, so: an explicit direction column wins; in a 1:1 chat anyone other than the
- * other person is us (whatever form our own id takes), and a row with no sender at all is theirs.
+ * Plain-to-noised id tables returned by `/api/znoise`, plus our own plain user id from `syncmsg_info.data.uid`.
+ * When `users` or `groups` is supplied, every conversation and participant id is translated to the noised form Zalo Web
+ * (zca-js) uses; conversations with no mapping are skipped instead of creating broken numeric-id threads.
  */
-export function isOutgoing(row: BackupRow, conv: { id: string; isGroup: boolean }, ownId: string): boolean {
+export type BackupIdMap = {
+    users?: ReadonlyMap<string, string>;
+    groups?: ReadonlyMap<string, string>;
+    myPlainUid?: string;
+};
+
+/**
+ * Whether this account sent the row. An explicit direction column wins; next is `"0"`, our plain id from `syncmsg_info`,
+ * or our noised id; in a 1:1 chat anyone other than the other person is us, and a row with no sender at all is theirs.
+ */
+export function isOutgoing(row: BackupRow, conv: { id: string; isGroup: boolean }, ownId: string, myPlainUid = ""): boolean {
     if (row.outgoing !== undefined) return row.outgoing;
     const sender = row.senderId;
-    if (sender === "0" || (ownId !== "" && sender === ownId)) return true;
+    if (sender === "0" || (myPlainUid !== "" && sender === myPlainUid) || (ownId !== "" && sender === ownId)) return true;
     if (!conv.isGroup && sender !== "" && sender !== conv.id) return true;
     return false;
 }
@@ -361,27 +371,51 @@ export type ConvertResult = {
     /** Ids of messages the backup says were recalled. */
     recalled: string[];
     skipped: Record<string, number>;
+    /** The thread id the converted messages target (noised when `idMap` was supplied). */
+    threadId?: string;
 };
 
 /**
  * Converts a conversation's rows to the raw message shape zca-js produces, so the same `normalizeMessage` as for live
- * messages applies. The phone's backup uses plain user ids (the Zalos project maps them to Zalo PC's "noised" ids; the
- * web protocol zca-js speaks has none), and "0" as the sender of messages sent from this account.
+ * messages applies. The phone's backup uses plain user and group ids, while Zalo Web (zca-js) uses noised ids mapped
+ * through `/api/znoise` (`idMap`).
  */
-export function convertConversation(conv: BackupConversation, ownId: string, nameOf: (userId: string) => string = () => ""): ConvertResult {
+export function convertConversation(
+    conv: BackupConversation,
+    ownId: string,
+    nameOf: (userId: string) => string = () => "",
+    idMap?: BackupIdMap,
+): ConvertResult {
     const messages: RawMessage[] = [];
     const recalled: string[] = [];
     const skipped: Record<string, number> = {};
     const skip = (reason: string) => {
         skipped[reason] = (skipped[reason] ?? 0) + 1;
     };
+
+    const hasNoiseMap = Boolean(idMap?.users || idMap?.groups);
+    const threadId = hasNoiseMap
+        ? (conv.isGroup ? idMap?.groups?.get(conv.id) : idMap?.users?.get(conv.id)) ?? ""
+        : conv.id;
+    if (!threadId) {
+        if (conv.rows.length) skipped.no_thread = conv.rows.length;
+        return { messages, recalled, skipped };
+    }
+
+    const myPlainUid = idMap?.myPlainUid ?? "";
+    const mapUser = (plain: string): string => {
+        if (!plain || plain === "0") return "";
+        if (myPlainUid && plain === myPlainUid) return ownId;
+        return idMap?.users?.get(plain) ?? plain;
+    };
+
     for (const row of conv.rows) {
         if (SKIPPED_TYPES.has(row.msgType)) {
             skip(`type_${row.msgType}`);
             continue;
         }
         const rowId = row.globalMsgId && row.globalMsgId !== "0" ? row.globalMsgId : row.cliMsgId;
-        const mine = isOutgoing(row, conv, ownId);
+        const mine = isOutgoing(row, conv, ownId, myPlainUid);
         const bin = row.bin;
 
         if (row.msgType === 36) {
@@ -427,35 +461,39 @@ export function convertConversation(conv: BackupConversation, ownId: string, nam
             continue;
         }
 
+        const uidFrom = conv.isGroup ? (mine ? ownId : mapUser(row.senderId)) : mine ? ownId : threadId;
+        const idTo = conv.isGroup ? threadId : mine ? threadId : ownId;
+
         const data: RawMessage["data"] = {
             msgId: rowId,
             cliMsgId: row.cliMsgId,
             msgType: type,
-            uidFrom: mine ? ownId : row.senderId || conv.id,
-            idTo: conv.isGroup ? conv.id : mine ? conv.id : ownId,
-            dName: mine ? "" : nameOf(row.senderId),
+            uidFrom,
+            idTo,
+            dName: mine ? "" : nameOf(uidFrom),
             ts: String(row.ts),
             content,
             ttl: row.ttl,
         };
         if (bin.quote && (bin.quote.globalMsgId !== "0" || bin.quote.cliMsgId !== "0" || bin.quote.msg)) {
             const quoteOwner = bin.quote.ownerId;
-            const quoteMine = quoteOwner === "0" || (ownId !== "" && quoteOwner === ownId);
+            const quoteMine = quoteOwner === "0" || (myPlainUid !== "" && quoteOwner === myPlainUid) || (ownId !== "" && quoteOwner === ownId);
+            const mappedQuoteOwner = quoteMine ? ownId : mapUser(quoteOwner);
             data.quote = {
-                ownerId: bin.quote.ownerId,
+                ownerId: mappedQuoteOwner || quoteOwner,
                 globalMsgId: bin.quote.globalMsgId,
-                fromD: bin.quote.fromD || (quoteMine ? "" : nameOf(quoteOwner) || (conv.isGroup ? "" : nameOf(conv.id))),
+                fromD: bin.quote.fromD || (quoteMine ? "" : nameOf(mappedQuoteOwner) || (conv.isGroup ? "" : nameOf(threadId))),
                 msg: bin.quote.msg,
                 attach: bin.quote.attach,
             };
         }
         const mentions = bin.mentions
-            .map((m) => ({ uid: m.uid.startsWith("-") ? "-1" : m.uid, pos: m.pos, len: m.len, type: m.type }))
+            .map((m) => ({ uid: m.uid.startsWith("-") ? "-1" : mapUser(m.uid), pos: m.pos, len: m.len, type: m.type }))
             .filter((m) => m.uid !== "0" && m.uid !== "");
         if (mentions.length) data.mentions = mentions;
-        messages.push({ type: conv.isGroup ? 1 : 0, threadId: conv.id, isSelf: mine, data });
+        messages.push({ type: conv.isGroup ? 1 : 0, threadId, isSelf: mine, data });
     }
-    return { messages, recalled, skipped };
+    return { messages, recalled, skipped, threadId };
 }
 
 // ---- Into the store ----
@@ -466,6 +504,8 @@ export interface ImportSink {
     recall(msgId: string): unknown;
     /** After a conversation's import: its imported messages must not count as unread. */
     settleHistory(kind: ThreadKind, threadId: string, importedIds: ReadonlySet<string>): void;
+    /** Removes a stale unnamed plain-id history thread before re-importing into its mapped noised id. */
+    dropPlainThread?(kind: ThreadKind, plainId: string): boolean;
 }
 
 /** `duplicates`: messages already stored (or beyond the per-chat limit); `skipped`: rows that aren't chat content. */
@@ -475,9 +515,18 @@ export type ImportCounts = { imported: number; duplicates: number; skipped: numb
  * Adds a conversation's messages to the store: new ids only, in timestamp order (the store keeps its lists sorted).
  * Messages already present (live, or from an earlier sync) are counted as duplicates and left alone.
  */
-export function importConversation(conv: BackupConversation, ownId: string, sink: ImportSink, nameOf?: (userId: string) => string): ImportCounts {
-    const { messages, recalled, skipped } = convertConversation(conv, ownId, nameOf);
+export function importConversation(
+    conv: BackupConversation,
+    ownId: string,
+    sink: ImportSink,
+    nameOf?: (userId: string) => string,
+    idMap?: BackupIdMap,
+): ImportCounts {
+    const { messages, recalled, skipped, threadId } = convertConversation(conv, ownId, nameOf, idMap);
     const kind: ThreadKind = conv.isGroup ? "group" : "user";
+    if (!threadId) {
+        return { imported: 0, duplicates: 0, skipped: Object.values(skipped).reduce((a, b) => a + b, 0), recalled: 0 };
+    }
     const ids = new Set<string>();
     let imported = 0;
     let duplicates = 0;
@@ -494,6 +543,6 @@ export function importConversation(conv: BackupConversation, ownId: string, sink
     }
     let recalledCount = 0;
     for (const id of recalled) if (sink.recall(id)) recalledCount++;
-    sink.settleHistory(kind, conv.id, ids);
+    sink.settleHistory(kind, threadId, ids);
     return { imported, duplicates, skipped: Object.values(skipped).reduce((a, b) => a + b, 0), recalled: recalledCount };
 }

@@ -34,7 +34,7 @@ import {
     type IncomingCall,
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
-import { HistorySync, backupDownloader, fileServiceCaller, type HistorySyncStatus } from "./historysync.js";
+import { HistorySync, backupDownloader, fileServiceCaller, noisedIdsResolver, type HistorySyncStatus } from "./historysync.js";
 import {
     acceptCall,
     answerAck,
@@ -236,6 +236,7 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             // async: a missing login is a rejected promise, not a throw.
             call: async (endpoint, params) => fileServiceCaller(this.requireApi())(endpoint, params),
             download: async (url, onProgress, signal) => backupDownloader(this.requireApi())(url, onProgress, signal),
+            resolveNoisedIds: async (userIds, groupIds) => noisedIdsResolver(this.requireApi())(userIds, groupIds),
             sink: this.store,
             nameOf: (id) => {
                 const name = this.friendList.get(id)?.name || this.store.getThread("user", id)?.name || this.memberName(id);
@@ -1830,19 +1831,52 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         const api = this.api;
         if (!api) return false;
         const generation = this.generation;
-        const unnamed = this.store.unnamedThreads();
         let changed = false;
+
+        // Chats imported by an earlier sync before /api/znoise mapping carry short plain ids (<=11 digits) and no raw
+        // live messages. Translate them to noised ids so they merge into real friends/groups automatically.
+        const initialUnnamed = this.store.unnamedThreads();
+        const plainUsers = initialUnnamed
+            .filter((t) => t.kind === "user" && /^\d{1,11}$/.test(t.id) && this.store.hasOnlyHistory("user", t.id))
+            .map((t) => t.id);
+        const plainGroups = initialUnnamed
+            .filter((t) => t.kind === "group" && /^\d{1,11}$/.test(t.id) && this.store.hasOnlyHistory("group", t.id))
+            .map((t) => t.id);
+        if (plainUsers.length > 0 || plainGroups.length > 0) {
+            const resolve = noisedIdsResolver(api);
+            for (let i = 0; i < Math.max(plainUsers.length, plainGroups.length); i += 100) {
+                const u = plainUsers.slice(i, i + 100);
+                const g = plainGroups.slice(i, i + 100);
+                if (u.length === 0 && g.length === 0) continue;
+                try {
+                    const res = await resolve(u, g);
+                    if (generation !== this.generation || this.api !== api) return changed;
+                    for (const [plain, noised] of res.users) {
+                        if (this.store.migrateThread("user", plain, noised)) changed = true;
+                    }
+                    for (const [plain, noised] of res.groups) {
+                        if (this.store.migrateThread("group", plain, noised)) changed = true;
+                    }
+                } catch {
+                    // Best effort: fall through to profile lookup for whatever is already noised.
+                }
+            }
+        }
+
+        const unnamed = this.store.unnamedThreads();
         const users = unnamed.filter((t) => t.kind === "user").map((t) => t.id);
         for (let i = 0; i < users.length; i += GROUP_INFO_BATCH) {
             const batch = users.slice(i, i + GROUP_INFO_BATCH);
             try {
                 const res = await api.getUserInfo(batch);
                 if (generation !== this.generation || this.api !== api) return changed;
-                for (const [id, p] of Object.entries(res.changed_profiles ?? {})) {
-                    const name = p.displayName || p.zaloName;
-                    if (!name) continue;
-                    this.store.upsertThread({ id: String(id).split("_")[0], kind: "user", name, avatar: p.avatar ?? "" });
-                    changed = true;
+                for (const profiles of [res.changed_profiles, res.unchanged_profiles]) {
+                    for (const [id, p] of Object.entries(profiles ?? {})) {
+                        const name = p.displayName || p.zaloName;
+                        if (!name) continue;
+                        this.store.upsertThread({ id: String(id).split("_")[0], kind: "user", name, avatar: p.avatar ?? "" });
+                        changed = true;
+                    }
                 }
             } catch {
                 // Someone who can't be looked up keeps their id; the rest still get names.
