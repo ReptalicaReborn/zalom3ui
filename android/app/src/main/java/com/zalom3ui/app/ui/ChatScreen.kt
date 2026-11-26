@@ -64,11 +64,14 @@ import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.outlined.Forward
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.automirrored.outlined.MissedVideoCall
+import androidx.compose.material.icons.automirrored.outlined.PhoneMissed
 import androidx.compose.material.icons.automirrored.outlined.Reply
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Call
@@ -364,7 +367,7 @@ fun ChatScreen(
                             ) {
                                 Avatar(chat.name, thread?.avatar.orEmpty(), key = chat.ref.key, isGroup = isGroup, size = 36.dp)
                                 Spacer(Modifier.width(12.dp))
-                                Column {
+                                Column(Modifier.weight(1f)) {
                                     Text(chat.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
                                     val subtitle = when {
                                         typing != null -> if (isGroup && typing.name.isNotBlank()) "${typing.name} is typing…" else "typing…"
@@ -378,6 +381,7 @@ fun ChatScreen(
                                             style = MaterialTheme.typography.bodySmall,
                                             color = if (typing != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
                                         )
                                     }
                                 }
@@ -709,7 +713,8 @@ private fun MessageList(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     // Newest at the bottom: reverseLayout keeps the view pinned to the latest message.
-    val reversed = remember(chat.messages) { chat.messages.asReversed() }
+    val items = remember(chat.messages, chat.firstUnreadId) { buildChatItems(chat.messages, chat.firstUnreadId) }
+    val reversedItems = remember(items) { items.asReversed() }
     val isGroup = chat.kind == "group"
     val unreadCount = remember(chat.messages, chat.firstUnreadId) {
         val start = chat.messages.indexOfFirst { it.id == chat.firstUnreadId }
@@ -721,7 +726,7 @@ private fun MessageList(
 
     LaunchedEffect(jumpTarget) {
         val (id, nonce) = jumpTarget ?: return@LaunchedEffect
-        val idx = reversed.indexOfFirst { it.id == id }
+        val idx = reversedItems.indexOfFirst { it.containsId(id) }
         if (idx >= 0) {
             val listIndex = if (typing != null) idx + 1 else idx
             listState.animateScrollToItem(listIndex)
@@ -770,21 +775,21 @@ private fun MessageList(
         lastSeenNewestId = newestId
     }
 
-    val floatingDateTs by remember(reversed, typing != null) {
+    val floatingDateTs by remember(reversedItems, typing != null) {
         derivedStateOf {
             if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
             val offset = if (typing != null) 1 else 0
             val layout = listState.layoutInfo
             val topItem = layout.visibleItemsInfo
-                .lastOrNull { it.index >= offset && (it.index - offset) < reversed.size }
+                .lastOrNull { it.index >= offset && (it.index - offset) < reversedItems.size }
                 ?: return@derivedStateOf null
             val topIndex = topItem.index - offset
-            val msg = reversed.getOrNull(topIndex) ?: return@derivedStateOf null
-            val older = reversed.getOrNull(topIndex + 1)
-            val hasInlineDayHeader = older == null || !sameDay(older.ts, msg.ts)
+            val item = reversedItems.getOrNull(topIndex) ?: return@derivedStateOf null
+            val older = reversedItems.getOrNull(topIndex + 1)
+            val hasInlineDayHeader = older == null || !sameDay(older.newestTs, item.oldestTs)
             // If this day's inline header is already visible at the top of the viewport, don't duplicate it with a pill.
             val inlineHeaderVisible = hasInlineDayHeader && (topItem.offset + topItem.size) <= layout.viewportEndOffset
-            if (inlineHeaderVisible) null else msg.ts
+            if (inlineHeaderVisible) null else item.oldestTs
         }
     }
     var showDatePill by remember { mutableStateOf(false) }
@@ -810,31 +815,59 @@ private fun MessageList(
             if (typing != null) {
                 item(key = "typing") { TypingBubble(isGroup, typing) }
             }
-            items(reversed.size, key = { reversed[it].id }) { i ->
-                val msg = reversed[i]
-                val older = reversed.getOrNull(i + 1)
-                val newer = reversed.getOrNull(i - 1)
-                val firstOfRun = older == null || older.fromId != msg.fromId || !sameDay(older.ts, msg.ts) ||
-                    msg.ts - older.ts > GROUP_GAP_MS || msg.id == chat.firstUnreadId
-                val lastOfRun = newer == null || newer.fromId != msg.fromId || !sameDay(newer.ts, msg.ts) ||
-                    newer.ts - msg.ts > GROUP_GAP_MS || newer.id == chat.firstUnreadId
+            items(reversedItems.size, key = { reversedItems[it].key }) { i ->
+                val item = reversedItems[i]
+                val olderItem = reversedItems.getOrNull(i + 1)
+                val newerItem = reversedItems.getOrNull(i - 1)
                 Column {
-                    if (older == null || !sameDay(older.ts, msg.ts)) DayHeader(msg.ts)
-                    if (msg.id == chat.firstUnreadId && unreadCount > 0) UnreadDivider(unreadCount)
-                    MessageRow(
-                        msg = msg,
-                        isGroup = isGroup,
-                        firstOfRun = firstOfRun,
-                        lastOfRun = lastOfRun,
-                        maxBubble = maxBubble,
-                        highlighted = highlightedMsgId == msg.id,
-                        onLongPress = { onOpenMenu(msg) },
-                        onOpenReactions = { onOpenReactions(msg) },
-                        onQuoteClick = onQuoteClick,
-                        onSwipeReply = { onSwipeReply(msg) },
-                        onOpenImage = onOpenImage,
-                        onOpenUrl = onOpenUrl,
-                    )
+                    if (olderItem == null || !sameDay(olderItem.newestTs, item.oldestTs)) DayHeader(item.oldestTs)
+                    if (item.firstUnreadAnchor && unreadCount > 0) UnreadDivider(unreadCount)
+                    when (item) {
+                        is ChatItem.CallGroup -> CallGroupRow(
+                            calls = item.calls,
+                            highlightedId = highlightedMsgId,
+                            onLongPressCall = onOpenMenu,
+                        )
+                        is ChatItem.Single -> {
+                            val msg = item.msg
+                            val systemLabel = systemMessageLabel(msg)
+                            when {
+                                !msg.recalled && msg.attachment?.kind == "call" -> CallSystemRow(
+                                    msg = msg,
+                                    highlighted = highlightedMsgId == msg.id,
+                                    onLongPress = { onOpenMenu(msg) },
+                                )
+                                systemLabel != null -> SystemInfoRow(
+                                    label = systemLabel,
+                                    ts = msg.ts,
+                                    highlighted = highlightedMsgId == msg.id,
+                                    onLongPress = { onOpenMenu(msg) },
+                                )
+                                else -> {
+                                    val older = (olderItem as? ChatItem.Single)?.msg?.takeIf { !isSystemLikeRow(it) }
+                                    val newer = (newerItem as? ChatItem.Single)?.msg?.takeIf { !isSystemLikeRow(it) }
+                                    val firstOfRun = older == null || older.fromId != msg.fromId || !sameDay(older.ts, msg.ts) ||
+                                        msg.ts - older.ts > GROUP_GAP_MS || msg.id == chat.firstUnreadId
+                                    val lastOfRun = newer == null || newer.fromId != msg.fromId || !sameDay(newer.ts, msg.ts) ||
+                                        newer.ts - msg.ts > GROUP_GAP_MS || newer.id == chat.firstUnreadId
+                                    MessageRow(
+                                        msg = msg,
+                                        isGroup = isGroup,
+                                        firstOfRun = firstOfRun,
+                                        lastOfRun = lastOfRun,
+                                        maxBubble = maxBubble,
+                                        highlighted = highlightedMsgId == msg.id,
+                                        onLongPress = { onOpenMenu(msg) },
+                                        onOpenReactions = { onOpenReactions(msg) },
+                                        onQuoteClick = onQuoteClick,
+                                        onSwipeReply = { onSwipeReply(msg) },
+                                        onOpenImage = onOpenImage,
+                                        onOpenUrl = onOpenUrl,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if (chat.loadingMore) {
@@ -935,6 +968,250 @@ private fun UnreadDivider(count: Int) {
             textAlign = TextAlign.Center,
             modifier = Modifier.padding(vertical = 6.dp).fillMaxWidth(),
         )
+    }
+}
+
+internal const val CALL_GROUP_WINDOW_MS = 5 * 60_000L
+
+internal sealed interface ChatItem {
+    val key: String
+    val oldestTs: Long
+    val newestTs: Long
+    val firstUnreadAnchor: Boolean
+    fun containsId(id: String): Boolean
+
+    data class Single(val msg: ChatMessage, override val firstUnreadAnchor: Boolean) : ChatItem {
+        override val key: String get() = msg.id
+        override val oldestTs: Long get() = msg.ts
+        override val newestTs: Long get() = msg.ts
+        override fun containsId(id: String): Boolean = msg.id == id
+    }
+
+    /** Two or more consecutive call log entries within [CALL_GROUP_WINDOW_MS] on the same day. */
+    data class CallGroup(val calls: List<ChatMessage>, override val firstUnreadAnchor: Boolean) : ChatItem {
+        override val key: String get() = "call-group:${calls.first().id}"
+        override val oldestTs: Long get() = calls.first().ts
+        override val newestTs: Long get() = calls.last().ts
+        override fun containsId(id: String): Boolean = calls.any { it.id == id }
+    }
+}
+
+private fun isCallLogMessage(msg: ChatMessage): Boolean = !msg.recalled && msg.attachment?.kind == "call"
+
+private fun isSystemLikeRow(msg: ChatMessage): Boolean = isCallLogMessage(msg) || systemMessageLabel(msg) != null
+
+/** Groups consecutive same-day call log entries within [windowMs] without crossing [firstUnreadId]. */
+internal fun buildChatItems(
+    messages: List<ChatMessage>,
+    firstUnreadId: String?,
+    windowMs: Long = CALL_GROUP_WINDOW_MS,
+): List<ChatItem> {
+    if (messages.isEmpty()) return emptyList()
+    val out = ArrayList<ChatItem>(messages.size)
+    var i = 0
+    while (i < messages.size) {
+        val m = messages[i]
+        if (!isCallLogMessage(m)) {
+            out += ChatItem.Single(m, firstUnreadAnchor = m.id == firstUnreadId)
+            i++
+            continue
+        }
+        val group = mutableListOf(m)
+        var j = i + 1
+        while (j < messages.size) {
+            val next = messages[j]
+            if (!isCallLogMessage(next)) break
+            if (next.id == firstUnreadId) break
+            if (!sameDay(group.last().ts, next.ts)) break
+            if (next.ts - group.last().ts > windowMs) break
+            group += next
+            j++
+        }
+        val anchor = m.id == firstUnreadId
+        out += if (group.size >= 2) ChatItem.CallGroup(group, firstUnreadAnchor = anchor) else ChatItem.Single(m, firstUnreadAnchor = anchor)
+        i = j
+    }
+    return out
+}
+
+/** Compact, centered single-line system row for a call log event (no nested card or message bubble). */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CallSystemRow(
+    msg: ChatMessage,
+    highlighted: Boolean,
+    onLongPress: () -> Unit,
+) {
+    val a = msg.attachment ?: return
+    val call = a.call
+    val missed = call?.missed == true
+    val icon = when {
+        call?.video == true && missed -> Icons.AutoMirrored.Outlined.MissedVideoCall
+        call?.video == true -> Icons.Outlined.Videocam
+        missed -> Icons.AutoMirrored.Outlined.PhoneMissed
+        else -> Icons.Outlined.Call
+    }
+    val tint = if (missed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    val label = a.title ?: if (call?.video == true) "Video call" else "Voice call"
+    val duration = a.duration?.takeIf { it > 0 }?.let(::formatDuration)
+    val summary = buildList {
+        add(label)
+        if (duration != null) add(duration)
+        add(formatClock(msg.ts))
+    }.joinToString(" · ")
+    val highlightColor by animateColorAsState(
+        targetValue = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent,
+        label = "callHighlight",
+    )
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(highlightColor, RoundedCornerShape(12.dp))
+            .padding(vertical = 4.dp, horizontal = 16.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .clip(CircleShape)
+                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.labelMedium,
+                color = tint,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** Compact centered summary row for consecutive call events within 5 minutes; expands on tap. */
+@Composable
+private fun CallGroupRow(
+    calls: List<ChatMessage>,
+    highlightedId: String?,
+    onLongPressCall: (ChatMessage) -> Unit,
+) {
+    val containsHighlight = highlightedId != null && calls.any { it.id == highlightedId }
+    var expanded by rememberSaveable(calls.first().id) { mutableStateOf(false) }
+    LaunchedEffect(containsHighlight) {
+        if (containsHighlight) expanded = true
+    }
+    val anyMissed = calls.any { it.attachment?.call?.missed == true }
+    val allVideo = calls.all { it.attachment?.call?.video == true }
+    val icon = when {
+        allVideo && anyMissed -> Icons.AutoMirrored.Outlined.MissedVideoCall
+        allVideo -> Icons.Outlined.Videocam
+        anyMissed -> Icons.AutoMirrored.Outlined.PhoneMissed
+        else -> Icons.Outlined.Call
+    }
+    val tint = if (anyMissed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    val timeRange = formatCallRange(calls.first().ts, calls.last().ts)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp, horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.65f),
+            modifier = Modifier
+                .clip(CircleShape)
+                .clickable { expanded = !expanded },
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+            ) {
+                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
+                Text(
+                    text = "${calls.size} calls · $timeRange",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = tint,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Icon(
+                    if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse calls" else "Expand calls",
+                    tint = tint,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+        AnimatedVisibility(visible = expanded) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                calls.forEach { callMsg ->
+                    CallSystemRow(
+                        msg = callMsg,
+                        highlighted = highlightedId == callMsg.id,
+                        onLongPress = { onLongPressCall(callMsg) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Distinct centered system/service info row (e.g. post-call audio feedback, connection notices). */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SystemInfoRow(
+    label: String,
+    ts: Long,
+    highlighted: Boolean,
+    onLongPress: () -> Unit,
+) {
+    val highlightColor by animateColorAsState(
+        targetValue = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent,
+        label = "systemHighlight",
+    )
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(highlightColor, RoundedCornerShape(12.dp))
+            .padding(vertical = 4.dp, horizontal = 20.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.55f),
+            modifier = Modifier
+                .clip(CircleShape)
+                .combinedClickable(onClick = {}, onLongClick = onLongPress),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+            ) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp),
+                )
+                Text(
+                    text = "$label · ${formatClock(ts)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 
