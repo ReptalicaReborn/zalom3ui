@@ -22,8 +22,6 @@ import androidx.core.content.ContextCompat
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ServerEvent
-import com.zalom3ui.app.data.SettingsStore
-import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.ui.call.CallActivity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope

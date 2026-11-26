@@ -25,7 +25,6 @@ import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
-import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.call.CallActivity
 import kotlinx.coroutines.CancellationException

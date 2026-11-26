@@ -23,7 +23,6 @@ import com.zalom3ui.app.call.CallState
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
-import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.server.MessageNotifier
 import com.zalom3ui.app.ui.AppTheme
 import kotlinx.coroutines.CancellationException
