@@ -214,6 +214,15 @@ impl Default for SessionInner {
     }
 }
 
+/// An unexpected close of the chat-socket listener (see [`ZaloSession::subscribe_listener_closed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerClosed {
+    pub code: u16,
+    /// Zalo closed it because another web session took over (`DuplicateConnection` or
+    /// `KickConnection`).
+    pub kicked: bool,
+}
+
 /// Manages the Zalo login lifecycle, real-time WebSocket listener, message/contact caching,
 /// and all REST chat/social/group/poll operations.
 pub struct ZaloSession {
@@ -226,6 +235,7 @@ pub struct ZaloSession {
     events_tx: broadcast::Sender<ServerBroadcastEvent>,
     voip_tx: broadcast::Sender<Value>,
     history_sync_tx: broadcast::Sender<Value>,
+    listener_closed_tx: broadcast::Sender<ListenerClosed>,
     retry_notify: Arc<Notify>,
     /// Wakes a pending listener reconnect (`notify_waiters`, so no stale permit is left behind).
     reconnect_wake: Notify,
@@ -249,6 +259,7 @@ impl ZaloSession {
         let (events_tx, _) = broadcast::channel(512);
         let (voip_tx, _) = broadcast::channel(128);
         let (history_sync_tx, _) = broadcast::channel(128);
+        let (listener_closed_tx, _) = broadcast::channel(16);
         Self {
             store,
             call_trace,
@@ -259,6 +270,7 @@ impl ZaloSession {
             events_tx,
             voip_tx,
             history_sync_tx,
+            listener_closed_tx,
             retry_notify: Arc::new(Notify::new()),
             reconnect_wake: Notify::new(),
             login,
@@ -343,6 +355,13 @@ impl ZaloSession {
     /// poller rather than the chat socket.
     pub fn publish_history_sync_control(&self, control: Value) {
         let _ = self.history_sync_tx.send(control);
+    }
+
+    /// Subscribes to unexpected chat-socket listener closes (manual stops are not reported).
+    /// Each close is sent before the status moves to `disconnected`, so a subscriber that also
+    /// follows the status events always sees the close code first.
+    pub fn subscribe_listener_closed(&self) -> broadcast::Receiver<ListenerClosed> {
+        self.listener_closed_tx.subscribe()
     }
 
     // ---- Lifecycle: start / resume / QR login / retry / reconnect / logout / shutdown ----
@@ -985,6 +1004,7 @@ impl ZaloSession {
                     format!("Connection closed ({code}: {reason})")
                 };
                 warn!(code, %reason, kicked, "Zalo WebSocket listener closed");
+                let _ = self.listener_closed_tx.send(ListenerClosed { code, kicked });
                 self.patch_status(|st| {
                     st.state = SessionState::Disconnected;
                     st.error = Some(error);

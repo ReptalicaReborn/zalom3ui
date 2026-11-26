@@ -34,7 +34,7 @@ use zalo_proto::{
 use crate::errors::{ApiResult, HttpError};
 use crate::routes::history_sync::sync_control_of;
 use crate::routes::AppState;
-use crate::session::ZaloSession;
+use crate::session::{ListenerClosed, ZaloSession};
 use crate::types::{
     CallEvent, CallState, CurrentCall, IncomingCall as ServerIncomingCall, SessionState, ThreadKind,
 };
@@ -261,6 +261,9 @@ struct CallStateInner {
     ctrl_poll_client: Option<Weak<ZaloClient>>,
     ctrl_poll_handle: Option<ControlPollerHandle>,
     ctrl_poll_task: Option<JoinHandle<()>>,
+    /// Set when the chat socket was kicked while polling; stays set until logout, so the poller
+    /// is not restarted (`ctrlPollOff` in `src/session.ts`).
+    ctrl_poll_off: bool,
 }
 
 impl Default for CallStateInner {
@@ -273,6 +276,7 @@ impl Default for CallStateInner {
             ctrl_poll_client: None,
             ctrl_poll_handle: None,
             ctrl_poll_task: None,
+            ctrl_poll_off: false,
         }
     }
 }
@@ -333,6 +337,7 @@ impl CallManager {
         let session = Arc::clone(&self.session);
         let mut voip_rx = session.subscribe_voip_controls();
         let mut events_rx = session.subscribe_events();
+        let mut closed_rx = session.subscribe_listener_closed();
 
         // Start ControlPoller immediately if already logged in.
         self.sync_control_poller();
@@ -340,6 +345,18 @@ impl CallManager {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // Close codes are sent before the matching status event, so this arm must win
+                    // when both are ready: the poller has to be off before a status event
+                    // would restart it.
+                    biased;
+                    ev = closed_rx.recv() => {
+                        let Some(mgr) = weak.upgrade() else { break };
+                        match ev {
+                            Ok(closed) => mgr.on_listener_closed(&closed),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
                     ev = voip_rx.recv() => {
                         let Some(mgr) = weak.upgrade() else { break };
                         match ev {
@@ -408,6 +425,9 @@ impl CallManager {
 
     fn on_logout(self: &Arc<Self>) {
         self.stop_control_poller();
+        if let Ok(mut s) = self.inner.lock() {
+            s.ctrl_poll_off = false;
+        }
         let active_id = self
             .inner
             .lock()
@@ -423,6 +443,31 @@ impl CallManager {
                 }
             }
         }
+    }
+
+    /// The chat socket closed. If Zalo kicked it (another web session, or maybe our own poll)
+    /// while the control poller runs, stop the poller for good (until logout) and leave a note in
+    /// the call log, like `listener.on("closed")` in `src/session.ts`.
+    fn on_listener_closed(&self, closed: &ListenerClosed) {
+        if !closed.kicked {
+            return;
+        }
+        {
+            let Ok(mut s) = self.inner.lock() else { return };
+            let Some(mut handle) = s.ctrl_poll_handle.take() else {
+                return;
+            };
+            handle.stop();
+            if let Some(t) = s.ctrl_poll_task.take() {
+                t.abort();
+            }
+            s.ctrl_poll_client = None;
+            s.ctrl_poll_off = true;
+        }
+        self.session.call_trace().record(&json!({
+            "kind": "ctrl_poll_off",
+            "reason": format!("chat socket closed ({}) while polling", closed.code),
+        }));
     }
 
     fn stop_control_poller(&self) {
@@ -449,6 +494,9 @@ impl CallManager {
         }
         {
             let Ok(s) = self.inner.lock() else { return };
+            if s.ctrl_poll_off {
+                return;
+            }
             if let Some(ref existing) = s.ctrl_poll_client {
                 if let Some(existing_arc) = existing.upgrade() {
                     if Arc::ptr_eq(&existing_arc, &client) {
@@ -3171,6 +3219,119 @@ mod tests {
         );
 
         srv_handle.abort();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A real protocol client whose control server refuses connections, so the poller starts and
+    /// idles without any network.
+    fn polling_client() -> Arc<ZaloClient> {
+        use zalo_proto::{ZaloContext, ZaloCookieJar, ZaloHttp};
+        let ctx = ZaloContext {
+            uid: "me".into(),
+            imei: "imei".into(),
+            user_agent: "ua".into(),
+            language: "vi".into(),
+            api_type: 30,
+            api_version: 645,
+            secret_key: "c2VjcmV0".into(),
+            service_map: HashMap::new(),
+            ws_urls: Vec::new(),
+            ctrs_urls: vec!["https://127.0.0.1:1".into()],
+            settings: json!({}),
+            extra_ver: json!({}),
+            login_info: json!({ "zpw_ctrs_new": ["https://127.0.0.1:1"] }),
+            cookies: Arc::new(std::sync::RwLock::new(ZaloCookieJar::new())),
+            upload_callbacks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        Arc::new(ZaloClient::new(Arc::new(ctx), ZaloHttp::new().unwrap()))
+    }
+
+    fn poller_running(mgr: &CallManager) -> bool {
+        mgr.inner.lock().unwrap().ctrl_poll_handle.is_some()
+    }
+
+    fn kicked(code: u16) -> ListenerClosed {
+        ListenerClosed { code, kicked: true }
+    }
+
+    #[tokio::test]
+    async fn a_kicked_chat_socket_turns_the_control_poller_off_until_logout() {
+        use crate::api::ProtoApi;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        // An ordinary drop leaves the poller alone.
+        mgr.on_listener_closed(&ListenerClosed {
+            code: 1006,
+            kicked: false,
+        });
+        assert!(poller_running(&mgr));
+        assert!(!session.call_trace().read().contains("ctrl_poll_off"));
+
+        // A kick stops it, and says why in the call log.
+        mgr.on_listener_closed(&kicked(3000));
+        assert!(!poller_running(&mgr));
+        let trace = session.call_trace().read();
+        assert!(trace.contains("\"kind\":\"ctrl_poll_off\""), "{trace}");
+        assert!(trace.contains("chat socket closed (3000) while polling"), "{trace}");
+
+        // It is not restarted by the status changes that follow...
+        mgr.sync_control_poller();
+        assert!(!poller_running(&mgr));
+
+        // ...until the user logs out and in again.
+        mgr.on_logout();
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        mgr.stop_control_poller();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_kick_while_not_polling_leaves_no_off_switch() {
+        use crate::api::ProtoApi;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        // No poller running yet.
+        mgr.on_listener_closed(&kicked(3003));
+        assert!(!session.call_trace().read().contains("ctrl_poll_off"));
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr), "the poller can still start");
+        mgr.stop_control_poller();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_session_close_signal_stops_the_poller_before_status_changes_restart_it() {
+        use crate::api::ProtoApi;
+        use crate::testing::settle;
+        use zalo_proto::WsEvent;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        mgr.spawn_background();
+        assert!(poller_running(&mgr), "started when already logged in");
+
+        session
+            .testing_dispatch(WsEvent::Closed {
+                code: 3003,
+                reason: "kicked".into(),
+            })
+            .await;
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(session.get_status().state, SessionState::Disconnected);
+        assert!(!poller_running(&mgr), "the poller stays off after the disconnected status");
+        assert!(session
+            .call_trace()
+            .read()
+            .contains("chat socket closed (3003) while polling"));
         let _ = fs::remove_dir_all(&dir);
     }
 
