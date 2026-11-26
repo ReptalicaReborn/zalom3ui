@@ -1,10 +1,10 @@
 package com.zalom3ui.app.data
 
+import android.content.Context
+import com.zalom3ui.app.server.ZaloCore
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -20,30 +20,12 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.MediaType
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.BufferedSink
-import okio.source
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 class ApiException(message: String, val code: Int = 0) : IOException(message)
 
@@ -56,10 +38,14 @@ internal val AppJson = Json {
     coerceInputValues = true
 }
 
-/** Talks to the Zalỏ server's REST API and WebSocket. */
-class ApiClient(serverUrl: String, private val token: String?) {
-    private val baseUrl: HttpUrl = normalizeServerUrl(serverUrl)
-        ?: throw IllegalArgumentException("Invalid server URL: $serverUrl")
+/**
+ * Talks to the Zalo core's REST API and event stream, over a [Transport]: HTTP to a Zalo server ([ApiClient] with a
+ * server address), or straight into the core running in this process ([onDevice]). Everything above the transport
+ * (requests, JSON, error mapping, models) is the same for both.
+ */
+class ApiClient internal constructor(private val transport: Transport) {
+    /** A client for the Zalo server at [serverUrl] (the "A server" mode); [token] is its access token. */
+    constructor(serverUrl: String, token: String?) : this(HttpTransport(serverUrl, token))
 
     private val json = AppJson
 
@@ -176,8 +162,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
         open: () -> InputStream,
     ) {
         val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
-        val body = StreamBody(mimeType?.toMediaTypeOrNull() ?: OCTET_STREAM, length, open)
-        execute<Unit>(Request.Builder().url(url("threads", kind, id, "attachments", query = query)).post(body), UPLOAD_HTTP)
+        execute<Unit>("POST", path("threads", kind, id, "attachments", query = query), ApiBody.Stream(mimeType, length, open), upload = true)
     }
 
     /** Full-text search across messages on the server (`GET /api/search?q=...&limit=...`). */
@@ -189,15 +174,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     /** Uploads a recorded voice message (`POST /api/threads/:kind/:id/voice`, multipart field `"voice"`). */
     suspend fun sendVoice(ref: ThreadRef, file: File) {
-        execute<Unit>(sendVoiceRequest(ref, file), UPLOAD_HTTP)
-    }
-
-    internal fun sendVoiceRequest(ref: ThreadRef, file: File): Request.Builder {
-        val body = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("voice", file.name, file.asRequestBody(AUDIO_MP4))
-            .build()
-        return Request.Builder().url(url("threads", ref.kind, ref.id, "voice")).post(body)
+        execute<Unit>("POST", path("threads", ref.kind, ref.id, "voice"), ApiBody.VoiceFile(file, AUDIO_MP4), upload = true)
     }
 
     suspend fun stickers(query: String): List<StickerInfo> = get("stickers", query = listOf("q" to query))
@@ -265,7 +242,7 @@ class ApiClient(serverUrl: String, private val token: String?) {
 
     /** The server's call log (JSON lines of the call events Zalo sent). */
     suspend fun callLog(): String {
-        val (code, body) = executeRaw(Request.Builder().url(url("debug", "call-log")).get())
+        val (code, body) = transport.execute("GET", path("debug", "call-log")).let { it.code to it.body }
         if (code !in 200..299) throw ApiException("HTTP $code", code)
         return body
     }
@@ -367,35 +344,8 @@ class ApiClient(serverUrl: String, private val token: String?) {
         httpDelete("threads", kind, id)
     }
 
-    internal fun eventsRequest(): Request {
-        val wsUrl = baseUrl.newBuilder()
-            .addPathSegment("ws")
-            .build()
-        return Request.Builder()
-            .url(wsUrl.toString().replaceFirst("http", "ws"))
-            .apply { token?.let { header("Authorization", "Bearer $it") } }
-            .build()
-    }
-
-    /** Live server events. Completes or throws when the socket closes; callers reconnect. */
-    fun events(): Flow<ServerEvent> = callbackFlow {
-        val request = eventsRequest()
-
-        val socket = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                runCatching { parseEvent(text) }.getOrNull()?.let { trySend(it) }
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                close()
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                close(if (response?.code == 401) ApiException("Wrong access token", 401) else t)
-            }
-        })
-        awaitClose { socket.close(1000, null) }
-    }
+    /** Live server events. Completes or throws when the stream closes; callers reconnect. */
+    fun events(): Flow<ServerEvent> = transport.events().mapNotNull { text -> runCatching { parseEvent(text) }.getOrNull() }
 
     internal fun parseEvent(text: String): ServerEvent? {
         val obj = json.parseToJsonElement(text).jsonObject
@@ -442,76 +392,42 @@ class ApiClient(serverUrl: String, private val token: String?) {
     private suspend inline fun <reified T> get(
         vararg segments: String,
         query: List<Pair<String, String>> = emptyList(),
-    ): T = execute(Request.Builder().url(url(*segments, query = query)).get())
+    ): T = execute("GET", path(*segments, query = query))
 
     private suspend inline fun <reified T> post(
         vararg segments: String,
         body: String = "",
-    ): T = execute(Request.Builder().url(url(*segments)).post(body.toRequestBody(JSON_MEDIA_TYPE)))
+    ): T = execute("POST", path(*segments), jsonBody(body))
 
     private suspend fun httpPut(vararg segments: String, body: String) {
-        execute<Unit>(Request.Builder().url(url(*segments)).put(body.toRequestBody(JSON_MEDIA_TYPE)))
+        execute<Unit>("PUT", path(*segments), jsonBody(body))
     }
 
     private suspend fun httpDelete(vararg segments: String) {
-        execute<Unit>(Request.Builder().url(url(*segments)).delete())
+        execute<Unit>("DELETE", path(*segments))
     }
+
+    private fun jsonBody(text: String) = ApiBody.Bytes(JSON, text.toByteArray(Charsets.UTF_8))
 
     private fun JsonObject.string(key: String): String = this[key]?.jsonPrimitive?.content.orEmpty()
 
     private fun JsonObject.threadRef(): ThreadRef = ThreadRef(string("threadKind"), string("threadId"))
 
-    private suspend fun executeRaw(builder: Request.Builder, client: OkHttpClient = http): Pair<Int, String> =
-        suspendCancellableCoroutine { cont ->
-            token?.let { builder.header("Authorization", "Bearer $it") }
-            val call = client.newCall(builder.build())
-            cont.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    if (cont.isActive) cont.resumeWithException(e)
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    try {
-                        response.use { res ->
-                            val body = res.body?.string().orEmpty()
-                            if (cont.isActive) cont.resume(res.code to body)
-                        }
-                    } catch (e: Throwable) {
-                        if (cont.isActive) cont.resumeWithException(e)
-                    }
-                }
-            })
-        }
-
-    private suspend inline fun <reified T> execute(builder: Request.Builder, client: OkHttpClient = http): T {
-        val (code, body) = executeRaw(builder, client)
+    private suspend inline fun <reified T> execute(
+        method: String,
+        path: String,
+        body: ApiBody = ApiBody.None,
+        upload: Boolean = false,
+    ): T {
+        val (code, text) = transport.execute(method, path, body, upload).let { it.code to it.body }
         if (code !in 200..299) {
-            val message = runCatching { json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.content }
+            val message = runCatching { json.parseToJsonElement(text).jsonObject["error"]?.jsonPrimitive?.content }
                 .getOrNull()
             throw ApiException(message ?: "HTTP $code", code)
         }
         if (T::class == Unit::class) return Unit as T
         // Off the main thread: callers run on the UI dispatcher, and the chat list alone can be a large document.
-        return withContext(Dispatchers.Default) { json.decodeFromString<T>(body) }
-    }
-
-    internal fun url(vararg segments: String, query: List<Pair<String, String>> = emptyList()): HttpUrl =
-        baseUrl.newBuilder()
-            .addPathSegment("api")
-            .apply { segments.forEach { addPathSegment(it) } }
-            .apply { query.forEach { (k, v) -> addQueryParameter(k, v) } }
-            .build()
-
-    /** Streams a picked photo or file from the content resolver instead of loading it into memory. */
-    private class StreamBody(private val type: MediaType, private val length: Long, private val open: () -> InputStream) : RequestBody() {
-        override fun contentType(): MediaType = type
-
-        override fun contentLength(): Long = length
-
-        override fun writeTo(sink: BufferedSink) {
-            open().source().use { sink.writeAll(it) }
-        }
+        return withContext(Dispatchers.Default) { json.decodeFromString<T>(text) }
     }
 
     @Serializable
@@ -520,22 +436,33 @@ class ApiClient(serverUrl: String, private val token: String?) {
     )
 
     companion object {
-        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
-        private val OCTET_STREAM = "application/octet-stream".toMediaType()
-        private val AUDIO_MP4 = "audio/mp4".toMediaType()
+        private const val JSON = "application/json"
+        private const val AUDIO_MP4 = "audio/mp4"
 
-        // Shared so the connection pool survives client rebuilds after settings changes.
-        private val http = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)
-            .build()
+        /** The client for the Zalo core running on this phone: direct calls, no socket, port or token. */
+        fun onDevice(context: Context): ApiClient {
+            val app = context.applicationContext ?: context
+            return ApiClient(NativeTransport(ZaloCore, File(app.cacheDir, "uploads")) { ZaloCore.ensureStarted(app) })
+        }
 
-        /** Uploads go to Zalo before the server answers: give them minutes, not seconds. */
-        private val UPLOAD_HTTP = http.newBuilder()
-            .writeTimeout(5, TimeUnit.MINUTES)
-            .readTimeout(5, TimeUnit.MINUTES)
-            .build()
+        /** The client the settings ask for, or null while a server is chosen but no address is set. */
+        fun forSettings(context: Context, settings: ServerSettings = SettingsStore(context).load()): ApiClient? = when {
+            settings.onDevice -> onDevice(context)
+            settings.isConfigured -> ApiClient(settings.serverUrl, settings.token.ifBlank { null })
+            else -> null
+        }
+
+        /** The percent-encoded request path and query for `/api/<segments>?<query>`; each segment is encoded whole. */
+        internal fun path(vararg segments: String, query: List<Pair<String, String>> = emptyList()): String {
+            val url = PATH_BASE.newBuilder()
+                .addPathSegment("api")
+                .apply { segments.forEach { addPathSegment(it) } }
+                .apply { query.forEach { (k, v) -> addQueryParameter(k, v) } }
+                .build()
+            return url.encodedPath + (url.encodedQuery?.let { "?$it" } ?: "")
+        }
+
+        private val PATH_BASE: HttpUrl = "http://localhost/".toHttpUrl()
 
         /** Accepts "192.168.1.5:3000" or "https://zalo.example.com/" and returns a base URL. */
         fun normalizeServerUrl(input: String): HttpUrl? {

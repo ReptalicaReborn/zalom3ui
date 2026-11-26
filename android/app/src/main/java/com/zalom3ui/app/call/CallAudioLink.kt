@@ -1,13 +1,10 @@
 package com.zalom3ui.app.call
 
-import okhttp3.OkHttpClient
+import android.content.Context
+import com.zalom3ui.app.data.ApiClient
+import com.zalom3ui.app.data.SettingsStore
+import com.zalom3ui.app.server.ZaloCore
 import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import okio.ByteString.Companion.toByteString
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** One audio packet from the server: RTP sequence, RTP timestamp and the Opus payload. */
@@ -17,79 +14,54 @@ class IncomingAudio(val seq: Int, val timestamp: Long, val opus: ByteArray)
 class IncomingVideo(val key: Boolean, val timestamp: Long, val accessUnit: ByteArray)
 
 /**
- * WebSocket to the local server's call-audio endpoint (docs/call-audio.md section 3). Binary messages only:
- * server to app `01 | u16 seq | u32 timestamp | opus`, app to server `02 | opus`. Video rides the same socket:
+ * The call's audio and video link (docs/call-audio.md section 3). Binary messages only: server to app
+ * `01 | u16 seq | u32 timestamp | opus`, app to server `02 | opus`. Video rides the same link:
  * `03 | flags | u32 timestamp | AU` in, `04 | flags | AU` out, `05` (the other side wants a key frame) in,
  * `06` (we need a key frame) out.
  *
- * [baseUrl] is the local server URL such as `http://127.0.0.1:41234`. Call [connect] to open the socket.
+ * The messages travel over an [AudioTransport]: a WebSocket to a Zalo server ([WebSocketAudioTransport]), or a
+ * handle into the core running in this process ([NativeAudioTransport]). Framing, backlog limits and close handling
+ * are the same for both. Call [connect] to open the link.
  */
-class CallAudioLink(
-    baseUrl: String,
-    token: String?,
+class CallAudioLink internal constructor(
+    private val transport: AudioTransport,
     private val onAudio: (seq: Int, timestamp: Long, opus: ByteArray) -> Unit,
     private val onClosed: (reason: String?) -> Unit,
-    client: OkHttpClient = sharedClient,
     private val onVideo: (key: Boolean, timestamp: Long, accessUnit: ByteArray) -> Unit = { _, _, _ -> },
     private val onKeyFrameWanted: () -> Unit = {},
 ) {
-    private val request = buildRequest(baseUrl, token)
-
-    // No read timeout: the socket is silent whenever the other side is.
-    private val http: OkHttpClient = if (client === sharedClient) {
-        sharedClient
-    } else {
-        client.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).build()
-    }
-
-    @Volatile private var socket: WebSocket? = null
     private val closed = AtomicBoolean(false)
     private val finished = AtomicBoolean(false)
 
     @Synchronized
     fun connect() {
-        if (socket != null || closed.get()) return
-        socket = http.newWebSocket(request, Listener())
+        if (closed.get()) return
+        transport.connect(Listener())
     }
 
-    /** Sends one 20 ms Opus frame; false if the socket is not open or its queue is full. */
-    fun send(opus: ByteArray): Boolean = socket?.send(encodeOutgoing(opus).toByteString()) ?: false
+    /** Sends one 20 ms Opus frame; false if the link is not open or its queue is full. */
+    fun send(opus: ByteArray): Boolean = transport.send(encodeOutgoing(opus))
 
     /**
-     * Sends one encoded camera frame. A delta frame is dropped (false) when the socket is already backed up, so a slow
+     * Sends one encoded camera frame. A delta frame is dropped (false) when the link is already backed up, so a slow
      * link makes the picture stutter instead of lagging further and further behind. Key frames are also capped well
      * below OkHttp's 16 MiB disconnect threshold.
      */
     fun sendVideo(key: Boolean, accessUnit: ByteArray): Boolean {
-        val s = socket ?: return false
-        if (!shouldSendVideo(key, s.queueSize())) return false
-        return s.send(encodeVideoOut(key, accessUnit).toByteString())
+        if (!shouldSendVideo(key, transport.queueSize())) return false
+        return transport.send(encodeVideoOut(key, accessUnit))
     }
 
     /** Asks the other side for a key frame (our decoder is starting or lost a frame). */
-    fun sendKeyFrameNeeded(): Boolean = socket?.send(encodeKeyFrameNeeded().toByteString()) ?: false
+    fun sendKeyFrameNeeded(): Boolean = transport.send(encodeKeyFrameNeeded())
 
     fun close() {
         closed.set(true)
-        val s = synchronized(this) {
-            val current = socket
-            socket = null
-            current
-        }
-        if (s != null && !s.close(1000, null)) {
-            s.cancel()
-        }
+        transport.close()
     }
 
-    private fun finish(reason: String?) {
-        if (!finished.compareAndSet(false, true)) return
-        socket = null
-        onClosed(reason)
-    }
-
-    private inner class Listener : WebSocketListener() {
-        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            val msg = bytes.toByteArray()
+    private inner class Listener : AudioTransport.Listener {
+        override fun onMessage(msg: ByteArray) {
             when (msg.firstOrNull()?.toInt()) {
                 TYPE_AUDIO_IN -> decodeIncoming(msg)?.let { onAudio(it.seq, it.timestamp, it.opus) }
                 TYPE_VIDEO_IN -> decodeVideoIn(msg)?.let { onVideo(it.key, it.timestamp, it.accessUnit) }
@@ -97,16 +69,10 @@ class CallAudioLink(
             }
         }
 
-        // Text messages are ignored: the audio socket only carries binary frames.
-
-        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            webSocket.close(code, null)
-            finish(reason.ifEmpty { null })
+        override fun onClosed(reason: String?) {
+            if (!finished.compareAndSet(false, true)) return
+            this@CallAudioLink.onClosed(reason)
         }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = finish(reason.ifEmpty { null })
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = finish(t.message)
     }
 
     companion object {
@@ -127,11 +93,26 @@ class CallAudioLink(
         /** Upper cap on queued bytes for key frames too, well below OkHttp's 16 MiB disconnect limit. */
         internal const val MAX_KEYFRAME_BACKLOG = 4 * 1024 * 1024L
 
-        private val sharedClient: OkHttpClient by lazy {
-            OkHttpClient.Builder()
-                .readTimeout(0, TimeUnit.MILLISECONDS)
-                .pingInterval(20, TimeUnit.SECONDS)
-                .build()
+        /**
+         * The link the settings ask for: into the core on this phone, or over a WebSocket to the configured server.
+         * Null while a server is chosen but no address is set.
+         */
+        fun forSettings(
+            context: Context,
+            onAudio: (seq: Int, timestamp: Long, opus: ByteArray) -> Unit,
+            onClosed: (reason: String?) -> Unit,
+            onVideo: (key: Boolean, timestamp: Long, accessUnit: ByteArray) -> Unit = { _, _, _ -> },
+            onKeyFrameWanted: () -> Unit = {},
+        ): CallAudioLink? {
+            val app = context.applicationContext ?: context
+            val settings = SettingsStore(app).load()
+            val transport = when {
+                settings.onDevice -> NativeAudioTransport(ZaloCore) { ZaloCore.ensureStarted(app) }
+                ApiClient.normalizeServerUrl(settings.serverUrl) != null ->
+                    WebSocketAudioTransport(settings.serverUrl, settings.token.ifBlank { null })
+                else -> return null
+            }
+            return CallAudioLink(transport, onAudio, onClosed, onVideo, onKeyFrameWanted)
         }
 
         internal fun shouldSendVideo(key: Boolean, queueSize: Long): Boolean =

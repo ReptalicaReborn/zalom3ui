@@ -10,32 +10,26 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
-import android.os.Process
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.zalom3ui.app.MainActivity
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.ApiClient
-import com.zalom3ui.app.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.io.File
 
 /**
- * Runs the embedded Rust Zalo server (libzalocore.so).
+ * Keeps the Zalo connection, and with it the 1:1 message history and message notifications, going while the app is
+ * closed: a foreground service that holds the process alive and owns the "Connected to Zalo" notification.
  *
- * Kept as NodeService in its own ":node" process for upgrade compatibility with existing manifest,
- * receivers, and LocalServer. Runs as a foreground service so the Zalo connection, and with it the
- * 1:1 message history, keeps going while the app is closed.
+ * The core itself ([ZaloCore], libzalocore.so) is a process-wide singleton that the app starts on first use, so the UI
+ * can use it while it is open with or without this service. Stopping or restarting the service does not stop the core
+ * or end the process.
  */
-class NodeService : Service() {
-    private var started = false
+class ZaloService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
@@ -45,7 +39,7 @@ class NodeService : Service() {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             scope.launch {
-                runCatching { ApiClient(LocalServer.url(this@NodeService), SettingsStore(this@NodeService).localToken()).retry() }
+                runCatching { ApiClient.onDevice(this@ZaloService).retry() }
             }
         }
     }
@@ -62,17 +56,12 @@ class NodeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        StartupLog.write(this, "service: start command (already running: $started)")
+        StartupLog.write(this, "service: start command")
         if (!promoteToForeground()) {
             return START_NOT_STICKY
         }
-        if (!started) {
-            started = true
-            Thread({ runServer() }, "zalocore").apply {
-                isDaemon = true
-                start()
-            }
-        }
+        // Idempotent: the core may already be running because the app started it.
+        scope.launch { ZaloCore.ensureStarted(this@ZaloService) }
         return START_STICKY
     }
 
@@ -80,12 +69,7 @@ class NodeService : Service() {
         StartupLog.write(this, "service: destroyed")
         scope.cancel()
         runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
-        if (started) {
-            runCatching { NodeRuntime.stopServer() }
-        }
         super.onDestroy()
-        // Allow zalocore a brief window to flush state cleanly, then guarantee the ":node" process exits for clean restarts.
-        Handler(Looper.getMainLooper()).postDelayed({ Process.killProcess(Process.myPid()) }, STOP_KILL_DELAY_MS)
     }
 
     private fun promoteToForeground(): Boolean {
@@ -107,27 +91,6 @@ class NodeService : Service() {
             stopSelf()
             false
         }
-    }
-
-    private fun runServer() {
-        try {
-            val dataDir = File(filesDir, "zalo").apply { mkdirs() }
-            val port = LocalServer.port(this)
-            StartupLog.write(this, "service: starting zalocore on port $port")
-            val code = NodeRuntime.startServer(
-                host = "127.0.0.1",
-                port = port,
-                token = SettingsStore(this).localToken(),
-                dataDir = dataDir.absolutePath,
-                logFile = StartupLog.serverLog(this).absolutePath,
-            )
-            Log.w(TAG, "zalocore exited with code $code")
-            StartupLog.write(this, "service: zalocore exited with code $code")
-        } catch (e: Throwable) {
-            Log.e(TAG, "Could not run the Zalo server", e)
-            StartupLog.error(this, "service: could not run zalocore", e)
-        }
-        stopSelf()
     }
 
     private fun buildNotification(): Notification {
@@ -152,9 +115,7 @@ class NodeService : Service() {
     }
 
     private companion object {
-        const val TAG = "ZalooNode"
         const val CHANNEL_ID = "server"
         const val NOTIFICATION_ID = 1
-        const val STOP_KILL_DELAY_MS = 300L
     }
 }

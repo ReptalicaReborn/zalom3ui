@@ -33,6 +33,7 @@ import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.server.LocalServer
+import com.zalom3ui.app.server.ZaloCore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -324,7 +325,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         restartJob?.cancel()
         restartJob = null
         settingsStore.save(settings)
-        if (wasOnWatch && !settings.onDevice) LocalServer.stop(getApplication())
+        if (wasOnWatch && !settings.onDevice) {
+            // Leaving the on-phone core: stop its service and the core, so it stops talking to Zalo.
+            LocalServer.stop(getApplication())
+            viewModelScope.launch(Dispatchers.IO) { ZaloCore.shutdown() }
+        }
         localStartedAt = 0L
         _state.value = UiState(
             settings = settingsStore.load(),
@@ -337,7 +342,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (visible) startLiveUpdates()
     }
 
-    /** Restarts the on-phone server, e.g. if it got stuck. */
+    /** Restarts the on-phone service and core, e.g. if it got stuck. */
     fun restartLocalServer() {
         if (!_state.value.settings.onDevice) return
         liveJob?.cancel()
@@ -352,8 +357,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(status = null, connectionError = null, startingSince = 0L, startupError = null) }
         restartJob?.cancel()
         restartJob = viewModelScope.launch {
-            // Let the old process exit before starting a new one.
-            delay(1_500)
+            // Same process: stop the core (flushing the store) and start a fresh one, then go live again.
+            withContext(Dispatchers.IO) { ZaloCore.restart(getApplication()) }
             if (visible) startLiveUpdates()
         }
     }
@@ -964,11 +969,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun rebuildClient() {
         val settings = _state.value.settings
-        client = when {
-            settings.onDevice -> ApiClient(LocalServer.url(getApplication()), settingsStore.localToken())
-            settings.isConfigured -> ApiClient(settings.serverUrl, settings.token.ifBlank { null })
-            else -> null
-        }
+        client = ApiClient.forSettings(getApplication(), settings)
     }
 
     private suspend fun refreshAll(api: ApiClient) {

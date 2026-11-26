@@ -83,7 +83,7 @@ class CallService : Service() {
     private var cameraWanted = false
     private val main = Handler(Looper.getMainLooper())
 
-    private val api: ApiClient get() = ApiClient(LocalServer.url(this), SettingsStore(this).localToken())
+    private val api: ApiClient get() = ApiClient.onDevice(this)
 
     override fun onCreate() {
         super.onCreate()
