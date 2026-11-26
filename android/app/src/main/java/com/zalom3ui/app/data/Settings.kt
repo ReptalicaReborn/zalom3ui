@@ -22,12 +22,7 @@ enum class ThemeMode(val label: String) {
     SYSTEM("System default"),
     LIGHT("Light"),
     DARK("Dark"),
-}
-
-/** Which palette the app uses. Gold is a dark-only palette, so it overrides light/dark and wallpaper colors. */
-enum class ColorTheme(val label: String) {
-    ZALO("Zalỏ blue"),
-    GOLD("ReptDoc gold"),
+    REPTDOC_GOLD("ReptDoc gold"),
 }
 
 enum class ChatAccent(val key: String, val label: String) {
@@ -46,7 +41,6 @@ enum class ChatAccent(val key: String, val label: String) {
 
 data class Appearance(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
-    val colorTheme: ColorTheme = ColorTheme.ZALO,
     /** Material You colors from the wallpaper (Android 12+) instead of the chosen chat accent. */
     val dynamicColor: Boolean = false,
     val accent: ChatAccent = ChatAccent.ULTRAMARINE,
@@ -76,18 +70,25 @@ class SettingsStore(context: Context) {
             .commit()
     }
 
-    fun loadAppearance(): Appearance = Appearance(
-        themeMode = ThemeMode.entries.firstOrNull { it.name == prefs.getString(KEY_THEME, null) } ?: ThemeMode.SYSTEM,
-        colorTheme = ColorTheme.entries.firstOrNull { it.name == prefs.getString(KEY_COLOR_THEME, null) } ?: ColorTheme.ZALO,
-        dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
-        accent = ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null)),
-        tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
-    )
+    fun loadAppearance(): Appearance {
+        val legacyGold = prefs.getString(KEY_COLOR_THEME, null) == "GOLD"
+        val themeMode = if (legacyGold) {
+            ThemeMode.REPTDOC_GOLD
+        } else {
+            ThemeMode.entries.firstOrNull { it.name == prefs.getString(KEY_THEME, null) } ?: ThemeMode.SYSTEM
+        }
+        return Appearance(
+            themeMode = themeMode,
+            dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
+            accent = ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null)),
+            tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
+        )
+    }
 
     fun saveAppearance(appearance: Appearance) {
         prefs.edit()
             .putString(KEY_THEME, appearance.themeMode.name)
-            .putString(KEY_COLOR_THEME, appearance.colorTheme.name)
+            .remove(KEY_COLOR_THEME)
             .putBoolean(KEY_DYNAMIC_COLOR, appearance.dynamicColor)
             .putString(KEY_CHAT_ACCENT, appearance.accent.key)
             .putBoolean(KEY_CHAT_TINTED_BG, appearance.tintedBackground)

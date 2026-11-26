@@ -86,7 +86,6 @@ import androidx.compose.ui.unit.dp
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatAccent
-import com.zalom3ui.app.data.ColorTheme
 import com.zalom3ui.app.data.ServerSettings
 import com.zalom3ui.app.data.ThemeMode
 
@@ -171,7 +170,7 @@ fun SettingsScreen(
             }
 
             SectionHeader("Appearance")
-            val zaloLook = appearance.colorTheme == ColorTheme.ZALO
+            val isGold = appearance.themeMode == ThemeMode.REPTDOC_GOLD
             val appearanceItems = buildList<@Composable () -> Unit> {
                 add {
                     Column(
@@ -180,30 +179,8 @@ fun SettingsScreen(
                             .padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
-                        ) {
-                            ColorTheme.entries.forEachIndexed { index, option ->
-                                ToggleButton(
-                                    checked = appearance.colorTheme == option,
-                                    onCheckedChange = { if (it) onAppearance(appearance.copy(colorTheme = option)) },
-                                    shapes = if (index == 0) {
-                                        ButtonGroupDefaults.connectedLeadingButtonShapes()
-                                    } else {
-                                        ButtonGroupDefaults.connectedTrailingButtonShapes()
-                                    },
-                                    colors = ToggleButtonDefaults.toggleButtonColors(
-                                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                                    ),
-                                    modifier = Modifier.weight(1f),
-                                ) {
-                                    Text(option.label)
-                                }
-                            }
-                        }
                         MiniChatPreview()
-                        if (zaloLook) {
+                        if (!isGold) {
                             AccentSwatchPicker(
                                 selected = appearance.accent,
                                 enabled = !dynamicActive,
@@ -212,7 +189,16 @@ fun SettingsScreen(
                         }
                     }
                 }
-                if (zaloLook) {
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable { pickTheme = true },
+                        colors = transparentListItemColors,
+                        leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
+                        headlineContent = { Text("Theme") },
+                        supportingContent = { Text(appearance.themeMode.label) },
+                    )
+                }
+                if (!isGold) {
                     add {
                         ListItem(
                             modifier = Modifier.clickable {
@@ -228,15 +214,6 @@ fun SettingsScreen(
                                     onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
                                 )
                             },
-                        )
-                    }
-                    add {
-                        ListItem(
-                            modifier = Modifier.clickable { pickTheme = true },
-                            colors = transparentListItemColors,
-                            leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
-                            headlineContent = { Text("Theme") },
-                            supportingContent = { Text(appearance.themeMode.label) },
                         )
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {

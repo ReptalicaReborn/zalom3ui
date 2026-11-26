@@ -25,7 +25,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatAccent
-import com.zalom3ui.app.data.ColorTheme
 import com.zalom3ui.app.data.ThemeMode
 
 private val BaseTypography = Typography()
@@ -409,17 +408,17 @@ val LocalChatColors = staticCompositionLocalOf {
 
 /** Whether the app is drawn dark, from the theme setting or the system. */
 @Composable
-fun isAppInDarkTheme(appearance: Appearance): Boolean = if (appearance.colorTheme == ColorTheme.GOLD) true else when (appearance.themeMode) {
+fun isAppInDarkTheme(appearance: Appearance): Boolean = when (appearance.themeMode) {
     ThemeMode.SYSTEM -> isSystemInDarkTheme()
     ThemeMode.LIGHT -> false
-    ThemeMode.DARK -> true
+    ThemeMode.DARK, ThemeMode.REPTDOC_GOLD -> true
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> Unit) {
     val dark = isAppInDarkTheme(appearance)
-    val gold = appearance.colorTheme == ColorTheme.GOLD
+    val gold = appearance.themeMode == ThemeMode.REPTDOC_GOLD
     val dynamic = !gold && appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val context = LocalContext.current
     val palette = accentPalette(appearance.accent)

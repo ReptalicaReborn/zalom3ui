@@ -57,6 +57,14 @@ test("parseNoisedIdsReply handles both parallel arrays and map objects", () => {
     assert.equal(map.users.get("101"), "1000000000000000101");
     assert.equal(map.users.has("102"), false);
     assert.equal(map.groups.get("201"), "2000000000000000201");
+
+    const fromString = parseNoisedIdsReply(
+        ["101"],
+        ["201"],
+        '{"fids":[1000000000000000101],"gids":{"201":2000000000000000201}}',
+    );
+    assert.equal(fromString.users.get("101"), "1000000000000000101");
+    assert.equal(fromString.groups.get("201"), "2000000000000000201");
 });
 
 test("decodeZaloAes decrypts URL-encoded AES payloads and preserves 19-digit ids with parseJsonKeepingBigInts", () => {

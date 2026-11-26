@@ -1247,8 +1247,10 @@ private fun messageText(msg: ChatMessage, onOutgoing: Boolean, onOpenUrl: (Strin
         }
         msg.attachment?.let { a ->
             val label = a.title?.takeIf { it.isNotBlank() } ?: a.href ?: "Attachment"
-            if (text.isNotBlank()) append("\n")
-            append("📎 $label")
+            if (text != label && !text.endsWith(label)) {
+                if (text.isNotBlank()) append("\n")
+                append("📎 $label")
+            }
         }
     }
 }

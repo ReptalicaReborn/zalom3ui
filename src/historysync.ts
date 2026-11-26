@@ -727,8 +727,20 @@ export function decodeZaloAes(secretKey: string, data: string): string | null {
 export function parseNoisedIdsReply(askedUsers: string[], askedGroups: string[], data: unknown): NoisedIdsReply {
     const users = new Map<string, string>();
     const groups = new Map<string, string>();
-    const obj = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
-    const apply = (asked: string[], answer: unknown, out: Map<string, string>) => {
+    const maybeParse = (v: unknown): unknown => {
+        if (typeof v !== "string") return v;
+        const trimmed = v.trim();
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return v;
+        try {
+            return parseJsonKeepingBigInts(trimmed);
+        } catch {
+            return v;
+        }
+    };
+    const unpacked = maybeParse(data);
+    const obj = unpacked && typeof unpacked === "object" && !Array.isArray(unpacked) ? (unpacked as Record<string, unknown>) : {};
+    const apply = (asked: string[], rawAnswer: unknown, out: Map<string, string>) => {
+        const answer = maybeParse(rawAnswer);
         if (Array.isArray(answer)) {
             if (answer.length !== asked.length) return;
             for (let i = 0; i < answer.length; i++) {
