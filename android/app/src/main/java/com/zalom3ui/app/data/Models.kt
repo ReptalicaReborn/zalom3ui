@@ -126,13 +126,35 @@ data class Attachment(
     val call: CallInfo? = null,
     /** Poll messages. */
     val poll: PollRef? = null,
+    /** Call-to-action button label on OA / ZNS link cards (e.g. "ĐẶT LẠI MÃ PIN"). */
+    val actionLabel: String? = null,
+    /** Detected one-time verification / OTP code (4–8 digits). */
+    val otp: String? = null,
 ) {
-    /** The picture to show for a photo, GIF or sticker (the full image when there is no thumbnail). */
+    /** The picture to show for a photo, GIF or sticker (ignoring local phone URIs from history backups). */
     val image: String? get() = when (kind) {
-        "sticker" -> thumb
-        "photo", "gif" -> thumb ?: href
+        "sticker" -> remoteThumb
+        "photo", "gif" -> remoteThumb ?: remoteHref
         else -> null
     }
+
+    val remoteThumb: String? get() = thumb?.takeIf(::isRemoteMediaUrl)
+    val remoteHref: String? get() = href?.takeIf(::isRemoteMediaUrl)
+}
+
+internal fun isLocalMediaUri(value: String?): Boolean {
+    val s = value?.trim() ?: return false
+    return s.startsWith("content://", ignoreCase = true) ||
+        s.startsWith("file://", ignoreCase = true) ||
+        s.startsWith("/storage/", ignoreCase = true) ||
+        s.startsWith("/sdcard/", ignoreCase = true) ||
+        s.startsWith("/data/", ignoreCase = true) ||
+        s.startsWith("/mnt/", ignoreCase = true)
+}
+
+internal fun isRemoteMediaUrl(value: String?): Boolean {
+    val s = value?.trim() ?: return false
+    return s.startsWith("http://", ignoreCase = true) || s.startsWith("https://", ignoreCase = true)
 }
 
 @Serializable
@@ -281,6 +303,39 @@ data class ThreadDetails(
 data class ThreadRef(val kind: String, val id: String) {
     val key: String get() = "$kind:$id"
 }
+
+/** One hit from `GET /api/search?q=...`. */
+@Serializable
+data class MessageSearchHit(
+    val threadId: String,
+    val threadKind: String,
+    val threadName: String = "",
+    val threadAvatar: String = "",
+    val message: ChatMessage,
+) {
+    val ref: ThreadRef get() = ThreadRef(threadKind, threadId)
+}
+
+typealias QuotedMessage = Quote
+typealias MentionDraft = Mention
+
+/** Optimistic outgoing message kept in [com.zalom3ui.app.ui.ChatState.pending] until sent or dismissed. */
+data class PendingMessage(
+    val localId: String,
+    val text: String,
+    val ts: Long,
+    val quote: QuotedMessage? = null,
+    val quoteId: String? = null,
+    val mentions: List<MentionDraft> = emptyList(),
+    val failed: Boolean = false,
+    val error: String? = null,
+)
+
+/** Text and/or media URIs shared into Zalỏ from another app via ACTION_SEND / ACTION_SEND_MULTIPLE. */
+data class PendingShare(
+    val text: String? = null,
+    val uris: List<android.net.Uri> = emptyList(),
+)
 
 /** Zalo's six quick reactions, in the order the official app shows them. */
 val QUICK_REACTIONS = listOf(

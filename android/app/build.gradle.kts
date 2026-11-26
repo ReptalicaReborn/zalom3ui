@@ -70,6 +70,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Sideload-only app: sign release builds with the debug key unless you configure your own.
             signingConfig = signingConfigs.getByName("debug")

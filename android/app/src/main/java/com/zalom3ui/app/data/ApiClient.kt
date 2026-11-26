@@ -4,6 +4,7 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -24,15 +25,18 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.BufferedSink
 import okio.source
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
@@ -172,6 +176,26 @@ class ApiClient(serverUrl: String, private val token: String?) {
         val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
         val body = StreamBody(mimeType?.toMediaTypeOrNull() ?: OCTET_STREAM, length, open)
         execute<Unit>(Request.Builder().url(url("threads", kind, id, "attachments", query = query)).post(body), UPLOAD_HTTP)
+    }
+
+    /** Full-text search across messages on the server (`GET /api/search?q=...&limit=...`). */
+    suspend fun searchMessages(query: String, limit: Int = 50): List<MessageSearchHit> =
+        get<SearchMessagesResponse>("search", query = listOf("q" to query, "limit" to limit.toString())).results
+
+    internal fun parseSearchResults(body: String): List<MessageSearchHit> =
+        json.decodeFromString<SearchMessagesResponse>(body).results
+
+    /** Uploads a recorded voice message (`POST /api/threads/:kind/:id/voice`, multipart field `"voice"`). */
+    suspend fun sendVoice(ref: ThreadRef, file: File) {
+        execute<Unit>(sendVoiceRequest(ref, file), UPLOAD_HTTP)
+    }
+
+    internal fun sendVoiceRequest(ref: ThreadRef, file: File): Request.Builder {
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("voice", file.name, file.asRequestBody(AUDIO_MP4))
+            .build()
+        return Request.Builder().url(url("threads", ref.kind, ref.id, "voice")).post(body)
     }
 
     suspend fun stickers(query: String): List<StickerInfo> = get("stickers", query = listOf("q" to query))
@@ -486,9 +510,15 @@ class ApiClient(serverUrl: String, private val token: String?) {
         }
     }
 
+    @Serializable
+    private data class SearchMessagesResponse(
+        val results: List<MessageSearchHit> = emptyList(),
+    )
+
     companion object {
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
         private val OCTET_STREAM = "application/octet-stream".toMediaType()
+        private val AUDIO_MP4 = "audio/mp4".toMediaType()
 
         // Shared so the connection pool survives client rebuilds after settings changes.
         private val http = OkHttpClient.Builder()

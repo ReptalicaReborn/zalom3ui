@@ -93,6 +93,10 @@ export type Attachment = {
     call?: { video: boolean; missed: boolean; outgoing: boolean };
     /** Poll messages: details (options, votes) come from GET /api/polls/:pollId. */
     poll?: { pollId: number; question: string; /** Set when the message reports a change (vote, close) rather than creation. */ event?: string };
+    /** Call-to-action button label for OA/ZNS/ecard link cards (e.g. "ĐẶT LẠI MÃ PIN"). */
+    actionLabel?: string;
+    /** Detected one-time verification / OTP code (4–8 digits) for quick copy. */
+    otp?: string;
 };
 
 /** Where the official client loads a sticker's picture from (its default `stickerUrl` config) by sticker id. */
@@ -132,6 +136,14 @@ export type ThreadSummary = ThreadInfo & {
     pinned: boolean;
     /** Epoch ms the mute ends, -1 for "until turned off", absent when not muted. */
     mutedUntil?: number;
+};
+
+export type MessageSearchHit = {
+    threadId: string;
+    threadKind: ThreadKind;
+    threadName: string;
+    threadAvatar: string;
+    message: ChatMessage;
 };
 
 /** Shape of a raw zca-js message (UserMessage/GroupMessage), kept loose on purpose. */
@@ -215,10 +227,38 @@ const MSG_TYPE_LABELS: Record<string, string> = {
     "chat.location.new": "[Location]",
     "chat.doodle": "[Drawing]",
     "chat.ecard": "[Card]",
+    "chat.list.action": "[Card]",
+    "chat.webcontent": "[Card]",
+    "chat.webcontent.v2": "[Card]",
     "chat.todo": "[Task]",
     "chat.poll": "[Poll]",
     "group.poll": "[Poll]",
 };
+
+const OTP_KEYWORD =
+    /\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b/i;
+
+function foldDiacritics(s: string): string {
+    return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[đĐ]/g, "d");
+}
+
+/**
+ * Extracts a 4–8 digit OTP / verification code when accompanied by an OTP keyword (Vietnamese or English).
+ * Ignores 9+ digit phone numbers / account IDs (e.g. `0378795621`) and currency amounts.
+ */
+export function extractOtpCode(text: string): string | undefined {
+    const folded = foldDiacritics(text);
+    if (!OTP_KEYWORD.test(folded)) return undefined;
+    const afterKeyword =
+        /\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b[^\d\n]{0,40}?(?<!\d)(\d{4,8})(?!\d)/i;
+    const direct = afterKeyword.exec(folded);
+    if (direct?.[1]) return direct[1];
+    const beforeKeyword =
+        /(?<!\d)(\d{4,8})(?!\d)[^\d\n]{0,24}\b(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)\b/i;
+    const reverse = beforeKeyword.exec(folded);
+    if (reverse?.[1]) return reverse[1];
+    return undefined;
+}
 
 export function threadKey(kind: ThreadKind, id: string): string {
     return `${kind}:${id}`;
@@ -276,7 +316,9 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
         return msg;
     }
 
-    const content = (data.content ?? {}) as Record<string, unknown>;
+    const content: Record<string, unknown> = Array.isArray(data.content)
+        ? { items: data.content }
+        : ((data.content ?? {}) as Record<string, unknown>);
     const attachment = parseAttachment(data.msgType, content);
     if (attachment) msg.attachment = attachment;
     if (attachment?.kind === "call") {
@@ -286,6 +328,13 @@ export function normalizeMessage(raw: RawMessage): StoredMessage {
     if (attachment?.kind === "poll") {
         msg.text = `[Poll] ${attachment.title}`;
         return msg;
+    }
+    if (data.msgType === "chat.webcontent" || data.msgType === "chat.webcontent.v2" || data.msgType === "chat.list.action") {
+        const preview = attachment?.title || attachment?.description;
+        if (preview) {
+            msg.text = preview;
+            return msg;
+        }
     }
     const known = attachment?.kind === "contact" ? "[Contact]" : MSG_TYPE_LABELS[data.msgType];
     // Notices and cards of a type we don't model (login alerts, group events): show their own text, not a placeholder.
@@ -369,18 +418,158 @@ export function parseAttachment(msgType: string, content: Record<string, unknown
         return call;
     }
 
+    const parseJsonObj = (v: unknown): Record<string, unknown> => {
+        if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+        if (typeof v === "string" && v.trim().startsWith("{")) {
+            try {
+                const p = JSON.parse(v);
+                if (p && typeof p === "object" && !Array.isArray(p)) return p as Record<string, unknown>;
+            } catch {
+                // ignore
+            }
+        }
+        return {};
+    };
+    const webUrl = (v: unknown): string | undefined => {
+        const s = str(v)?.trim();
+        return s && /^https?:\/\/[^\s/]/i.test(s) ? s : undefined;
+    };
+
+    // OA list / interactive card messages (`chat.list.action`): array of header + child parts, or single object.
+    if (msgType === "chat.list.action") {
+        const items = Array.isArray(content.items)
+            ? content.items.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"))
+            : [content];
+        const lead = items.find((x) => typeof x.type === "string" && /^l\.a\.header\./.test(x.type)) ?? items[0];
+        if (lead) {
+            const title = str(lead.title) ?? items.map((x) => str(x.title)).find(Boolean);
+            const description = str(lead.description) ?? items.map((x) => str(x.description)).find((d) => d && d !== title);
+            const thumb = webUrl(lead.thumb) ?? items.map((x) => webUrl(x.thumb)).find(Boolean);
+            const actionItem = items.find((x) => x !== lead && webUrl(x.href)) ?? items.find((x) => webUrl(x.href));
+            const href = webUrl(lead.href) ?? (actionItem ? webUrl(actionItem.href) : undefined);
+            const actionLabel = actionItem && actionItem !== lead ? str(actionItem.title) : undefined;
+            const otp = extractOtpCode([title, description].filter(Boolean).join("\n"));
+            if (title || description || thumb || href) {
+                const card: Attachment = {
+                    kind: "link",
+                    ...(title ? { title } : {}),
+                    ...(description && description !== title ? { description } : {}),
+                    ...(thumb ? { thumb } : {}),
+                    ...(href ? { href } : {}),
+                    ...(actionLabel ? { actionLabel } : {}),
+                    ...(otp ? { otp } : {}),
+                };
+                return card;
+            }
+        }
+    }
+
+    // ZInstant / ZNS cards (`chat.webcontent`, `chat.webcontent.v2`): OA notifications, PIN resets, OTPs, order updates.
+    if (msgType === "chat.webcontent" || msgType === "chat.webcontent.v2") {
+        const zMsg = parseJsonObj(content.zinstant_msg);
+        const meta = Object.keys(zMsg).length ? zMsg : params;
+        const customObj = parseJsonObj(meta.customMsg ?? params.customMsg);
+        const msgMap = parseJsonObj(customObj.msg);
+        let localized = str(msgMap.vi) ?? str(msgMap.en) ?? "";
+        if (localized && Array.isArray(customObj.highLightsV2)) {
+            customObj.highLightsV2.forEach((h, idx) => {
+                const ho = parseJsonObj(h);
+                const replacement = str(ho.text) ?? str(ho.value) ?? str(ho.name) ?? "";
+                if (replacement) localized = localized.replace(`$${idx}$`, replacement);
+            });
+        }
+        const rawActions = Array.isArray(meta.actions)
+            ? meta.actions
+            : Array.isArray(params.actions)
+              ? params.actions
+              : Array.isArray(meta.buttons)
+                ? meta.buttons
+                : [];
+        let actionLabel = str(meta.actionTitle) ?? str(params.actionTitle);
+        let href = webUrl(content.href) ?? webUrl(meta.href) ?? webUrl(meta.url) ?? webUrl(params.href) ?? webUrl(params.url);
+        let otpFromAction: string | undefined;
+        for (const entry of rawActions) {
+            const act = parseJsonObj(entry);
+            const actData = parseJsonObj(act.actionData ?? act.data);
+            const label = str(act.actionTitle) ?? str(act.title) ?? str(act.name);
+            const url = webUrl(act.actionUrl) ?? webUrl(act.href) ?? webUrl(act.url) ?? webUrl(actData.url) ?? webUrl(actData.href) ?? webUrl(actData.link);
+            if (!actionLabel && label) actionLabel = label;
+            if (!href && url) href = url;
+            const candidateCode = str(actData.otp) ?? str(actData.code) ?? str(actData.copyText) ?? str(actData.text);
+            if (!otpFromAction && candidateCode && /^\d{4,8}$/.test(candidateCode.trim())) {
+                otpFromAction = candidateCode.trim();
+            }
+        }
+        const lines = localized
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+        const title = str(content.title) ?? str(meta.title) ?? lines[0];
+        const bodyFromLocalized = lines.length > 1 ? lines.slice(1).join("\n") : lines[0];
+        const rawDesc = str(content.description) ?? str(meta.description) ?? bodyFromLocalized;
+        const description = rawDesc && rawDesc !== title ? rawDesc : undefined;
+        const thumb = webUrl(content.thumb) ?? webUrl(meta.thumb) ?? webUrl(meta.logo) ?? webUrl(params.thumb);
+        const otp = otpFromAction ?? extractOtpCode([title, description, localized].filter(Boolean).join("\n"));
+        if (title || description || thumb || href || actionLabel || otp) {
+            return {
+                kind: "link",
+                ...(title ? { title } : {}),
+                ...(description ? { description } : {}),
+                ...(thumb ? { thumb } : {}),
+                ...(href ? { href } : {}),
+                ...(actionLabel ? { actionLabel } : {}),
+                ...(otp ? { otp } : {}),
+            };
+        }
+    }
+
+    // E-card (`chat.ecard`): greeting/event cards with optional CTA buttons.
+    if (msgType === "chat.ecard") {
+        const title = str(content.title);
+        const description = str(content.description);
+        const thumb = webUrl(content.thumb) ?? webUrl(content.href);
+        const href = webUrl(content.href);
+        const actions = Array.isArray(params.actions) ? params.actions : [];
+        const firstAction = actions.length ? parseJsonObj(actions[0]) : {};
+        const actionLabel = str(firstAction.name) ?? str(firstAction.title);
+        if (title || description || thumb) {
+            return {
+                kind: "link",
+                ...(title ? { title } : {}),
+                ...(description && description !== title ? { description } : {}),
+                ...(thumb ? { thumb } : {}),
+                ...(href ? { href } : {}),
+                ...(actionLabel ? { actionLabel } : {}),
+            };
+        }
+    }
+
     let kind: AttachmentKind = KIND_BY_MSG_TYPE[msgType] ?? "other";
     if (msgType === "chat.recommended") {
         const action = str(content.action) ?? "";
         kind = action === "recommened.user" ? "contact" : action === "recommened.link" ? "link" : "other";
     }
+    const isLocalUri = (s: string) => /^(content:\/\/|file:\/\/|\/(?:storage|sdcard|data|mnt)\/)/i.test(s.trim());
+    const isMedia = kind === "photo" || kind === "gif" || kind === "video";
+    const remoteStr = (v: unknown) => {
+        const s = str(v);
+        return s && !isLocalUri(s) ? s : undefined;
+    };
+    const rawTitle = str(content.title);
     const attachment: Attachment = {
         kind,
-        title: str(content.title),
+        title: isMedia && rawTitle && isLocalUri(rawTitle) ? undefined : rawTitle,
         description: str(content.description),
-        // A photo's "hd" copy is the full-size one when Zalo sends it.
-        href: (kind === "photo" ? str(params.hd) : undefined) ?? str(content.href),
-        thumb: str(content.thumb),
+        // A photo's "hd" copy is the full-size one when Zalo sends it; ignore local phone URIs from history backups.
+        href: isMedia
+            ? (kind === "photo" ? remoteStr(params.hd) : undefined) ??
+              remoteStr(content.href) ??
+              remoteStr(params.oriUrl) ??
+              remoteStr(params.origUrl) ??
+              remoteStr(params.normalUrl) ??
+              remoteStr(params.url)
+            : str(content.href),
+        thumb: isMedia ? remoteStr(content.thumb) ?? remoteStr(params.thumbUrl) ?? remoteStr(params.thumb) : str(content.thumb),
         width: num(params.width, params.video_width, params.w),
         height: num(params.height, params.video_height, params.h),
         duration: num(params.duration),
@@ -570,14 +759,17 @@ export class ChatStore {
         this.messages.set(key, list);
         if (evictedSelf) return false;
 
-        if (!this.threads.has(key)) {
+        const existingThread = this.threads.get(key);
+        if (!existingThread) {
             this.threads.set(key, {
                 id: msg.threadId,
                 kind: msg.threadKind,
-                // For a 1:1 chat with someone not in the friend list, their display name is the best we have.
+                // For a 1:1/OA chat not in the friend list, their display name is the best we have.
                 name: msg.threadKind === "user" && !msg.isSelf ? msg.fromName || msg.threadId : msg.threadId,
                 avatar: "",
             });
+        } else if (msg.threadKind === "user" && !msg.isSelf && msg.fromName && existingThread.name === existingThread.id) {
+            existingThread.name = msg.fromName;
         }
         if (opts.history) {
             this.scheduleSave();
@@ -621,6 +813,36 @@ export class ChatStore {
         let list = this.messages.get(threadKey(kind, id)) ?? [];
         if (opts.before !== undefined) list = list.filter((m) => m.ts < opts.before!);
         return list.slice(-limit).map((m) => this.toPublic(m));
+    }
+
+    /**
+     * Searches cached messages across all conversations with diacritic-insensitive, case-insensitive matching.
+     * Skips recalled messages and returns hits sorted newest-first, capped to [1, 100].
+     */
+    searchMessages(query: string, limit = 50): MessageSearchHit[] {
+        const needle = foldForSearch(query.trim());
+        if (!needle) return [];
+        const cap = Math.min(Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 50), 100);
+        const matches: { thread: ThreadInfo | undefined; msg: StoredMessage }[] = [];
+        for (const [key, list] of this.messages) {
+            const thread = this.threads.get(key);
+            for (const m of list) {
+                if (m.recalled) continue;
+                const hit =
+                    foldForSearch(m.text).includes(needle) ||
+                    (m.attachment?.title !== undefined && foldForSearch(m.attachment.title).includes(needle)) ||
+                    (m.attachment?.description !== undefined && foldForSearch(m.attachment.description).includes(needle));
+                if (hit) matches.push({ thread, msg: m });
+            }
+        }
+        matches.sort((a, b) => b.msg.ts - a.msg.ts);
+        return matches.slice(0, cap).map(({ thread, msg }) => ({
+            threadId: msg.threadId,
+            threadKind: msg.threadKind,
+            threadName: thread?.name || msg.threadId,
+            threadAvatar: thread?.avatar ?? "",
+            message: this.toPublic(msg),
+        }));
     }
 
     /** Sets (or with an empty code, clears) one user's reaction. Returns the updated message. */
@@ -876,6 +1098,10 @@ export class ChatStore {
         this.saveTimer = setTimeout(() => this.flush(), 2000);
         this.saveTimer.unref();
     }
+}
+
+function foldForSearch(text: string): string {
+    return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/Đ/g, "D").toLowerCase();
 }
 
 function union(a: string[] | undefined, b: string[] | undefined): string[] {

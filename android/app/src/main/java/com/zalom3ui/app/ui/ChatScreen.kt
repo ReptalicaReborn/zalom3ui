@@ -1,5 +1,7 @@
 package com.zalom3ui.app.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.widget.Toast
@@ -24,16 +26,22 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.systemGestureExclusion
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -43,6 +51,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -53,6 +62,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -68,32 +79,40 @@ import androidx.compose.material.icons.automirrored.outlined.MissedVideoCall
 import androidx.compose.material.icons.automirrored.outlined.PhoneMissed
 import androidx.compose.material.icons.automirrored.outlined.Reply
 import androidx.compose.material.icons.automirrored.outlined.Undo
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Call
-import androidx.compose.material.icons.outlined.Poll
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EmojiEmotions
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Group
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.MarkChatUnread
+import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Mood
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.PersonAdd
+import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Poll
 import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material.icons.outlined.RadioButtonUnchecked
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -108,6 +127,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
@@ -136,12 +156,24 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -169,14 +201,22 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.SubcomposeAsyncImage
+import com.zalom3ui.app.data.Appearance
+import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.MuteOption
+import com.zalom3ui.app.data.PendingMessage
 import com.zalom3ui.app.data.QUICK_REACTIONS
 import com.zalom3ui.app.data.Quote
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.ui.call.CallActivity
+import java.io.File
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
@@ -206,12 +246,18 @@ class ChatActions(
     val onRenameGroup: (String) -> Unit,
     val onLeaveGroup: (silent: Boolean) -> Unit,
     val onOpenInfo: () -> Unit = {},
+    val onDraftChange: (String) -> Unit = {},
+    val onSendVoice: (File) -> Unit = {},
+    val onRetryPending: (String) -> Unit = {},
+    val onDismissPending: (String) -> Unit = {},
+    val onDeleteMany: (List<ChatMessage>) -> Unit = {},
+    val onForwardMany: (List<ChatMessage>) -> Unit = {},
 )
 
 /** Photos and videos picked at once from the system photo picker. */
 private const val MAX_PICKED_MEDIA = 20
 
-private enum class MessageAction { REPLY, COPY, FORWARD, RECALL, DELETE }
+private enum class MessageAction { REPLY, COPY, FORWARD, SELECT, RECALL, DELETE }
 
 /** Messages from the same person this close together are drawn as one group of bubbles. */
 private const val GROUP_GAP_MS = 5 * 60_000L
@@ -229,17 +275,71 @@ fun ChatScreen(
     actions: ChatActions,
     initialSearch: Boolean = false,
     onSearchConsumed: () -> Unit = {},
+    initialDraft: String = "",
+    chatAccentOverride: ChatAccent? = null,
+    appearance: Appearance? = null,
+    scrollToMsgId: String? = null,
+    onScrolledToMsg: () -> Unit = {},
+) {
+    if (chatAccentOverride != null && appearance != null) {
+        AppTheme(appearance.copy(accent = chatAccentOverride, dynamicColor = false)) {
+            ChatScreenContent(
+                chat = chat,
+                thread = thread,
+                typing = typing,
+                stickers = stickers,
+                actions = actions,
+                initialSearch = initialSearch,
+                onSearchConsumed = onSearchConsumed,
+                initialDraft = initialDraft,
+                scrollToMsgId = scrollToMsgId,
+                onScrolledToMsg = onScrolledToMsg,
+            )
+        }
+    } else {
+        ChatScreenContent(
+            chat = chat,
+            thread = thread,
+            typing = typing,
+            stickers = stickers,
+            actions = actions,
+            initialSearch = initialSearch,
+            onSearchConsumed = onSearchConsumed,
+            initialDraft = initialDraft,
+            scrollToMsgId = scrollToMsgId,
+            onScrolledToMsg = onScrolledToMsg,
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChatScreenContent(
+    chat: ChatState,
+    thread: ThreadSummary?,
+    typing: TypingInfo?,
+    stickers: StickerSearch,
+    actions: ChatActions,
+    initialSearch: Boolean,
+    onSearchConsumed: () -> Unit,
+    initialDraft: String,
+    scrollToMsgId: String?,
+    onScrolledToMsg: () -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val colors = LocalChatColors.current
-    var menuFor by remember { mutableStateOf<String?>(null) }
-    var reactionsFor by remember { mutableStateOf<String?>(null) }
-    var replyTo by remember { mutableStateOf<ChatMessage?>(null) }
-    var confirm by remember { mutableStateOf<Pair<MessageAction, ChatMessage>?>(null) }
+    var menuFor by remember(chat.ref) { mutableStateOf<String?>(null) }
+    var reactionsFor by remember(chat.ref) { mutableStateOf<String?>(null) }
+    var replyTo by remember(chat.ref) { mutableStateOf<ChatMessage?>(null) }
+    var confirm by remember(chat.ref) { mutableStateOf<Pair<MessageAction, ChatMessage>?>(null) }
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
-    var viewing by rememberSaveable { mutableStateOf<String?>(null) }
+    var viewingUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    var viewingMsgId by rememberSaveable { mutableStateOf<String?>(null) }
     var showStickers by rememberSaveable { mutableStateOf(false) }
+    var pendingCameraUriStr by rememberSaveable { mutableStateOf<String?>(null) }
+    var previewMediaUris by remember(chat.ref) { mutableStateOf<List<Uri>>(emptyList()) }
+    val selectedIds = remember(chat.ref) { mutableStateListOf<String>() }
 
     var searching by rememberSaveable { mutableStateOf(initialSearch) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -271,6 +371,16 @@ fun ChatScreen(
         }
     }
 
+    LaunchedEffect(scrollToMsgId, chat.messages, chat.loading) {
+        val target = scrollToMsgId ?: return@LaunchedEffect
+        if (chat.messages.any { it.id == target }) {
+            jumpToMessage(target)
+            onScrolledToMsg()
+        } else if (!chat.loading) {
+            onScrolledToMsg()
+        }
+    }
+
     val closeSearch: () -> Unit = {
         searching = false
         searchQuery = ""
@@ -284,15 +394,75 @@ fun ChatScreen(
     if (selectedMsg != null) overlayMsg = selectedMsg
 
     BackHandler(enabled = selectedMsg != null) { menuFor = null }
-    BackHandler(enabled = searching && selectedMsg == null) { closeSearch() }
+    BackHandler(enabled = selectedIds.isNotEmpty() && selectedMsg == null) { selectedIds.clear() }
+    BackHandler(enabled = searching && selectedMsg == null && selectedIds.isEmpty()) { closeSearch() }
 
     val isGroup = chat.kind == "group"
     DisposableEffect(chat.ref) { onDispose { VoicePlayback.stop() } }
-    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKED_MEDIA)) {
-        if (it.isNotEmpty()) actions.onSendFiles(it)
+
+    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKED_MEDIA)) { uris ->
+        if (uris.isNotEmpty()) {
+            val allImages = uris.all { uri ->
+                val mime = context.contentResolver.getType(uri)
+                mime == null || mime.startsWith("image/")
+            }
+            if (allImages) {
+                previewMediaUris = uris
+            } else {
+                actions.onSendFiles(uris)
+            }
+        }
     }
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
         if (it.isNotEmpty()) actions.onSendFiles(it)
+    }
+    val takePicture = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        val uriStr = pendingCameraUriStr
+        pendingCameraUriStr = null
+        if (success && uriStr != null) {
+            previewMediaUris = listOf(Uri.parse(uriStr))
+        }
+    }
+    fun launchCamera() {
+        val dir = File(context.cacheDir, "camera").apply { mkdirs() }
+        val photoFile = File(dir, "photo_${System.currentTimeMillis()}.jpg")
+        val uri = runCatching {
+            FileProvider.getUriForFile(context, "${context.packageName}.files", photoFile)
+        }.getOrNull()
+        if (uri == null) {
+            Toast.makeText(context, "Couldn't open camera", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingCameraUriStr = uri.toString()
+        runCatching { takePicture.launch(uri) }.onFailure {
+            pendingCameraUriStr = null
+            Toast.makeText(context, "No camera app available", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            launchCamera()
+        } else {
+            Toast.makeText(context, "Camera permission is needed to take photos", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val onTakePhoto: () -> Unit = {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            launchCamera()
+        } else {
+            cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    val chatPhotoEntries = remember(chat.messages) { extractChatPhotoEntries(chat.messages) }
+    val chatPhotos = remember(chatPhotoEntries) { chatPhotoEntries.map { it.second } }
+
+    fun toggleSelect(msg: ChatMessage) {
+        if (msg.id in selectedIds) {
+            selectedIds.remove(msg.id)
+        } else {
+            selectedIds.add(msg.id)
+        }
     }
 
     val onAction: (ChatMessage, MessageAction) -> Unit = { msg, action ->
@@ -307,6 +477,9 @@ fun ChatScreen(
                 }
             }
             MessageAction.FORWARD -> actions.onForward(msg)
+            MessageAction.SELECT -> {
+                if (msg.id !in selectedIds) selectedIds.add(msg.id)
+            }
             MessageAction.RECALL, MessageAction.DELETE -> confirm = action to msg
         }
     }
@@ -329,7 +502,24 @@ fun ChatScreen(
             modifier = scaffoldModifier,
             containerColor = colors.background,
             topBar = {
-                if (searching) {
+                if (selectedIds.isNotEmpty()) {
+                    val idSet = selectedIds.toSet()
+                    val selectedMessages = chat.messages.filter { it.id in idSet }
+                    val forwardable = selectedMessages.filter { it.isText }
+                    SelectionTopBar(
+                        count = selectedIds.size,
+                        canForward = forwardable.isNotEmpty(),
+                        onClose = { selectedIds.clear() },
+                        onForward = {
+                            selectedIds.clear()
+                            if (forwardable.isNotEmpty()) actions.onForwardMany(forwardable)
+                        },
+                        onDelete = {
+                            selectedIds.clear()
+                            if (selectedMessages.isNotEmpty()) actions.onDeleteMany(selectedMessages)
+                        },
+                    )
+                } else if (searching) {
                     InChatSearchTopBar(
                         query = searchQuery,
                         onQueryChange = {
@@ -416,16 +606,21 @@ fun ChatScreen(
             },
             bottomBar = {
                 Composer(
+                    threadKey = chat.ref.key,
+                    initialDraft = initialDraft,
+                    onDraftChange = actions.onDraftChange,
                     isGroup = isGroup,
                     members = chat.members,
                     sending = chat.sending,
                     uploading = chat.uploading,
                     stickers = stickers,
+                    onTakePhoto = onTakePhoto,
                     onPickMedia = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
                     onPickFiles = { pickFiles.launch(arrayOf("*/*")) },
                     onPickSticker = { showStickers = true },
                     onSearchStickers = actions.onSearchStickers,
                     onSendSticker = actions.onSendSticker,
+                    onSendVoice = actions.onSendVoice,
                     replyTo = replyTo,
                     onCancelReply = { replyTo = null },
                     onStartTyping = actions.onStartTyping,
@@ -445,6 +640,8 @@ fun ChatScreen(
                     chat = chat,
                     typing = typing,
                     jumpTarget = jumpTarget,
+                    selectedIds = selectedIds.toSet(),
+                    onToggleSelect = ::toggleSelect,
                     onOpenMenu = { menuFor = it.id },
                     onOpenReactions = { reactionsFor = it.id },
                     onQuoteClick = { quote ->
@@ -452,8 +649,13 @@ fun ChatScreen(
                     },
                     onSwipeReply = { replyTo = it },
                     onLoadEarlier = actions.onLoadEarlier,
-                    onOpenImage = { viewing = it },
+                    onOpenImage = { msgId, url ->
+                        viewingMsgId = msgId
+                        viewingUrl = url
+                    },
                     onOpenUrl = onOpenUrl,
+                    onRetryPending = actions.onRetryPending,
+                    onDismissPending = actions.onDismissPending,
                 )
                 if (chat.loading && chat.messages.isEmpty()) {
                     LinearWavyProgressIndicator(Modifier.fillMaxWidth())
@@ -543,7 +745,36 @@ fun ChatScreen(
         )
     }
 
-    viewing?.let { PhotoViewer(it, onDismiss = { viewing = null }) }
+    if (previewMediaUris.isNotEmpty()) {
+        MediaPreviewSheet(
+            uris = previewMediaUris,
+            onRemove = { uri -> previewMediaUris = previewMediaUris - uri },
+            onDismiss = { previewMediaUris = emptyList() },
+            onSend = { uris, caption ->
+                previewMediaUris = emptyList()
+                if (uris.isNotEmpty()) actions.onSendFiles(uris)
+                val trimmed = caption.trim()
+                if (trimmed.isNotEmpty()) {
+                    actions.onSend(trimmed, null, emptyList()) {}
+                }
+            },
+        )
+    }
+
+    viewingUrl?.let { url ->
+        val idx = findChatPhotoIndex(chatPhotoEntries, viewingMsgId, url)
+        val gallery = if (idx >= 0) chatPhotos else listOf(url)
+        val initialIndex = if (idx >= 0) idx else 0
+        PhotoViewer(
+            photos = gallery,
+            initialIndex = initialIndex,
+            onDismiss = {
+                viewingUrl = null
+                viewingMsgId = null
+            },
+            subtitle = chat.name,
+        )
+    }
     if (showStickers) {
         StickerSheet(
             search = stickers,
@@ -554,6 +785,154 @@ fun ChatScreen(
             },
             onDismiss = { showStickers = false },
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SelectionTopBar(
+    count: Int,
+    canForward: Boolean,
+    onClose: () -> Unit,
+    onForward: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    TopAppBar(
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        navigationIcon = {
+            IconButton(onClick = onClose) {
+                Icon(Icons.Outlined.Close, contentDescription = "Clear selection")
+            }
+        },
+        title = {
+            Text(
+                "$count selected",
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
+        actions = {
+            IconButton(onClick = onForward, enabled = canForward) {
+                Icon(Icons.AutoMirrored.Outlined.Forward, contentDescription = "Forward selected")
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Outlined.DeleteOutline, contentDescription = "Delete selected")
+            }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MediaPreviewSheet(
+    uris: List<Uri>,
+    onRemove: (Uri) -> Unit,
+    onDismiss: () -> Unit,
+    onSend: (List<Uri>, String) -> Unit,
+) {
+    val colors = LocalChatColors.current
+    var caption by rememberSaveable { mutableStateOf("") }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    if (uris.size == 1) "Send photo" else "Send ${uris.size} photos",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Outlined.Close, contentDescription = "Cancel")
+                }
+            }
+            if (uris.size == 1) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 180.dp, max = 300.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    SubcomposeAsyncImage(
+                        model = uris.first(),
+                        contentDescription = "Selected photo",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp),
+                    )
+                }
+            } else {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(vertical = 2.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    items(uris, key = { it.toString() }) { uri ->
+                        Box(
+                            modifier = Modifier
+                                .size(width = 120.dp, height = 148.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                        ) {
+                            SubcomposeAsyncImage(
+                                model = uri,
+                                contentDescription = "Selected photo",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                            Surface(
+                                shape = CircleShape,
+                                color = Color.Black.copy(alpha = 0.6f),
+                                contentColor = Color.White,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(6.dp)
+                                    .size(26.dp)
+                                    .clip(CircleShape)
+                                    .clickable { onRemove(uri) },
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Outlined.Close, contentDescription = "Remove photo", modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = caption,
+                    onValueChange = { caption = it },
+                    placeholder = { Text("Add a caption…") },
+                    maxLines = 4,
+                    shape = RoundedCornerShape(24.dp),
+                    modifier = Modifier.weight(1f),
+                )
+                FilledIconButton(
+                    onClick = { onSend(uris, caption) },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = colors.outgoing,
+                        contentColor = colors.onOutgoing,
+                    ),
+                    modifier = Modifier.size(50.dp),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                }
+            }
+        }
     }
 }
 
@@ -702,20 +1081,27 @@ private fun MessageList(
     chat: ChatState,
     typing: TypingInfo?,
     jumpTarget: Pair<String, Int>?,
+    selectedIds: Set<String>,
+    onToggleSelect: (ChatMessage) -> Unit,
     onOpenMenu: (ChatMessage) -> Unit,
     onOpenReactions: (ChatMessage) -> Unit,
     onQuoteClick: (Quote) -> Unit,
     onSwipeReply: (ChatMessage) -> Unit,
     onLoadEarlier: () -> Unit,
-    onOpenImage: (String) -> Unit,
+    onOpenImage: (String, String) -> Unit,
     onOpenUrl: (String) -> Unit,
+    onRetryPending: (String) -> Unit,
+    onDismissPending: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     // Newest at the bottom: reverseLayout keeps the view pinned to the latest message.
     val items = remember(chat.messages, chat.firstUnreadId) { buildChatItems(chat.messages, chat.firstUnreadId) }
     val reversedItems = remember(items) { items.asReversed() }
+    val reversedPending = remember(chat.pending) { chat.pending.asReversed() }
+    val bottomOffset = (if (typing != null) 1 else 0) + reversedPending.size
     val isGroup = chat.kind == "group"
+    val selectionMode = selectedIds.isNotEmpty()
     val unreadCount = remember(chat.messages, chat.firstUnreadId) {
         val start = chat.messages.indexOfFirst { it.id == chat.firstUnreadId }
         if (start < 0) 0 else chat.messages.drop(start).count { !it.isSelf }
@@ -728,7 +1114,7 @@ private fun MessageList(
         val (id, nonce) = jumpTarget ?: return@LaunchedEffect
         val idx = reversedItems.indexOfFirst { it.containsId(id) }
         if (idx >= 0) {
-            val listIndex = if (typing != null) idx + 1 else idx
+            val listIndex = bottomOffset + idx
             listState.animateScrollToItem(listIndex)
             highlightedMsgId = id
             highlightNonce = nonce
@@ -752,8 +1138,8 @@ private fun MessageList(
     LaunchedEffect(listState, chat.hasMore, chat.messages.size) {
         snapshotFlow { nearTop }.collect { if (it && chat.hasMore) onLoadEarlier() }
     }
-    // Follow new messages (and "typing…") when already at the bottom.
-    LaunchedEffect(chat.messages.lastOrNull()?.id, typing != null) {
+    // Follow new messages, optimistic pending bubbles, and "typing…" when already at the bottom.
+    LaunchedEffect(chat.messages.lastOrNull()?.id, chat.pending.size, typing != null) {
         if (listState.firstVisibleItemIndex <= 1) listState.animateScrollToItem(0)
     }
 
@@ -775,10 +1161,10 @@ private fun MessageList(
         lastSeenNewestId = newestId
     }
 
-    val floatingDateTs by remember(reversedItems, typing != null) {
+    val floatingDateTs by remember(reversedItems, bottomOffset) {
         derivedStateOf {
             if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
-            val offset = if (typing != null) 1 else 0
+            val offset = bottomOffset
             val layout = listState.layoutInfo
             val topItem = layout.visibleItemsInfo
                 .lastOrNull { it.index >= offset && (it.index - offset) < reversedItems.size }
@@ -815,6 +1201,15 @@ private fun MessageList(
             if (typing != null) {
                 item(key = "typing") { TypingBubble(isGroup, typing) }
             }
+            items(reversedPending.size, key = { "pending:${reversedPending[it].localId}" }) { i ->
+                val pending = reversedPending[i]
+                PendingMessageRow(
+                    pending = pending,
+                    maxBubble = maxBubble,
+                    onRetry = { onRetryPending(pending.localId) },
+                    onDismiss = { onDismissPending(pending.localId) },
+                )
+            }
             items(reversedItems.size, key = { reversedItems[it].key }) { i ->
                 val item = reversedItems[i]
                 val olderItem = reversedItems.getOrNull(i + 1)
@@ -826,22 +1221,32 @@ private fun MessageList(
                         is ChatItem.CallGroup -> CallGroupRow(
                             calls = item.calls,
                             highlightedId = highlightedMsgId,
+                            selectedIds = selectedIds,
+                            selectionMode = selectionMode,
+                            onToggleSelect = onToggleSelect,
                             onLongPressCall = onOpenMenu,
                         )
                         is ChatItem.Single -> {
                             val msg = item.msg
                             val systemLabel = systemMessageLabel(msg)
+                            val isSelected = msg.id in selectedIds
                             when {
                                 !msg.recalled && msg.attachment?.kind == "call" -> CallSystemRow(
                                     msg = msg,
                                     highlighted = highlightedMsgId == msg.id,
-                                    onLongPress = { onOpenMenu(msg) },
+                                    selected = isSelected,
+                                    selectionMode = selectionMode,
+                                    onClick = { if (selectionMode) onToggleSelect(msg) },
+                                    onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
                                 )
                                 systemLabel != null -> SystemInfoRow(
                                     label = systemLabel,
                                     ts = msg.ts,
                                     highlighted = highlightedMsgId == msg.id,
-                                    onLongPress = { onOpenMenu(msg) },
+                                    selected = isSelected,
+                                    selectionMode = selectionMode,
+                                    onClick = { if (selectionMode) onToggleSelect(msg) },
+                                    onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
                                 )
                                 else -> {
                                     val older = (olderItem as? ChatItem.Single)?.msg?.takeIf { !isSystemLikeRow(it) }
@@ -857,12 +1262,21 @@ private fun MessageList(
                                         lastOfRun = lastOfRun,
                                         maxBubble = maxBubble,
                                         highlighted = highlightedMsgId == msg.id,
-                                        onLongPress = { onOpenMenu(msg) },
-                                        onOpenReactions = { onOpenReactions(msg) },
-                                        onQuoteClick = onQuoteClick,
+                                        selectionMode = selectionMode,
+                                        selected = isSelected,
+                                        onToggleSelect = { onToggleSelect(msg) },
+                                        onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
+                                        onOpenReactions = { if (selectionMode) onToggleSelect(msg) else onOpenReactions(msg) },
+                                        onQuoteClick = { quote ->
+                                            if (selectionMode) onToggleSelect(msg) else onQuoteClick(quote)
+                                        },
                                         onSwipeReply = { onSwipeReply(msg) },
-                                        onOpenImage = onOpenImage,
-                                        onOpenUrl = onOpenUrl,
+                                        onOpenImage = { url ->
+                                            if (selectionMode) onToggleSelect(msg) else onOpenImage(msg.id, url)
+                                        },
+                                        onOpenUrl = { url ->
+                                            if (selectionMode) onToggleSelect(msg) else onOpenUrl(url)
+                                        },
                                     )
                                 }
                             }
@@ -937,6 +1351,113 @@ private fun MessageList(
                         modifier = Modifier.align(Alignment.TopEnd).offset(x = 4.dp, y = (-8).dp),
                     )
                 }
+            }
+        }
+    }
+}
+
+/** Optimistic outgoing bubble while in-flight (clock icon) or failed (error tint + tap-to-retry + dismiss). */
+@Composable
+private fun PendingMessageRow(
+    pending: PendingMessage,
+    maxBubble: Dp,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val shape = RoundedCornerShape(20.dp)
+    val failed = pending.failed
+    val container = if (failed) {
+        MaterialTheme.colorScheme.errorContainer
+    } else {
+        colors.outgoing.copy(alpha = 0.72f)
+    }
+    val content = if (failed) {
+        MaterialTheme.colorScheme.onErrorContainer
+    } else {
+        colors.onOutgoing.copy(alpha = 0.92f)
+    }
+    val meta = content.copy(alpha = 0.75f)
+    val border = if (failed) BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.55f)) else null
+
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        horizontalAlignment = Alignment.End,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (failed) {
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.size(32.dp).padding(end = 4.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = "Dismiss failed message",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+            Surface(
+                shape = shape,
+                color = container,
+                contentColor = content,
+                border = border,
+                modifier = Modifier
+                    .widthIn(max = maxBubble)
+                    .clip(shape)
+                    .then(if (failed) Modifier.clickable(onClick = onRetry) else Modifier),
+            ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    pending.quote?.let { q ->
+                        QuoteBlock(q.fromName, q.text, onOutgoing = !failed, onClick = {})
+                    }
+                    TextWithFooter(
+                        text = AnnotatedString(pending.text),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = content,
+                        footer = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(formatClock(pending.ts), style = MaterialTheme.typography.labelSmall, color = meta)
+                                Spacer(Modifier.width(4.dp))
+                                Icon(
+                                    imageVector = if (failed) Icons.Outlined.ErrorOutline else Icons.Outlined.Schedule,
+                                    contentDescription = if (failed) "Failed to send" else "Sending",
+                                    tint = if (failed) MaterialTheme.colorScheme.error else meta,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        if (failed) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier
+                    .padding(top = 3.dp, end = 6.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onRetry)
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            ) {
+                Icon(
+                    Icons.Outlined.ErrorOutline,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(13.dp),
+                )
+                Text(
+                    text = "Tap to retry",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Medium,
+                )
             }
         }
     }
@@ -1040,6 +1561,9 @@ internal fun buildChatItems(
 private fun CallSystemRow(
     msg: ChatMessage,
     highlighted: Boolean,
+    selected: Boolean = false,
+    selectionMode: Boolean = false,
+    onClick: () -> Unit = {},
     onLongPress: () -> Unit,
 ) {
     val a = msg.attachment ?: return
@@ -1060,22 +1584,33 @@ private fun CallSystemRow(
         add(formatClock(msg.ts))
     }.joinToString(" · ")
     val highlightColor by animateColorAsState(
-        targetValue = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent,
+        targetValue = when {
+            selected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            highlighted -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+            else -> Color.Transparent
+        },
         label = "callHighlight",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .background(highlightColor, RoundedCornerShape(12.dp))
+            .then(if (selectionMode) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(vertical = 4.dp, horizontal = 16.dp),
         contentAlignment = Alignment.Center,
     ) {
+        if (selectionMode) {
+            SelectionCheckIndicator(
+                selected = selected,
+                modifier = Modifier.align(Alignment.CenterStart),
+            )
+        }
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier
                 .clip(CircleShape)
-                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
                 .padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
             Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
@@ -1095,12 +1630,16 @@ private fun CallSystemRow(
 private fun CallGroupRow(
     calls: List<ChatMessage>,
     highlightedId: String?,
+    selectedIds: Set<String> = emptySet(),
+    selectionMode: Boolean = false,
+    onToggleSelect: (ChatMessage) -> Unit = {},
     onLongPressCall: (ChatMessage) -> Unit,
 ) {
     val containsHighlight = highlightedId != null && calls.any { it.id == highlightedId }
+    val containsSelected = selectedIds.isNotEmpty() && calls.any { it.id in selectedIds }
     var expanded by rememberSaveable(calls.first().id) { mutableStateOf(false) }
-    LaunchedEffect(containsHighlight) {
-        if (containsHighlight) expanded = true
+    LaunchedEffect(containsHighlight, containsSelected) {
+        if (containsHighlight || containsSelected) expanded = true
     }
     val anyMissed = calls.any { it.attachment?.call?.missed == true }
     val allVideo = calls.all { it.attachment?.call?.video == true }
@@ -1156,7 +1695,10 @@ private fun CallGroupRow(
                     CallSystemRow(
                         msg = callMsg,
                         highlighted = highlightedId == callMsg.id,
-                        onLongPress = { onLongPressCall(callMsg) },
+                        selected = callMsg.id in selectedIds,
+                        selectionMode = selectionMode,
+                        onClick = { if (selectionMode) onToggleSelect(callMsg) },
+                        onLongPress = { if (selectionMode) onToggleSelect(callMsg) else onLongPressCall(callMsg) },
                     )
                 }
             }
@@ -1171,25 +1713,39 @@ private fun SystemInfoRow(
     label: String,
     ts: Long,
     highlighted: Boolean,
+    selected: Boolean = false,
+    selectionMode: Boolean = false,
+    onClick: () -> Unit = {},
     onLongPress: () -> Unit,
 ) {
     val highlightColor by animateColorAsState(
-        targetValue = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent,
+        targetValue = when {
+            selected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            highlighted -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+            else -> Color.Transparent
+        },
         label = "systemHighlight",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .background(highlightColor, RoundedCornerShape(12.dp))
+            .then(if (selectionMode) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(vertical = 4.dp, horizontal = 20.dp),
         contentAlignment = Alignment.Center,
     ) {
+        if (selectionMode) {
+            SelectionCheckIndicator(
+                selected = selected,
+                modifier = Modifier.align(Alignment.CenterStart),
+            )
+        }
         Surface(
             shape = CircleShape,
             color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.55f),
             modifier = Modifier
                 .clip(CircleShape)
-                .combinedClickable(onClick = {}, onLongClick = onLongPress),
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress),
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1215,6 +1771,16 @@ private fun SystemInfoRow(
     }
 }
 
+@Composable
+private fun SelectionCheckIndicator(selected: Boolean, modifier: Modifier = Modifier) {
+    Icon(
+        imageVector = if (selected) Icons.Filled.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
+        contentDescription = if (selected) "Selected" else "Not selected",
+        tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+        modifier = modifier.size(22.dp),
+    )
+}
+
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun MessageRow(
@@ -1224,6 +1790,9 @@ private fun MessageRow(
     lastOfRun: Boolean,
     maxBubble: Dp,
     highlighted: Boolean,
+    selectionMode: Boolean = false,
+    selected: Boolean = false,
+    onToggleSelect: () -> Unit = {},
     onLongPress: () -> Unit,
     onOpenReactions: () -> Unit,
     onQuoteClick: (Quote) -> Unit,
@@ -1242,8 +1811,12 @@ private fun MessageRow(
     val currentSettleSpec by rememberUpdatedState(settleSpec)
 
     val highlightColor by animateColorAsState(
-        targetValue = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.24f) else Color.Transparent,
-        animationSpec = tween(durationMillis = if (highlighted) 160 else 640),
+        targetValue = when {
+            selected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            highlighted -> MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
+            else -> Color.Transparent
+        },
+        animationSpec = tween(durationMillis = if (highlighted || selected) 160 else 640),
         label = "bubbleHighlight",
     )
 
@@ -1252,7 +1825,8 @@ private fun MessageRow(
             .fillMaxWidth()
             .padding(top = if (firstOfRun) 8.dp else 2.dp)
             .clip(RoundedCornerShape(20.dp))
-            .background(highlightColor),
+            .background(highlightColor)
+            .then(if (selectionMode) Modifier.clickable(onClick = onToggleSelect) else Modifier),
     ) {
         // Revealed while swiping a message to the right to reply to it.
         if (dragOffset > 0f) {
@@ -1275,8 +1849,8 @@ private fun MessageRow(
             Modifier
                 .fillMaxWidth()
                 .offset { IntOffset(dragOffset.roundToInt(), 0) }
-                .pointerInput(msg.id, msg.recalled) {
-                    if (msg.recalled) {
+                .pointerInput(msg.id, msg.recalled, selectionMode) {
+                    if (msg.recalled || selectionMode) {
                         dragOffset = 0f
                         return@pointerInput
                     }
@@ -1319,38 +1893,56 @@ private fun MessageRow(
                         },
                     )
                 },
-            horizontalArrangement = if (self) Arrangement.End else Arrangement.Start,
-            verticalAlignment = Alignment.Bottom,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (isGroup && !self) {
-                Box(Modifier.width(36.dp)) {
-                    if (lastOfRun) Avatar(msg.fromName, "", key = msg.fromId, isGroup = false, size = 28.dp)
-                }
+            if (selectionMode) {
+                SelectionCheckIndicator(
+                    selected = selected,
+                    modifier = Modifier.padding(start = 4.dp, end = 8.dp),
+                )
             }
-            Column(
-                horizontalAlignment = if (self) Alignment.End else Alignment.Start,
-                modifier = Modifier.widthIn(max = maxBubble),
+            Row(
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = if (self) Arrangement.End else Arrangement.Start,
+                verticalAlignment = Alignment.Bottom,
             ) {
-                if (msg.attachment?.kind == "sticker" && !msg.recalled) {
-                    StickerBubble(msg, isGroup, firstOfRun, onLongPress)
-                } else {
-                    Bubble(
-                        msg = msg,
-                        isGroup = isGroup,
-                        firstOfRun = firstOfRun,
-                        lastOfRun = lastOfRun,
-                        onLongPress = onLongPress,
-                        onOpenImage = onOpenImage,
-                        onQuoteClick = onQuoteClick,
-                        onOpenUrl = onOpenUrl,
-                    )
+                if (isGroup && !self) {
+                    Box(Modifier.width(36.dp)) {
+                        if (lastOfRun) Avatar(msg.fromName, "", key = msg.fromId, isGroup = false, size = 28.dp)
+                    }
                 }
-                if (msg.reactions.isNotEmpty()) {
-                    Reactions(
-                        msg = msg,
-                        onClick = onOpenReactions,
-                        modifier = Modifier.offset(y = (-6).dp).padding(horizontal = 10.dp),
-                    )
+                Column(
+                    horizontalAlignment = if (self) Alignment.End else Alignment.Start,
+                    modifier = Modifier.widthIn(max = maxBubble),
+                ) {
+                    if (msg.attachment?.kind == "sticker" && !msg.recalled) {
+                        StickerBubble(
+                            msg = msg,
+                            isGroup = isGroup,
+                            firstOfRun = firstOfRun,
+                            onClick = { if (selectionMode) onToggleSelect() },
+                            onLongPress = onLongPress,
+                        )
+                    } else {
+                        Bubble(
+                            msg = msg,
+                            isGroup = isGroup,
+                            firstOfRun = firstOfRun,
+                            lastOfRun = lastOfRun,
+                            onClick = { if (selectionMode) onToggleSelect() },
+                            onLongPress = onLongPress,
+                            onOpenImage = onOpenImage,
+                            onQuoteClick = onQuoteClick,
+                            onOpenUrl = onOpenUrl,
+                        )
+                    }
+                    if (msg.reactions.isNotEmpty()) {
+                        Reactions(
+                            msg = msg,
+                            onClick = onOpenReactions,
+                            modifier = Modifier.offset(y = (-6).dp).padding(horizontal = 10.dp),
+                        )
+                    }
                 }
             }
         }
@@ -1364,6 +1956,7 @@ private fun Bubble(
     isGroup: Boolean,
     firstOfRun: Boolean,
     lastOfRun: Boolean,
+    onClick: () -> Unit = {},
     onLongPress: () -> Unit,
     onOpenImage: (String) -> Unit,
     onQuoteClick: (Quote) -> Unit,
@@ -1383,7 +1976,7 @@ private fun Bubble(
     val content = if (self) colors.onOutgoing else colors.onIncoming
     val meta = content.copy(alpha = 0.75f)
     val attachment = msg.attachment?.takeIf { !msg.recalled && it.isShown() }
-    val isFramelessMedia = attachment != null && attachment.kind in setOf("photo", "gif", "video")
+    val isFramelessMedia = attachment != null && attachment.hasRenderableMedia()
 
     val footer: @Composable () -> Unit = {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1400,12 +1993,12 @@ private fun Bubble(
         color = container,
         contentColor = content,
         shadowElevation = shadowElevation,
-        modifier = Modifier.clip(shape).combinedClickable(onClick = {}, onLongClick = onLongPress),
+        modifier = Modifier.clip(shape).combinedClickable(onClick = onClick, onLongClick = onLongPress),
     ) {
         if (isFramelessMedia && attachment != null) {
             val caption = attachment.caption()
             val showHeader = (isGroup && !self && firstOfRun && msg.fromName.isNotBlank()) || msg.quote != null
-            Column {
+            Column(Modifier.widthIn(max = 280.dp)) {
                 if (showHeader) {
                     Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp)) {
                         if (isGroup && !self && firstOfRun && msg.fromName.isNotBlank()) {
@@ -1488,6 +2081,13 @@ private fun Bubble(
                         color = content,
                         footer = footer,
                     )
+                    if (!self) {
+                        val otp = remember(msg.text) { extractOtpCode(msg.text) }
+                        if (otp != null) {
+                            Spacer(Modifier.height(8.dp))
+                            OtpCopyChip(otp = otp)
+                        }
+                    }
                 }
             }
         }
@@ -1497,10 +2097,16 @@ private fun Bubble(
 /** A sticker stands on its own, without a bubble; the time sits under it. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun StickerBubble(msg: ChatMessage, isGroup: Boolean, firstOfRun: Boolean, onLongPress: () -> Unit) {
+private fun StickerBubble(
+    msg: ChatMessage,
+    isGroup: Boolean,
+    firstOfRun: Boolean,
+    onClick: () -> Unit = {},
+    onLongPress: () -> Unit,
+) {
     Column(
         horizontalAlignment = if (msg.isSelf) Alignment.End else Alignment.Start,
-        modifier = Modifier.clip(RoundedCornerShape(12.dp)).combinedClickable(onClick = {}, onLongClick = onLongPress),
+        modifier = Modifier.clip(RoundedCornerShape(12.dp)).combinedClickable(onClick = onClick, onLongClick = onLongPress),
     ) {
         if (isGroup && !msg.isSelf && firstOfRun && msg.fromName.isNotBlank()) {
             Text(
@@ -1853,9 +2459,10 @@ private fun FocusedMessageOverlay(
                     if (msg.isText) {
                         ToolbarActionItem("Forward", Icons.AutoMirrored.Outlined.Forward) { onAction(MessageAction.FORWARD) }
                     }
-                    if (msg.isSelf) {
-                        ToolbarActionItem("Recall", Icons.AutoMirrored.Outlined.Undo, destructive = true) { onAction(MessageAction.RECALL) }
-                    }
+                }
+                ToolbarActionItem("Select", Icons.Outlined.CheckCircle) { onAction(MessageAction.SELECT) }
+                if (!msg.recalled && msg.isSelf) {
+                    ToolbarActionItem("Recall", Icons.AutoMirrored.Outlined.Undo, destructive = true) { onAction(MessageAction.RECALL) }
                 }
                 ToolbarActionItem("Delete", Icons.Outlined.DeleteOutline, destructive = true) { onAction(MessageAction.DELETE) }
             }
@@ -1876,7 +2483,7 @@ private fun ToolbarActionItem(
         modifier = Modifier
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .padding(horizontal = 8.dp, vertical = 6.dp),
     ) {
         Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(20.dp))
         Spacer(Modifier.height(2.dp))
@@ -1917,30 +2524,39 @@ private fun TypingBubble(isGroup: Boolean, typing: TypingInfo) {
     }
 }
 
-/** Message input: a rounded field with a unified emoji/sticker drawer, Signal-style attachment sheet, and spring Send button. */
+/** Message input: rounded field, emoji/sticker drawer, attachment sheet, hold-to-record voice, and keyboard shortcuts. */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun Composer(
+    threadKey: String,
+    initialDraft: String,
+    onDraftChange: (String) -> Unit,
     isGroup: Boolean,
     members: List<GroupMember>?,
     sending: Boolean,
     uploading: Int,
     stickers: StickerSearch,
+    onTakePhoto: () -> Unit,
     onPickMedia: () -> Unit,
     onPickFiles: () -> Unit,
     onPickSticker: () -> Unit,
     onSearchStickers: (String) -> Unit,
     onSendSticker: (StickerInfo) -> Unit,
+    onSendVoice: (File) -> Unit,
     replyTo: ChatMessage?,
     onCancelReply: () -> Unit,
     onStartTyping: () -> Unit,
     onLoadMembers: () -> Unit,
     onSend: (String, List<GroupMember>, onSent: () -> Unit) -> Unit,
 ) {
+    val context = LocalContext.current
     val colors = LocalChatColors.current
     val haptics = LocalHapticFeedback.current
-    var value by remember { mutableStateOf(TextFieldValue("")) }
-    val mentioned = remember { mutableStateListOf<GroupMember>() }
+    val recorderScope = rememberCoroutineScope()
+    var value by remember(threadKey) {
+        mutableStateOf(TextFieldValue(initialDraft, TextRange(initialDraft.length)))
+    }
+    val mentioned = remember(threadKey) { mutableStateListOf<GroupMember>() }
     var showEmoji by rememberSaveable { mutableStateOf(false) }
     var attachSheet by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -1948,6 +2564,46 @@ private fun Composer(
     val density = LocalDensity.current
     val ime = WindowInsets.ime
     val imeVisible by remember(ime, density) { derivedStateOf { ime.getBottom(density) > 0 } }
+
+    val voiceRecorder = remember(context) { VoiceRecorder(context) }
+    val isRecording by voiceRecorder.isRecording.collectAsStateWithLifecycle()
+    val recordingElapsedMs by voiceRecorder.elapsedMs.collectAsStateWithLifecycle()
+    val recordingAmplitudes by voiceRecorder.amplitudes.collectAsStateWithLifecycle()
+    var recordingLocked by remember(threadKey) { mutableStateOf(false) }
+    var slideOffsetX by remember { mutableFloatStateOf(0f) }
+    var slideOffsetY by remember { mutableFloatStateOf(0f) }
+
+    DisposableEffect(Unit) {
+        onDispose { voiceRecorder.cancel() }
+    }
+    DisposableEffect(threadKey) {
+        onDispose {
+            voiceRecorder.cancel()
+            recordingLocked = false
+        }
+    }
+    LaunchedEffect(isRecording) {
+        if (!isRecording) {
+            recordingLocked = false
+            slideOffsetX = 0f
+            slideOffsetY = 0f
+        }
+    }
+    BackHandler(enabled = isRecording && recordingLocked) {
+        voiceRecorder.cancel()
+        recordingLocked = false
+    }
+
+    val recordAudioPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) {
+            Toast.makeText(context, "Microphone permission is needed for voice messages", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val currentOnSendVoice by rememberUpdatedState(onSendVoice)
+    val currentRequestAudioPerm by rememberUpdatedState {
+        recordAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
     // The keyboard and the emoji/sticker drawer take turns.
     LaunchedEffect(imeVisible) { if (imeVisible) showEmoji = false }
     // Starting a reply (swipe or menu) goes straight to typing it.
@@ -1967,16 +2623,23 @@ private fun Composer(
         if (q == null) emptyList() else members.orEmpty().filter { foldForSearch(it.name).contains(q) }.take(6)
     }
 
+    fun updateValue(newValue: TextFieldValue) {
+        if (newValue.text != value.text) {
+            onDraftChange(newValue.text)
+        }
+        value = newValue
+    }
+
     fun replaceSelection(insert: String) {
         val start = value.selection.min
-        value = TextFieldValue(value.text.replaceRange(start, value.selection.max, insert), TextRange(start + insert.length))
+        updateValue(TextFieldValue(value.text.replaceRange(start, value.selection.max, insert), TextRange(start + insert.length)))
     }
 
     fun insertMention(member: GroupMember) {
         val (start, _) = mentionQuery ?: return
         val end = value.selection.start
         val tag = "@${member.name} "
-        value = TextFieldValue(value.text.replaceRange(start, end, tag), TextRange(start + tag.length))
+        updateValue(TextFieldValue(value.text.replaceRange(start, end, tag), TextRange(start + tag.length)))
         mentioned += member
     }
 
@@ -1988,15 +2651,70 @@ private fun Composer(
         val cursor = value.selection.start
         if (cursor == 0) return
         val start = previousCharacterStart(value.text, cursor)
-        value = TextFieldValue(value.text.removeRange(start, cursor), TextRange(start))
+        updateValue(TextFieldValue(value.text.removeRange(start, cursor), TextRange(start)))
+    }
+
+    fun sendCurrentText() {
+        if (sending || value.text.isBlank()) return
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        val sentText = value.text
+        onSend(sentText, mentioned.toList()) {
+            if (value.text == sentText) {
+                value = TextFieldValue("")
+                mentioned.clear()
+                onDraftChange("")
+            }
+        }
     }
 
     var showCreatePoll by remember { mutableStateOf(false) }
     if (showCreatePoll) CreatePollDialog(onDismiss = { showCreatePoll = false })
     val canCreatePoll = isGroup && LocalPolls.current != null
+    val cancelThresholdPx = with(density) { 96.dp.toPx() }
+    val lockThresholdPx = with(density) { 72.dp.toPx() }
+
     Column(Modifier.background(colors.background).navigationBarsPadding().imePadding()) {
         if (uploading > 0) UploadingNote(uploading)
-        if (suggestions.isNotEmpty()) {
+        if (isRecording && !recordingLocked) {
+            val lockProgress = (-slideOffsetY / lockThresholdPx).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(end = 12.dp, bottom = 4.dp),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shadowElevation = 2.dp,
+                    modifier = Modifier.graphicsLayer {
+                        translationY = (slideOffsetY * 0.35f).coerceAtLeast(-28f)
+                        val s = 1f + 0.12f * lockProgress
+                        scaleX = s
+                        scaleY = s
+                    },
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
+                        Icon(
+                            Icons.Outlined.Lock,
+                            contentDescription = "Slide up to lock recording",
+                            tint = if (lockProgress > 0.7f) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Icon(
+                            Icons.Filled.KeyboardArrowUp,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
+        }
+        if (!isRecording && suggestions.isNotEmpty()) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                 shape = RoundedCornerShape(16.dp),
@@ -2017,109 +2735,253 @@ private fun Composer(
             }
         }
         val ultra = LocalUltraExpressive.current
+        val buttonSize = if (ultra) 116.dp else 48.dp
+        val showSendButton = value.text.isNotBlank() || sending || (isRecording && recordingLocked)
+
         Row(
             Modifier.padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            FilledIconButton(
-                onClick = { attachSheet = true },
-                colors = IconButtonDefaults.filledIconButtonColors(
-                    containerColor = colors.outgoing,
-                    contentColor = colors.onOutgoing,
-                ),
-                modifier = Modifier.padding(end = 8.dp).size(if (ultra) 88.dp else 48.dp),
-            ) {
-                Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(if (ultra) 46.dp else 26.dp))
-            }
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                modifier = Modifier.weight(1f),
-            ) {
-                Column {
-                    replyTo?.let { ReplyPreview(it, onCancelReply) }
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        IconButton(onClick = {
-                            if (showEmoji) {
-                                showEmoji = false
-                                runCatching { focus.requestFocus() }
-                                keyboard?.show()
-                            } else {
-                                keyboard?.hide()
-                                showEmoji = true
-                            }
-                        }) {
-                            Icon(
-                                if (showEmoji) Icons.Outlined.Keyboard else Icons.Outlined.EmojiEmotions,
-                                contentDescription = if (showEmoji) "Show keyboard" else "Emoji & stickers",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        BasicTextField(
-                            value = value,
-                            onValueChange = {
-                                if (it.text != value.text && it.text.isNotEmpty()) onStartTyping()
-                                value = it
-                            },
-                            textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                            maxLines = 6,
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(top = 13.dp, bottom = 13.dp, end = 16.dp)
-                                .focusRequester(focus),
-                            decorationBox = { inner ->
-                                Box {
-                                    if (value.text.isEmpty()) {
-                                        Text(
-                                            "Message",
-                                            style = MaterialTheme.typography.bodyLarge,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-                                    inner()
-                                }
-                            },
+            if (isRecording) {
+                if (recordingLocked) {
+                    IconButton(
+                        onClick = {
+                            voiceRecorder.cancel()
+                            recordingLocked = false
+                        },
+                        modifier = Modifier.padding(end = 4.dp).size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Outlined.DeleteOutline,
+                            contentDescription = "Cancel recording",
+                            tint = MaterialTheme.colorScheme.error,
                         )
                     }
                 }
+                VoiceRecordingBar(
+                    elapsedMs = recordingElapsedMs,
+                    amplitudes = recordingAmplitudes,
+                    locked = recordingLocked,
+                    slideCancelProgress = (-slideOffsetX / cancelThresholdPx).coerceIn(0f, 1f),
+                    slideOffsetX = slideOffsetX,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                FilledIconButton(
+                    onClick = { attachSheet = true },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = colors.outgoing,
+                        contentColor = colors.onOutgoing,
+                    ),
+                    modifier = Modifier.padding(end = 8.dp).size(if (ultra) 88.dp else 48.dp),
+                ) {
+                    Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(if (ultra) 46.dp else 26.dp))
+                }
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Column {
+                        replyTo?.let { ReplyPreview(it, onCancelReply) }
+                        Row(verticalAlignment = Alignment.Bottom) {
+                            IconButton(onClick = {
+                                if (showEmoji) {
+                                    showEmoji = false
+                                    runCatching { focus.requestFocus() }
+                                    keyboard?.show()
+                                } else {
+                                    keyboard?.hide()
+                                    showEmoji = true
+                                }
+                            }) {
+                                Icon(
+                                    if (showEmoji) Icons.Outlined.Keyboard else Icons.Outlined.EmojiEmotions,
+                                    contentDescription = if (showEmoji) "Show keyboard" else "Emoji & stickers",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            BasicTextField(
+                                value = value,
+                                onValueChange = {
+                                    if (it.text != value.text && it.text.isNotEmpty()) onStartTyping()
+                                    updateValue(it)
+                                },
+                                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                                maxLines = 6,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(top = 13.dp, bottom = 13.dp, end = 16.dp)
+                                    .focusRequester(focus)
+                                    .onPreviewKeyEvent { event ->
+                                        val isPlainEnter = event.type == KeyEventType.KeyDown &&
+                                            (event.key == Key.Enter || event.key == Key.NumPadEnter) &&
+                                            !event.isShiftPressed &&
+                                            !event.isAltPressed &&
+                                            !event.isCtrlPressed
+                                        if (isPlainEnter && !sending && value.text.isNotBlank()) {
+                                            sendCurrentText()
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    },
+                                decorationBox = { inner ->
+                                    Box {
+                                        if (value.text.isEmpty()) {
+                                            Text(
+                                                "Message",
+                                                style = MaterialTheme.typography.bodyLarge,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        inner()
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
             }
-            AnimatedVisibility(
-                visible = value.text.isNotBlank() || ultra,
-                enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleIn(MaterialTheme.motionScheme.fastSpatialSpec()),
-                exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleOut(MaterialTheme.motionScheme.fastSpatialSpec()),
-            ) {
+
+            if (showSendButton) {
+                val isVoiceSend = isRecording && recordingLocked
                 FilledIconButton(
                     onClick = {
-                        if (value.text.isBlank()) return@FilledIconButton
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        val sentText = value.text
-                        onSend(sentText, mentioned.toList()) {
-                            if (value.text == sentText) {
-                                value = TextFieldValue("")
-                                mentioned.clear()
-                            }
+                        if (isVoiceSend) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            recordingLocked = false
+                            val file = voiceRecorder.stop()
+                            if (file != null) currentOnSendVoice(file)
+                        } else {
+                            sendCurrentText()
                         }
                     },
-                    enabled = !sending && value.text.isNotBlank(),
+                    enabled = isVoiceSend || (!sending && value.text.isNotBlank()),
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = if (ultra) Color(0xFFFF9EA8) else colors.outgoing,
                         contentColor = if (ultra) Color(0xFF1F1114) else colors.onOutgoing,
                         disabledContainerColor = if (ultra) Color(0xFFFF9EA8).copy(alpha = 0.72f) else colors.outgoing.copy(alpha = 0.38f),
                         disabledContentColor = if (ultra) Color(0xFF1F1114).copy(alpha = 0.72f) else colors.onOutgoing.copy(alpha = 0.38f),
                     ),
-                    modifier = Modifier.padding(start = 8.dp).size(if (ultra) 116.dp else 48.dp),
+                    modifier = Modifier.padding(start = 8.dp).size(buttonSize),
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send",
+                        contentDescription = if (isVoiceSend) "Send voice message" else "Send",
                         modifier = Modifier.size(if (ultra) 56.dp else 24.dp),
                     )
                 }
+            } else {
+                // Keep mounted through the entire press-hold-drag-release gesture so pointerInput is never cancelled.
+                val micScale by animateFloatAsState(
+                    targetValue = if (isRecording) 1.18f else 1f,
+                    animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+                    label = "micHoldScale",
+                )
+                Surface(
+                    shape = CircleShape,
+                    color = if (isRecording) MaterialTheme.colorScheme.error else if (ultra) Color(0xFFFF9EA8) else colors.outgoing,
+                    contentColor = if (isRecording) MaterialTheme.colorScheme.onError else if (ultra) Color(0xFF1F1114) else colors.onOutgoing,
+                    shadowElevation = if (isRecording) 6.dp else 0.dp,
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .size(buttonSize)
+                        .systemGestureExclusion()
+                        .graphicsLayer {
+                            scaleX = micScale
+                            scaleY = micScale
+                            if (isRecording) {
+                                translationX = slideOffsetX.coerceIn(-cancelThresholdPx * 0.45f, 0f)
+                                translationY = slideOffsetY.coerceIn(-lockThresholdPx * 0.35f, 0f)
+                            }
+                        }
+                        .pointerInput(voiceRecorder) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val hasAudio = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO,
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (!hasAudio) {
+                                    currentRequestAudioPerm()
+                                    do {
+                                        val ev = awaitPointerEvent()
+                                    } while (ev.changes.any { it.pressed })
+                                    return@awaitEachGesture
+                                }
+
+                                VoicePlayback.stop()
+                                val started = voiceRecorder.start(recorderScope)
+                                if (!started) {
+                                    Toast.makeText(context, "Couldn't start recording", Toast.LENGTH_SHORT).show()
+                                    return@awaitEachGesture
+                                }
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                recordingLocked = false
+                                slideOffsetX = 0f
+                                slideOffsetY = 0f
+
+                                var totalDx = 0f
+                                var totalDy = 0f
+                                var canceledBySlide = false
+                                var lockedBySlide = false
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (!change.pressed) {
+                                        change.consume()
+                                        break
+                                    }
+                                    val delta = change.position - change.previousPosition
+                                    totalDx += delta.x
+                                    totalDy += delta.y
+                                    slideOffsetX = totalDx.coerceAtMost(0f)
+                                    slideOffsetY = totalDy.coerceAtMost(0f)
+                                    change.consume()
+
+                                    if (totalDx <= -cancelThresholdPx) {
+                                        canceledBySlide = true
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        voiceRecorder.cancel()
+                                        break
+                                    }
+                                    if (totalDy <= -lockThresholdPx) {
+                                        lockedBySlide = true
+                                        recordingLocked = true
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        break
+                                    }
+                                }
+
+                                slideOffsetX = 0f
+                                slideOffsetY = 0f
+
+                                if (!canceledBySlide && !lockedBySlide) {
+                                    val file = voiceRecorder.stop()
+                                    if (file != null) {
+                                        currentOnSendVoice(file)
+                                    } else {
+                                        Toast.makeText(context, "Hold to record a voice message", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        },
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Outlined.Mic,
+                            contentDescription = "Hold to record voice message",
+                            modifier = Modifier.size(if (ultra) 56.dp else 24.dp),
+                        )
+                    }
+                }
             }
         }
-        if (showEmoji) {
+        if (showEmoji && !isRecording) {
             EmojiStickerDrawer(
                 stickers = stickers,
                 onEmoji = { emoji ->
@@ -2138,6 +3000,10 @@ private fun Composer(
     if (attachSheet) {
         AttachmentSheet(
             onDismiss = { attachSheet = false },
+            onTakePhoto = {
+                attachSheet = false
+                onTakePhoto()
+            },
             onPickMedia = {
                 attachSheet = false
                 onPickMedia()
@@ -2164,23 +3030,121 @@ private fun Composer(
     }
 }
 
+/** Live recording bar overlay shown inside the composer while recording a voice note. */
+@Composable
+private fun VoiceRecordingBar(
+    elapsedMs: Long,
+    amplitudes: List<Float>,
+    locked: Boolean,
+    slideCancelProgress: Float,
+    slideOffsetX: Float,
+    modifier: Modifier = Modifier,
+) {
+    val pulseTransition = rememberInfiniteTransition(label = "voiceRecPulse")
+    val dotAlpha by pulseTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(550), RepeatMode.Reverse),
+        label = "recDotAlpha",
+    )
+    val waveColor = MaterialTheme.colorScheme.primary
+    val trackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f)
+
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = modifier.height(48.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .graphicsLayer { alpha = dotAlpha }
+                    .background(Color(0xFFE53935), CircleShape),
+            )
+            Text(
+                text = formatRecordingDuration(elapsedMs),
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontWeight = FontWeight.SemiBold,
+                    fontFeatureSettings = "tnum",
+                ),
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+            )
+            Canvas(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(24.dp),
+            ) {
+                val maxBars = 28
+                val step = size.width / maxBars
+                val barWidth = (step * 0.56f).coerceIn(2.dp.toPx(), 3.5.dp.toPx())
+                val radius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                val visible = if (amplitudes.size > maxBars) amplitudes.takeLast(maxBars) else amplitudes
+                val startOffset = maxBars - visible.size
+                for (i in 0 until maxBars) {
+                    val left = i * step + (step - barWidth) / 2f
+                    val amp = if (i >= startOffset) visible[i - startOffset] else null
+                    val h = if (amp != null) {
+                        (size.height * amp.coerceIn(0.12f, 1f)).coerceAtLeast(barWidth)
+                    } else {
+                        barWidth
+                    }
+                    val top = (size.height - h) / 2f
+                    drawRoundRect(
+                        color = if (amp != null) waveColor else trackColor,
+                        topLeft = Offset(left, top),
+                        size = Size(barWidth, h),
+                        cornerRadius = radius,
+                    )
+                }
+            }
+            if (!locked) {
+                Text(
+                    text = "← Slide to cancel",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (slideCancelProgress > 0.65f) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    modifier = Modifier.graphicsLayer {
+                        translationX = (slideOffsetX * 0.25f).coerceAtLeast(-28f)
+                        alpha = (1f - slideCancelProgress * 0.6f).coerceIn(0.35f, 1f)
+                    },
+                )
+            }
+        }
+    }
+}
+
 /** Signal-style attachment sheet with expressive 60.dp rounded-squircle tinted tiles. */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun AttachmentSheet(
     onDismiss: () -> Unit,
+    onTakePhoto: () -> Unit,
     onPickMedia: () -> Unit,
     onPickFiles: () -> Unit,
     onPickSticker: () -> Unit,
     onCreatePoll: (() -> Unit)? = null,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Row(
-            Modifier
+        FlowRow(
+            modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            AttachmentTile(
+                label = "Camera",
+                icon = Icons.Outlined.PhotoCamera,
+                container = MaterialTheme.colorScheme.secondaryContainer,
+                content = MaterialTheme.colorScheme.onSecondaryContainer,
+                onClick = onTakePhoto,
+            )
             AttachmentTile(
                 label = "Photos & videos",
                 icon = Icons.Outlined.PhotoLibrary,
@@ -2226,7 +3190,7 @@ private fun AttachmentTile(
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .widthIn(min = 84.dp)
+            .widthIn(min = 76.dp)
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
             .padding(8.dp),
@@ -2290,6 +3254,30 @@ private fun findQuotedMessageId(messages: List<ChatMessage>, quote: Quote): Stri
         }?.let { return it.id }
     }
     return null
+}
+
+/** `(messageId, fullUrl)` pairs for all non-recalled photo/GIF messages in [messages], oldest first. */
+internal fun extractChatPhotoEntries(messages: List<ChatMessage>): List<Pair<String, String>> =
+    messages.mapNotNull { msg ->
+        if (msg.recalled) return@mapNotNull null
+        val a = msg.attachment ?: return@mapNotNull null
+        if (a.kind != "photo" && a.kind != "gif") return@mapNotNull null
+        val image = a.image ?: return@mapNotNull null
+        val full = (a.href ?: image).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        msg.id to full
+    }
+
+/** Full image URLs of all non-recalled photo/GIF messages in [messages], in chronological order. */
+internal fun extractChatPhotoUrls(messages: List<ChatMessage>): List<String> =
+    extractChatPhotoEntries(messages).map { it.second }
+
+/** Resolves the gallery index for a tapped photo, preferring [msgId] match when duplicate URLs exist. */
+internal fun findChatPhotoIndex(entries: List<Pair<String, String>>, msgId: String?, url: String): Int {
+    if (msgId != null) {
+        val byId = entries.indexOfFirst { it.first == msgId }
+        if (byId >= 0) return byId
+    }
+    return entries.indexOfFirst { it.second == url }
 }
 
 /** IDs of non-recalled messages matching [query] (case- and diacritic-insensitive), newest first. */

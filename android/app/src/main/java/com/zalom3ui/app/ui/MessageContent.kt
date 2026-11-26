@@ -44,7 +44,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import android.content.ClipData
+import android.content.ClipboardManager
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MissedVideoCall
@@ -52,8 +57,10 @@ import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.automirrored.outlined.PhoneMissed
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
@@ -61,7 +68,9 @@ import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LocationOn
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingToolbarDefaults
 import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
@@ -109,6 +118,7 @@ import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
+import com.zalom3ui.app.data.isLocalMediaUri
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.abs
@@ -126,10 +136,20 @@ import kotlinx.coroutines.withContext
 private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
-fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null)
+fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS &&
+    (href != null || thumb != null || title != null || description != null || otp != null || actionLabel != null || kind in setOf("photo", "gif", "video"))
 
-/** Caption under a photo or video, when the sender wrote one. */
-fun Attachment.caption(): String? = title?.takeIf { kind in setOf("photo", "gif", "video") && it.isNotBlank() }
+/** Whether a photo, GIF, or video has a remote URL that can be rendered frameless. */
+fun Attachment.hasRenderableMedia(): Boolean = when (kind) {
+    "photo", "gif" -> image != null
+    "video" -> remoteThumb != null || remoteHref != null
+    else -> false
+}
+
+/** Caption under a photo or video, when the sender wrote one (ignoring local phone content/file URIs). */
+fun Attachment.caption(): String? = title?.takeIf {
+    kind in setOf("photo", "gif", "video") && it.isNotBlank() && !isLocalMediaUri(it)
+}
 
 /** "4:05" for a voice or video length in ms. */
 fun formatDuration(ms: Long): String {
@@ -192,17 +212,39 @@ fun AttachmentContent(
     val context = LocalContext.current
     when (a.kind) {
         "photo", "gif" -> {
-            val image = a.image ?: return
-            MediaFrame(image, mediaAspect(a.width, a.height), edgeToEdge = edgeToEdge, onClick = { onOpenImage(a.href ?: image) })
+            val image = a.image
+            if (image == null) {
+                UnavailableMediaRow(
+                    label = if (a.kind == "gif") "GIF unavailable" else "Photo unavailable",
+                    isVideo = false,
+                    onOutgoing = onOutgoing,
+                )
+                return
+            }
+            val fullUrl = a.remoteHref ?: image
+            val fallback = fullUrl.takeIf { it != image }
+            MediaFrame(
+                url = image,
+                aspect = mediaAspect(a.width, a.height),
+                edgeToEdge = edgeToEdge,
+                fallbackUrl = fallback,
+                onClick = { onOpenImage(fullUrl) },
+            )
         }
         "video" -> {
+            val thumb = a.remoteThumb
+            val videoUrl = a.remoteHref
+            if (thumb == null && videoUrl == null) {
+                UnavailableMediaRow(label = "Video unavailable", isVideo = true, onOutgoing = onOutgoing)
+                return
+            }
             Box(contentAlignment = Alignment.Center) {
-                if (a.thumb != null) {
+                if (thumb != null) {
                     MediaFrame(
-                        a.thumb,
-                        mediaAspect(a.width, a.height),
+                        url = thumb,
+                        aspect = mediaAspect(a.width, a.height),
                         edgeToEdge = edgeToEdge,
-                        onClick = { a.href?.let { openExternally(context, it, "video/*") } },
+                        onClick = { videoUrl?.let { openExternally(context, it, "video/*") } },
                     )
                 } else {
                     val placeholderMod = if (edgeToEdge) {
@@ -220,8 +262,8 @@ fun AttachmentContent(
                         placeholderMod
                             .background(Color.Black)
                             .then(
-                                if (a.href != null) {
-                                    Modifier.clickable { openExternally(context, a.href, "video/*") }
+                                if (videoUrl != null) {
+                                    Modifier.clickable { openExternally(context, videoUrl, "video/*") }
                                 } else {
                                     Modifier
                                 },
@@ -254,7 +296,7 @@ fun AttachmentContent(
             onOutgoing = onOutgoing,
             onClick = a.href?.let { href -> { openExternally(context, href) } },
         )
-        "link" -> LinkCard(a, onOutgoing, onClick = a.href?.let { href -> { openExternally(context, href) } })
+        "link" -> LinkCard(a, onOutgoing, onClick = a.remoteHref?.let { href -> { openExternally(context, href) } })
         "contact" -> CardRow(
             icon = { Avatar(a.title.orEmpty(), a.thumb.orEmpty(), key = a.userId ?: a.title.orEmpty(), isGroup = false, size = 40.dp) },
             title = a.title ?: "Contact",
@@ -299,20 +341,62 @@ private fun StickerPlaceholder() {
 }
 
 @Composable
-private fun MediaFrame(url: String, aspect: Float, edgeToEdge: Boolean = false, onClick: () -> Unit) {
-    SubcomposeAsyncImage(
-        model = url,
-        contentDescription = "Photo",
-        contentScale = ContentScale.Crop,
-        modifier = Modifier
-            .widthIn(max = if (edgeToEdge) 280.dp else 260.dp)
+private fun UnavailableMediaRow(label: String, isVideo: Boolean, onOutgoing: Boolean) {
+    val content = LocalContentColor.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(vertical = 2.dp),
+    ) {
+        Icon(
+            if (isVideo) Icons.Outlined.Videocam else Icons.Outlined.BrokenImage,
+            contentDescription = null,
+            tint = content.copy(alpha = 0.72f),
+            modifier = Modifier.size(20.dp),
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = content.copy(alpha = 0.80f),
+        )
+    }
+}
+
+@Composable
+private fun MediaFrame(
+    url: String,
+    aspect: Float,
+    edgeToEdge: Boolean = false,
+    fallbackUrl: String? = null,
+    onClick: () -> Unit,
+) {
+    var activeUrl by remember(url, fallbackUrl) { mutableStateOf(url) }
+    val frameMod = if (edgeToEdge) {
+        val frameHeight = (280.dp / aspect).coerceIn(140.dp, 340.dp)
+        Modifier
+            .widthIn(max = 280.dp)
+            .fillMaxWidth()
+            .height(frameHeight)
+    } else {
+        Modifier
+            .widthIn(max = 260.dp)
             .fillMaxWidth()
             .aspectRatio(aspect)
             .heightIn(max = 360.dp)
-            .then(if (edgeToEdge) Modifier else Modifier.clip(RoundedCornerShape(12.dp)))
-            .clickable(onClick = onClick),
+            .clip(RoundedCornerShape(12.dp))
+    }
+    SubcomposeAsyncImage(
+        model = activeUrl,
+        contentDescription = "Photo",
+        contentScale = ContentScale.Crop,
+        onError = {
+            if (fallbackUrl != null && activeUrl != fallbackUrl) {
+                activeUrl = fallbackUrl
+            }
+        },
+        modifier = frameMod.clickable(onClick = onClick),
         loading = { MediaPlaceholder() },
-        error = { MediaPlaceholder() },
+        error = { MediaUnavailablePlaceholder() },
     )
 }
 
@@ -322,6 +406,28 @@ private fun MediaPlaceholder() {
         Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) { Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+}
+
+@Composable
+private fun MediaUnavailablePlaceholder() {
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest).padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            Icons.Outlined.BrokenImage,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+            modifier = Modifier.size(28.dp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Media unavailable",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+        )
+    }
 }
 
 @Composable
@@ -387,17 +493,67 @@ private fun FileBadge(ext: String?) {
     }
 }
 
+private val OTP_KEYWORD_RE = Regex(
+    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b""",
+    RegexOption.IGNORE_CASE,
+)
+private val OTP_AFTER_RE = Regex(
+    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b[^\d\n]{0,40}?(?<!\d)(\d{4,8})(?!\d)""",
+    RegexOption.IGNORE_CASE,
+)
+private val OTP_BEFORE_RE = Regex(
+    """(?<!\d)(\d{4,8})(?!\d)[^\d\n]{0,24}\b(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)\b""",
+    RegexOption.IGNORE_CASE,
+)
+
+/**
+ * Extracts a 4–8 digit OTP / verification code when accompanied by an OTP keyword (Vietnamese or English).
+ * Ignores 9+ digit phone numbers or account IDs (e.g. `0378795621`).
+ */
+internal fun extractOtpCode(text: String): String? {
+    if (text.isBlank()) return null
+    val folded = foldForSearch(text)
+    if (!OTP_KEYWORD_RE.containsMatchIn(folded)) return null
+    OTP_AFTER_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
+    OTP_BEFORE_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
+    return null
+}
+
+/** One-tap chip that copies a detected OTP code to the clipboard. */
+@Composable
+fun OtpCopyChip(otp: String, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    FilledTonalButton(
+        onClick = {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
+            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+        },
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+        modifier = modifier,
+    ) {
+        Icon(Icons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Copy OTP · $otp", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+    }
+}
+
 @Composable
 private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?) {
+    val context = LocalContext.current
     val tint = if (onOutgoing) Color.White.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+    val isRichCard = a.actionLabel != null || a.otp != null || a.remoteHref == null
+    val otp = remember(a.otp, a.title, a.description) {
+        a.otp ?: extractOtpCode(listOfNotNull(a.title, a.description).joinToString("\n"))
+    }
     Column(
         Modifier
             .widthIn(max = 280.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(tint)
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+            .then(if (onClick != null && a.actionLabel == null) Modifier.clickable(onClick = onClick) else Modifier),
     ) {
-        a.thumb?.let {
+        a.remoteThumb?.let {
             SubcomposeAsyncImage(
                 model = it,
                 contentDescription = null,
@@ -406,18 +562,57 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
                 error = {},
             )
         }
-        Column(Modifier.padding(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
+        Column(Modifier.padding(12.dp)) {
+            val host = a.remoteHref?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.")
+            if (host != null && !isRichCard) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(host, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Spacer(Modifier.height(2.dp))
+            }
+            a.title?.let {
                 Text(
-                    a.href?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.") ?: "Link",
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
+                    it,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = if (isRichCard) 3 else 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
-            a.title?.let { Text(it, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis) }
-            a.description?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+            a.description?.let {
+                if (a.title != null) Spacer(Modifier.height(4.dp))
+                Text(
+                    it,
+                    style = if (isRichCard) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+                    maxLines = if (isRichCard) 10 else 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (otp != null) {
+                Spacer(Modifier.height(10.dp))
+                OtpCopyChip(otp = otp, modifier = Modifier.fillMaxWidth())
+            }
+            val ctaLabel = a.actionLabel
+            if (ctaLabel != null && (onClick != null || otp != null)) {
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        if (onClick != null) {
+                            onClick()
+                        } else if (otp != null) {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
+                            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                ) {
+                    Text(ctaLabel, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
         }
     }
 }
@@ -895,10 +1090,22 @@ private suspend fun sharePhoto(context: Context, bitmap: Bitmap): Boolean {
     }
 }
 
-/** Full-screen zoomable photo viewer with pinch/double-tap zoom, swipe-to-dismiss, and M3 Expressive toolbar. */
+/** Single-photo overload for [PhotoViewer]. */
+@Composable
+fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) =
+    PhotoViewer(photos = listOf(url), initialIndex = 0, onDismiss = onDismiss, subtitle = subtitle)
+
+/** Full-screen swipeable, zoomable photo gallery with pinch/double-tap zoom, swipe-to-dismiss, and M3 Expressive toolbar. */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
+fun PhotoViewer(
+    photos: List<String>,
+    initialIndex: Int = 0,
+    onDismiss: () -> Unit,
+    subtitle: String? = null,
+) {
+    if (photos.isEmpty()) return
+
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
@@ -908,6 +1115,10 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
     val effectsSpec = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
     val dismissThresholdPx = with(density) { 140.dp.toPx() }
 
+    val pagerState = rememberPagerState(
+        initialPage = initialIndex.coerceIn(0, (photos.size - 1).coerceAtLeast(0)),
+    ) { photos.size }
+
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var dismissOffsetY by remember { mutableFloatStateOf(0f) }
@@ -916,9 +1127,17 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
     var busyAction by remember { mutableStateOf(false) }
     var animJob by remember { mutableStateOf<Job?>(null) }
 
+    LaunchedEffect(pagerState.currentPage) {
+        animJob?.cancel()
+        scale = 1f
+        offset = Offset.Zero
+        dismissOffsetY = 0f
+    }
+
     val scrimAlpha = (1f - abs(dismissOffsetY) / (dismissThresholdPx * 2.5f)).coerceIn(0.15f, 1f)
     val dismissScale = (1f - abs(dismissOffsetY) / (dismissThresholdPx * 10f)).coerceIn(0.88f, 1f)
     val isSwiping = abs(dismissOffsetY) > 1f
+    val currentUrl = photos.getOrElse(pagerState.currentPage) { photos.first() }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -928,174 +1147,196 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black.copy(alpha = scrimAlpha))
-                .onSizeChanged { viewportSize = it }
-                .pointerInput(spatialSpec, dismissThresholdPx) {
-                    awaitEachGesture {
-                        var zoomAcc = 1f
-                        var panAcc = Offset.Zero
-                        var pastTouchSlop = false
-                        val touchSlop = viewConfiguration.touchSlop
-                        var swipingToDismiss = false
+                .onSizeChanged { viewportSize = it },
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                userScrollEnabled = scale <= 1.01f && !isSwiping,
+                modifier = Modifier.fillMaxSize(),
+            ) { page ->
+                val pageUrl = photos.getOrNull(page) ?: return@HorizontalPager
+                val isCurrentPage = page == pagerState.currentPage
 
-                        awaitFirstDown(requireUnconsumed = false)
-                        do {
-                            val event = awaitPointerEvent()
-                            val canceled = event.changes.any { it.isConsumed }
-                            if (!canceled) {
-                                val zoomChange = event.calculateZoom()
-                                val panChange = event.calculatePan()
-                                val pointerCount = event.changes.count { it.pressed }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(page, spatialSpec, dismissThresholdPx) {
+                            awaitEachGesture {
+                                var zoomAcc = 1f
+                                var panAcc = Offset.Zero
+                                var pastTouchSlop = false
+                                val touchSlop = viewConfiguration.touchSlop
+                                var swipingToDismiss = false
+                                var wasCanceled = false
 
-                                if (!pastTouchSlop) {
-                                    zoomAcc *= zoomChange
-                                    panAcc += panChange
-                                    val centroidSize = event.calculateCentroidSize(useCurrent = false)
-                                    val zoomMotion = abs(1f - zoomAcc) * centroidSize
-                                    val panMotion = panAcc.getDistance()
-                                    if (pointerCount >= 2 || zoomMotion > touchSlop || panMotion > touchSlop) {
-                                        pastTouchSlop = true
+                                awaitFirstDown(requireUnconsumed = false)
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val canceled = event.changes.any { it.isConsumed }
+                                    if (canceled) {
+                                        wasCanceled = true
+                                    } else {
+                                        val zoomChange = event.calculateZoom()
+                                        val panChange = event.calculatePan()
+                                        val pointerCount = event.changes.count { it.pressed }
+
+                                        if (!pastTouchSlop) {
+                                            zoomAcc *= zoomChange
+                                            panAcc += panChange
+                                            val centroidSize = event.calculateCentroidSize(useCurrent = false)
+                                            val zoomMotion = abs(1f - zoomAcc) * centroidSize
+                                            val panMotion = panAcc.getDistance()
+                                            if (pointerCount >= 2 || zoomMotion > touchSlop || panMotion > touchSlop) {
+                                                pastTouchSlop = true
+                                                if (pointerCount < 2 && scale <= 1.01f && abs(panAcc.y) > abs(panAcc.x)) {
+                                                    swipingToDismiss = true
+                                                    animJob?.cancel()
+                                                } else if (pointerCount >= 2 || scale > 1.01f) {
+                                                    animJob?.cancel()
+                                                }
+                                            }
+                                        }
+
+                                        if (pastTouchSlop) {
+                                            if (pointerCount >= 2 || (scale > 1.01f && !swipingToDismiss)) {
+                                                swipingToDismiss = false
+                                                if (dismissOffsetY != 0f) dismissOffsetY = 0f
+                                                val newScale = (scale * zoomChange).coerceIn(1f, 4f)
+                                                val centroid = event.calculateCentroid(useCurrent = false)
+                                                val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+                                                val scaleRatio = if (scale > 0f) newScale / scale else 1f
+                                                val focusOffset = (centroid - center - offset) * (scaleRatio - 1f)
+                                                val candidateOffset = if (newScale <= 1.01f) {
+                                                    Offset.Zero
+                                                } else {
+                                                    offset + panChange - focusOffset
+                                                }
+                                                scale = newScale
+                                                offset = clampPhotoOffset(candidateOffset, newScale, viewportSize)
+                                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                            } else if (swipingToDismiss && scale <= 1.01f) {
+                                                dismissOffsetY += panChange.y
+                                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                            }
+                                            // Horizontal drags at 1x zoom (scale <= 1.01f) are left unconsumed so HorizontalPager advances smoothly.
+                                        }
+                                    }
+                                } while (!wasCanceled && event.changes.any { it.pressed })
+
+                                if (swipingToDismiss) {
+                                    if (!wasCanceled && abs(dismissOffsetY) >= dismissThresholdPx) {
+                                        currentOnDismiss()
+                                    } else if (dismissOffsetY != 0f) {
+                                        val startY = dismissOffsetY
                                         animJob?.cancel()
-                                        if (pointerCount < 2 && scale <= 1.02f && abs(panAcc.y) > abs(panAcc.x)) {
-                                            swipingToDismiss = true
+                                        animJob = scope.launch {
+                                            animate(
+                                                initialValue = startY,
+                                                targetValue = 0f,
+                                                animationSpec = spatialSpec,
+                                            ) { value, _ -> dismissOffsetY = value }
                                         }
                                     }
-                                }
-
-                                if (pastTouchSlop) {
-                                    if (pointerCount >= 2 || (scale > 1.02f && !swipingToDismiss)) {
-                                        swipingToDismiss = false
-                                        if (dismissOffsetY != 0f) dismissOffsetY = 0f
-                                        val newScale = (scale * zoomChange).coerceIn(1f, 4f)
-                                        val centroid = event.calculateCentroid(useCurrent = false)
-                                        val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
-                                        val scaleRatio = if (scale > 0f) newScale / scale else 1f
-                                        val focusOffset = (centroid - center - offset) * (scaleRatio - 1f)
-                                        val candidateOffset = if (newScale <= 1.01f) {
-                                            Offset.Zero
-                                        } else {
-                                            offset + panChange - focusOffset
+                                } else if (scale < 1.02f && (scale != 1f || offset != Offset.Zero)) {
+                                    val startScale = scale
+                                    val startOffset = offset
+                                    animJob?.cancel()
+                                    animJob = scope.launch {
+                                        animate(
+                                            initialValue = 0f,
+                                            targetValue = 1f,
+                                            animationSpec = spatialSpec,
+                                        ) { t, _ ->
+                                            val nextScale = (startScale + (1f - startScale) * t).coerceIn(1f, 4f)
+                                            scale = nextScale
+                                            offset = clampPhotoOffset(
+                                                Offset(startOffset.x * (1f - t), startOffset.y * (1f - t)),
+                                                nextScale,
+                                                viewportSize,
+                                            )
                                         }
-                                        scale = newScale
-                                        offset = clampPhotoOffset(candidateOffset, newScale, viewportSize)
-                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                    } else if (swipingToDismiss && scale <= 1.02f) {
-                                        dismissOffsetY += panChange.y
-                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
                                     }
-                                }
-                            }
-                        } while (!canceled && event.changes.any { it.pressed })
-
-                        if (swipingToDismiss) {
-                            if (abs(dismissOffsetY) >= dismissThresholdPx) {
-                                currentOnDismiss()
-                            } else if (dismissOffsetY != 0f) {
-                                val startY = dismissOffsetY
-                                animJob?.cancel()
-                                animJob = scope.launch {
-                                    animate(
-                                        initialValue = startY,
-                                        targetValue = 0f,
-                                        animationSpec = spatialSpec,
-                                    ) { value, _ -> dismissOffsetY = value }
-                                }
-                            }
-                        } else if (scale < 1.02f && (scale != 1f || offset != Offset.Zero)) {
-                            val startScale = scale
-                            val startOffset = offset
-                            animJob?.cancel()
-                            animJob = scope.launch {
-                                animate(
-                                    initialValue = 0f,
-                                    targetValue = 1f,
-                                    animationSpec = spatialSpec,
-                                ) { t, _ ->
-                                    val nextScale = (startScale + (1f - startScale) * t).coerceIn(1f, 4f)
-                                    scale = nextScale
-                                    offset = clampPhotoOffset(
-                                        Offset(startOffset.x * (1f - t), startOffset.y * (1f - t)),
-                                        nextScale,
-                                        viewportSize,
-                                    )
                                 }
                             }
                         }
-                    }
-                }
-                .pointerInput(spatialSpec) {
-                    detectTapGestures(
-                        onTap = { showChrome = !showChrome },
-                        onDoubleTap = { tap ->
-                            animJob?.cancel()
-                            val startScale = scale
-                            val startOffset = offset
-                            val targetScale = if (startScale > 1.05f) 1f else 2.5f
-                            val targetOffset = if (targetScale <= 1f) {
-                                Offset.Zero
-                            } else {
-                                val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
-                                val rel = tap - center
-                                clampPhotoOffset(-rel * (targetScale - 1f), targetScale, viewportSize)
-                            }
-                            animJob = scope.launch {
-                                animate(
-                                    initialValue = 0f,
-                                    targetValue = 1f,
-                                    animationSpec = spatialSpec,
-                                ) { t, _ ->
-                                    val nextScale = (startScale + (targetScale - startScale) * t).coerceIn(1f, 4f)
-                                    scale = nextScale
-                                    offset = clampPhotoOffset(
-                                        Offset(
-                                            startOffset.x + (targetOffset.x - startOffset.x) * t,
-                                            startOffset.y + (targetOffset.y - startOffset.y) * t,
-                                        ),
-                                        nextScale,
-                                        viewportSize,
-                                    )
+                        .pointerInput(page, spatialSpec) {
+                            detectTapGestures(
+                                onTap = { showChrome = !showChrome },
+                                onDoubleTap = { tap ->
+                                    animJob?.cancel()
+                                    val startScale = scale
+                                    val startOffset = offset
+                                    val targetScale = if (startScale > 1.05f) 1f else 2.5f
+                                    val targetOffset = if (targetScale <= 1f) {
+                                        Offset.Zero
+                                    } else {
+                                        val center = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+                                        val rel = tap - center
+                                        clampPhotoOffset(-rel * (targetScale - 1f), targetScale, viewportSize)
+                                    }
+                                    animJob = scope.launch {
+                                        animate(
+                                            initialValue = 0f,
+                                            targetValue = 1f,
+                                            animationSpec = spatialSpec,
+                                        ) { t, _ ->
+                                            val nextScale = (startScale + (targetScale - startScale) * t).coerceIn(1f, 4f)
+                                            scale = nextScale
+                                            offset = clampPhotoOffset(
+                                                Offset(
+                                                    startOffset.x + (targetOffset.x - startOffset.x) * t,
+                                                    startOffset.y + (targetOffset.y - startOffset.y) * t,
+                                                ),
+                                                nextScale,
+                                                viewportSize,
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        },
+                ) {
+                    SubcomposeAsyncImage(
+                        model = pageUrl,
+                        contentDescription = "Photo",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                if (isCurrentPage) {
+                                    scaleX = scale * dismissScale
+                                    scaleY = scale * dismissScale
+                                    translationX = offset.x
+                                    translationY = offset.y + dismissOffsetY
                                 }
+                            },
+                        loading = {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                LoadingIndicator(color = Color.White)
+                            }
+                        },
+                        error = {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Outlined.Image,
+                                    contentDescription = "Couldn't load photo",
+                                    tint = Color.White.copy(alpha = 0.6f),
+                                    modifier = Modifier.size(48.dp),
+                                )
                             }
                         },
                     )
-                },
-        ) {
-            SubcomposeAsyncImage(
-                model = url,
-                contentDescription = "Photo",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = scale * dismissScale
-                        scaleY = scale * dismissScale
-                        translationX = offset.x
-                        translationY = offset.y + dismissOffsetY
-                    },
-                loading = {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        LoadingIndicator(color = Color.White)
-                    }
-                },
-                error = {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Outlined.Image,
-                            contentDescription = "Couldn't load photo",
-                            tint = Color.White.copy(alpha = 0.6f),
-                            modifier = Modifier.size(48.dp),
-                        )
-                    }
-                },
-            )
+                }
+            }
 
-            // Top translucent gradient bar with optional subtitle and Close button.
+            // Top translucent gradient bar with optional subtitle, gallery pill counter, and Close button.
             AnimatedVisibility(
                 visible = showChrome && !isSwiping,
                 enter = fadeIn(animationSpec = effectsSpec),
                 exit = fadeOut(animationSpec = effectsSpec),
                 modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth(),
             ) {
-                Row(
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(
@@ -1105,7 +1346,6 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
                         )
                         .statusBarsPadding()
                         .padding(horizontal = 8.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (!subtitle.isNullOrBlank()) {
                         Text(
@@ -1114,12 +1354,32 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f).padding(start = 8.dp),
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .padding(start = 8.dp, end = if (photos.size > 1) 128.dp else 56.dp),
                         )
-                    } else {
-                        Spacer(Modifier.weight(1f))
                     }
-                    IconButton(onClick = onDismiss) {
+                    if (photos.size > 1) {
+                        Surface(
+                            shape = CircleShape,
+                            color = Color(0x991E1F22),
+                            contentColor = Color.White,
+                            modifier = Modifier.align(Alignment.Center),
+                        ) {
+                            Text(
+                                text = "${pagerState.currentPage + 1} / ${photos.size}",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.Medium,
+                                    fontFeatureSettings = "tnum",
+                                ),
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.align(Alignment.CenterEnd),
+                    ) {
                         Icon(Icons.Outlined.Close, contentDescription = "Close", tint = Color.White)
                     }
                 }
@@ -1145,10 +1405,11 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
                     IconButton(
                         enabled = !busyAction,
                         onClick = {
+                            val targetUrl = currentUrl
                             busyAction = true
                             scope.launch {
                                 val ok = try {
-                                    val bmp = loadPhotoBitmap(context, url)
+                                    val bmp = loadPhotoBitmap(context, targetUrl)
                                     if (bmp != null) savePhotoToGallery(context, bmp) else false
                                 } finally {
                                     busyAction = false
@@ -1166,10 +1427,11 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
                     IconButton(
                         enabled = !busyAction,
                         onClick = {
+                            val targetUrl = currentUrl
                             busyAction = true
                             scope.launch {
                                 val ok = try {
-                                    val bmp = loadPhotoBitmap(context, url)
+                                    val bmp = loadPhotoBitmap(context, targetUrl)
                                     if (bmp != null) sharePhoto(context, bmp) else false
                                 } finally {
                                     busyAction = false
@@ -1182,7 +1444,7 @@ fun PhotoViewer(url: String, onDismiss: () -> Unit, subtitle: String? = null) {
                     ) {
                         Icon(Icons.Outlined.Share, contentDescription = "Share")
                     }
-                    IconButton(onClick = { openExternally(context, url, "image/*") }) {
+                    IconButton(onClick = { openExternally(context, currentUrl, "image/*") }) {
                         Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = "Open in another app")
                     }
                 }

@@ -35,6 +35,7 @@ import {
 } from "./calls.js";
 import { ControlPoller, serverList } from "./ctrlpoll.js";
 import { HistorySync, backupDownloader, fileServiceCaller, noisedIdsResolver, type HistorySyncStatus } from "./historysync.js";
+import { extractDroppedMessages } from "./oamsg.js";
 import {
     acceptCall,
     answerAck,
@@ -169,6 +170,7 @@ const RESUME_RETRY_MIN_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 60_000;
 const SESSION_EXPIRED = "Your Zalo session has ended. Log in again with the QR code.";
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp"]);
+const AUDIO_EXTENSIONS = new Set(["m4a", "aac", "mp3", "ogg", "opus", "wav", "amr", "3gp", "webm"]);
 const STICKER_SEARCH_LIMIT = 30;
 const MAX_STICKERS_CACHE = 500;
 const MAX_GROUP_NAME = 100;
@@ -195,6 +197,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
     private readonly callTrace: CallTrace;
     /** Sockets already tapped for call events (zca-js opens a new one on each reconnect). */
     private tappedSockets = new WeakSet<object>();
+    /** Unknown 1:1 / OA thread ids we already attempted to resolve via getUserInfo in this session. */
+    private lookedUpUsers = new Set<string>();
     /** The control-channel poll (calls reach Zalo PC there, not on the chat socket), for [ctrlPollApi]. */
     private ctrlPoller: ControlPoller | null = null;
     private ctrlPollApi: API | null = null;
@@ -742,6 +746,8 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             if (!live()) return;
             if (!Buffer.isBuffer(data)) return;
             this.historySync.onFrame(data, l.cipherKey);
+            const dropped = extractDroppedMessages(data, l.cipherKey, this.status.ownId ?? "");
+            for (const raw of dropped) this.ingest(raw as unknown as Message);
             let info: FrameInfo | null;
             try {
                 info = inspectFrame(data, l.cipherKey);
@@ -1334,6 +1340,30 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         return res.attachment.map((a) => String(a.msgId));
     }
 
+    /** Uploads an audio clip and sends it as a real Zalo voice message. */
+    async sendVoice(
+        kind: ThreadKind,
+        threadId: string,
+        file: { buffer: Buffer; originalname: string },
+    ): Promise<void> {
+        const api = this.requireApi();
+        if (!file.buffer || file.buffer.length === 0) throw new HttpError(400, "The voice recording is empty");
+        const rawName = path.basename(file.originalname.trim());
+        const baseName = rawName && rawName !== "." && rawName !== ".." && !rawName.startsWith(".") ? rawName : "voice.m4a";
+        const ext = path.extname(baseName).slice(1).toLowerCase();
+        const filename = (AUDIO_EXTENSIONS.has(ext) ? baseName : `${baseName}.m4a`) as `${string}.${string}`;
+        const uploaded = await api.uploadAttachment(
+            [{ data: file.buffer, filename, metadata: { totalSize: file.buffer.length } }],
+            threadId,
+            toThreadType(kind),
+        );
+        const first = uploaded[0];
+        const voiceUrl = first && "fileUrl" in first && typeof first.fileUrl === "string" ? first.fileUrl : "";
+        if (!voiceUrl) throw new HttpError(502, "Failed to upload voice recording");
+        // The message itself comes back through the listener (selfListen), which stores it.
+        await api.sendVoice({ voiceUrl }, threadId, toThreadType(kind));
+    }
+
     /** Zalo's sticker search ("hi", "love", "cảm ơn"…), with the image of each. */
     async searchStickers(keyword: string): Promise<StickerInfo[]> {
         const api = this.requireApi();
@@ -1713,7 +1743,40 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
             // Votes and closing arrive as poll messages too.
             if (poll.event) this.emit("poll", { pollId: poll.pollId });
         }
-        if (this.store.addMessage(msg)) this.emit("message", this.store.toPublic(msg));
+        if (this.store.addMessage(msg)) {
+            this.emit("message", this.store.toPublic(msg));
+            if (msg.threadKind === "user") {
+                const thread = this.store.getThread("user", msg.threadId);
+                if (!thread || thread.name === thread.id) {
+                    this.resolveUserThread(msg.threadId);
+                }
+            }
+        }
+    }
+
+    private resolveUserThread(userId: string): void {
+        if (!userId || userId === "0" || this.lookedUpUsers.has(userId)) return;
+        const api = this.api;
+        if (!api || typeof api.getUserInfo !== "function") return;
+        this.lookedUpUsers.add(userId);
+        const generation = this.generation;
+        api.getUserInfo([userId]).then(
+            (res) => {
+                if (generation !== this.generation || this.api !== api) return;
+                let changed = false;
+                for (const profiles of [res.changed_profiles, res.unchanged_profiles]) {
+                    for (const [id, p] of Object.entries(profiles ?? {})) {
+                        const name = p.displayName || p.zaloName;
+                        const cleanId = String(id).split("_")[0];
+                        if (!name && !p.avatar) continue;
+                        this.store.upsertThread({ id: cleanId, kind: "user", name: name || cleanId, avatar: p.avatar ?? "" });
+                        changed = true;
+                    }
+                }
+                if (changed) this.emit("threads");
+            },
+            () => {},
+        );
     }
 
     private onUndo(undo: Undo): void {

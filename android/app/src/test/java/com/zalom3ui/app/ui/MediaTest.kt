@@ -73,8 +73,33 @@ class MediaTest {
     fun photoImageFallsBackToTheFullPicture() {
         assertEquals("https://x/t.jpg", Attachment(kind = "photo", href = "https://x/y.jpg", thumb = "https://x/t.jpg").image)
         assertEquals("https://x/y.jpg", Attachment(kind = "photo", href = "https://x/y.jpg").image)
+        assertEquals(
+            "skips local content:// thumb and falls back to remote href",
+            "https://cdn/full.jpg",
+            Attachment(kind = "photo", href = "https://cdn/full.jpg", thumb = "content://media/external/images/media/703").image,
+        )
+        assertNull(
+            "local-only transferred photo has no remote image",
+            Attachment(kind = "photo", href = "content://media/external/images/media/703", thumb = "/storage/emulated/0/a.jpg").image,
+        )
+        assertFalse(
+            Attachment(kind = "photo", href = "content://media/external/images/media/703").hasRenderableMedia(),
+        )
         assertEquals("Nice", Attachment(kind = "photo", href = "h", title = "Nice").caption())
+        assertNull(
+            "local content:// URI is never shown as a photo caption",
+            Attachment(kind = "photo", title = "content://media/external/images/media/703").caption(),
+        )
         assertNull("a file's title is its name, not a caption", Attachment(kind = "file", title = "a.pdf").caption())
+    }
+
+    @Test
+    fun extractOtpCodeMatchesVerificationCodesAndIgnoresAccountNumbers() {
+        assertEquals("482910", extractOtpCode("Mã xác thực OTP của bạn là: 482910 (hiệu lực 2 phút)"))
+        assertEquals("9912", extractOtpCode("Your verification code is 9912"))
+        assertEquals("739201", extractOtpCode("739201 là mã xác nhận giao dịch"))
+        assertNull(extractOtpCode("Bạn đang yêu cầu cài đặt lại mã PIN tài khoản Giang với mã tài khoản 0378795621 tại The 1."))
+        assertNull(extractOtpCode("Chiều nay 17:30 đi ăn nhé"))
     }
 
     @Test
