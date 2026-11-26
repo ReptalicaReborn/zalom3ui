@@ -32,6 +32,11 @@ function msg(id: string, ts: number, extra: Partial<StoredMessage> = {}): Stored
     return { ...normalizeMessage(raw({ msgId: id, ts: String(ts) })), ...extra };
 }
 
+/** A message in the 1:1 chat with `threadId`. */
+function inThread(id: string, ts: number, threadId: string, extra: Partial<StoredMessage> = {}): StoredMessage {
+    return msg(id, ts, { threadId, fromId: threadId, ...extra });
+}
+
 test("normalizeMessage keeps plain text and the raw fields needed for actions", () => {
     const m = normalizeMessage(raw({ ttl: 0, st: 3, at: 5, cmd: 501 }));
     assert.equal(m.text, "hello");
@@ -317,7 +322,14 @@ test("ChatStore persists messages and settings to disk", () => {
         a.applyReaction("1", "100", "/-heart");
         a.setPinned("user", "100", true);
         a.flush();
-        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+        // messages/meta.json and one file per chat, named by the hex of the thread key ("user:100").
+        const cache = path.join(dir, "messages");
+        assert.equal(fs.existsSync(file), false);
+        assert.equal(fs.statSync(cache).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(path.join(cache, "threads")).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(path.join(cache, "meta.json")).mode & 0o777, 0o600);
+        assert.deepEqual(fs.readdirSync(path.join(cache, "threads")), ["757365723a313030.json"]);
+        assert.equal(fs.statSync(path.join(cache, "threads", "757365723a313030.json")).mode & 0o777, 0o600);
 
         const b = new ChatStore(file);
         assert.equal(b.getMessages("user", "100").length, 1);
@@ -476,9 +488,6 @@ test("cached unread counts and search text match recomputing them on every call"
             );
         }
     };
-    const inThread = (id: string, ts: number, threadId: string, extra: Partial<StoredMessage> = {}) =>
-        msg(id, ts, { threadId, fromId: threadId, ...extra });
-
     store.addMessage(inThread("a1", 1000, "a", { text: "Cà phê sữa đá nhé" }));
     store.addMessage(inThread("a2", 2000, "a", { text: "Đường Điện Biên Phủ" }));
     store.addMessage(inThread("a3", 3000, "a", { text: "ok", isSelf: true }));
@@ -527,4 +536,312 @@ test("cached unread counts and search text match recomputing them on every call"
     check("removeThread");
     store.clear();
     check("clear");
+});
+
+// ---- Saving one file per chat ----
+
+type StoreInternals = {
+    threads: Map<string, unknown>;
+    messages: Map<string, StoredMessage[]>;
+    readUpTo: Map<string, number>;
+    pinned: Set<string>;
+    mutedUntil: Map<string, number>;
+    markedUnread: Set<string>;
+    index: Map<string, string>;
+    messageCap: number;
+    saveInBackground(): Promise<void>;
+};
+
+const internals = (store: ChatStore) => store as unknown as StoreInternals;
+
+/** Everything the store saves, as it reads back from JSON. A chat with no messages left has no file. */
+function savedState(store: ChatStore) {
+    const s = internals(store);
+    return JSON.parse(
+        JSON.stringify({
+            threads: Object.fromEntries(s.threads),
+            messages: Object.fromEntries([...s.messages].filter(([, list]) => list.length > 0)),
+            readUpTo: Object.fromEntries(s.readUpTo),
+            pinned: [...s.pinned].sort(),
+            mutedUntil: Object.fromEntries(s.mutedUntil),
+            markedUnread: [...s.markedUnread].sort(),
+            index: Object.fromEntries(s.index),
+            messageCap: s.messageCap,
+        }),
+    );
+}
+
+/** What callers see. */
+function publicView(store: ChatStore) {
+    return {
+        threads: store.listThreads(1_000),
+        messages: store.listThreads(1_000).map((t) => store.getMessages(t.kind, t.id, { limit: 500 })),
+        search: ["ca phe", "hen", "x"].map((q) => store.searchMessages(q)),
+    };
+}
+
+/** Pins, mutes, read state, reactions, receipts, a recall, a removal, history and a moved plain-id thread. */
+function fillStore(store: ChatStore) {
+    store.ownId = "me";
+    store.allowMessages(2000);
+    store.upsertThread({ id: "a", kind: "user", name: "An", avatar: "https://x/a.jpg" });
+    store.upsertThread({ id: "empty", kind: "user", name: "Nobody", avatar: "" });
+    store.addMessage(inThread("a1", 1000, "a", { text: "Cà phê sữa đá" }));
+    store.addMessage(inThread("a2", 2000, "a", { text: "hẹn mai", isSelf: true, fromId: "me" }));
+    store.addMessage(inThread("a3", 3000, "a", { text: "x" }));
+    store.applyReaction("a1", "me", "/-heart");
+    store.applyReceipt("user", "a", "a2", { deliveredTo: ["a"], seenBy: ["a"] });
+    store.addMessage(inThread("b1", 1500, "b", { text: "[Link] Tin", attachment: { kind: "link", title: "Tin", description: "Cà phê" } }));
+    store.addMessage(inThread("b2", 2500, "b", { text: "bye" }));
+    store.recall("b2");
+    store.addMessage(inThread("b3", 2600, "b", { text: "gone" }));
+    store.removeMessage("b3");
+    store.addMessage({ ...normalizeMessage(raw({ msgId: "g1", uidFrom: "u9", content: "hẹn nhóm" }, { type: 1, threadId: "g" })) });
+    store.upsertThread({ id: "g", kind: "group", name: "Nhóm", avatar: "" });
+    store.addMessage(inThread("p1", 500, "123", { text: "old x", fromName: "", raw: undefined }), { history: true });
+    store.migrateThread("user", "123", "a");
+    store.addMessage(inThread("h1", 400, "a", { text: "history x", raw: undefined }), { history: true });
+    store.settleHistory("user", "a", new Set(["h1"]));
+    store.setPinned("user", "b", true);
+    store.setMuted("user", "a", -1);
+    store.setMuted("group", "g", 5_000);
+    store.markUnread("user", "b");
+}
+
+const threadFile = (dir: string, key: string) => path.join(dir, "messages", "threads", `${Buffer.from(key).toString("hex")}.json`);
+
+test("ChatStore reloads exactly what it saved", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-roundtrip-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        const a = new ChatStore(file);
+        fillStore(a);
+        a.flush();
+        const b = new ChatStore(file);
+        b.ownId = "me";
+        assert.deepEqual(savedState(b), savedState(a));
+        assert.deepEqual(publicView(b), publicView(a));
+        // The plain-id thread moved into "a" has no file left.
+        assert.equal(fs.existsSync(threadFile(dir, "user:123")), false);
+        assert.equal(fs.existsSync(threadFile(dir, "user:a")), true);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore rewrites only the files whose contents changed", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-dirty-"));
+    const file = path.join(dir, "messages.json");
+    // Every write goes through a new temporary file renamed into place, so a rewritten file has a new inode.
+    const inode = (f: string) => fs.statSync(f).ino;
+    try {
+        const store = new ChatStore(file);
+        store.addMessage(inThread("a1", 1000, "a"));
+        store.addMessage(inThread("b1", 1000, "b"));
+        store.flush();
+        const fileA = threadFile(dir, "user:a");
+        const fileB = threadFile(dir, "user:b");
+        const meta = path.join(dir, "messages", "meta.json");
+        const before = { a: inode(fileA), b: inode(fileB), meta: inode(meta) };
+
+        store.applyReaction("a1", "100", "/-heart");
+        store.flush();
+        assert.notEqual(inode(fileA), before.a, "the changed chat is rewritten");
+        assert.equal(inode(fileB), before.b, "the other chat is not");
+        assert.equal(inode(meta), before.meta, "a reaction does not touch meta.json");
+
+        store.markRead("user", "b", 5000);
+        store.flush();
+        assert.notEqual(inode(meta), before.meta, "read markers live in meta.json");
+        assert.equal(inode(fileB), before.b, "marking a chat read does not rewrite its messages");
+
+        const now = { a: inode(fileA), b: inode(fileB), meta: inode(meta) };
+        store.flush();
+        store.markRead("user", "b", 4000); // already read further
+        store.flush();
+        assert.deepEqual({ a: inode(fileA), b: inode(fileB), meta: inode(meta) }, now, "nothing changed, nothing written");
+
+        store.removeThread("user", "b");
+        store.flush();
+        assert.equal(fs.existsSync(fileB), false, "a removed chat's file is deleted");
+        assert.equal(inode(fileA), now.a);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore moves an old single-file cache to one file per chat, keeping everything", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-migrate-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        // What the previous version saved: one snapshot of everything.
+        const old = new ChatStore();
+        fillStore(old);
+        const s = internals(old);
+        fs.writeFileSync(
+            file,
+            JSON.stringify({
+                threads: Object.fromEntries(s.threads),
+                messages: Object.fromEntries(s.messages),
+                readUpTo: Object.fromEntries(s.readUpTo),
+                pinned: [...s.pinned],
+                mutedUntil: Object.fromEntries(s.mutedUntil),
+                markedUnread: [...s.markedUnread],
+                messageCap: s.messageCap,
+            }),
+        );
+
+        const migrated = new ChatStore(file);
+        migrated.ownId = "me";
+        assert.deepEqual(savedState(migrated), savedState(old));
+        assert.deepEqual(publicView(migrated), publicView(old));
+        assert.equal(fs.existsSync(file), false, "the old file is moved aside");
+        assert.ok(fs.existsSync(`${file}.migrated`), "and kept as a backup");
+        assert.ok(fs.existsSync(path.join(dir, "messages", "meta.json")));
+        assert.equal(fs.readdirSync(path.join(dir, "messages", "threads")).length, 3);
+
+        // The next start reads the new layout.
+        const reloaded = new ChatStore(file);
+        reloaded.ownId = "me";
+        assert.deepEqual(savedState(reloaded), savedState(old));
+
+        // Logging out deletes the backup too.
+        reloaded.clear();
+        reloaded.flush();
+        assert.equal(fs.existsSync(`${file}.migrated`), false);
+        assert.deepEqual(fs.readdirSync(path.join(dir, "messages", "threads")), []);
+        assert.deepEqual(new ChatStore(file).listThreads(), []);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore keeps the old cache until every chat of it is written", (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-migrate-fail-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        const old = new ChatStore();
+        old.addMessage(inThread("a1", 1000, "a"));
+        old.addMessage(inThread("b1", 1000, "b"));
+        const s = internals(old);
+        fs.writeFileSync(file, JSON.stringify({ threads: Object.fromEntries(s.threads), messages: Object.fromEntries(s.messages), readUpTo: {} }));
+
+        // The disk fills up while writing chat "b".
+        const write = fs.writeFileSync;
+        const failB = t.mock.method(fs, "writeFileSync", (f: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+            if (String(f).includes(Buffer.from("user:b").toString("hex"))) throw new Error("ENOSPC");
+            return (write as (...args: unknown[]) => void)(f, ...rest);
+        });
+        const store = new ChatStore(file);
+        assert.equal(store.getMessages("user", "b").length, 1, "the old cache still loads");
+        assert.ok(fs.existsSync(file), "the old file stays");
+        assert.equal(fs.existsSync(path.join(dir, "messages", "meta.json")), false, "the move is not marked done");
+        failB.mock.restore();
+
+        store.flush();
+        assert.ok(fs.existsSync(path.join(dir, "messages", "meta.json")));
+        assert.equal(fs.existsSync(file), false);
+        assert.deepEqual(savedState(new ChatStore(file)), savedState(old));
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore backs up an unreadable chat file and still loads the others", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-corrupt-thread-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        const a = new ChatStore(file);
+        a.addMessage(inThread("a1", 1000, "a"));
+        a.addMessage(inThread("b1", 1000, "b"));
+        a.flush();
+        fs.writeFileSync(threadFile(dir, "user:b"), "{not valid json");
+
+        const b = new ChatStore(file);
+        assert.equal(b.getMessages("user", "a").length, 1);
+        assert.equal(b.getMessages("user", "b").length, 0);
+        assert.deepEqual(
+            b.listThreads().map((t) => t.id).sort(),
+            ["a", "b"],
+            "the chat itself is still listed",
+        );
+        const threads = fs.readdirSync(path.join(dir, "messages", "threads"));
+        const backup = threads.find((f) => f.startsWith(`${Buffer.from("user:b").toString("hex")}.json.corrupt.`));
+        assert.ok(backup);
+        assert.equal(fs.readFileSync(path.join(dir, "messages", "threads", backup), "utf8"), "{not valid json");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore keeps every chat's messages when meta.json is unreadable", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-corrupt-meta-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        const a = new ChatStore(file);
+        a.allowMessages(2000);
+        for (let i = 0; i < 600; i++) a.addMessage(inThread(`a${i}`, 1000 + i, "a"));
+        a.flush();
+        const meta = path.join(dir, "messages", "meta.json");
+        fs.writeFileSync(meta, "garbage");
+
+        const b = new ChatStore(file);
+        assert.equal(b.getMessages("user", "a", { limit: 500 }).length, 500);
+        assert.ok(b.getMessage("a0"), "all 600 messages are there");
+        assert.deepEqual(
+            b.listThreads().map((t) => [t.id, t.unread]),
+            [["a", 0]],
+            "the chat is listed again, its history read",
+        );
+        b.addMessage(inThread("new", 5000, "a"));
+        assert.ok(b.getMessage("a0"), "the raised limit is kept");
+        assert.ok(fs.readdirSync(path.join(dir, "messages")).some((f) => f.startsWith("meta.json.corrupt.")));
+        b.flush();
+        assert.deepEqual(savedState(new ChatStore(file)), savedState(b));
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("ChatStore saves in the background, and a sync flush in the middle wins", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zaloo-async-"));
+    const file = path.join(dir, "messages.json");
+    try {
+        const store = new ChatStore(file);
+        store.addMessage(inThread("a1", 1000, "a"));
+        await internals(store).saveInBackground();
+        assert.deepEqual(savedState(new ChatStore(file)), savedState(store), "saved without a flush");
+
+        // A newer message while the background save is still writing: flushing at shutdown keeps it.
+        store.addMessage(inThread("a2", 2000, "a"));
+        const saving = internals(store).saveInBackground();
+        store.addMessage(inThread("a3", 3000, "a"));
+        store.flush();
+        await saving;
+        assert.deepEqual(
+            new ChatStore(file).getMessages("user", "a").map((m) => m.id),
+            ["a1", "a2", "a3"],
+        );
+
+        // Exiting right after a flush, before the background write lands: the flush wrote it already.
+        store.addMessage(inThread("a4", 4000, "a"));
+        const pending = internals(store).saveInBackground();
+        store.flush();
+        assert.deepEqual(
+            new ChatStore(file).getMessages("user", "a").map((m) => m.id),
+            ["a1", "a2", "a3", "a4"],
+        );
+        await pending;
+
+        // Logging out while a background save is writing: the old messages must not come back.
+        store.addMessage(inThread("b1", 1000, "b"));
+        const writing = internals(store).saveInBackground();
+        store.clear();
+        store.flush();
+        await writing;
+        assert.deepEqual(new ChatStore(file).listThreads(), []);
+        assert.deepEqual(fs.readdirSync(path.join(dir, "messages", "threads")), [], "no files or temporary files left");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
