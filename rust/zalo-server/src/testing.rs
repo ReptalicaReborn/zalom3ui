@@ -401,3 +401,11 @@ pub fn test_credentials() -> Credentials {
     serde_json::from_value(json!({ "imei": "i", "cookie": [], "userAgent": "ua" }))
         .expect("test credentials")
 }
+
+/// Lets every task that can run without waiting on time or I/O run (a few scheduler rounds). With
+/// tokio's paused clock, follow a `tokio::time::advance` with this.
+pub async fn settle() {
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+}

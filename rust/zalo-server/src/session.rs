@@ -42,6 +42,8 @@ const MEMBERS_CACHE_MS: i64 = 10 * 60_000;
 const SEEN_RECEIPT_LIMIT: usize = 50;
 const RESUME_RETRY_MIN_MS: u64 = 5_000;
 const RESUME_RETRY_MAX_MS: u64 = 60_000;
+const RECONNECT_MIN_MS: u64 = 5_000;
+const RECONNECT_MAX_MS: u64 = 5 * 60_000;
 const SESSION_EXPIRED: &str = "Your Zalo session has ended. Log in again with the QR code.";
 const STICKER_SEARCH_LIMIT: usize = 30;
 const MAX_STICKERS_CACHE: usize = 500;
@@ -58,6 +60,22 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Backoff before the `attempt`-th (0-based) automatic listener reconnect, without jitter:
+/// 5 s, doubling each time, capped at 5 min.
+pub fn reconnect_base_delay(attempt: u32) -> Duration {
+    let ms = RECONNECT_MIN_MS
+        .saturating_mul(1u64 << attempt.min(16))
+        .min(RECONNECT_MAX_MS);
+    Duration::from_millis(ms)
+}
+
+/// [`reconnect_base_delay`] shortened by up to 10 % at random, so clients don't retry in lockstep
+/// (and the cap is never exceeded).
+fn reconnect_delay(attempt: u32) -> Duration {
+    let base = reconnect_base_delay(attempt);
+    base.mul_f64(1.0 - rand::random::<f64>() * 0.1)
 }
 
 fn to_thread_type(kind: ThreadKind) -> ThreadType {
@@ -154,6 +172,9 @@ struct SessionInner {
     client: Option<Arc<dyn ZaloApi>>,
     listener_handle: Option<Arc<dyn ListenerControl>>,
     listener_task: Option<JoinHandle<()>>,
+    reconnect_task: Option<JoinHandle<()>>,
+    /// Consecutive reconnect delays that have run out without a successful `Connected`.
+    reconnect_attempts: u32,
     resume_task: Option<JoinHandle<()>>,
     qr_task: Option<JoinHandle<()>>,
     qr_abort_tx: Option<oneshot::Sender<()>>,
@@ -175,6 +196,8 @@ impl Default for SessionInner {
             client: None,
             listener_handle: None,
             listener_task: None,
+            reconnect_task: None,
+            reconnect_attempts: 0,
             resume_task: None,
             qr_task: None,
             qr_abort_tx: None,
@@ -204,6 +227,8 @@ pub struct ZaloSession {
     voip_tx: broadcast::Sender<Value>,
     history_sync_tx: broadcast::Sender<Value>,
     retry_notify: Arc<Notify>,
+    /// Wakes a pending listener reconnect (`notify_waiters`, so no stale permit is left behind).
+    reconnect_wake: Notify,
     login: Arc<dyn ZaloLogin>,
 }
 
@@ -235,6 +260,7 @@ impl ZaloSession {
             voip_tx,
             history_sync_tx,
             retry_notify: Arc::new(Notify::new()),
+            reconnect_wake: Notify::new(),
             login,
         }
     }
@@ -422,9 +448,11 @@ impl ZaloSession {
         }
     }
 
-    /// Wakes a waiting offline-resume loop immediately so it retries without waiting for backoff.
+    /// Wakes a waiting offline-resume loop and a pending listener reconnect immediately, so they
+    /// retry without waiting for backoff (the app calls this when the network comes back).
     pub fn retry_now(&self) {
         self.retry_notify.notify_one();
+        self.reconnect_wake.notify_waiters();
     }
 
     /// Alias for [`Self::retry_now`].
@@ -453,6 +481,10 @@ impl ZaloSession {
             if let Some(task) = s.resume_task.take() {
                 task.abort();
             }
+            if let Some(task) = s.reconnect_task.take() {
+                task.abort();
+            }
+            s.reconnect_attempts = 0;
             s.status.state = SessionState::LoggingIn;
             s.status.qr_image = None;
             s.status.scanned_by = None;
@@ -601,6 +633,10 @@ impl ZaloSession {
                 if let Some(t) = s.listener_task.take() {
                     t.abort();
                 }
+                if let Some(t) = s.reconnect_task.take() {
+                    t.abort();
+                }
+                s.reconnect_attempts = 0;
                 s.client = None;
                 s.members.clear();
                 s.poll_groups.clear();
@@ -613,6 +649,7 @@ impl ZaloSession {
             }
         }
         self.retry_notify.notify_one();
+        self.reconnect_wake.notify_waiters();
         self.call_trace.clear();
         self.store.set_own_id(None);
         let _ = fs::remove_file(&self.credentials_file);
@@ -641,22 +678,33 @@ impl ZaloSession {
             if let Some(t) = s.listener_task.take() {
                 t.abort();
             }
+            if let Some(t) = s.reconnect_task.take() {
+                t.abort();
+            }
+            s.reconnect_attempts = 0;
             s.client = None;
         }
         self.retry_notify.notify_one();
+        self.reconnect_wake.notify_waiters();
     }
 
-    /// Restarts the real-time WebSocket listener (returns `409 Conflict` if not logged in).
+    /// Restarts the real-time WebSocket listener now (returns `409 Conflict` if not logged in).
+    /// Cancels any pending automatic reconnect and resets its backoff.
     pub fn reconnect(self: &Arc<Self>) -> Result<(), HttpError> {
         let (client, generation) = {
-            let s = self
+            let mut s = self
                 .inner
-                .read()
+                .write()
                 .map_err(|_| HttpError::internal("Session lock poisoned"))?;
             let Some(c) = s.client.as_ref() else {
                 return Err(HttpError::conflict("Not logged in"));
             };
-            (Arc::clone(c), s.generation)
+            let client = Arc::clone(c);
+            if let Some(t) = s.reconnect_task.take() {
+                t.abort();
+            }
+            s.reconnect_attempts = 0;
+            (client, s.generation)
         };
         self.start_listener(client, generation)
             .map_err(proto_to_http_error)
@@ -777,6 +825,9 @@ impl ZaloSession {
             WsEvent::Connected => {
                 info!("Zalo WebSocket listener connected");
                 self.call_trace.record(&json!({ "kind": "listening" }));
+                if let Ok(mut s) = self.inner.write() {
+                    s.reconnect_attempts = 0;
+                }
                 self.patch_status(|st| {
                     st.state = SessionState::Ready;
                     st.error = None;
@@ -939,22 +990,71 @@ impl ZaloSession {
                     st.error = Some(error);
                 });
                 if !kicked {
-                    // Schedule a clean reconnect attempt after a short delay when not kicked
-                    let session = Arc::clone(self);
-                    let c = Arc::clone(client);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        if session.is_generation_and_client(generation, &c) {
-                            let status = session.get_status();
-                            if status.state == SessionState::Disconnected {
-                                let _ = session.start_listener(c, generation);
-                            }
-                        }
-                    });
+                    self.schedule_reconnect(Arc::clone(client), generation);
                 }
             }
             WsEvent::Error(err) => {
                 warn!("Zalo listener error: {err}");
+            }
+        }
+    }
+
+    /// Schedules the one automatic listener reconnect that follows an unexpected close: waits the
+    /// current backoff delay (or until [`Self::retry_now`]), then restarts the listener. Replaces
+    /// any reconnect already pending, so at most one such task exists; logout, a new login and a
+    /// manual [`Self::reconnect`] cancel it. The backoff resets on the next `Connected`.
+    fn schedule_reconnect(self: &Arc<Self>, client: Arc<dyn ZaloApi>, generation: u64) {
+        let session = Arc::clone(self);
+        let task_client = Arc::clone(&client);
+        let task = tokio::spawn(async move {
+            session.reconnect_loop(task_client, generation).await;
+        });
+        if let Ok(mut s) = self.inner.write() {
+            if s.generation == generation {
+                if let Some(old) = s.reconnect_task.replace(task) {
+                    old.abort();
+                }
+                return;
+            }
+        }
+        task.abort();
+    }
+
+    async fn reconnect_loop(self: &Arc<Self>, client: Arc<dyn ZaloApi>, generation: u64) {
+        loop {
+            let attempt = self
+                .inner
+                .read()
+                .map(|s| s.reconnect_attempts)
+                .unwrap_or(0);
+            let delay = reconnect_delay(attempt);
+            // Created before sleeping so a wake in between is not lost.
+            let wake = self.reconnect_wake.notified();
+            let woken = tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = wake => true,
+            };
+            if !self.is_generation_and_client(generation, &client)
+                || self.get_status().state != SessionState::Disconnected
+            {
+                return;
+            }
+            if !woken {
+                if let Ok(mut s) = self.inner.write() {
+                    s.reconnect_attempts = s.reconnect_attempts.saturating_add(1);
+                }
+            }
+            info!(attempt, woken, "Reconnecting Zalo WebSocket listener");
+            match self.start_listener(Arc::clone(&client), generation) {
+                Ok(()) => {
+                    if let Ok(mut s) = self.inner.write() {
+                        if s.generation == generation {
+                            s.reconnect_task = None;
+                        }
+                    }
+                    return;
+                }
+                Err(err) => warn!("Could not restart the Zalo WebSocket listener: {err}"),
             }
         }
     }
@@ -3189,3 +3289,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod reconnect_tests;
