@@ -1,6 +1,3 @@
-import java.net.URI
-import java.security.MessageDigest
-import java.util.zip.ZipInputStream
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
@@ -10,11 +7,6 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
-
-// Embedded Node.js that runs the Zalo server on the phone (https://github.com/nodejs-mobile/nodejs-mobile).
-val nodeMobileVersion = "v18.20.4"
-val nodeMobileSha256 = "bd7321eaa1a7602fbe0bb87302df2d79d87835cf4363fbdd17c350dbb485c2af"
-val nodeMobileDir = layout.buildDirectory.dir("nodejs-mobile")
 
 android {
     lint {
@@ -31,16 +23,6 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
-
-        externalNativeBuild {
-            cmake {
-                arguments += "-DNODE_MOBILE_DIR=${nodeMobileDir.get().asFile.absolutePath}"
-                // libnode.so (nodejs-mobile) links against the shared C++ runtime. With the shared STL the build packages
-                // libc++_shared.so next to it; without it Node can't load ("libc++_shared.so" not found) and the app stays
-                // on "Starting Zalo…".
-                arguments += "-DANDROID_STL=c++_shared"
-            }
-        }
     }
 
     externalNativeBuild {
@@ -49,8 +31,7 @@ android {
         }
     }
 
-    // arm64 only (every current phone): libnode.so is ~60 MB per CPU type. The split keeps the APK's name
-    // (app-arm64-v8a-debug.apk) and limits the native build to that one type.
+    // arm64 only (every current phone): keeps the APK name (app-arm64-v8a-debug.apk) and limits native builds to arm64-v8a.
     splits {
         abi {
             isEnable = true
@@ -89,106 +70,92 @@ android {
     }
 }
 
-/** Downloads the nodejs-mobile release, checks its hash, and extracts libnode.so and the headers. */
-abstract class FetchNodeMobileTask : DefaultTask() {
-    @get:Input abstract val version: Property<String>
-    @get:Input abstract val sha256: Property<String>
-    @get:Internal abstract val cacheDir: DirectoryProperty
-    @get:OutputDirectory abstract val outputDir: DirectoryProperty
-
-    @TaskAction
-    fun fetch() {
-        val v = version.get()
-        val zip = cacheDir.file("nodejs-mobile-$v-android.zip").get().asFile
-        if (!zip.exists() || sha256Of(zip) != sha256.get()) {
-            zip.parentFile.mkdirs()
-            val part = File(zip.path + ".part")
-            val url = "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/$v/nodejs-mobile-$v-android.zip"
-            logger.lifecycle("Downloading $url")
-            URI(url).toURL().openStream().use { input -> part.outputStream().use { input.copyTo(it) } }
-            val actual = sha256Of(part)
-            if (actual != sha256.get()) {
-                part.delete()
-                throw GradleException("nodejs-mobile download has SHA-256 $actual, expected ${sha256.get()}")
-            }
-            if (!part.renameTo(zip)) {
-                part.copyTo(zip, overwrite = true)
-                part.delete()
-            }
-            if (!zip.exists()) throw GradleException("Failed to move ${part.path} to ${zip.path}")
-        }
-
-        val out = outputDir.get().asFile
-        out.deleteRecursively()
-        val outPrefix = out.canonicalPath + File.separator
-        ZipInputStream(zip.inputStream().buffered()).use { zin ->
-            while (true) {
-                val entry = zin.nextEntry ?: break
-                val keep = !entry.isDirectory &&
-                    ((entry.name.startsWith("bin/") && entry.name.endsWith("/libnode.so")) || entry.name.startsWith("include/"))
-                if (!keep) continue
-                val target = File(out, entry.name)
-                require(target.canonicalPath.startsWith(outPrefix)) { "Bad zip entry ${entry.name}" }
-                target.parentFile.mkdirs()
-                target.outputStream().use { zin.copyTo(it) }
-            }
-        }
-    }
-
-    private fun sha256Of(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().buffered().use { input ->
-            val buf = ByteArray(1 shl 16)
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                digest.update(buf, 0, n)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-}
-
-/** Bundles the server (../src) into one file with esbuild and stages it as an app asset. */
-abstract class BundleServerTask : DefaultTask() {
-    @get:Internal abstract val repoRoot: DirectoryProperty
-    @get:InputFiles @get:PathSensitive(PathSensitivity.RELATIVE) abstract val serverSources: ConfigurableFileCollection
+/** Compiles the embedded Rust Zalo server (libzalocore.so) for arm64-v8a using the Android NDK toolchain. */
+abstract class BuildRustCoreTask : DefaultTask() {
+    @get:Internal abstract val rustDir: DirectoryProperty
+    @get:Internal abstract val sdkDir: DirectoryProperty
+    @get:InputFiles @get:PathSensitive(PathSensitivity.RELATIVE) abstract val rustSources: ConfigurableFileCollection
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
     @get:Inject abstract val execOps: ExecOperations
 
-    @TaskAction
-    fun bundle() {
-        val root = repoRoot.get().asFile
-        val npm = if (System.getProperty("os.name").startsWith("Windows")) "npm.cmd" else "npm"
-        val target = File(outputDir.get().asFile, "server/server.mjs")
-        target.parentFile.mkdirs()
-        execOps.exec {
-            workingDir = root
-            commandLine(npm, "run", "--silent", "bundle", "--", "--outfile=${target.absolutePath}")
+    private fun resolveNdkDir(): File {
+        val candidates = buildList {
+            for (env in listOf("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK_LATEST_HOME")) {
+                System.getenv(env)?.takeIf { it.isNotBlank() }?.let { add(File(it)) }
+            }
+            val sdkRoots = listOfNotNull(
+                sdkDir.orNull?.asFile,
+                System.getenv("ANDROID_HOME")?.takeIf { it.isNotBlank() }?.let { File(it) },
+                System.getenv("ANDROID_SDK_ROOT")?.takeIf { it.isNotBlank() }?.let { File(it) },
+            )
+            for (sdk in sdkRoots) {
+                File(sdk, "ndk").listFiles()
+                    ?.filter { it.isDirectory }
+                    ?.sortedByDescending { it.name }
+                    ?.forEach { add(it) }
+                add(File(sdk, "ndk-bundle"))
+            }
         }
+        return candidates.firstOrNull { File(it, "toolchains/llvm/prebuilt").isDirectory }
+            ?: throw GradleException(
+                "Could not locate Android NDK (checked ANDROID_NDK_* env vars and <sdk>/ndk/*)",
+            )
     }
-}
 
-val fetchNodeMobile = tasks.register<FetchNodeMobileTask>("fetchNodeMobile") {
-    version.set(nodeMobileVersion)
-    sha256.set(nodeMobileSha256)
-    cacheDir.set(rootProject.layout.projectDirectory.dir(".nodejs-mobile"))
-    outputDir.set(nodeMobileDir)
-}
+    @TaskAction
+    fun build() {
+        val rust = rustDir.get().asFile
+        val ndk = resolveNdkDir()
+        val isWindows = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
+        val clangName = if (isWindows) "aarch64-linux-android26-clang.cmd" else "aarch64-linux-android26-clang"
+        val arName = if (isWindows) "llvm-ar.exe" else "llvm-ar"
+        val cargo = if (isWindows) "cargo.exe" else "cargo"
 
-// CMake reads the headers and libnode.so from the extracted release.
-tasks.configureEach {
-    if (name.startsWith("configureCMake") || name.startsWith("buildCMake")) dependsOn(fetchNodeMobile)
+        val prebuiltRoot = File(ndk, "toolchains/llvm/prebuilt")
+        val llvmBin = prebuiltRoot.listFiles()
+            ?.filter { it.isDirectory }
+            ?.map { File(it, "bin") }
+            ?.firstOrNull { File(it, clangName).isFile && File(it, arName).isFile }
+            ?: throw GradleException(
+                "Could not locate $clangName and $arName under ${prebuiltRoot.absolutePath}",
+            )
+
+        val clang = File(llvmBin, clangName).absolutePath
+        val llvmAr = File(llvmBin, arName).absolutePath
+
+        execOps.exec {
+            workingDir = rust
+            environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", clang)
+            environment("CC_aarch64_linux_android", clang)
+            environment("AR_aarch64_linux_android", llvmAr)
+            commandLine(cargo, "build", "--release", "--target", "aarch64-linux-android", "-p", "zalo-android")
+        }
+
+        val built = File(rust, "target/aarch64-linux-android/release/libzalocore.so")
+        if (!built.isFile) {
+            throw GradleException("Expected compiled Rust library not found at ${built.absolutePath}")
+        }
+        val dest = File(outputDir.get().asFile, "arm64-v8a/libzalocore.so")
+        dest.parentFile.mkdirs()
+        built.copyTo(dest, overwrite = true)
+    }
 }
 
 androidComponents {
     onVariants { variant ->
-        val bundle = tasks.register<BundleServerTask>("bundleServer${variant.name.replaceFirstChar { it.uppercase() }}") {
-            val repo = rootProject.layout.projectDirectory.dir("..")
-            repoRoot.set(repo)
-            serverSources.from(repo.dir("src"), repo.file("package.json"), repo.file("package-lock.json"))
+        val buildRustCore = tasks.register<BuildRustCoreTask>(
+            "buildRustCore${variant.name.replaceFirstChar { it.uppercase() }}",
+        ) {
+            val rustRoot = rootProject.layout.projectDirectory.dir("../rust")
+            rustDir.set(rustRoot)
+            sdkDir.set(androidComponents.sdkComponents.sdkDirectory)
+            rustSources.from(
+                project.fileTree(rustRoot) {
+                    include("Cargo.toml", "Cargo.lock", "zalo-*/Cargo.toml", "zalo-*/src/**")
+                },
+            )
         }
-        variant.sources.assets?.addGeneratedSourceDirectory(bundle, BundleServerTask::outputDir)
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRustCore, BuildRustCoreTask::outputDir)
     }
 }
 

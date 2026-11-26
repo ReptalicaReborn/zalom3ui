@@ -14,7 +14,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Process
-import android.system.Os
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.zalom3ui.app.MainActivity
@@ -29,11 +28,11 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 /**
- * Runs the Zalo server (the bundled src/ of this repo) in embedded Node.js.
+ * Runs the embedded Rust Zalo server (libzalocore.so).
  *
- * Lives in its own ":node" process: Node can only start once per process, so stopping the service
- * ends the process and the next start gets a fresh one. It runs as a foreground service so the
- * Zalo connection, and with it the 1:1 message history, keeps going while the app is closed.
+ * Kept as NodeService in its own ":node" process for upgrade compatibility with existing manifest,
+ * receivers, and LocalServer. Runs as a foreground service so the Zalo connection, and with it the
+ * 1:1 message history, keeps going while the app is closed.
  */
 class NodeService : Service() {
     private var started = false
@@ -69,8 +68,10 @@ class NodeService : Service() {
         }
         if (!started) {
             started = true
-            // Node needs a bigger stack than Android's default thread stack.
-            Thread(null, Runnable { runNode() }, "node", NODE_STACK_BYTES).start()
+            Thread({ runServer() }, "zalocore").apply {
+                isDaemon = true
+                start()
+            }
         }
         return START_STICKY
     }
@@ -79,9 +80,12 @@ class NodeService : Service() {
         StartupLog.write(this, "service: destroyed")
         scope.cancel()
         runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
+        if (started) {
+            runCatching { NodeRuntime.stopServer() }
+        }
         super.onDestroy()
-        // Exit after onDestroy() returns so Android records stopSelf() cleanly instead of treating it as a crash.
-        Handler(Looper.getMainLooper()).post { Process.killProcess(Process.myPid()) }
+        // Allow zalocore a brief window to flush state cleanly, then guarantee the ":node" process exits for clean restarts.
+        Handler(Looper.getMainLooper()).postDelayed({ Process.killProcess(Process.myPid()) }, STOP_KILL_DELAY_MS)
     }
 
     private fun promoteToForeground(): Boolean {
@@ -105,30 +109,23 @@ class NodeService : Service() {
         }
     }
 
-    private fun runNode() {
+    private fun runServer() {
         try {
-            val script = File(filesDir, "server/server.mjs")
-            script.parentFile?.mkdirs()
-            // Always refresh: the bundle changes with every app update and is only ~2 MB.
-            assets.open("server/server.mjs").use { input -> script.outputStream().use { input.copyTo(it) } }
-
             val dataDir = File(filesDir, "zalo").apply { mkdirs() }
-            Os.setenv("HOST", "127.0.0.1", true)
-            Os.setenv("PORT", LocalServer.port(this).toString(), true)
-            Os.setenv("ACCESS_TOKEN", SettingsStore(this).localToken(), true)
-            Os.setenv("DATA_DIR", dataDir.absolutePath, true)
-            Os.setenv("HOME", filesDir.absolutePath, true)
-            Os.setenv("TMPDIR", cacheDir.absolutePath, true)
-            // The server copies its console output here, so a failed start can be shared (StartupLog.report).
-            Os.setenv("LOG_FILE", StartupLog.serverLog(this).absolutePath, true)
-
-            StartupLog.write(this, "service: starting Node on port ${LocalServer.port(this)}")
-            val code = NodeRuntime.startNode(arrayOf("node", "--max-old-space-size=$HEAP_MB", script.absolutePath))
-            Log.w(TAG, "Node exited with code $code")
-            StartupLog.write(this, "service: Node exited with code $code")
+            val port = LocalServer.port(this)
+            StartupLog.write(this, "service: starting zalocore on port $port")
+            val code = NodeRuntime.startServer(
+                host = "127.0.0.1",
+                port = port,
+                token = SettingsStore(this).localToken(),
+                dataDir = dataDir.absolutePath,
+                logFile = StartupLog.serverLog(this).absolutePath,
+            )
+            Log.w(TAG, "zalocore exited with code $code")
+            StartupLog.write(this, "service: zalocore exited with code $code")
         } catch (e: Throwable) {
             Log.e(TAG, "Could not run the Zalo server", e)
-            StartupLog.error(this, "service: could not run Node", e)
+            StartupLog.error(this, "service: could not run zalocore", e)
         }
         stopSelf()
     }
@@ -158,7 +155,6 @@ class NodeService : Service() {
         const val TAG = "ZalooNode"
         const val CHANNEL_ID = "server"
         const val NOTIFICATION_ID = 1
-        const val NODE_STACK_BYTES = 8L * 1024 * 1024
-        const val HEAP_MB = 192
+        const val STOP_KILL_DELAY_MS = 300L
     }
 }

@@ -11,41 +11,36 @@ on:
 jobs:
   server:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run bundle
-      # The phone app embeds Node 18.20.4 (nodejs-mobile): check the bundle starts there with no node_modules.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18.20.4
-      - name: Bundle smoke test on Node 18
+          workspaces: rust
+      - run: cargo test --workspace
+      - run: cargo build --release -p zalo-cli
+      - name: Server smoke test
         run: |
-          mkdir -p /tmp/bundle && cp dist/server.bundle.mjs /tmp/bundle/
-          cd /tmp/bundle
-          node --version
-          PORT=3999 ACCESS_TOKEN=t DATA_DIR=/tmp/bundle/data node server.bundle.mjs > server.log 2>&1 &
+          rm -rf /tmp/rust-smoke && mkdir -p /tmp/rust-smoke
+          PORT=3999 ACCESS_TOKEN=t DATA_DIR=/tmp/rust-smoke ./target/release/zalom3ui-server > /tmp/rust-smoke/server.log 2>&1 &
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true' EXIT
           ready=0
           for i in $(seq 1 40); do
-            if curl -fsS -H "Authorization: Bearer t" localhost:3999/api/status >/dev/null 2>&1; then
+            if curl -fsS -H "Authorization: Bearer t" http://127.0.0.1:3999/api/status >/dev/null 2>&1; then
               ready=1
               break
             fi
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.5
           done
-          cat server.log
+          cat /tmp/rust-smoke/server.log
           test "$ready" = 1
-          curl -fsS -H "Authorization: Bearer t" localhost:3999/api/status
-          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/api/status)" = 401
+          curl -fsS -H "Authorization: Bearer t" http://127.0.0.1:3999/api/status
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3999/api/status)" = 401
 
   android:
     runs-on: ubuntu-latest
@@ -54,33 +49,32 @@ jobs:
         working-directory: android
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 22
-          cache: npm
-      # The app bundles the server (../src) with esbuild.
-      - run: npm ci
-        working-directory: .
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-      - uses: actions/cache@v4
-        with:
-          path: android/.nodejs-mobile
-          key: nodejs-mobile-${{ hashFiles('android/app/build.gradle.kts') }}
       - run: ./gradlew --no-daemon testDebugUnitTest assembleDebug assembleRelease
-      # A missing runtime or bundle would only show up as a crash on the phone.
-      - name: Check APKs contain Node.js and the server
+      # A missing native library would only show up as a crash on the phone; also ensure legacy Node artifacts stay gone.
+      - name: Check APKs contain Rust core and Opus (and no Node.js)
         run: |
           for apk in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
             echo "$apk: $(du -h "$apk" | cut -f1)"
-            unzip -l "$apk" | grep -E "libnode\.so|libnodebridge\.so|libc\+\+_shared\.so|libzaloopus\.so|assets/server/server\.mjs"
-            # libnode.so needs libc++_shared.so; without it Node fails to load on the phone. libzaloopus.so is the
-            # Opus codec calls use.
-            for f in libnode.so libnodebridge.so libc++_shared.so libzaloopus.so assets/server/server.mjs; do
-              unzip -l "$apk" | grep -q "$f" || { echo "::error::$f missing from $apk"; exit 1; }
+            unzip -l "$apk" | grep -E "libzalocore\.so|libzaloopus\.so"
+            for f in libzalocore.so libzaloopus.so; do
+              unzip -l "$apk" | grep -qF "$f" || { echo "::error::$f missing from $apk"; exit 1; }
+            done
+            for f in libnode.so libc++_shared.so libnodebridge.so assets/server/server.mjs; do
+              if unzip -l "$apk" | grep -qF "$f"; then
+                echo "::error::unexpected legacy file $f found in $apk"
+                exit 1
+              fi
             done
           done
       # Debug and R8-optimized release APKs, for arm64-v8a phones.

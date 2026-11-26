@@ -1,12 +1,20 @@
 package com.zalom3ui.app.server
 
-/** Entry point into the embedded Node.js (nodejs-mobile) via src/main/cpp/native-lib.cpp. */
+/** Entry point into the embedded Rust Zalo server (libzalocore.so). */
 object NodeRuntime {
     init {
-        System.loadLibrary("node")
-        System.loadLibrary("nodebridge")
+        System.loadLibrary("zalocore")
     }
 
-    /** Runs Node with [args] (argv, starting with "node") and blocks until it exits. Only once per process. */
-    external fun startNode(args: Array<String>): Int
+    /** Starts the embedded Rust server and blocks until it exits or [stopServer] is called. */
+    external fun startServer(
+        host: String,
+        port: Int,
+        token: String,
+        dataDir: String,
+        logFile: String,
+    ): Int
+
+    /** Requests a clean shutdown of the running embedded Rust server. */
+    external fun stopServer()
 }
