@@ -22,11 +22,11 @@ enum class ThemeMode(val label: String) {
     SYSTEM("System default"),
     LIGHT("Light"),
     DARK("Dark"),
-    REPTDOC_GOLD("ReptDoc gold"),
 }
 
 enum class ChatAccent(val key: String, val label: String) {
     ULTRAMARINE("ultramarine", "Ultramarine"),
+    REPTDOC_GOLD("gold", "ReptDoc gold"),
     CRIMSON("crimson", "Crimson"),
     FOREST("forest", "Forest"),
     PLUM("plum", "Plum"),
@@ -73,16 +73,22 @@ class SettingsStore(context: Context) {
     }
 
     fun loadAppearance(): Appearance {
-        val legacyGold = prefs.getString(KEY_COLOR_THEME, null) == "GOLD"
+        val rawTheme = prefs.getString(KEY_THEME, null)
+        val legacyGold = rawTheme == "REPTDOC_GOLD" || prefs.getString(KEY_COLOR_THEME, null) == "GOLD"
         val themeMode = if (legacyGold) {
-            ThemeMode.REPTDOC_GOLD
+            ThemeMode.DARK
         } else {
-            ThemeMode.entries.firstOrNull { it.name == prefs.getString(KEY_THEME, null) } ?: ThemeMode.SYSTEM
+            ThemeMode.entries.firstOrNull { it.name == rawTheme } ?: ThemeMode.SYSTEM
+        }
+        val accent = if (legacyGold) {
+            ChatAccent.REPTDOC_GOLD
+        } else {
+            ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null))
         }
         return Appearance(
             themeMode = themeMode,
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
-            accent = ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null)),
+            accent = accent,
             tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
             ultraExpressive = prefs.getBoolean(KEY_ULTRA_EXPRESSIVE, false),
         )

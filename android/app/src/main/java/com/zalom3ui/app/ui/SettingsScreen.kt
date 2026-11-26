@@ -172,7 +172,6 @@ fun SettingsScreen(
             }
 
             SectionHeader("Appearance")
-            val isGold = appearance.themeMode == ThemeMode.REPTDOC_GOLD
             val showEasterEgg = easterEggUnlocked || appearance.ultraExpressive
             val appearanceItems = buildList<@Composable () -> Unit> {
                 add {
@@ -202,13 +201,11 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.primary,
                             )
                         }
-                        if (!isGold) {
-                            AccentSwatchPicker(
-                                selected = appearance.accent,
-                                enabled = !dynamicActive,
-                                onSelect = { onAppearance(appearance.copy(accent = it)) },
-                            )
-                        }
+                        AccentSwatchPicker(
+                            selected = appearance.accent,
+                            enabled = !dynamicActive,
+                            onSelect = { onAppearance(appearance.copy(accent = it)) },
+                        )
                     }
                 }
                 add {
@@ -216,46 +213,44 @@ fun SettingsScreen(
                         modifier = Modifier.clickable { pickTheme = true },
                         colors = transparentListItemColors,
                         leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
-                        headlineContent = { Text("Theme") },
+                        headlineContent = { Text("Dark mode") },
                         supportingContent = { Text(appearance.themeMode.label) },
                     )
                 }
-                if (!isGold) {
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable {
+                            onAppearance(appearance.copy(tintedBackground = !appearance.tintedBackground))
+                        },
+                        colors = transparentListItemColors,
+                        leadingContent = { Icon(Icons.Outlined.FormatColorFill, null) },
+                        headlineContent = { Text("Tinted chat background") },
+                        supportingContent = { Text("Subtle accent wash behind messages") },
+                        trailingContent = {
+                            Switch(
+                                checked = appearance.tintedBackground,
+                                onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
+                            )
+                        },
+                    )
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     add {
                         ListItem(
                             modifier = Modifier.clickable {
-                                onAppearance(appearance.copy(tintedBackground = !appearance.tintedBackground))
+                                onAppearance(appearance.copy(dynamicColor = !appearance.dynamicColor))
                             },
                             colors = transparentListItemColors,
-                            leadingContent = { Icon(Icons.Outlined.FormatColorFill, null) },
-                            headlineContent = { Text("Tinted chat background") },
-                            supportingContent = { Text("Subtle accent wash behind messages") },
+                            leadingContent = { Icon(Icons.Outlined.Palette, null) },
+                            headlineContent = { Text("Wallpaper colors") },
+                            supportingContent = { Text("Use colors from your wallpaper instead of Color") },
                             trailingContent = {
                                 Switch(
-                                    checked = appearance.tintedBackground,
-                                    onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
+                                    checked = appearance.dynamicColor,
+                                    onCheckedChange = { onAppearance(appearance.copy(dynamicColor = it)) },
                                 )
                             },
                         )
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        add {
-                            ListItem(
-                                modifier = Modifier.clickable {
-                                    onAppearance(appearance.copy(dynamicColor = !appearance.dynamicColor))
-                                },
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.Palette, null) },
-                                headlineContent = { Text("Wallpaper colors") },
-                                supportingContent = { Text("Use colors from your wallpaper instead of chat color") },
-                                trailingContent = {
-                                    Switch(
-                                        checked = appearance.dynamicColor,
-                                        onCheckedChange = { onAppearance(appearance.copy(dynamicColor = it)) },
-                                    )
-                                },
-                            )
-                        }
                     }
                 }
                 if (showEasterEgg) {
@@ -295,6 +290,12 @@ fun SettingsScreen(
                         .fillMaxWidth()
                         .padding(16.dp),
                 ) {
+                    val serverToggleColors = ToggleButtonDefaults.tonalToggleButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        checkedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        checkedContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
@@ -303,9 +304,7 @@ fun SettingsScreen(
                             checked = onDevice,
                             onCheckedChange = { if (it) onDevice = true },
                             shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
-                            colors = ToggleButtonDefaults.toggleButtonColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                            ),
+                            colors = serverToggleColors,
                             modifier = Modifier.weight(1f),
                         ) {
                             Icon(
@@ -320,9 +319,7 @@ fun SettingsScreen(
                             checked = !onDevice,
                             onCheckedChange = { if (it) onDevice = false },
                             shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
-                            colors = ToggleButtonDefaults.toggleButtonColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                            ),
+                            colors = serverToggleColors,
                             modifier = Modifier.weight(1f),
                         ) {
                             Icon(
@@ -331,14 +328,14 @@ fun SettingsScreen(
                                 modifier = Modifier.size(ToggleButtonDefaults.IconSize),
                             )
                             Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
-                            Text("A server")
+                            Text("Remote server")
                         }
                     }
                     Text(
                         if (onDevice) {
                             "The Zalo connection runs inside this app and stays connected in the background."
                         } else {
-                            "Connect to a Zalỏ server you run yourself (see the README)."
+                            "Connect to a Zalỏ server running on another computer or VPS."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -396,33 +393,6 @@ fun SettingsScreen(
                 }
             }
 
-            if (current.onDevice && loggedIn) {
-                SectionHeader("Call research")
-                ExpressiveSettingsGroup(
-                    items = listOf(
-                        {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onShareCallLog),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.Share, null) },
-                                headlineContent = { Text("Share call log") },
-                                supportingContent = {
-                                    Text("Call events Zalo sent (call ids, server addresses; no messages), to help add calls")
-                                },
-                            )
-                        },
-                        {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onClearCallLog),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.DeleteSweep, null) },
-                                headlineContent = { Text("Clear call log") },
-                            )
-                        },
-                    ),
-                )
-            }
-
             if (current.onDevice) IncomingCallSettings()
 
             if (current.onDevice || loggedIn) {
@@ -470,6 +440,33 @@ fun SettingsScreen(
                 }
                 ExpressiveSettingsGroup(items = accountItems)
             }
+
+            if (current.onDevice && loggedIn) {
+                SectionHeader("Developer")
+                ExpressiveSettingsGroup(
+                    items = listOf(
+                        {
+                            ListItem(
+                                modifier = Modifier.clickable(onClick = onShareCallLog),
+                                colors = transparentListItemColors,
+                                leadingContent = { Icon(Icons.Outlined.Share, null) },
+                                headlineContent = { Text("Share call log") },
+                                supportingContent = {
+                                    Text("Call events Zalo sent (call ids, server addresses; no messages), to help debug calls")
+                                },
+                            )
+                        },
+                        {
+                            ListItem(
+                                modifier = Modifier.clickable(onClick = onClearCallLog),
+                                colors = transparentListItemColors,
+                                leadingContent = { Icon(Icons.Outlined.DeleteSweep, null) },
+                                headlineContent = { Text("Clear call log") },
+                            )
+                        },
+                    ),
+                )
+            }
             Spacer(Modifier.height(28.dp))
         }
     }
@@ -477,7 +474,7 @@ fun SettingsScreen(
     if (pickTheme) {
         AlertDialog(
             onDismissRequest = { pickTheme = false },
-            title = { Text("Theme") },
+            title = { Text("Dark mode") },
             text = {
                 Column {
                     ThemeMode.entries.forEach { mode ->
@@ -626,7 +623,7 @@ private fun AccentSwatchPicker(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "Chat color",
+                "Color",
                 style = MaterialTheme.typography.titleSmall,
                 color = if (enabled) {
                     MaterialTheme.colorScheme.onSurface
@@ -681,7 +678,7 @@ private fun AccentSwatchPicker(
                         Icon(
                             Icons.Rounded.Check,
                             contentDescription = null,
-                            tint = Color.White,
+                            tint = if (accent == ChatAccent.REPTDOC_GOLD) Color(0xFF1A1206) else Color.White,
                             modifier = Modifier
                                 .size(22.dp)
                                 .graphicsLayer {
