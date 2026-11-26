@@ -69,5 +69,7 @@ zalo-server = { path = "zalo-server" }
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind (not abort): the core runs inside the app process, so a panic must stay catchable at the JNI
+# boundary (catch_unwind) and inside one tokio task, instead of killing the whole app.
+panic = "unwind"
 strip = "symbols"
