@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::crypto::{decode_event_payload, parse_json_keeping_bigints};
 use crate::error::{ProtoError, Result};
+use crate::framelog::{FrameReport, ItemReport};
 use crate::http::ZaloHttp;
 use crate::types::{FileDonePayload, RawWsMessage, ThreadType, WsEvent, ZaloContext};
 
@@ -422,7 +423,10 @@ async fn run_listener_loop(
                 msg = ws_read.next() => {
                     match msg {
                         Some(Ok(Message::Binary(bytes))) => {
-                            let events = dispatch_frame(&bytes, &mut cipher_key, &ctx, self_listen);
+                            let (events, frame_report) = dispatch_frame_traced(&bytes, &mut cipher_key, &ctx, self_listen);
+                            if let Some(report) = frame_report {
+                                let _ = event_tx.send(WsEvent::Frame(report));
+                            }
                             let mut duplicate = false;
                             for ev in events {
                                 match &ev {
@@ -542,19 +546,48 @@ pub fn dispatch_frame(
     ctx: &ZaloContext,
     self_listen: bool,
 ) -> Vec<WsEvent> {
+    dispatch_frame_traced(frame, cipher_key, ctx, self_listen).0
+}
+
+/// Like [`dispatch_frame`], and also returns the structure-only [`FrameReport`] for the socket
+/// log (`None` when the frame has no usable header). The report never contains message text.
+pub fn dispatch_frame_traced(
+    frame: &[u8],
+    cipher_key: &mut Option<String>,
+    ctx: &ZaloContext,
+    self_listen: bool,
+) -> (Vec<WsEvent>, Option<FrameReport>) {
     let Some((version, cmd, sub_cmd)) = decode_frame_header(frame) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    let mut report = FrameReport::new(version, cmd, sub_cmd);
+    let events = dispatch_body(frame, (version, cmd, sub_cmd), cipher_key, ctx, self_listen, &mut report);
+    (events, Some(report))
+}
+
+fn dispatch_body(
+    frame: &[u8],
+    (version, cmd, sub_cmd): (u8, u16, u8),
+    cipher_key: &mut Option<String>,
+    ctx: &ZaloContext,
+    self_listen: bool,
+    report: &mut FrameReport,
+) -> Vec<WsEvent> {
     let body = &frame[4..];
     if body.is_empty() {
+        report.error = Some("empty body");
         return Vec::new();
     }
     let Ok(text) = std::str::from_utf8(body) else {
+        report.error = Some("body not utf-8");
         return vec![WsEvent::Error("WebSocket frame body is not valid UTF-8".into())];
     };
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => return vec![WsEvent::Error(format!("WebSocket JSON parse error: {e}"))],
+        Err(e) => {
+            report.error = Some("body not json");
+            return vec![WsEvent::Error(format!("WebSocket JSON parse error: {e}"))];
+        }
     };
 
     // Handshake cipher key (v=1, cmd=1, sub=1)
@@ -590,161 +623,116 @@ pub fn dispatch_frame(
     let own_id = ctx.uid.as_str();
     let mut events = Vec::new();
 
+    let decoded = decode_inner();
+    let inner_ref = decoded.as_ref().ok().map(unwrap_data);
+    if let (Ok(d), Some(inner)) = (decoded.as_ref(), inner_ref) {
+        report.describe_payload(d, inner);
+    } else {
+        report.error = Some("payload decode failed");
+    }
+    // `pageMsgs` (Official Account / ZNS / OTP) are read on 501 and 510 whatever the subCmd.
+    let has_page_msgs = inner_ref
+        .and_then(|i| i.get("pageMsgs"))
+        .is_some_and(Value::is_array);
+    let ctl = ListCtx { own_id, self_listen };
+
     match (version, cmd, sub_cmd) {
         // Live 1:1 messages + pageMsgs (OA/ZNS/OTP)
-        (1, 501, 0) => match decode_inner() {
+        (1, 501, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
-                let mut batch = Vec::new();
-                if let Some(msgs) = inner.get("msgs").and_then(|v| v.as_array()) {
-                    for msg in msgs {
-                        if is_undo_content(msg.get("content")) {
-                            if let Some(undo) = normalize_ws_message(msg, ThreadType::User, own_id, false) {
-                                if !undo.is_self || self_listen {
-                                    events.push(WsEvent::Undo(undo));
-                                }
-                            }
-                        } else if let Some(raw) = normalize_ws_message(msg, ThreadType::User, own_id, true) {
-                            if !raw.is_self || self_listen {
-                                batch.push(raw);
-                            }
-                        }
-                    }
-                }
-                if let Some(page_msgs) = inner.get("pageMsgs").and_then(|v| v.as_array()) {
-                    for msg in page_msgs {
-                        if is_undo_content(msg.get("content")) {
-                            continue;
-                        }
-                        if let Some(raw) = normalize_page_or_offline_message(msg, ThreadType::User, own_id) {
-                            batch.push(raw);
-                        }
-                    }
-                }
-                if !batch.is_empty() {
-                    events.push(WsEvent::Messages(batch));
-                }
+                let inner = unwrap_data(decoded);
+                let mut got = Collected::default();
+                collect_list(report, inner, "msgs", ThreadType::User, ListMode::WsLive, &ctl, &mut got);
+                collect_list(report, inner, "pageMsgs", ThreadType::User, ListMode::Page, &ctl, &mut got);
+                got.push_live(&mut events);
             }
             Err(e) => events.push(WsEvent::Error(e.to_string())),
         },
 
+        // pageMsgs on 501 with another subCmd: the TS port captured them (any subCmd). `msgs` stay
+        // with the (1, 501, 0) arm only, as in TS, so nothing is emitted twice.
+        (1, 501, _) if has_page_msgs => {
+            let inner = inner_ref.unwrap_or(&parsed);
+            let mut got = Collected::default();
+            collect_list(report, inner, "pageMsgs", ThreadType::User, ListMode::Page, &ctl, &mut got);
+            got.push_live(&mut events);
+        }
+
         // Live Group messages (+ any pageMsgs)
-        (1, 521, 0) => match decode_inner() {
+        (1, 521, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
-                let mut batch = Vec::new();
-                if let Some(msgs) = inner.get("groupMsgs").and_then(|v| v.as_array()) {
-                    for msg in msgs {
-                        if is_undo_content(msg.get("content")) {
-                            if let Some(undo) = normalize_ws_message(msg, ThreadType::Group, own_id, false) {
-                                if !undo.is_self || self_listen {
-                                    events.push(WsEvent::Undo(undo));
-                                }
-                            }
-                        } else if let Some(raw) = normalize_ws_message(msg, ThreadType::Group, own_id, true) {
-                            if !raw.is_self || self_listen {
-                                batch.push(raw);
-                            }
-                        }
-                    }
-                }
-                if let Some(page_msgs) = inner.get("pageMsgs").and_then(|v| v.as_array()) {
-                    for msg in page_msgs {
-                        if !is_undo_content(msg.get("content")) {
-                            if let Some(raw) = normalize_page_or_offline_message(msg, ThreadType::User, own_id) {
-                                batch.push(raw);
-                            }
-                        }
-                    }
-                }
-                if !batch.is_empty() {
-                    events.push(WsEvent::Messages(batch));
-                }
+                let inner = unwrap_data(decoded);
+                let mut got = Collected::default();
+                collect_list(report, inner, "groupMsgs", ThreadType::Group, ListMode::WsLive, &ctl, &mut got);
+                collect_list(report, inner, "pageMsgs", ThreadType::User, ListMode::Page, &ctl, &mut got);
+                got.push_live(&mut events);
             }
             Err(e) => events.push(WsEvent::Error(e.to_string())),
         },
 
         // Old 1:1 messages + pageMsgs
-        (_, 510, 1) => match decode_inner() {
+        (_, 510, 1) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
-                let mut out = Vec::new();
-                if let Some(msgs) = inner.get("msgs").and_then(|v| v.as_array()) {
-                    for msg in msgs {
-                        if let Some(raw) = normalize_ws_message(msg, ThreadType::User, own_id, true) {
-                            out.push(raw);
-                        }
-                    }
-                }
-                if let Some(page_msgs) = inner.get("pageMsgs").and_then(|v| v.as_array()) {
-                    for msg in page_msgs {
-                        if !is_undo_content(msg.get("content")) {
-                            if let Some(raw) = normalize_page_or_offline_message(msg, ThreadType::User, own_id) {
-                                out.push(raw);
-                            }
-                        }
-                    }
-                }
+                let inner = unwrap_data(decoded);
+                let mut got = Collected::default();
+                collect_list(report, inner, "msgs", ThreadType::User, ListMode::WsOld, &ctl, &mut got);
+                collect_list(report, inner, "pageMsgs", ThreadType::User, ListMode::Page, &ctl, &mut got);
                 events.push(WsEvent::OldMessages {
                     thread_type: ThreadType::User,
-                    messages: out,
+                    messages: got.msgs,
                 });
             }
             Err(e) => events.push(WsEvent::Error(e.to_string())),
         },
 
+        // pageMsgs on 510 with another subCmd: replayed history like 510/1, but not part of the
+        // paged replay (no cursor), so it gets its own event.
+        (_, 510, _) if has_page_msgs => {
+            let inner = inner_ref.unwrap_or(&parsed);
+            let mut got = Collected::default();
+            collect_list(report, inner, "pageMsgs", ThreadType::User, ListMode::Page, &ctl, &mut got);
+            if !got.msgs.is_empty() {
+                events.push(WsEvent::OldPageMessages(got.msgs));
+            }
+        }
+
         // Old Group messages
-        (_, 511, 1) => match decode_inner() {
+        (_, 511, 1) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
-                let mut out = Vec::new();
-                if let Some(msgs) = inner.get("groupMsgs").and_then(|v| v.as_array()) {
-                    for msg in msgs {
-                        if let Some(raw) = normalize_ws_message(msg, ThreadType::Group, own_id, true) {
-                            out.push(raw);
-                        }
-                    }
-                }
+                let inner = unwrap_data(decoded);
+                let mut got = Collected::default();
+                collect_list(report, inner, "groupMsgs", ThreadType::Group, ListMode::WsOld, &ctl, &mut got);
                 events.push(WsEvent::OldMessages {
                     thread_type: ThreadType::Group,
-                    messages: out,
+                    messages: got.msgs,
                 });
             }
             Err(e) => events.push(WsEvent::Error(e.to_string())),
         },
 
         // Offline / re-push frames (504, 513, 514, 524, 534, 551, 570)
-        (1, c, _) if OFFLINE_PUSH_CMDS.contains(&c) => match decode_inner() {
+        (1, c, _) if OFFLINE_PUSH_CMDS.contains(&c) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
-                let mut batch = Vec::new();
+                let inner = unwrap_data(decoded);
+                let mut got = Collected::default();
                 for (key, ttype) in [
                     ("pageMsgs", ThreadType::User),
                     ("msgs", ThreadType::User),
                     ("groupMsgs", ThreadType::Group),
                 ] {
-                    if let Some(list) = inner.get(key).and_then(|v| v.as_array()) {
-                        for item in list {
-                            if is_undo_content(item.get("content")) {
-                                continue;
-                            }
-                            if let Some(raw) = normalize_page_or_offline_message(item, ttype, own_id) {
-                                batch.push(raw);
-                            }
-                        }
-                    }
+                    collect_list(report, inner, key, ttype, ListMode::Page, &ctl, &mut got);
                 }
-                if !batch.is_empty() {
-                    events.push(WsEvent::Messages(batch));
+                if !got.msgs.is_empty() {
+                    events.push(WsEvent::Messages(got.msgs));
                 }
             }
             Err(e) => events.push(WsEvent::Error(e.to_string())),
         },
 
         // Delivered & seen (User)
-        (_, 502, 0) => match decode_inner() {
+        (_, 502, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 if let Some(deliv) = inner.get("delivereds").and_then(|v| v.as_array()) {
                     if !deliv.is_empty() {
                         events.push(WsEvent::Delivered {
@@ -766,9 +754,9 @@ pub fn dispatch_frame(
         },
 
         // Delivered & seen (Group)
-        (_, 522, 0) => match decode_inner() {
+        (_, 522, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 if let Some(deliv) = inner.get("delivereds").and_then(|v| v.as_array()) {
                     let filtered: Vec<Value> = deliv
                         .iter()
@@ -820,9 +808,9 @@ pub fn dispatch_frame(
         },
 
         // Controls (file_done, group, fr, voip, history sync)
-        (1, 601, 0) => match decode_inner() {
+        (1, 601, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 if let Some(controls) = inner.get("controls").and_then(|v| v.as_array()) {
                     for control in controls {
                         let Some(content) = control.get("content") else {
@@ -924,9 +912,9 @@ pub fn dispatch_frame(
         },
 
         // Typing actions
-        (_, 602, 0) => match decode_inner() {
+        (_, 602, 0) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 if let Some(actions) = inner.get("actions").and_then(|v| v.as_array()) {
                     for action in actions {
                         let act_type = action
@@ -978,9 +966,9 @@ pub fn dispatch_frame(
         },
 
         // Live reactions (612)
-        (_, 612, _) => match decode_inner() {
+        (_, 612, _) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 for (key, ttype) in [
                     ("reacts", ThreadType::User),
                     ("reactGroups", ThreadType::Group),
@@ -1012,9 +1000,9 @@ pub fn dispatch_frame(
         },
 
         // Old reactions (610 = User, 611 = Group)
-        (_, c @ (610 | 611), _) => match decode_inner() {
+        (_, c @ (610 | 611), _) => match decoded.as_ref() {
             Ok(decoded) => {
-                let inner = unwrap_data(&decoded);
+                let inner = unwrap_data(decoded);
                 let ttype = if c == 611 {
                     ThreadType::Group
                 } else {
@@ -1041,7 +1029,8 @@ pub fn dispatch_frame(
 
         // Any other frame -> RawFrame
         _ => {
-            let payload = decode_inner().unwrap_or(parsed);
+            report.consumed = false;
+            let payload = decoded.unwrap_or(parsed);
             events.push(WsEvent::RawFrame {
                 cmd,
                 sub_cmd,
@@ -1058,6 +1047,99 @@ fn unwrap_data(v: &Value) -> &Value {
         Some(inner) if inner.is_object() => inner,
         _ => v,
     }
+}
+
+/// Per-frame settings shared by the list handlers.
+struct ListCtx<'a> {
+    own_id: &'a str,
+    self_listen: bool,
+}
+
+/// How an array of message items is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListMode {
+    /// `msgs` / `groupMsgs` on live frames: undo items become `Undo` events, e2ee is masked.
+    WsLive,
+    /// `msgs` / `groupMsgs` on history frames: everything is a message, e2ee is masked.
+    WsOld,
+    /// `pageMsgs` and offline re-push arrays (port of `toRawMessage`): undo items are skipped.
+    Page,
+}
+
+#[derive(Default)]
+struct Collected {
+    msgs: Vec<RawWsMessage>,
+    undos: Vec<RawWsMessage>,
+}
+
+impl Collected {
+    /// Pushes live events: undos first, then one `Messages` batch (if any).
+    fn push_live(self, events: &mut Vec<WsEvent>) {
+        events.extend(self.undos.into_iter().map(WsEvent::Undo));
+        if !self.msgs.is_empty() {
+            events.push(WsEvent::Messages(self.msgs));
+        }
+    }
+}
+
+/// Reads `inner[name]` (if it is an array) as `mode` says, collects the resulting messages and
+/// records one [`ItemReport`] per item in `report` (outcome and drop reason, never content).
+fn collect_list(
+    report: &mut FrameReport,
+    inner: &Value,
+    name: &str,
+    thread_type: ThreadType,
+    mode: ListMode,
+    ctl: &ListCtx<'_>,
+    out: &mut Collected,
+) {
+    let Some(list) = inner.get(name).and_then(|v| v.as_array()) else {
+        return;
+    };
+    let mut items = Vec::with_capacity(list.len().min(32));
+    for item in list {
+        let mut ir = ItemReport::describe(item, ctl.own_id);
+        let undo = is_undo_content(item.get("content"));
+        match mode {
+            ListMode::WsLive | ListMode::WsOld => {
+                if !item.is_object() {
+                    ir.dropped("not an object");
+                } else if mode == ListMode::WsLive && undo {
+                    match normalize_ws_message(item, thread_type, ctl.own_id, false) {
+                        Some(u) if !u.is_self || ctl.self_listen => {
+                            out.undos.push(u);
+                            ir.undo();
+                        }
+                        _ => ir.dropped("own undo (selfListen off)"),
+                    }
+                } else {
+                    match normalize_ws_message(item, thread_type, ctl.own_id, true) {
+                        Some(m) if mode == ListMode::WsOld || !m.is_self || ctl.self_listen => {
+                            if m.thread_id.is_empty() || m.thread_id == "0" {
+                                // Kept as before; the store decides. Flag it for the log.
+                                ir.note = Some("thread id empty/0");
+                            }
+                            out.msgs.push(m);
+                            ir.kept();
+                        }
+                        _ => ir.dropped("own message (selfListen off)"),
+                    }
+                }
+            }
+            ListMode::Page => match try_normalize_page(item, thread_type, ctl.own_id) {
+                Ok(m) => {
+                    if is_e2ee_type(item.get("msgType").and_then(|v| v.as_str())) {
+                        ir.note = Some("e2ee-masked");
+                    }
+                    out.msgs.push(m);
+                    ir.kept();
+                }
+                Err(reason) => ir.dropped(reason),
+            },
+        }
+        items.push(ir);
+    }
+    report.set_items(name, items);
 }
 
 fn is_undo_content(content: Option<&Value>) -> bool {
@@ -1146,20 +1228,33 @@ fn normalize_ws_message(
 }
 
 /// Port of `src/oamsg.ts:toRawMessage` for `pageMsgs` and offline re-push commands.
+///
+/// Like TS, `??` semantics: a JSON `null` id falls through to the next candidate.
+#[cfg(test)]
 fn normalize_page_or_offline_message(
     item: &Value,
     thread_type: ThreadType,
     own_id: &str,
 ) -> Option<RawWsMessage> {
-    let obj = item.as_object()?;
-    let msg_id = obj
-        .get("msgId")
-        .or_else(|| obj.get("globalMsgId"))
-        .or_else(|| obj.get("cliMsgId"))
+    try_normalize_page(item, thread_type, own_id).ok()
+}
+
+/// `normalize_page_or_offline_message` with the reason an item was dropped.
+fn try_normalize_page(
+    item: &Value,
+    thread_type: ThreadType,
+    own_id: &str,
+) -> std::result::Result<RawWsMessage, &'static str> {
+    let obj = item.as_object().ok_or("not an object")?;
+    let msg_id = ["msgId", "globalMsgId", "cliMsgId"]
+        .iter()
+        .filter_map(|k| obj.get(*k))
+        .find(|v| !v.is_null())
         .map(json_as_string)
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty())
+        .ok_or("no msgId")?;
     if is_undo_content(obj.get("content")) {
-        return None;
+        return Err("undo content");
     }
 
     let raw_uid_from = obj.get("uidFrom").map(json_as_string).unwrap_or_default();
@@ -1176,7 +1271,7 @@ fn normalize_page_or_offline_message(
         }
     };
     if thread_id.is_empty() || thread_id == "0" {
-        return None;
+        return Err("thread id empty/0");
     }
 
     let uid_from = if raw_uid_from == "0" {
@@ -1190,11 +1285,12 @@ fn normalize_page_or_offline_message(
         raw_id_to
     };
 
-    let msg_type = obj
-        .get("msgType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("webchat")
-        .to_string();
+    // TS: `String(m.msgType ?? "webchat")`.
+    let msg_type = match obj.get("msgType") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string(),
+        _ => "webchat".to_string(),
+    };
     let content = if is_e2ee_type(Some(&msg_type)) {
         Value::String("[Encrypted message]".to_string())
     } else {
@@ -1212,8 +1308,10 @@ fn normalize_page_or_offline_message(
         .map(json_as_string)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| msg_id.clone());
+    // TS: only a string or a number is a usable `ts`, anything else becomes "now".
     let ts = obj
         .get("ts")
+        .filter(|v| v.is_string() || v.is_number())
         .cloned()
         .unwrap_or_else(|| Value::Number(Utc::now().timestamp_millis().into()));
 
@@ -1250,7 +1348,7 @@ fn normalize_page_or_offline_message(
         data_map.insert("quote".to_string(), Value::Object(qm));
     }
 
-    Some(RawWsMessage {
+    Ok(RawWsMessage {
         thread_type,
         thread_id,
         is_self,
@@ -1427,6 +1525,224 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    fn oa_item(id: &str, text: &str) -> Value {
+        json!({
+            "msgId": id,
+            "msgType": "chat.webcontent",
+            "uidFrom": "99999",
+            "idTo": "0",
+            "oaName": "Some OA",
+            "content": { "title": text, "href": "https://example.invalid/x" },
+            "ts": 1700000000003i64
+        })
+    }
+
+    #[test]
+    fn page_msgs_on_501_with_other_sub_cmd_are_captured_once() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        // `msgs` next to `pageMsgs` on a non-zero subCmd must NOT be re-emitted (TS did not either).
+        let frame = plain_frame(
+            501,
+            3,
+            json!({ "data": {
+                "msgs": [{ "msgId": "1", "uidFrom": "20002", "idTo": "0", "content": "hi", "ts": 1 }],
+                "pageMsgs": [oa_item("700", "OTP 123456")]
+            }}),
+        );
+        let events = dispatch_frame(&frame, &mut ck, &ctx, true);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::Messages(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].thread_id, "99999");
+                assert_eq!(list[0].data["msgType"], "chat.webcontent");
+            }
+            other => panic!("expected Messages, got {other:?}"),
+        }
+        // Without pageMsgs, an unknown 501 subCmd is still a RawFrame.
+        let frame = plain_frame(501, 3, json!({ "data": { "msgs": [] } }));
+        let events = dispatch_frame(&frame, &mut ck, &ctx, true);
+        assert!(matches!(events[0], WsEvent::RawFrame { cmd: 501, sub_cmd: 3, .. }));
+    }
+
+    #[test]
+    fn page_msgs_on_510_other_sub_cmd_are_history_not_live() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let frame = plain_frame(510, 2, json!({ "data": { "pageMsgs": [oa_item("701", "x")] } }));
+        let events = dispatch_frame(&frame, &mut ck, &ctx, true);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::OldPageMessages(list) => assert_eq!(list[0].thread_id, "99999"),
+            other => panic!("expected OldPageMessages, got {other:?}"),
+        }
+        // 510/1 keeps its OldMessages semantics (paged replay).
+        let frame = plain_frame(510, 1, json!({ "data": { "pageMsgs": [oa_item("702", "x")] } }));
+        let events = dispatch_frame(&frame, &mut ck, &ctx, true);
+        match &events[0] {
+            WsEvent::OldMessages { messages, .. } => assert_eq!(messages.len(), 1),
+            other => panic!("expected OldMessages, got {other:?}"),
+        }
+        // No pageMsgs: not consumed.
+        let frame = plain_frame(510, 2, json!({ "data": { "msgs": [] } }));
+        assert!(matches!(
+            dispatch_frame(&frame, &mut ck, &ctx, true)[0],
+            WsEvent::RawFrame { cmd: 510, .. }
+        ));
+    }
+
+    #[test]
+    fn page_message_normalizer_matches_ts_to_raw_message() {
+        // `??`: a null msgId falls through to globalMsgId.
+        let m = normalize_page_or_offline_message(
+            &json!({ "msgId": null, "globalMsgId": 555, "uidFrom": 99999, "idTo": "0", "content": "x" }),
+            ThreadType::User,
+            "10001",
+        )
+        .expect("globalMsgId fallback");
+        assert_eq!(m.data["msgId"], "555");
+        assert_eq!(m.thread_id, "99999");
+        // Numeric msgType is stringified, a junk ts becomes "now", own uid (not just 0) is self.
+        let m = normalize_page_or_offline_message(
+            &json!({ "msgId": "9", "msgType": 7, "uidFrom": "10001", "idTo": "20002", "ts": {"a": 1}, "content": "x" }),
+            ThreadType::User,
+            "10001",
+        )
+        .expect("kept");
+        assert_eq!(m.data["msgType"], "7");
+        assert!(m.is_self);
+        assert_eq!(m.thread_id, "20002");
+        assert!(m.data["ts"].is_number());
+        // Non-numeric OA ids are fine.
+        let m = normalize_page_or_offline_message(
+            &json!({ "msgId": "9", "uidFrom": "oa.zalo", "idTo": "0", "content": "x" }),
+            ThreadType::User,
+            "10001",
+        )
+        .expect("non numeric uid");
+        assert_eq!(m.thread_id, "oa.zalo");
+        // Real drops.
+        for bad in [
+            json!({ "uidFrom": "1", "content": "x" }),
+            json!({ "msgId": "1", "uidFrom": "0", "idTo": "0", "content": "x" }),
+            json!({ "msgId": "1", "uidFrom": "", "content": "x" }),
+            json!({ "msgId": "1", "uidFrom": "5", "content": { "deleteMsg": 1 } }),
+            json!("str"),
+        ] {
+            assert!(normalize_page_or_offline_message(&bad, ThreadType::User, "10001").is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn traced_report_unknown_cmd_is_not_consumed() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let frame = plain_frame(9999, 4, json!({ "data": { "foo": 1, "list": [1, 2, 3] } }));
+        let (events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        assert!(matches!(events[0], WsEvent::RawFrame { cmd: 9999, .. }));
+        let r = report.expect("report");
+        assert_eq!((r.version, r.cmd, r.sub_cmd), (1, 9999, 4));
+        assert!(!r.consumed);
+        assert_eq!(r.payload_keys, vec!["data"]);
+        assert_eq!(r.data_keys, vec!["foo", "list"]);
+        assert_eq!(r.arrays.len(), 1);
+        assert_eq!((r.arrays[0].name.as_str(), r.arrays[0].len, r.arrays[0].read), ("list", 3, false));
+    }
+
+    #[test]
+    fn traced_report_handled_501_with_page_msgs_and_drop_reasons() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let frame = plain_frame(
+            501,
+            0,
+            json!({ "data": {
+                "pageMsgs": [
+                    oa_item("800", "ok"),
+                    { "uidFrom": "99999", "idTo": "0", "content": "no id" },
+                    { "msgId": "801", "uidFrom": "0", "idTo": "0", "content": "no thread" },
+                    { "msgId": "802", "uidFrom": "99999", "content": { "deleteMsg": 1 } },
+                    "junk"
+                ],
+                "other": [1]
+            }}),
+        );
+        let (events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        assert_eq!(events.len(), 1);
+        let r = report.expect("report");
+        assert!(r.consumed);
+        let page = r.arrays.iter().find(|a| a.name == "pageMsgs").expect("pageMsgs");
+        assert!(page.read);
+        assert_eq!(page.len, 5);
+        let outcomes: Vec<(&str, Option<&str>)> = page.items.iter().map(|i| (i.outcome, i.reason)).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("message", None),
+                ("dropped", Some("no msgId")),
+                ("dropped", Some("thread id empty/0")),
+                ("dropped", Some("undo content")),
+                ("dropped", Some("not an object")),
+            ]
+        );
+        assert_eq!(page.items[0].msg_type.as_deref(), Some("chat.webcontent"));
+        assert_eq!(page.items[0].content, "{href,title}");
+        assert_eq!(page.items[0].uid_from, "other");
+        assert_eq!(page.items[2].uid_from, "zero");
+        assert!(!r.arrays.iter().find(|a| a.name == "other").unwrap().read);
+    }
+
+    #[test]
+    fn traced_report_lists_control_acts() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let frame = plain_frame(
+            601,
+            0,
+            json!({ "data": { "controls": [
+                { "content": { "act_type": "group", "act": "join_reject" } },
+                { "content": { "act_type": "fr", "act": "req" } }
+            ]}}),
+        );
+        let (_events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        let r = report.expect("report");
+        assert_eq!(r.acts, vec!["group/join_reject", "fr/req"]);
+    }
+
+    #[test]
+    fn traced_report_never_contains_text_or_values() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let secret = "SECRET-OTP-482910 Nguyen Van A 0901234567";
+        let frame = plain_frame(
+            501,
+            0,
+            json!({ "data": {
+                "msgs": [
+                    { "msgId": "1", "uidFrom": "20002", "idTo": "0", "dName": secret, "content": secret, "ts": 1 },
+                    { "msgId": "2", "uidFrom": "20002", "idTo": "0", "content": { "title": secret, "description": secret }, "ts": 1 },
+                    { "msgId": "3", "uidFrom": "20002", "idTo": "0", "content": format!("{{\"params\":\"{secret}\"}}"), "ts": 1 }
+                ],
+                "pageMsgs": [{
+                    "msgId": "4", "msgType": "chat.webcontent", "uidFrom": "99999", "idTo": "0",
+                    "oaName": secret, "content": { "href": secret }, "ts": 1
+                }]
+            }}),
+        );
+        let (events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        assert!(!events.is_empty());
+        let r = report.expect("report");
+        let rendered = serde_json::to_string(&r).unwrap();
+        for needle in ["SECRET", "482910", "Nguyen", "0901234567", "example"] {
+            assert!(!rendered.contains(needle), "leaked {needle}: {rendered}");
+        }
+        let msgs = r.arrays.iter().find(|a| a.name == "msgs").unwrap();
+        assert_eq!(msgs.items[0].content, "string");
+        assert_eq!(msgs.items[1].content, "{description,title}");
+        assert_eq!(msgs.items[2].content, "string>{params}");
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::api::{ListenerControl, ListenerStart, ProtoLogin, ZaloApi, ZaloLogin}
 use crate::errors::HttpError;
 use crate::log::{create_dir_private, CallTrace};
 use crate::replay::{BatchStats, ReplayHub};
+use crate::socket_log::SocketLog;
 use crate::store::{normalize_message, recalled_message_id, ChatStore};
 use crate::types::{
     reaction_code, thread_key, ChatMessage, FoundUser, FriendRequest, GroupMember, MentionInfo,
@@ -262,6 +263,7 @@ pub struct ZaloSession {
     store: ChatStore,
     call_trace: CallTrace,
     data_dir: PathBuf,
+    socket_log: SocketLog,
     credentials_file: PathBuf,
     send_read_receipts: bool,
     inner: RwLock<SessionInner>,
@@ -291,6 +293,7 @@ impl ZaloSession {
         let credentials_file = data_dir.join("credentials.json");
         let call_trace = CallTrace::new(&data_dir);
         let replay = ReplayHub::open(&data_dir, now_ms());
+        let socket_log = SocketLog::open(&data_dir);
         let (events_tx, _) = broadcast::channel(512);
         let (voip_tx, _) = broadcast::channel(128);
         let (history_sync_tx, _) = broadcast::channel(128);
@@ -299,6 +302,7 @@ impl ZaloSession {
             store,
             call_trace,
             data_dir,
+            socket_log,
             credentials_file,
             send_read_receipts,
             inner: RwLock::new(SessionInner::default()),
@@ -324,6 +328,11 @@ impl ZaloSession {
     /// Replay reports, replay mode and the listener clock (`/api/debug/replay-*`).
     pub fn replay(&self) -> &ReplayHub {
         &self.replay
+    }
+
+    /// The socket diagnostic log (`/api/debug/socket-log`).
+    pub fn socket_log(&self) -> &SocketLog {
+        &self.socket_log
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -987,10 +996,16 @@ impl ZaloSession {
         handle: &Arc<dyn ListenerControl>,
         generation: u64,
     ) {
+        if let WsEvent::Frame(mut report) = event {
+            report.ts = now_ms();
+            self.socket_log.record(report);
+            return;
+        }
         if !matches!(event, WsEvent::Closed { .. }) {
             self.replay.touch(now_ms());
         }
         match event {
+            WsEvent::Frame(_) => {}
             WsEvent::Connected => {
                 info!("Zalo WebSocket listener connected");
                 self.call_trace.record(&json!({ "kind": "listening" }));
@@ -1038,6 +1053,12 @@ impl ZaloSession {
                 let kind = from_thread_type(thread_type);
                 if let Some(last_id) = self.replay.record_batch(now_ms(), kind, stats) {
                     handle.request_old_messages(thread_type, Some(last_id));
+                }
+            }
+            WsEvent::OldPageMessages(msgs) => {
+                // History pageMsgs outside the paged replay: stored, never notify, no replay stats.
+                for raw in msgs {
+                    let _ = self.ingest_raw(raw, true, generation);
                 }
             }
             WsEvent::Undo(undo) => {
