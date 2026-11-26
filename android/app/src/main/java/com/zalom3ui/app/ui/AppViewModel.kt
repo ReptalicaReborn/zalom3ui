@@ -976,7 +976,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val threads = if (status.isLoggedIn) api.threads() else emptyList()
         val sync = if (status.isLoggedIn) runCatching { api.historySyncStatus() }.getOrNull() else null
         _state.update {
-            it.copy(status = status, threads = threads, connectionError = null, startupError = null, historySync = sync ?: it.historySync)
+            it.copy(
+                status = status,
+                threads = keepUnchanged(it.threads, threads),
+                connectionError = null,
+                startupError = null,
+                historySync = sync ?: it.historySync,
+            )
         }
         _state.value.chat?.let { chat ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE)
@@ -1079,7 +1085,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refreshThreads(api: ApiClient) {
         val threads = api.threads()
-        _state.update { it.copy(threads = threads) }
+        _state.update { it.copy(threads = keepUnchanged(it.threads, threads)) }
     }
 
     private suspend fun markRead(api: ApiClient, ref: ThreadRef) {
@@ -1089,7 +1095,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             throw e
         } catch (_: Exception) {
         }
-        _state.update { s -> s.copy(threads = s.threads.map { if (it.ref == ref) it.copy(unread = 0) else it }) }
+        _state.update { s -> s.copy(threads = s.threads.map { if (it.ref == ref && it.unread != 0) it.copy(unread = 0) else it }) }
     }
 
     private fun updateChat(ref: ThreadRef, fn: (ChatState) -> ChatState) {
@@ -1160,6 +1166,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             text.isBlank() -> if (key in drafts) drafts - key else drafts
             drafts[key] == text -> drafts
             else -> drafts + (key to text)
+        }
+
+        /**
+         * [fresh] (just loaded from the server) with each thread that didn't change replaced by its instance in [current],
+         * and [current] itself when nothing changed, so the chat list redraws only the rows that did.
+         */
+        fun keepUnchanged(current: List<ThreadSummary>, fresh: List<ThreadSummary>): List<ThreadSummary> {
+            if (current.isEmpty() || fresh.isEmpty()) return fresh
+            val byKey = current.associateBy { it.key }
+            val merged = fresh.map { t -> byKey[t.key]?.takeIf { it == t } ?: t }
+            return if (merged.size == current.size && merged.indices.all { merged[it] === current[it] }) current else merged
         }
 
         fun sortThreads(threads: List<ThreadSummary>): List<ThreadSummary> =

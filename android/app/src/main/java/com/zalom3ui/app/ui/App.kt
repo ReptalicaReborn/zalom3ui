@@ -19,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.GroupAdd
 import androidx.compose.material.icons.outlined.People
@@ -44,6 +45,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.server.StartupLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -126,8 +128,11 @@ private fun AppNav(vm: AppViewModel) {
         if (!wideNow) nav.navigate(Routes.CHAT)
     }
 
-    /** What the chat screen can do, for the phone screen and the tablet pane alike. */
-    fun chatActions(chat: ChatState, onBack: () -> Unit) =
+    /**
+     * What the chat screen can do, for the phone screen and the tablet pane alike. Callers remember it per chat, so the
+     * chat screen can skip recomposing when nothing it shows changed.
+     */
+    fun chatActions(ref: ThreadRef, onBack: () -> Unit) =
         ChatActions(
             onBack = onBack,
             onSend = { text, quote, mentioned, onSent -> vm.send(text, quote, mentioned, onSent) },
@@ -141,13 +146,13 @@ private fun AppNav(vm: AppViewModel) {
                 vm.select(msg)
                 nav.navigate(Routes.FORWARD)
             },
-            onPin = { vm.setPinned(chat.ref, it) },
-            onMute = { vm.setMuted(chat.ref, it) },
+            onPin = { vm.setPinned(ref, it) },
+            onMute = { vm.setMuted(ref, it) },
             onMarkUnread = {
-                vm.markUnread(chat.ref)
-                if (wideNow) vm.closeChat(chat.ref) else nav.popBackStack(Routes.HOME, inclusive = false)
+                vm.markUnread(ref)
+                if (wideNow) vm.closeChat(ref) else nav.popBackStack(Routes.HOME, inclusive = false)
             },
-            onDeleteConversation = { vm.deleteConversation(chat.ref) },
+            onDeleteConversation = { vm.deleteConversation(ref) },
             onSendFiles = vm::sendFiles,
             onSearchStickers = vm::searchStickers,
             onSendSticker = vm::sendSticker,
@@ -157,11 +162,11 @@ private fun AppNav(vm: AppViewModel) {
             onRenameGroup = vm::renameGroup,
             onLeaveGroup = { silent ->
                 vm.leaveGroup(silent) {
-                    vm.closeChat(chat.ref)
+                    vm.closeChat(ref)
                     nav.popBackStack(Routes.HOME, inclusive = false)
                 }
             },
-            onDraftChange = { vm.setDraft(chat.ref, it) },
+            onDraftChange = { vm.setDraft(ref, it) },
             onSendVoice = vm::sendVoice,
             onRetryPending = vm::retryPending,
             onDismissPending = vm::dismissPending,
@@ -171,23 +176,28 @@ private fun AppNav(vm: AppViewModel) {
                 nav.navigate(Routes.FORWARD)
             },
         )
+    // Only these slices are read here, so a state change elsewhere (a message, someone typing) doesn't recompose the NavHost.
+    val openState = vm.state.collectAsStateWithLifecycle()
+    val openRequest by remember { derivedStateOf { openState.value.openRequest } }
+    val hasThreads by remember { derivedStateOf { openState.value.threads.isNotEmpty() } }
+    val pendingShare by remember { derivedStateOf { openState.value.pendingShare } }
+    val sessionState by remember { derivedStateOf { openState.value.status?.state } }
+    val signedIn by remember { derivedStateOf { openState.value.status?.isLoggedIn == true } }
     // A tapped notification: open its chat once the chat list knows it.
-    val openState by vm.state.collectAsStateWithLifecycle()
-    LaunchedEffect(openState.openRequest, openState.threads) {
-        if (openState.openRequest == null) return@LaunchedEffect
+    LaunchedEffect(openRequest, hasThreads) {
+        if (openRequest == null) return@LaunchedEffect
         val thread = vm.consumeOpenRequest() ?: return@LaunchedEffect
         vm.openChat(thread)
         goToChat()
     }
     // Content shared into Zalỏ from another app: pick a target chat once ready.
-    LaunchedEffect(openState.pendingShare, openState.status?.state) {
-        if (openState.pendingShare != null && openState.status?.state == "ready") {
+    LaunchedEffect(pendingShare, sessionState) {
+        if (pendingShare != null && sessionState == "ready") {
             if (nav.currentDestination?.route != Routes.SHARE) {
                 nav.navigate(Routes.SHARE) { launchSingleTop = true }
             }
         }
     }
-    val signedIn = openState.status?.isLoggedIn == true
     LaunchedEffect(signedIn) { if (signedIn) vm.loadFriendRequests() }
     // Turning a tablet (or resizing a window) moves an open chat between its own screen and the pane.
     LaunchedEffect(wide) {
@@ -218,6 +228,30 @@ private fun AppNav(vm: AppViewModel) {
         // Each destination collects state itself so it never renders a stale capture.
         screen(Routes.HOME, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
+            // Remembered: a new instance each recomposition would make the chat list and every row recompose too.
+            val listActions = remember(vm, nav) {
+                ThreadListActions(
+                    onOpen = { thread ->
+                        vm.openChat(thread)
+                        if (!wideNow) nav.navigate(Routes.CHAT)
+                    },
+                    onNewChat = { nav.navigate(Routes.NEW_CHAT) },
+                    onContacts = { nav.navigate(Routes.CONTACTS) },
+                    onReconnect = vm::reconnectZalo,
+                    onSettings = { nav.navigate(Routes.SETTINGS) },
+                    onMarkAllRead = vm::markAllRead,
+                    onPin = { thread, pinned -> vm.setPinned(thread.ref, pinned) },
+                    onMute = { thread, option -> vm.setMuted(thread.ref, option) },
+                    onMarkRead = { vm.markThreadRead(it.ref) },
+                    onMarkUnread = { vm.markUnread(it.ref) },
+                    onDelete = { vm.deleteConversation(it.ref) },
+                    onSearchMessages = vm::searchAllMessages,
+                    onOpenSearchHit = { hit ->
+                        vm.openChatAtMessage(hit.ref, hit.threadName, hit.message.id)
+                        goToChat()
+                    },
+                )
+            }
             val status = state.status
             val connectionError = state.connectionError
             when {
@@ -249,46 +283,39 @@ private fun AppNav(vm: AppViewModel) {
                     chat = state.chat,
                     onCloseChat = { vm.closeChat() },
                     chatPane = { chat ->
+                        val actions = remember(chat.ref) { chatActions(chat.ref, onBack = { vm.closeChat(chat.ref) }) }
+                        // The composer reads it only when it is created, so read it only then too.
+                        val initialDraft = remember(chat.ref) { vm.draft(chat.ref) }
                         ChatScreen(
                             chat = chat,
                             thread = state.threads.firstOrNull { it.ref == chat.ref },
                             typing = state.typing[chat.ref.key],
                             stickers = state.stickers,
-                            actions = chatActions(chat, onBack = { vm.closeChat(chat.ref) }),
+                            actions = actions,
                             initialSearch = pendingSearch,
                             onSearchConsumed = { pendingSearch = false },
-                            initialDraft = vm.draft(chat.ref),
+                            initialDraft = initialDraft,
                             chatAccentOverride = state.chatAccents[chat.ref.key],
                             appearance = state.appearance,
                             scrollToMsgId = state.scrollToMsgId,
                             onScrolledToMsg = vm::clearScrollToMsgId,
                         )
                     },
-                ) { selectedKey -> ThreadListScreen(
-                    state = state,
-                    selectedKey = selectedKey,
-                    actions = ThreadListActions(
-                        onOpen = { thread ->
-                            vm.openChat(thread)
-                            if (!wideNow) nav.navigate(Routes.CHAT)
-                        },
-                        onNewChat = { nav.navigate(Routes.NEW_CHAT) },
-                        onContacts = { nav.navigate(Routes.CONTACTS) },
-                        onReconnect = vm::reconnectZalo,
-                        onSettings = { nav.navigate(Routes.SETTINGS) },
-                        onMarkAllRead = vm::markAllRead,
-                        onPin = { thread, pinned -> vm.setPinned(thread.ref, pinned) },
-                        onMute = { thread, option -> vm.setMuted(thread.ref, option) },
-                        onMarkRead = { vm.markThreadRead(it.ref) },
-                        onMarkUnread = { vm.markUnread(it.ref) },
-                        onDelete = { vm.deleteConversation(it.ref) },
-                        onSearchMessages = vm::searchAllMessages,
-                        onOpenSearchHit = { hit ->
-                            vm.openChatAtMessage(hit.ref, hit.threadName, hit.message.id)
-                            goToChat()
-                        },
-                    ),
-                ) }
+                ) { selectedKey ->
+                    // The fields go in as they are (no copies), so the list skips when none of them changed.
+                    ThreadListScreen(
+                        threads = state.threads,
+                        drafts = state.drafts,
+                        typing = state.typing,
+                        status = state.status,
+                        connectionError = state.connectionError,
+                        pendingRequests = state.friendRequests?.size ?: 0,
+                        messageSearchResults = state.messageSearchResults,
+                        messageSearchBusy = state.messageSearchBusy,
+                        actions = listActions,
+                        selectedKey = selectedKey,
+                    )
+                }
             }
         }
         screen(Routes.NEW_CHAT, nav) {
@@ -418,15 +445,18 @@ private fun AppNav(vm: AppViewModel) {
             if (chat == null) {
                 LaunchedEffect(Unit) { nav.popBackStack(Routes.HOME, inclusive = false) }
             } else {
+                val actions = remember(chat.ref) { chatActions(chat.ref, onBack = { nav.safePopBackStack(Routes.CHAT) }) }
+                // The composer reads it only when it is created, so read it only then too.
+                val initialDraft = remember(chat.ref) { vm.draft(chat.ref) }
                 ChatScreen(
                     chat = chat,
                     thread = state.threads.firstOrNull { it.ref == chat.ref },
                     typing = state.typing[chat.ref.key],
                     stickers = state.stickers,
-                    actions = chatActions(chat, onBack = { nav.safePopBackStack(Routes.CHAT) }),
+                    actions = actions,
                     initialSearch = pendingSearch,
                     onSearchConsumed = { pendingSearch = false },
-                    initialDraft = vm.draft(chat.ref),
+                    initialDraft = initialDraft,
                     chatAccentOverride = state.chatAccents[chat.ref.key],
                     appearance = state.appearance,
                     scrollToMsgId = state.scrollToMsgId,
