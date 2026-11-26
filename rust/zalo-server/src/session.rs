@@ -3176,16 +3176,52 @@ fn is_transient_proto_error(err: &ProtoError) -> bool {
 
 fn describe_proto_error(err: &ProtoError) -> String {
     match err {
-        ProtoError::Http(e) => {
-            if e.is_timeout() {
-                "connection timed out".to_string()
-            } else if e.is_connect() {
-                "no internet connection".to_string()
-            } else {
-                e.to_string()
+        ProtoError::Http(e) => describe_network_error(e, e.is_timeout(), e.is_connect()),
+        ProtoError::Io(e) => describe_network_error(e, e.kind() == std::io::ErrorKind::TimedOut, false),
+        other => other.to_string(),
+    }
+}
+
+/// A short, human-readable reason for a failed request, like `describeError` in `src/session.ts`:
+/// an unresolvable host is "no internet connection", a refused or reset connection is
+/// "connection refused", and a timeout is "connection timed out". Looks through the whole source
+/// chain, since the cause is usually an `io::Error` several layers down.
+fn describe_network_error(
+    err: &(dyn std::error::Error + 'static),
+    timed_out: bool,
+    connect_failed: bool,
+) -> String {
+    let (mut timeout, mut refused, mut dns) = (timed_out, false, false);
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset => {
+                    refused = true
+                }
+                std::io::ErrorKind::TimedOut => timeout = true,
+                _ => {}
             }
         }
-        other => other.to_string(),
+        let text = e.to_string().to_lowercase();
+        if ["dns error", "failed to lookup address", "name or service not known", "no address associated", "temporary failure in name resolution"]
+            .iter()
+            .any(|needle| text.contains(needle))
+        {
+            dns = true;
+        }
+        cur = e.source();
+    }
+    if timeout {
+        "connection timed out".to_string()
+    } else if dns {
+        "no internet connection".to_string()
+    } else if refused {
+        "connection refused".to_string()
+    } else if connect_failed {
+        "no internet connection".to_string()
+    } else {
+        err.to_string()
     }
 }
 
@@ -3314,5 +3350,7 @@ mod tests {
 mod reconnect_tests;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod login_tests;
 #[cfg(test)]
 mod test_support;
