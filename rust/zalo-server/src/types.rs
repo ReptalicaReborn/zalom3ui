@@ -522,6 +522,10 @@ pub struct ChatMessage {
     /// Group chats only: how many members have seen it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_count: Option<usize>,
+    /// One-time code (4-8 digits) found in an incoming message: the card's code, or one detected in
+    /// the plain text. Computed when the message is served; the API and notifications carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otp: Option<String>,
 }
 
 /// Persisted on-disk message inside `threads/<hex>.json` and legacy `messages.json`.

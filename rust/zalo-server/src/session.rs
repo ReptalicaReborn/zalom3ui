@@ -3604,6 +3604,7 @@ mod tests {
             mentions_me: false,
             status: None,
             seen_count: None,
+            otp: None,
         };
 
         assert!(session.should_notify(&msg, false));
