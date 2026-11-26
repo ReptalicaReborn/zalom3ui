@@ -207,6 +207,8 @@ data class ChatMessage(
     val status: String? = null,
     /** Group chats only: how many members have seen it. */
     val seenCount: Int? = null,
+    /** One-time code the server found in an incoming message (a card's code or one in the text). */
+    val otp: String? = null,
 ) {
     /** Plain text messages ("webchat" in Zalo) are the only kind the server can forward. */
     val isText: Boolean get() = !recalled && attachment == null && msgType == "webchat"

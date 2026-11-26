@@ -68,4 +68,10 @@ data class StaySettings(
     val mode: StayConnected = StayConnected.ALWAYS,
     /** Bridge mode: cancel the official Zalo app's message notification once Zalỏ has shown its own for the chat. */
     val hideZaloNotifications: Boolean = true,
+    /**
+     * "Codes from Zalo's notifications" (off by default): read one-time codes from the official Zalo app's message
+     * notifications and show them in a Zalỏ notification with a Copy action. Independent of [mode]; it never brings the
+     * core online.
+     */
+    val otpFromZaloNotifications: Boolean = false,
 )

@@ -57,14 +57,19 @@
             android:exported="false"
             android:foregroundServiceType="microphone|camera" />
 
+        <!-- "Copy 482910" on notifications that carry a one-time code: writes the clipboard, opens nothing. -->
+        <receiver
+            android:name=".server.OtpCopyReceiver"
+            android:exported="false" />
+
         <!-- "Reply" / "Mark as read" on message notifications; next to the notifier. -->
         <receiver
             android:name=".server.NotificationActionReceiver"
             android:exported="false" />
 
-        <!-- "While open + notification bridge": watches the official Zalo app's notifications to bring the core online for
-             a minute. Off unless that mode is chosen (the app enables it), and only bound once the user grants
-             notification access. -->
+        <!-- Watches the official Zalo app's notifications: "While open + notification bridge" brings the core online for a
+             minute, "Codes from Zalo's notifications" reads one-time codes. Off unless one of them is chosen (the app
+             enables it), and only bound once the user grants notification access. -->
         <service
             android:name=".server.ZaloNotificationListener"
             android:enabled="false"

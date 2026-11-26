@@ -111,17 +111,31 @@ object StayConnectedCoordinator {
         store.saveStay(store.loadStay().copy(hideZaloNotifications = hide))
     }
 
+    /**
+     * The "Codes from Zalo's notifications" switch changed: saves it and enables or disables the notification listener
+     * component (on when the bridge mode or this switch wants it). Never touches the core or the listener connection.
+     */
+    fun saveOtpFromZaloNotifications(context: Context, on: Boolean) {
+        val app = context.applicationContext
+        val store = SettingsStore(app)
+        store.saveStay(store.loadStay().copy(otpFromZaloNotifications = on))
+        refreshFromSettings(app)
+        if (on) ZaloNotificationListener.requestRebind(app)
+    }
+
     /** Reads the saved settings again (the app switched between the phone and a server, or the mode changed). */
     fun refreshFromSettings(context: Context) {
         val app = context.applicationContext
         val store = SettingsStore(app)
         val onDevice = store.load().onDevice
-        val newMode = if (onDevice) store.loadStay().mode else StayConnected.ALWAYS
+        val saved = store.loadStay()
+        val newMode = if (onDevice) saved.mode else StayConnected.ALWAYS
         synchronized(lock) {
             mode = newMode
             enabled = onDevice && newMode.pausesWhenClosed
         }
-        setBridgeComponentEnabled(app, onDevice && newMode.usesBridge)
+        // One component, two independent jobs: the bridge (this mode) and the code rescue (its own switch).
+        setListenerComponentEnabled(app, ListenerJobs.componentEnabled(onDevice, saved.mode, saved.otpFromZaloNotifications))
         if (enabled) {
             synchronized(lock) {
                 // The core, if running, is connected; foreground or not decides what happens next.
@@ -282,7 +296,7 @@ object StayConnectedCoordinator {
     private fun appIsVisible(): Boolean =
         ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
 
-    private fun setBridgeComponentEnabled(app: Context, enable: Boolean) {
+    private fun setListenerComponentEnabled(app: Context, enable: Boolean) {
         runCatching {
             app.packageManager.setComponentEnabledSetting(
                 ComponentName(app, ZaloNotificationListener::class.java),

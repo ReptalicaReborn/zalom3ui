@@ -53,6 +53,9 @@ class MessageNotifier(
 
     private data class Line(val sender: String, val text: String, val ts: Long)
 
+    /** The latest one-time code in each chat's notification, kept (10 min) until the chat is read, so "Copy" survives newer lines. */
+    private val otpByThread = HashMap<String, Pair<String, Long>>()
+
     private var scope: CoroutineScope? = null
 
     /** Listens until [scope] ends; reconnects while the server starts or restarts. */
@@ -87,7 +90,13 @@ class MessageNotifier(
     private fun show(msg: ChatMessage, threadName: String) {
         val ref = ThreadRef(msg.threadKind, msg.threadId)
         val lines = history.getOrPut(ref.key) { ArrayDeque() }
-        lines.addLast(Line(msg.fromName.ifBlank { threadName }, notificationText(msg), msg.ts))
+        val otp = OtpText.messageCode(msg)
+        if (otp != null) {
+            otpByThread[ref.key] = otp to System.currentTimeMillis()
+            OtpNotifications.dedupe.noteNotified(otp, System.currentTimeMillis())
+        }
+        val text = notificationText(msg)
+        lines.addLast(Line(msg.fromName.ifBlank { threadName }, if (otp != null) OtpText.line(otp, text) else text, msg.ts))
         while (lines.size > MAX_LINES) lines.removeFirst()
 
         val isGroup = ref.kind == "group"
@@ -135,7 +144,9 @@ class MessageNotifier(
             .setShowsUserInterface(false)
             .build()
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        // A chat with a code in it: "Copy 482910", and the code stays off the lock screen.
+        val code = otpByThread[ref.key]?.takeIf { System.currentTimeMillis() - it.second <= OtpDedupe.RESCUE_MEMORY_MS }?.first
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setStyle(style)
             .setContentTitle(threadName)
@@ -147,7 +158,11 @@ class MessageNotifier(
             .setWhen(msg.ts)
             .addAction(reply)
             .addAction(markRead)
-            .build()
+        if (code != null) {
+            builder.addAction(OtpNotifications.copyAction(context, code))
+            OtpNotifications.applyLockScreenPrivacy(context, builder, CHANNEL_ID)
+        }
+        val notification = builder.build()
         if (canNotify(context)) {
             val posted = runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
             if (posted.isSuccess) runCatching { onPosted(ref, threadName) }
@@ -254,6 +269,7 @@ class MessageNotifier(
 
     private fun cancel(ref: ThreadRef) {
         history.remove(ref.key)
+        otpByThread.remove(ref.key)
         NotificationManagerCompat.from(context).cancel(ref.key, NOTIFICATION_ID)
     }
 

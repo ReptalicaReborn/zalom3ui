@@ -395,8 +395,8 @@ fun SettingsScreen(
 
             if (current.onDevice) IncomingCallSettings()
 
-            // How long Zalo stays connected; only the on-phone core has this choice.
-            if (current.onDevice) StayConnectedSettings()
+            // How long Zalo stays connected (only the on-phone core has this choice), and codes from Zalo's notifications.
+            StayConnectedSettings(showModes = current.onDevice)
 
             if (current.onDevice || loggedIn) {
                 SectionHeader("Account")
