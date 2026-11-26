@@ -630,7 +630,8 @@ type SearchText = {
  * Given `data/messages.json`, it saves to `data/messages/`: `meta.json` (threads, read markers, pins, mutes, the
  * message limit) and one `threads/<hex of the thread key>.json` per chat. A save writes only the files whose contents
  * changed, so a new message rewrites its own chat and not the whole cache. An old single-file `messages.json` is
- * moved to this layout on first load and kept as `messages.json.migrated`.
+ * moved to this layout on first load and kept as `messages.json.migrated` until the next start reads the new layout
+ * cleanly.
  */
 export class ChatStore {
     private threads = new Map<string, ThreadInfo>();
@@ -1182,6 +1183,7 @@ export class ChatStore {
                 backUpCorrupt(meta, err);
             }
         }
+        let allRead = metaLoaded;
         // One unreadable chat is backed up and skipped; the others still load.
         for (const name of listDir(threads)) {
             if (!THREAD_FILE.test(name)) continue;
@@ -1195,9 +1197,13 @@ export class ChatStore {
                 this.messages.set(key, data.messages);
                 for (const m of data.messages) this.index.set(m.id, key);
             } catch (err) {
+                allRead = false;
                 backUpCorrupt(file, err);
             }
         }
+        // The new layout loaded cleanly after a migration: the old single-file copy is no longer needed (it can be tens
+        // of MB on a phone). Kept while anything failed to read, as the only other copy.
+        if (allRead) removeQuietly(`${this.file}.migrated`);
         if (!metaLoaded) {
             // Only a history import lets a chat grow past the usual limit; its raised limit was in meta.json too.
             for (const list of this.messages.values()) {

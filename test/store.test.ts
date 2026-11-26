@@ -700,10 +700,12 @@ test("ChatStore moves an old single-file cache to one file per chat, keeping eve
         assert.ok(fs.existsSync(path.join(dir, "messages", "meta.json")));
         assert.equal(fs.readdirSync(path.join(dir, "messages", "threads")).length, 3);
 
-        // The next start reads the new layout.
+        // The next start reads the new layout, and drops the backup once that worked.
         const reloaded = new ChatStore(file);
         reloaded.ownId = "me";
         assert.deepEqual(savedState(reloaded), savedState(old));
+        assert.equal(fs.existsSync(`${file}.migrated`), false, "the backup goes once the new layout reads cleanly");
+        fs.writeFileSync(`${file}.migrated`, "{}");
 
         // Logging out deletes the backup too.
         reloaded.clear();

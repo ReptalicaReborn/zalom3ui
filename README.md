@@ -23,7 +23,8 @@ web UI, and an Android phone app (Material 3) that can run the whole thing on th
 - **History**: Zalo Web has no history endpoint for 1:1 chats, so the server keeps its own cache
   (`data/messages/`: `meta.json` plus one file per chat in `threads/`, last 500 messages per chat) and replays what
   was missed while offline. A save rewrites only the chats that changed. An older single-file `data/messages.json`
-  is moved to this layout on first start and kept as `data/messages.json.migrated`.
+  is moved to this layout on first start; its backup copy (`data/messages.json.migrated`) is deleted on the next
+  start once the new files load cleanly.
   Group chats additionally pull recent history from Zalo when opened.
 
 > [!IMPORTANT]
