@@ -62,8 +62,10 @@ android {
 
     packaging {
         jniLibs {
-            // Compress native libraries in the APK (extracted on install) to keep the download small.
-            useLegacyPackaging = true
+            // Store native libraries uncompressed: Android loads them straight from the APK instead of unpacking a
+            // second copy at install. libnode.so alone is ~50 MB unpacked, so the app takes ~17 MB less on the phone,
+            // at the cost of a bigger download (~53 MB instead of ~19 MB).
+            useLegacyPackaging = false
         }
     }
 
