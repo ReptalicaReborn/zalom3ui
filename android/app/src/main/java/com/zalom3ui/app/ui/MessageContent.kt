@@ -47,6 +47,9 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import android.content.ClipData
+import android.content.ClipboardManager
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MissedVideoCall
@@ -54,17 +57,20 @@ import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.automirrored.outlined.PhoneMissed
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LocationOn
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingToolbarDefaults
 import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
@@ -130,7 +136,8 @@ import kotlinx.coroutines.withContext
 private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
-fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS && (href != null || thumb != null || title != null || kind in setOf("photo", "gif", "video"))
+fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS &&
+    (href != null || thumb != null || title != null || description != null || otp != null || actionLabel != null || kind in setOf("photo", "gif", "video"))
 
 /** Whether a photo, GIF, or video has a remote URL that can be rendered frameless. */
 fun Attachment.hasRenderableMedia(): Boolean = when (kind) {
@@ -289,7 +296,7 @@ fun AttachmentContent(
             onOutgoing = onOutgoing,
             onClick = a.href?.let { href -> { openExternally(context, href) } },
         )
-        "link" -> LinkCard(a, onOutgoing, onClick = a.href?.let { href -> { openExternally(context, href) } })
+        "link" -> LinkCard(a, onOutgoing, onClick = a.remoteHref?.let { href -> { openExternally(context, href) } })
         "contact" -> CardRow(
             icon = { Avatar(a.title.orEmpty(), a.thumb.orEmpty(), key = a.userId ?: a.title.orEmpty(), isGroup = false, size = 40.dp) },
             title = a.title ?: "Contact",
@@ -486,17 +493,67 @@ private fun FileBadge(ext: String?) {
     }
 }
 
+private val OTP_KEYWORD_RE = Regex(
+    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b""",
+    RegexOption.IGNORE_CASE,
+)
+private val OTP_AFTER_RE = Regex(
+    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b[^\d\n]{0,40}?(?<!\d)(\d{4,8})(?!\d)""",
+    RegexOption.IGNORE_CASE,
+)
+private val OTP_BEFORE_RE = Regex(
+    """(?<!\d)(\d{4,8})(?!\d)[^\d\n]{0,24}\b(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)\b""",
+    RegexOption.IGNORE_CASE,
+)
+
+/**
+ * Extracts a 4–8 digit OTP / verification code when accompanied by an OTP keyword (Vietnamese or English).
+ * Ignores 9+ digit phone numbers or account IDs (e.g. `0378795621`).
+ */
+internal fun extractOtpCode(text: String): String? {
+    if (text.isBlank()) return null
+    val folded = foldForSearch(text)
+    if (!OTP_KEYWORD_RE.containsMatchIn(folded)) return null
+    OTP_AFTER_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
+    OTP_BEFORE_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
+    return null
+}
+
+/** One-tap chip that copies a detected OTP code to the clipboard. */
+@Composable
+fun OtpCopyChip(otp: String, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    FilledTonalButton(
+        onClick = {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
+            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+        },
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+        modifier = modifier,
+    ) {
+        Icon(Icons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Copy OTP · $otp", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+    }
+}
+
 @Composable
 private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?) {
+    val context = LocalContext.current
     val tint = if (onOutgoing) Color.White.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+    val isRichCard = a.actionLabel != null || a.otp != null || a.remoteHref == null
+    val otp = remember(a.otp, a.title, a.description) {
+        a.otp ?: extractOtpCode(listOfNotNull(a.title, a.description).joinToString("\n"))
+    }
     Column(
         Modifier
             .widthIn(max = 280.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(tint)
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+            .then(if (onClick != null && a.actionLabel == null) Modifier.clickable(onClick = onClick) else Modifier),
     ) {
-        a.thumb?.let {
+        a.remoteThumb?.let {
             SubcomposeAsyncImage(
                 model = it,
                 contentDescription = null,
@@ -505,18 +562,57 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
                 error = {},
             )
         }
-        Column(Modifier.padding(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
+        Column(Modifier.padding(12.dp)) {
+            val host = a.remoteHref?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.")
+            if (host != null && !isRichCard) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(host, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Spacer(Modifier.height(2.dp))
+            }
+            a.title?.let {
                 Text(
-                    a.href?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.") ?: "Link",
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
+                    it,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = if (isRichCard) 3 else 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
-            a.title?.let { Text(it, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis) }
-            a.description?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+            a.description?.let {
+                if (a.title != null) Spacer(Modifier.height(4.dp))
+                Text(
+                    it,
+                    style = if (isRichCard) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+                    maxLines = if (isRichCard) 10 else 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (otp != null) {
+                Spacer(Modifier.height(10.dp))
+                OtpCopyChip(otp = otp, modifier = Modifier.fillMaxWidth())
+            }
+            val ctaLabel = a.actionLabel
+            if (ctaLabel != null && (onClick != null || otp != null)) {
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        if (onClick != null) {
+                            onClick()
+                        } else if (otp != null) {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
+                            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                ) {
+                    Text(ctaLabel, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
         }
     }
 }

@@ -94,6 +94,15 @@ class MediaTest {
     }
 
     @Test
+    fun extractOtpCodeMatchesVerificationCodesAndIgnoresAccountNumbers() {
+        assertEquals("482910", extractOtpCode("Mã xác thực OTP của bạn là: 482910 (hiệu lực 2 phút)"))
+        assertEquals("9912", extractOtpCode("Your verification code is 9912"))
+        assertEquals("739201", extractOtpCode("739201 là mã xác nhận giao dịch"))
+        assertNull(extractOtpCode("Bạn đang yêu cầu cài đặt lại mã PIN tài khoản Giang với mã tài khoản 0378795621 tại The 1."))
+        assertNull(extractOtpCode("Chiều nay 17:30 đi ăn nhé"))
+    }
+
+    @Test
     fun durationsSizesAndFrames() {
         assertEquals("0:05", formatDuration(4_600))
         assertEquals("1:05", formatDuration(65_000))

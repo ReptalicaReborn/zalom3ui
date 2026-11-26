@@ -126,6 +126,10 @@ data class Attachment(
     val call: CallInfo? = null,
     /** Poll messages. */
     val poll: PollRef? = null,
+    /** Call-to-action button label on OA / ZNS link cards (e.g. "ĐẶT LẠI MÃ PIN"). */
+    val actionLabel: String? = null,
+    /** Detected one-time verification / OTP code (4–8 digits). */
+    val otp: String? = null,
 ) {
     /** The picture to show for a photo, GIF or sticker (ignoring local phone URIs from history backups). */
     val image: String? get() = when (kind) {
