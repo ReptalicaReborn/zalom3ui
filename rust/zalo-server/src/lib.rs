@@ -7,6 +7,7 @@ pub mod embedded;
 pub mod errors;
 pub mod http;
 pub mod log;
+pub mod replay;
 pub mod routes;
 pub mod session;
 pub mod store;

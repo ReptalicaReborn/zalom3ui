@@ -26,6 +26,7 @@ use zalo_proto::{
 use crate::api::{ListenerControl, ListenerStart, ProtoLogin, ZaloApi, ZaloLogin};
 use crate::errors::HttpError;
 use crate::log::{create_dir_private, CallTrace};
+use crate::replay::{BatchStats, ReplayHub};
 use crate::store::{normalize_message, recalled_message_id, ChatStore};
 use crate::types::{
     reaction_code, thread_key, ChatMessage, FoundUser, FriendRequest, GroupMember, MentionInfo,
@@ -52,6 +53,12 @@ const MAX_TEXT_LENGTH: usize = 4000;
 const MAX_FORWARD_TARGETS: usize = 20;
 const VIEWING_TTL_MS: i64 = 90_000;
 const NOTIFY_MAX_AGE_MS: i64 = 10 * 60_000;
+/// While a notify window is open, replayed messages notify when they are newer than the window's
+/// trigger time minus this margin.
+pub const NOTIFY_WINDOW_MARGIN_MS: i64 = 2 * 60_000;
+/// A notify window closes by itself after at most this long without being extended, so a client
+/// that forgets to close it cannot leave replayed history notifying forever.
+pub const NOTIFY_WINDOW_MAX_TTL_MS: i64 = 10 * 60_000;
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 const AUDIO_EXTENSIONS: &[&str] = &["m4a", "aac", "mp3", "ogg", "opus", "wav", "amr", "3gp", "webm"];
 
@@ -167,6 +174,17 @@ pub fn mute_until(option: MuteOption) -> i64 {
     }
 }
 
+/// What [`ZaloSession::ingest_raw`] did with one raw message (the replay report counts these).
+enum Ingested {
+    Message {
+        ts: i64,
+        id: String,
+        already_stored: bool,
+    },
+    /// A recall; it carries no timestamp of the message it recalls.
+    Undo { already_stored: bool },
+}
+
 struct SessionInner {
     status: SessionStatus,
     client: Option<Arc<dyn ZaloApi>>,
@@ -187,6 +205,19 @@ struct SessionInner {
     sticker_order: VecDeque<i64>,
     viewing: Option<(String, i64)>,
     looked_up_users: HashSet<String>,
+    /// The chat listener is paused (or will be once the login in flight completes): no listener,
+    /// no reconnects, credentials and login intact.
+    pause_requested: bool,
+    notify_window: Option<NotifyWindow>,
+}
+
+/// While open, replayed messages may notify (see [`ZaloSession::set_notify_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotifyWindow {
+    /// The news that opened the window (epoch ms): the earliest trigger of a coalesced burst.
+    pub trigger_ts: i64,
+    /// When the window closes unless extended (epoch ms).
+    pub expires_at: i64,
 }
 
 impl Default for SessionInner {
@@ -210,6 +241,8 @@ impl Default for SessionInner {
             sticker_order: VecDeque::new(),
             viewing: None,
             looked_up_users: HashSet::new(),
+            pause_requested: false,
+            notify_window: None,
         }
     }
 }
@@ -240,6 +273,7 @@ pub struct ZaloSession {
     /// Wakes a pending listener reconnect (`notify_waiters`, so no stale permit is left behind).
     reconnect_wake: Notify,
     login: Arc<dyn ZaloLogin>,
+    replay: ReplayHub,
 }
 
 impl ZaloSession {
@@ -256,6 +290,7 @@ impl ZaloSession {
     ) -> Self {
         let credentials_file = data_dir.join("credentials.json");
         let call_trace = CallTrace::new(&data_dir);
+        let replay = ReplayHub::open(&data_dir, now_ms());
         let (events_tx, _) = broadcast::channel(512);
         let (voip_tx, _) = broadcast::channel(128);
         let (history_sync_tx, _) = broadcast::channel(128);
@@ -274,6 +309,7 @@ impl ZaloSession {
             retry_notify: Arc::new(Notify::new()),
             reconnect_wake: Notify::new(),
             login,
+            replay,
         }
     }
 
@@ -283,6 +319,11 @@ impl ZaloSession {
 
     pub fn call_trace(&self) -> &CallTrace {
         &self.call_trace
+    }
+
+    /// Replay reports, replay mode and the listener clock (`/api/debug/replay-*`).
+    pub fn replay(&self) -> &ReplayHub {
+        &self.replay
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -317,7 +358,10 @@ impl ZaloSession {
             .read()
             .map_err(|_| HttpError::internal("Session lock poisoned"))?;
         match (&s.client, s.status.state) {
-            (Some(c), SessionState::Ready | SessionState::Disconnected) => Ok(Arc::clone(c)),
+            (
+                Some(c),
+                SessionState::Ready | SessionState::Disconnected | SessionState::Paused,
+            ) => Ok(Arc::clone(c)),
             _ => Err(HttpError::conflict("Not logged in")),
         }
     }
@@ -376,7 +420,12 @@ impl ZaloSession {
             let Ok(mut s) = self.inner.write() else {
                 return;
             };
-            if s.resuming || matches!(s.status.state, SessionState::Ready | SessionState::Disconnected) {
+            if s.resuming
+                || matches!(
+                    s.status.state,
+                    SessionState::Ready | SessionState::Disconnected | SessionState::Paused
+                )
+            {
                 return;
             }
             s.resuming = true;
@@ -485,7 +534,10 @@ impl ZaloSession {
             let Ok(mut s) = self.inner.write() else {
                 return;
             };
-            if matches!(s.status.state, SessionState::Ready | SessionState::Disconnected) {
+            if matches!(
+                s.status.state,
+                SessionState::Ready | SessionState::Disconnected | SessionState::Paused
+            ) {
                 return;
             }
             // Abort any prior QR attempt or offline resume loop
@@ -656,6 +708,8 @@ impl ZaloSession {
                     t.abort();
                 }
                 s.reconnect_attempts = 0;
+                s.pause_requested = false;
+                s.notify_window = None;
                 s.client = None;
                 s.members.clear();
                 s.poll_groups.clear();
@@ -680,6 +734,7 @@ impl ZaloSession {
     /// Stops background tasks and WebSocket listener without deleting credentials or message cache.
     pub fn shutdown(&self) {
         if let Ok(mut s) = self.inner.write() {
+            let had_listener = s.listener_handle.is_some();
             s.generation = s.generation.wrapping_add(1);
             s.resuming = false;
             if let Some(tx) = s.qr_abort_tx.take() {
@@ -702,6 +757,9 @@ impl ZaloSession {
             }
             s.reconnect_attempts = 0;
             s.client = None;
+            if had_listener {
+                self.replay.note_disconnected(now_ms());
+            }
         }
         self.retry_notify.notify_one();
         self.reconnect_wake.notify_waiters();
@@ -710,6 +768,10 @@ impl ZaloSession {
     /// Restarts the real-time WebSocket listener now (returns `409 Conflict` if not logged in).
     /// Cancels any pending automatic reconnect and resets its backoff.
     pub fn reconnect(self: &Arc<Self>) -> Result<(), HttpError> {
+        if self.get_status().state == SessionState::Paused {
+            self.resume();
+            return Ok(());
+        }
         let (client, generation) = {
             let mut s = self
                 .inner
@@ -727,6 +789,80 @@ impl ZaloSession {
         };
         self.start_listener(client, generation)
             .map_err(proto_to_http_error)
+    }
+
+    /// Pauses the chat listener without logging out: stops it, cancels any pending reconnect (so
+    /// nothing reconnects while paused), flushes the store, and moves the status to `paused`.
+    /// Credentials and login stay. REST calls (sending, marking read) still work. Does nothing
+    /// when not logged in. If the saved login is still in flight, the pause applies once it
+    /// completes. Undo with [`Self::resume`].
+    pub fn pause(&self) {
+        let paused_now = {
+            let Ok(mut s) = self.inner.write() else {
+                return;
+            };
+            match s.status.state {
+                SessionState::Ready | SessionState::Disconnected if s.client.is_some() => {
+                    s.pause_requested = true;
+                    if let Some(h) = s.listener_handle.take() {
+                        h.stop();
+                    }
+                    if let Some(t) = s.listener_task.take() {
+                        t.abort();
+                    }
+                    if let Some(t) = s.reconnect_task.take() {
+                        t.abort();
+                    }
+                    s.reconnect_attempts = 0;
+                    true
+                }
+                SessionState::LoggingIn if s.resuming => {
+                    s.pause_requested = true;
+                    false
+                }
+                _ => false,
+            }
+        };
+        if paused_now {
+            self.replay.note_disconnected(now_ms());
+            self.store.flush();
+            self.patch_status(|st| {
+                st.state = SessionState::Paused;
+                st.error = None;
+                st.retrying = false;
+            });
+        }
+    }
+
+    /// Starts the chat listener again after [`Self::pause`]; `Connected` then triggers the replay
+    /// and its report. Does nothing unless paused (a pause still waiting for the login in flight is
+    /// cancelled).
+    pub fn resume(self: &Arc<Self>) {
+        let (client, generation) = {
+            let Ok(mut s) = self.inner.write() else {
+                return;
+            };
+            if !s.pause_requested {
+                return;
+            }
+            s.pause_requested = false;
+            match (s.client.as_ref(), s.status.state) {
+                (Some(c), SessionState::Paused) => (Arc::clone(c), s.generation),
+                _ => return,
+            }
+        };
+        self.patch_status(|st| {
+            st.state = SessionState::Ready;
+            st.error = None;
+        });
+        if let Err(err) = self.start_listener(Arc::clone(&client), generation) {
+            warn!("Failed to restart Zalo WebSocket listener: {err}");
+            self.patch_status(|st| {
+                st.state = SessionState::Disconnected;
+                st.error = Some(describe_proto_error(&err));
+            });
+            self.schedule_reconnect(client, generation);
+        }
     }
 
     // ---- Internal login completion & listener ----
@@ -758,8 +894,17 @@ impl ZaloSession {
             return;
         }
 
+        let start_paused = self
+            .inner
+            .read()
+            .map(|s| s.pause_requested)
+            .unwrap_or(false);
         self.patch_status(|st| {
-            st.state = SessionState::Ready;
+            st.state = if start_paused {
+                SessionState::Paused
+            } else {
+                SessionState::Ready
+            };
             st.own_id = Some(own_id.clone());
             st.own_name = own_name;
             st.own_avatar = own_avatar;
@@ -769,12 +914,14 @@ impl ZaloSession {
             st.retrying = false;
         });
 
-        if let Err(err) = self.start_listener(Arc::clone(&client), generation) {
-            warn!("Failed to start Zalo WebSocket listener: {err}");
-            self.patch_status(|st| {
-                st.state = SessionState::Disconnected;
-                st.error = Some(describe_proto_error(&err));
-            });
+        if !start_paused {
+            if let Err(err) = self.start_listener(Arc::clone(&client), generation) {
+                warn!("Failed to start Zalo WebSocket listener: {err}");
+                self.patch_status(|st| {
+                    st.state = SessionState::Disconnected;
+                    st.error = Some(describe_proto_error(&err));
+                });
+            }
         }
 
         let session_contacts = Arc::clone(self);
@@ -840,6 +987,9 @@ impl ZaloSession {
         handle: &Arc<dyn ListenerControl>,
         generation: u64,
     ) {
+        if !matches!(event, WsEvent::Closed { .. }) {
+            self.replay.touch(now_ms());
+        }
         match event {
             WsEvent::Connected => {
                 info!("Zalo WebSocket listener connected");
@@ -851,8 +1001,14 @@ impl ZaloSession {
                     st.state = SessionState::Ready;
                     st.error = None;
                 });
-                handle.request_old_messages(ThreadType::User);
-                handle.request_old_messages(ThreadType::Group);
+                // Replay what we missed, and write the replay report for this connect.
+                let plan = self.replay.begin(
+                    now_ms(),
+                    self.store.newest_message_of_kind(ThreadKind::User),
+                    self.store.newest_message_of_kind(ThreadKind::Group),
+                );
+                handle.request_old_messages(ThreadType::User, plan.user_last_id);
+                handle.request_old_messages(ThreadType::Group, plan.group_last_id);
                 handle.request_old_reactions(ThreadType::User);
                 handle.request_old_reactions(ThreadType::Group);
             }
@@ -861,12 +1017,27 @@ impl ZaloSession {
             }
             WsEvent::Messages(msgs) => {
                 for raw in msgs {
-                    self.ingest_raw(raw, false, generation);
+                    let _ = self.ingest_raw(raw, false, generation);
                 }
             }
-            WsEvent::OldMessages { messages, .. } => {
+            WsEvent::OldMessages {
+                thread_type,
+                messages,
+            } => {
+                let mut stats = BatchStats::default();
                 for raw in messages {
-                    self.ingest_raw(raw, true, generation);
+                    match self.ingest_raw(raw, true, generation) {
+                        Ingested::Message {
+                            ts,
+                            id,
+                            already_stored,
+                        } => stats.add(ts, &id, already_stored),
+                        Ingested::Undo { already_stored } => stats.add_untimed(already_stored),
+                    }
+                }
+                let kind = from_thread_type(thread_type);
+                if let Some(last_id) = self.replay.record_batch(now_ms(), kind, stats) {
+                    handle.request_old_messages(thread_type, Some(last_id));
                 }
             }
             WsEvent::Undo(undo) => {
@@ -1004,6 +1175,7 @@ impl ZaloSession {
                     format!("Connection closed ({code}: {reason})")
                 };
                 warn!(code, %reason, kicked, "Zalo WebSocket listener closed");
+                self.replay.note_disconnected(now_ms());
                 let _ = self.listener_closed_tx.send(ListenerClosed { code, kicked });
                 self.patch_status(|st| {
                     st.state = SessionState::Disconnected;
@@ -1079,12 +1251,18 @@ impl ZaloSession {
         }
     }
 
-    fn ingest_raw(self: &Arc<Self>, raw: RawWsMessage, is_old: bool, generation: u64) {
+    fn ingest_raw(
+        self: &Arc<Self>,
+        raw: RawWsMessage,
+        is_old: bool,
+        generation: u64,
+    ) -> Ingested {
         if let Some(recalled_id) = recalled_message_id(&raw.data) {
+            let already_stored = self.store.has_message(&recalled_id);
             if let Some(updated) = self.store.apply_undo(&recalled_id) {
                 self.broadcast_message_updated(&updated);
             }
-            return;
+            return Ingested::Undo { already_stored };
         }
         let kind = from_thread_type(raw.thread_type);
         let own_id = self.own_id();
@@ -1104,6 +1282,11 @@ impl ZaloSession {
             }
         }
 
+        let outcome = Ingested::Message {
+            ts: msg.ts,
+            id: msg.id.clone(),
+            already_stored: self.store.has_message(&msg.id),
+        };
         if self.store.add_message(msg.clone()) {
             let public_msg = self.store.to_public(&msg);
             let notify = self.should_notify(&public_msg, is_old);
@@ -1129,6 +1312,7 @@ impl ZaloSession {
                 }
             }
         }
+        outcome
     }
 
     fn resolve_user_thread(self: &Arc<Self>, user_id: String, generation: u64) {
@@ -1973,11 +2157,29 @@ impl ZaloSession {
     }
 
     /// [`Self::should_notify`] with the current time (epoch ms) passed in.
+    ///
+    /// Live messages notify unless they are ours, recalled, older than 10 minutes, in a muted
+    /// chat, or in the chat on screen. Replayed ("old") messages never notify, except while a
+    /// notify window is open ([`Self::set_notify_window`]): then the replay is the news, and a
+    /// replayed message notifies when it is newer than the window's trigger minus
+    /// [`NOTIFY_WINDOW_MARGIN_MS`] and its chat's read marker does not already cover it (plus the
+    /// same not-ours / not-muted / not-on-screen rules).
     pub fn should_notify_at(&self, msg: &ChatMessage, is_old: bool, now: i64) -> bool {
-        if is_old || msg.is_self || msg.recalled {
+        if msg.is_self || msg.recalled {
             return false;
         }
-        if now - msg.ts > NOTIFY_MAX_AGE_MS {
+        if is_old {
+            let Some(window) = self.notify_window_at(now) else {
+                return false;
+            };
+            if msg.ts < window.trigger_ts - NOTIFY_WINDOW_MARGIN_MS
+                || self
+                    .store
+                    .is_read_at(msg.thread_kind, &msg.thread_id, msg.ts)
+            {
+                return false;
+            }
+        } else if now - msg.ts > NOTIFY_MAX_AGE_MS {
             return false;
         }
         if self.store.is_muted_at(msg.thread_kind, &msg.thread_id, now) {
@@ -1991,6 +2193,47 @@ impl ZaloSession {
             .and_then(|s| s.viewing.clone())
             .is_some_and(|(vkey, until)| vkey == key && until > now);
         !viewing_this
+    }
+
+    /// Opens (or extends) the notify window: for `ttl_ms` (clamped to 1 s .. 10 min) replayed
+    /// messages newer than `trigger_ts` minus 2 minutes may notify. Called while the app is
+    /// brought online by a notification from the official Zalo app. A burst coalesces: while a
+    /// window is open, a new call keeps the earliest trigger and pushes the expiry out.
+    pub fn set_notify_window(&self, trigger_ts: i64, ttl_ms: i64) -> NotifyWindow {
+        self.set_notify_window_at(trigger_ts, ttl_ms, now_ms())
+    }
+
+    /// [`Self::set_notify_window`] with the current time (epoch ms) passed in.
+    pub fn set_notify_window_at(&self, trigger_ts: i64, ttl_ms: i64, now: i64) -> NotifyWindow {
+        let ttl = ttl_ms.clamp(1_000, NOTIFY_WINDOW_MAX_TTL_MS);
+        let mut window = NotifyWindow {
+            trigger_ts,
+            expires_at: now + ttl,
+        };
+        if let Ok(mut s) = self.inner.write() {
+            if let Some(existing) = s.notify_window.filter(|w| w.expires_at > now) {
+                window.trigger_ts = window.trigger_ts.min(existing.trigger_ts);
+                window.expires_at = window.expires_at.max(existing.expires_at);
+            }
+            s.notify_window = Some(window);
+        }
+        window
+    }
+
+    /// Closes the notify window now.
+    pub fn clear_notify_window(&self) {
+        if let Ok(mut s) = self.inner.write() {
+            s.notify_window = None;
+        }
+    }
+
+    /// The notify window if one is open at `now`.
+    pub fn notify_window_at(&self, now: i64) -> Option<NotifyWindow> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|s| s.notify_window)
+            .filter(|w| w.expires_at > now)
     }
 
     pub fn thread_name(&self, kind: ThreadKind, thread_id: &str) -> String {
@@ -3114,7 +3357,7 @@ impl ZaloSession {
     pub async fn testing_dispatch(self: &Arc<Self>, event: WsEvent) {
         struct Noop;
         impl ListenerControl for Noop {
-            fn request_old_messages(&self, _: ThreadType) {}
+            fn request_old_messages(&self, _: ThreadType, _: Option<String>) {}
             fn request_old_reactions(&self, _: ThreadType) {}
             fn stop(&self) {}
         }
@@ -3363,5 +3606,7 @@ mod session_tests;
 mod login_tests;
 #[cfg(test)]
 mod features_tests;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod test_support;

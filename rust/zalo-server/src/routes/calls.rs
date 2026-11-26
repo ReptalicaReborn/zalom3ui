@@ -3446,6 +3446,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_paused_listener_stops_the_control_poller_like_a_logout_would() {
+        use crate::api::ProtoApi;
+
+        let (session, mgr, _transport, dir) = make_manager(0);
+        session.testing_attach(Arc::new(ProtoApi::new(polling_client())));
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        session.pause();
+        assert_eq!(session.get_status().state, SessionState::Paused);
+        mgr.sync_control_poller();
+        assert!(!poller_running(&mgr), "no polling while paused");
+
+        // Resuming brings the session back (here the fake-less client cannot open a socket, so
+        // it is `disconnected` and retrying); polling starts again with it.
+        session.resume();
+        assert_ne!(session.get_status().state, SessionState::Paused);
+        mgr.sync_control_poller();
+        assert!(poller_running(&mgr));
+
+        mgr.stop_control_poller();
+        session.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_kick_while_not_polling_leaves_no_off_switch() {
         use crate::api::ProtoApi;
 
