@@ -214,10 +214,52 @@ impl VoiceCallTransport for ProtoVoiceCallTransport {
 
 // ---- CallManager state machine ----
 
+/// One message from the server to the app's call-audio client, whatever the transport.
 #[derive(Debug, Clone)]
-enum AudioWsOut {
+pub enum AudioWsOut {
+    /// A binary frame (`0x01` audio, `0x03` video, `0x05` key-frame request).
     Binary(Vec<u8>),
+    /// The link is over: close code and reason (`1000` "replaced" / "call ended").
     Close(u16, &'static str),
+}
+
+/// Why no audio link could be opened: the WebSocket handler closes with this code and reason.
+pub const NO_ACTIVE_CALL_CLOSE: (u16, &str) = (1008, "No active call");
+
+/// Transport-agnostic call-audio link: frames in ([`AudioLink::handle_incoming`]), frames out
+/// ([`AudioLink::recv`]), close-with-reason (an [`AudioWsOut::Close`] from `recv`). Used by the
+/// `/ws/call-audio` WebSocket handler and by the in-process embedded handle. Only one link is
+/// registered at a time: opening another closes the older one with `1000 "replaced"`. Frames to
+/// the client are dropped when it lags (bounded queue). Unregisters itself on drop.
+pub struct AudioLink {
+    manager: Arc<CallManager>,
+    id: u64,
+    rx: tokio::sync::Mutex<mpsc::Receiver<AudioWsOut>>,
+}
+
+impl AudioLink {
+    /// The next message for the client; `None` when the link was unregistered without a close.
+    pub async fn recv(&self) -> Option<AudioWsOut> {
+        self.rx.lock().await.recv().await
+    }
+
+    /// Handles one binary frame from the app: `0x02` audio, `0x04` video, `0x06` key-frame request.
+    /// Anything else is ignored.
+    pub fn handle_incoming(&self, data: &[u8]) {
+        if let Some(opus) = decode_audio_from_app(data) {
+            self.manager.send_call_audio(opus.to_vec());
+        } else if let Some((key, annex_b)) = decode_video_from_app(data) {
+            self.manager.send_call_video(key, annex_b.to_vec());
+        } else if is_key_frame_wanted(data) {
+            self.manager.request_call_key_frame();
+        }
+    }
+}
+
+impl Drop for AudioLink {
+    fn drop(&mut self) {
+        self.manager.unregister_audio_ws(self.id);
+    }
 }
 
 struct AudioWsClient {
@@ -1986,7 +2028,18 @@ impl CallManager {
         }
     }
 
-    /// Registers a newly connected `/ws/call-audio` client, replacing any existing one with code `1000`.
+    /// Opens the audio link for the call in progress, replacing an existing link with `1000`
+    /// "replaced". `None` when there is no active call (close `1008`, [`NO_ACTIVE_CALL_CLOSE`]).
+    pub fn open_audio_link(self: &Arc<Self>) -> Option<AudioLink> {
+        let (id, rx) = self.register_audio_ws()?;
+        Some(AudioLink {
+            manager: Arc::clone(self),
+            id,
+            rx: tokio::sync::Mutex::new(rx),
+        })
+    }
+
+    /// Registers a newly connected audio client, replacing any existing one with code `1000`.
     fn register_audio_ws(&self) -> Option<(u64, mpsc::Receiver<AudioWsOut>)> {
         let mut s = self.inner.lock().ok()?;
         s.active.as_ref()?;
@@ -2010,11 +2063,11 @@ impl CallManager {
 // ---- Axum Router & Handlers ----
 
 /// Builds the Track 1 calls & call-log router with an isolated `CallManager` per server instance.
-pub fn router(state: AppState) -> Router<AppState> {
+pub fn router(state: AppState) -> (Router<AppState>, Arc<CallManager>) {
     let manager = CallManager::new(Arc::clone(&state.session));
     manager.spawn_background();
 
-    Router::new()
+    let router = Router::new()
         .route("/api/debug/call-log", get(get_call_log).delete(clear_call_log))
         .route("/api/calls/current", get(current_call))
         .route("/api/calls/{callId}/decline", post(post_decline_call))
@@ -2025,7 +2078,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/calls/mute", post(post_mute_call))
         .route("/api/calls/camera", post(post_camera_call))
         .route("/ws/call-audio", get(ws_call_audio))
-        .layer(Extension(manager))
+        .layer(Extension(Arc::clone(&manager)));
+    (router, manager)
 }
 
 async fn get_call_log(State(state): State<AppState>) -> impl IntoResponse {
@@ -2129,11 +2183,11 @@ async fn ws_call_audio(
 }
 
 async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) {
-    let Some((client_id, mut out_rx)) = manager.register_audio_ws() else {
+    let Some(link) = manager.open_audio_link() else {
         let _ = socket
             .send(Message::Close(Some(CloseFrame {
-                code: 1008,
-                reason: "No active call".into(),
+                code: NO_ACTIVE_CALL_CLOSE.0,
+                reason: NO_ACTIVE_CALL_CLOSE.1.into(),
             })))
             .await;
         return;
@@ -2155,7 +2209,7 @@ async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) 
                     break;
                 }
             }
-            out = out_rx.recv() => {
+            out = link.recv() => {
                 match out {
                     Some(AudioWsOut::Binary(data)) => {
                         if socket.send(Message::Binary(data.into())).await.is_err() {
@@ -2178,14 +2232,7 @@ async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) 
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
                         alive = true;
-                        let slice = data.as_ref();
-                        if let Some(opus) = decode_audio_from_app(slice) {
-                            manager.send_call_audio(opus.to_vec());
-                        } else if let Some((key, annex_b)) = decode_video_from_app(slice) {
-                            manager.send_call_video(key, annex_b.to_vec());
-                        } else if is_key_frame_wanted(slice) {
-                            manager.request_call_key_frame();
-                        }
+                        link.handle_incoming(data.as_ref());
                     }
                     Some(Ok(Message::Pong(_))) => {
                         alive = true;
@@ -2207,8 +2254,7 @@ async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) 
         }
     }
 
-    manager.unregister_audio_ws(client_id);
-    debug!(client_id, "Closed /ws/call-audio connection");
+    debug!(client_id = link.id, "Closed /ws/call-audio connection");
 }
 
 // ---- JSON & control helpers ----
@@ -2921,6 +2967,113 @@ mod tests {
         }
 
         srv_handle.abort();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn embedded_audio_replacement_binary_streaming_and_call_end_close() {
+        use crate::embedded::{AudioPoll, EmbeddedAudio};
+
+        let media = FakeMediaServer::start(true).await;
+        let (_session, mgr, _transport, dir) = make_manager(media.port);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let open = |mgr: &Arc<CallManager>| {
+            mgr.open_audio_link()
+                .map(|l| EmbeddedAudio::new(l, shutdown_tx.subscribe()))
+        };
+        let wait = Duration::from_millis(400);
+
+        // 1. No active call -> no link (the WebSocket path closes with 1008)
+        assert!(open(&mgr).is_none());
+        assert_eq!(NO_ACTIVE_CALL_CLOSE, (1008, "No active call"));
+
+        // 2. Answer an incoming call, then open a1
+        mgr.on_voip_control(&ring_control(media.port, "777002", true), "socket", now_ms(), false);
+        mgr.answer_call("777002", None).await.unwrap();
+        mgr.set_call_camera(true).unwrap();
+        let a1 = open(&mgr).expect("link while a call is active");
+
+        // Ending an unrelated call does NOT close a1
+        mgr.on_voip_control(
+            &json!({ "act": "cancel", "data": { "callId": "other-call" }, "raw": {} }),
+            "socket",
+            now_ms(),
+            false,
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // 3. Opening a2 replaces a1 with 1000 "replaced"
+        let a2 = open(&mgr).unwrap();
+        loop {
+            match a1.next(wait).await {
+                AudioPoll::Frame(_) => continue,
+                AudioPoll::Closed => break,
+                AudioPoll::Timeout => panic!("a1 should be closed"),
+            }
+        }
+        assert_eq!(a1.close_info(), Some((1000, "replaced".to_string())));
+        assert_eq!(a1.next(wait).await, AudioPoll::Closed);
+
+        // 4. Frames from the app: audio (0x02), video (0x04), key-frame want (0x06)
+        a2.send(&[0x02, 0xaa, 0xbb, 0xcc]);
+        let mut vid_msg = vec![0x04, 0x01];
+        vid_msg.extend_from_slice(&hex::decode("00000001658880").unwrap());
+        a2.send(&vid_msg);
+        a2.send(&[0x06]);
+        a2.send(&[0x09, 1, 2, 3]); // unknown: ignored
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(media
+            .got
+            .lock()
+            .unwrap()
+            .audio
+            .iter()
+            .any(|a| a == &[0xaa, 0xbb, 0xcc]));
+        assert_eq!(media.got.lock().unwrap().video.len(), 1);
+
+        // Frames to the app: PLI from the fake media -> 0x05
+        let my_video_ssrc = rtp_header(&media.got.lock().unwrap().video[0]).unwrap().ssrc;
+        media.push(zrtc::rtcp(7, &pli(0x5151, my_video_ssrc), true).unwrap());
+        let got_kfr = tokio::time::timeout(Duration::from_millis(600), async {
+            loop {
+                if let AudioPoll::Frame(b) = a2.next(Duration::from_millis(100)).await {
+                    if b == KEY_FRAME_REQUEST {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(got_kfr, "a2 should receive 0x05 key frame request");
+
+        // A quiet link times out instead of closing
+        assert_eq!(a2.next(Duration::from_millis(20)).await, AudioPoll::Timeout);
+        assert_eq!(a2.close_info(), None);
+
+        // 5. Hang up -> a2 closes with 1000 "call ended"
+        mgr.hang_up_call().unwrap();
+        loop {
+            match a2.next(wait).await {
+                AudioPoll::Frame(_) => continue,
+                AudioPoll::Closed => break,
+                AudioPoll::Timeout => panic!("a2 should be closed"),
+            }
+        }
+        assert_eq!(a2.close_info(), Some((1000, "call ended".to_string())));
+
+        // Closing a handle, and shutting the core down, both end a waiting reader
+        mgr.on_voip_control(&ring_control(media.port, "777003", false), "socket", now_ms(), false);
+        mgr.answer_call("777003", None).await.unwrap();
+        let a3 = open(&mgr).unwrap();
+        a3.close();
+        assert_eq!(a3.next(wait).await, AudioPoll::Closed);
+        assert_eq!(a3.close_info(), Some((1000, "closed".to_string())));
+        let a4 = open(&mgr).unwrap();
+        shutdown_tx.send_replace(true);
+        assert_eq!(a4.next(wait).await, AudioPoll::Closed);
+        assert_eq!(a4.close_info(), Some((1001, "shutting down".to_string())));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

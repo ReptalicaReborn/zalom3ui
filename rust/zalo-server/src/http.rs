@@ -41,6 +41,21 @@ const STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self
 /// Builds the complete Axum [`Router`] with all REST routes, `/ws`, Track 1/2 sub-routers,
 /// optional static file serving (`config.public_dir`), and security middleware.
 pub fn build_router(config: Arc<Config>, session: Arc<ZaloSession>) -> Router {
+    build_app(config, session, true).router
+}
+
+/// The built application: the [`Router`] plus the call manager behind `/api/calls/*` and
+/// `/ws/call-audio`, which an in-process embedder needs to open an audio link without a socket.
+pub struct App {
+    pub router: Router,
+    pub calls: Arc<routes::calls::CallManager>,
+}
+
+/// Builds the application. With `network_facing`, the [`security_middleware`] (Host, Origin and
+/// bearer-token checks, security headers) wraps every route, as for the TCP server. Without it
+/// (the in-process embedded core, reachable only by the app itself) those checks are skipped;
+/// body-size limits stay either way.
+pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing: bool) -> App {
     let store = session.store().clone();
     let state = AppState {
         config: Arc::clone(&config),
@@ -55,6 +70,8 @@ pub fn build_router(config: Arc<Config>, session: Arc<ZaloSession>) -> Router {
         )
         .route("/api/threads/{kind}/{id}/voice", post(upload_voice))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
+
+    let (call_routes, calls) = routes::calls::router(state.clone());
 
     let json_routes = Router::new()
         // Session & auth
@@ -134,7 +151,7 @@ pub fn build_router(config: Arc<Config>, session: Arc<ZaloSession>) -> Router {
         .route("/api/polls/{pollId}/options", post(post_add_poll_options))
         .route("/api/polls/{pollId}/lock", post(post_lock_poll))
         // Modular Track 1 & Track 2 sub-routers
-        .merge(routes::calls::router(state.clone()))
+        .merge(call_routes)
         .merge(routes::history_sync::router(state.clone()))
         .layer(DefaultBodyLimit::max(MAX_JSON_BYTES));
 
@@ -149,12 +166,16 @@ pub fn build_router(config: Arc<Config>, session: Arc<ZaloSession>) -> Router {
         }
     }
 
-    router
-        .layer(middleware::from_fn_with_state(
+    if network_facing {
+        router = router.layer(middleware::from_fn_with_state(
             state.clone(),
             security_middleware,
-        ))
-        .with_state(state)
+        ));
+    }
+    App {
+        router: router.with_state(state),
+        calls,
+    }
 }
 
 // ---- Security Middleware ----
@@ -330,21 +351,58 @@ async fn ws_events(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl 
         .on_upgrade(move |socket| handle_ws_events(socket, state))
 }
 
-async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
-    let mut rx = state.session.subscribe_events();
+/// The event stream every client of the server sees: first `{"type":"status",...}` with the
+/// current status, then every broadcast event, each as the JSON text sent over `/ws`. Shared by
+/// the WebSocket handler and the in-process embedded subscription.
+pub struct EventStream {
+    rx: tokio::sync::broadcast::Receiver<Value>,
+    initial: Option<String>,
+}
 
-    let initial = json!({
-        "type": "status",
-        "status": state.session.get_status(),
-    });
-    if socket
-        .send(Message::Text(initial.to_string().into()))
-        .await
-        .is_err()
-    {
-        return;
+impl EventStream {
+    /// Subscribes first, then snapshots the status, so no event is missed in between.
+    pub fn new(session: &ZaloSession) -> Self {
+        let rx = session.subscribe_events();
+        let initial = json!({
+            "type": "status",
+            "status": session.get_status(),
+        })
+        .to_string();
+        Self {
+            rx,
+            initial: Some(initial),
+        }
     }
 
+    /// The next event as JSON text, or `None` once the server is gone. Cancel-safe.
+    pub async fn next(&mut self) -> Option<String> {
+        if let Some(initial) = self.initial.take() {
+            return Some(initial);
+        }
+        loop {
+            match self.rx.recv().await {
+                Ok(payload) => return Some(payload.to_string()),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
+    let mut events = EventStream::new(&state.session);
+
+    if let Some(initial) = events.next().await {
+        if socket
+            .send(Message::Text(initial.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Ping/pong keep-alive is a WebSocket-only concern.
     let mut heartbeat = tokio::time::interval(Duration::from_secs(WS_HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // consume immediate tick
@@ -380,15 +438,14 @@ async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
                     }
                 }
             }
-            ev = rx.recv() => {
+            ev = events.next() => {
                 match ev {
-                    Ok(payload) => {
-                        if socket.send(Message::Text(payload.to_string().into())).await.is_err() {
+                    Some(text) => {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    None => break,
                 }
             }
         }
