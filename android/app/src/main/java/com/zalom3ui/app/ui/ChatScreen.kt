@@ -35,6 +35,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.systemGestureExclusion
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -2881,6 +2882,7 @@ private fun Composer(
                     modifier = Modifier
                         .padding(start = 8.dp)
                         .size(buttonSize)
+                        .systemGestureExclusion()
                         .graphicsLayer {
                             scaleX = micScale
                             scaleY = micScale

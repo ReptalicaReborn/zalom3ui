@@ -1,12 +1,17 @@
 package com.zalom3ui.app.ui
 
 import android.widget.Toast
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
@@ -208,8 +213,27 @@ private fun AppNav(vm: AppViewModel) {
         startDestination = Routes.HOME,
         enterTransition = { slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it / 4 } + fadeIn() },
         exitTransition = { fadeOut() },
-        popEnterTransition = { fadeIn() },
-        popExitTransition = { slideOutHorizontally(spring(stiffness = Spring.StiffnessMedium)) { it / 4 } + fadeOut() },
+        // Linear timing + delayed fade prevents predictive back from jumping/fading out on small edge touches.
+        popEnterTransition = {
+            scaleIn(
+                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
+                initialScale = 0.96f,
+            ) + fadeIn(
+                animationSpec = tween(durationMillis = 280, easing = LinearEasing),
+                initialAlpha = 0.85f,
+            )
+        },
+        popExitTransition = {
+            scaleOut(
+                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
+                targetScale = 0.92f,
+                transformOrigin = TransformOrigin(pivotFractionX = 0.5f, pivotFractionY = 0.5f),
+            ) + slideOutHorizontally(
+                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
+            ) { it / 16 } + fadeOut(
+                animationSpec = tween(durationMillis = 160, delayMillis = 160, easing = LinearEasing),
+            )
+        },
     ) {
         // Each destination collects state itself so it never renders a stale capture.
         composable(Routes.HOME) {
@@ -293,7 +317,7 @@ private fun AppNav(vm: AppViewModel) {
             ContactsScreen(
                 title = "New message",
                 threads = state.threads,
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.NEW_CHAT) },
                 onPick = { thread ->
                     vm.openChat(thread)
                     goToChat()
@@ -319,7 +343,7 @@ private fun AppNav(vm: AppViewModel) {
                 minPicks = 2,
                 busy = busy,
                 onLoad = vm::loadFriends,
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.NEW_GROUP) },
                 onConfirm = { name, ids ->
                     busy = true
                     vm.createGroup(name, ids, onDone = { busy = false }) { thread ->
@@ -339,7 +363,7 @@ private fun AppNav(vm: AppViewModel) {
                     vm.loadFriends()
                     vm.loadFriendRequests()
                 },
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.CONTACTS) },
                 onAccept = vm::acceptFriend,
                 onReject = vm::rejectFriend,
                 onUndo = vm::cancelSentRequest,
@@ -352,7 +376,7 @@ private fun AppNav(vm: AppViewModel) {
         }
         composable(Routes.ADD_FRIEND) {
             AddFriendScreen(
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.ADD_FRIEND) },
                 onFind = vm::findUser,
                 onRequest = vm::sendFriendRequest,
                 onUndo = vm::undoFriendRequest,
@@ -369,7 +393,7 @@ private fun AppNav(vm: AppViewModel) {
                 groupName = chat?.name.orEmpty(),
                 members = chat?.members,
                 onLoad = vm::loadMembers,
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.MEMBERS) },
                 onAdd = { nav.navigate(Routes.ADD_MEMBERS) },
                 onOpen = { member ->
                     val existing = state.threads.firstOrNull { it.kind == "user" && it.id == member.id }
@@ -392,11 +416,11 @@ private fun AppNav(vm: AppViewModel) {
                 minPicks = 1,
                 busy = busy,
                 onLoad = vm::loadFriends,
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.ADD_MEMBERS) },
                 onConfirm = { _, ids ->
                     busy = true
                     vm.addMembers(ids, onFinished = { busy = false }) {
-                        nav.popBackStack()
+                        nav.safePopBackStack(Routes.ADD_MEMBERS)
                     }
                 },
             )
@@ -419,7 +443,7 @@ private fun AppNav(vm: AppViewModel) {
                     thread = state.threads.firstOrNull { it.ref == chat.ref },
                     typing = state.typing[chat.ref.key],
                     stickers = state.stickers,
-                    actions = chatActions(chat, onBack = { nav.popBackStack() }),
+                    actions = chatActions(chat, onBack = { nav.safePopBackStack(Routes.CHAT) }),
                     initialSearch = pendingSearch,
                     onSearchConsumed = { pendingSearch = false },
                     initialDraft = state.drafts[chat.ref.key].orEmpty(),
@@ -439,7 +463,7 @@ private fun AppNav(vm: AppViewModel) {
                 ChatInfoScreen(
                     chat = chat,
                     thread = state.threads.firstOrNull { it.ref == chat.ref },
-                    onBack = { nav.popBackStack() },
+                    onBack = { nav.safePopBackStack(Routes.CHAT_INFO) },
                     onSearch = {
                         pendingSearch = true
                         nav.popBackToChat()
@@ -489,7 +513,7 @@ private fun AppNav(vm: AppViewModel) {
                 threads = state.threads,
                 onBack = {
                     vm.selectManyForForward(emptyList())
-                    nav.popBackStack()
+                    nav.safePopBackStack(Routes.FORWARD)
                 },
                 onPick = { target ->
                     if (many.isNotEmpty()) {
@@ -519,7 +543,7 @@ private fun AppNav(vm: AppViewModel) {
                 threads = state.threads,
                 onBack = {
                     vm.setPendingShare(null)
-                    nav.popBackStack()
+                    nav.safePopBackStack(Routes.SHARE)
                 },
                 onPick = { thread ->
                     vm.deliverPendingShare(thread.ref, thread.name) { goToChat() }
@@ -536,15 +560,15 @@ private fun AppNav(vm: AppViewModel) {
                 profileAvatar = state.status?.ownAvatar,
                 loggedIn = state.status?.isLoggedIn == true,
                 canGoBack = true,
-                onBack = { nav.popBackStack() },
+                onBack = { nav.safePopBackStack(Routes.SETTINGS) },
                 onSave = {
                     vm.saveSettings(it)
-                    nav.popBackStack()
+                    nav.safePopBackStack(Routes.SETTINGS)
                 },
                 onAppearance = vm::setAppearance,
                 onRestartServer = {
                     vm.restartLocalServer()
-                    nav.popBackStack()
+                    nav.safePopBackStack(Routes.SETTINGS)
                 },
                 onLogout = {
                     vm.logout()
@@ -559,6 +583,18 @@ private fun AppNav(vm: AppViewModel) {
     }
 }
 
+/**
+ * Pops the top destination only while it is still active and another destination sits beneath it.
+ * Prevents rapid double-taps on a back arrow from popping the root screen and leaving an empty host.
+ */
+private fun NavHostController.safePopBackStack(fromRoute: String? = null) {
+    if (previousBackStackEntry == null) return
+    val current = currentBackStackEntry ?: return
+    if (fromRoute != null && current.destination.route != fromRoute) return
+    if (current.lifecycle.currentState != Lifecycle.State.RESUMED) return
+    popBackStack()
+}
+
 private fun NavHostController.popBackToChat() {
-    if (!popBackStack(Routes.CHAT, inclusive = false)) popBackStack()
+    if (!popBackStack(Routes.CHAT, inclusive = false)) safePopBackStack()
 }
