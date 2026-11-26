@@ -51,11 +51,31 @@ So there are three identity levels, not two:
 does **not** touch the phone's login (PC is a companion session, like web), so the notification bridge keeps
 working. New QR login required when toggled.
 
-**Unknowns (need the inputs below):** the exact `zpw_type` and `zpw_ver` Zalo PC uses now, and whether it sends
-login fields Zalỏ doesn't. These are read from one captured Zalo PC login, or from the Zalo PC web bundle.
-
 **Risk:** low. Same protocol family; it's a companion session; reversible by toggling off. Worst case Zalo
 rejects the session and you log in again as web.
+
+### What public reverse-engineering says (unverified, sources conflict)
+
+Read from third-party RE repos (`qnguyen3/zalo-swift-re`, `ctdoteam1110/ctdozlite`, `williamcachamwri/zalo-tg`),
+not confirmed against Zalo. The values **drift with each Zalo PC release**, so pin them from a current source
+before using them:
+
+| Field | Value(s) seen | Source |
+|---|---|---|
+| `zpw_type` (Zalo PC) | **23** (Zalo PC 26.10.20, captured 2026‑11‑08); **30** in three older notes | qnguyen3 vs ctdozlite / williamcachamwri |
+| `zpw_ver` (Zalo PC) | **694** (current), 693, 671 | version drift |
+| `computer_name` | the machine's real hostname (`os.hostname()`), fallback literal `ZaloPCClient` — **not** a fixed string | williamcachamwri, qnguyen3 |
+| User-Agent | `ZaloPC-darwin-23v694` (Electron sets the whole UA), or an Electron `ZaloPC/…` string | qnguyen3 / williamcachamwri |
+| PC QR login | `GET /api/login/reqqr` with `type=30`, `client_version`, `imei`, `computer_name`; confirm URL carries `src=pc` | ctdozlite, williamcachamwri |
+
+So the PC lever is real and roughly known: a different `zpw_type`/`zpw_ver`, a desktop User-Agent, a hostname
+`computer_name`, and the `src=pc` QR confirm. **But** — the decisive point — **none of these sources document
+whether Zalo PC receives OA / OTP / ZNS messages differently from a web session.** That is exactly the unknown
+Experiment A is testing, and nothing public answers it. So Experiment A stays a gamble, justified only once the
+socket log shows OTPs never reach the web session.
+
+No source describes the **mobile** app's `zpw_type`, login, signing or UA at all; Experiment B remains
+unsourced and would need the APK.
 
 ## Experiment B: emulate the mobile app (expensive, higher-risk) — fork only
 
