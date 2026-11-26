@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -15,6 +16,7 @@ import androidx.activity.viewModels
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.zalom3ui.app.data.PendingShare
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
@@ -50,6 +52,7 @@ class MainActivity : ComponentActivity() {
             AppTheme(state.appearance) { App(viewModel) }
         }
         handleOpenChat(intent)
+        handleShareIntent(intent)
         // Lets the on-phone server show its "connected" and message notifications (Android 13+).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -61,6 +64,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleOpenChat(intent)
+        handleShareIntent(intent)
     }
 
     /** A tapped message notification names the chat to open. */
@@ -70,6 +74,39 @@ class MainActivity : ComponentActivity() {
         intent.removeExtra(EXTRA_KIND)
         intent.removeExtra(EXTRA_ID)
         viewModel.requestOpen(ThreadRef(kind, id))
+    }
+
+    /** Content shared into Zalỏ from another app via the Android share sheet. */
+    private fun handleShareIntent(intent: Intent?) {
+        val action = intent?.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        val uris: List<Uri> = when (action) {
+            Intent.ACTION_SEND -> {
+                val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+                listOfNotNull(uri)
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
+                }
+            }
+            else -> emptyList()
+        }
+        intent.action = null
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        if (text != null || uris.isNotEmpty()) {
+            viewModel.setPendingShare(PendingShare(text = text, uris = uris))
+        }
     }
 
     override fun onStart() {

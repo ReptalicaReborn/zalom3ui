@@ -1,6 +1,8 @@
 package com.zalom3ui.app.data
 
 import android.content.Context
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -35,7 +37,9 @@ enum class ChatAccent(val key: String, val label: String) {
     ;
 
     companion object {
-        fun fromKey(key: String?): ChatAccent = entries.firstOrNull { it.key == key } ?: ULTRAMARINE
+        fun fromKeyOrNull(key: String?): ChatAccent? = entries.firstOrNull { it.key == key }
+
+        fun fromKey(key: String?): ChatAccent = fromKeyOrNull(key) ?: ULTRAMARINE
     }
 }
 
@@ -105,6 +109,36 @@ class SettingsStore(context: Context) {
             .apply()
     }
 
+    fun loadChatAccents(): Map<String, ChatAccent> =
+        decodeChatAccents(prefs.getString(KEY_CHAT_ACCENTS, null))
+
+    fun saveChatAccent(threadKey: String, accent: ChatAccent?) = synchronized(this) {
+        val updated = loadChatAccents().toMutableMap()
+        if (accent == null) {
+            updated.remove(threadKey)
+        } else {
+            updated[threadKey] = accent
+        }
+        prefs.edit().apply {
+            if (updated.isEmpty()) remove(KEY_CHAT_ACCENTS) else putString(KEY_CHAT_ACCENTS, encodeChatAccents(updated))
+        }.apply()
+    }
+
+    fun loadDrafts(): Map<String, String> =
+        decodeDrafts(prefs.getString(KEY_CHAT_DRAFTS, null))
+
+    fun saveDraft(threadKey: String, text: String) = synchronized(this) {
+        val updated = loadDrafts().toMutableMap()
+        if (text.isBlank()) {
+            updated.remove(threadKey)
+        } else {
+            updated[threadKey] = text
+        }
+        prefs.edit().apply {
+            if (updated.isEmpty()) remove(KEY_CHAT_DRAFTS) else putString(KEY_CHAT_DRAFTS, encodeDrafts(updated))
+        }.apply()
+    }
+
     /**
      * Secret shared between the UI and the on-phone server, so other apps on the phone can't use
      * the server's localhost port. Created on first use.
@@ -167,7 +201,7 @@ class SettingsStore(context: Context) {
         }
     }
 
-    private companion object {
+    internal companion object {
         val localConfigLock = Any()
         val LOCAL_PORT_RANGE = 40000..59999
         const val LOCAL_PROPS_FILE = "local-server.properties"
@@ -183,5 +217,30 @@ class SettingsStore(context: Context) {
         const val KEY_CHAT_ACCENT = "chat_accent"
         const val KEY_CHAT_TINTED_BG = "chat_tinted_bg"
         const val KEY_ULTRA_EXPRESSIVE = "ultra_expressive"
+        const val KEY_CHAT_ACCENTS = "chat_accents"
+        const val KEY_CHAT_DRAFTS = "chat_drafts"
+
+        fun encodeChatAccents(accents: Map<String, ChatAccent>): String =
+            Json.encodeToString(accents.mapValues { it.value.key })
+
+        fun decodeChatAccents(raw: String?): Map<String, ChatAccent> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            val pairs = runCatching { Json.decodeFromString<Map<String, String>>(raw) }.getOrNull() ?: return emptyMap()
+            return buildMap {
+                for ((threadKey, accentKey) in pairs) {
+                    val accent = ChatAccent.fromKeyOrNull(accentKey)
+                    if (accent != null) put(threadKey, accent)
+                }
+            }
+        }
+
+        fun encodeDrafts(drafts: Map<String, String>): String =
+            Json.encodeToString(drafts.filterValues { it.isNotBlank() })
+
+        fun decodeDrafts(raw: String?): Map<String, String> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            val map = runCatching { Json.decodeFromString<Map<String, String>>(raw) }.getOrNull() ?: return emptyMap()
+            return map.filterValues { it.isNotBlank() }
+        }
     }
 }
