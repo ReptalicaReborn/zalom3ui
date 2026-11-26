@@ -51,6 +51,7 @@ import androidx.compose.material.icons.outlined.WifiOff
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -95,6 +96,12 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -104,16 +111,20 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import coil.compose.SubcomposeAsyncImage
 import com.zalom3ui.app.R
+import com.zalom3ui.app.data.MessageSearchHit
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.ThreadSummary
 import kotlin.math.abs
@@ -134,6 +145,8 @@ class ThreadListActions(
     val onMarkRead: (ThreadSummary) -> Unit,
     val onMarkUnread: (ThreadSummary) -> Unit,
     val onDelete: (ThreadSummary) -> Unit,
+    val onSearchMessages: (String) -> Unit = {},
+    val onOpenSearchHit: (MessageSearchHit) -> Unit = {},
 )
 
 /** Filter modes shown in the chat list's connected pill bar. */
@@ -144,6 +157,60 @@ internal fun filterChats(chats: List<ThreadSummary>, filter: ChatFilter): List<T
     ChatFilter.ALL -> chats
     ChatFilter.UNREAD -> chats.filter { it.unread > 0 }
     ChatFilter.GROUPS -> chats.filter { it.kind == "group" }
+}
+
+private val WHITESPACE_REGEX = Regex("\\s+")
+
+/** Trims [draft], collapses newlines/whitespace runs to single spaces, and returns null if blank. */
+internal fun formatDraftSnippet(draft: String?): String? =
+    draft?.trim()?.takeIf { it.isNotEmpty() }?.replace(WHITESPACE_REGEX, " ")
+
+/** Finds non-overlapping character ranges in [text] matching [query] (case- and diacritic-insensitive). */
+internal fun findHighlightRanges(text: String, query: String): List<IntRange> {
+    val needle = query.trim()
+    if (text.isEmpty() || needle.isEmpty()) return emptyList()
+    val direct = mutableListOf<IntRange>()
+    var start = 0
+    while (start < text.length) {
+        val idx = text.indexOf(needle, startIndex = start, ignoreCase = true)
+        if (idx < 0) break
+        direct.add(idx until (idx + needle.length))
+        start = idx + needle.length
+    }
+    if (direct.isNotEmpty()) return direct
+
+    val foldedNeedle = foldForSearch(needle)
+    if (foldedNeedle.isEmpty()) return emptyList()
+
+    val foldedBuilder = StringBuilder(text.length)
+    val origStarts = ArrayList<Int>(text.length)
+    val origEnds = ArrayList<Int>(text.length)
+    var i = 0
+    while (i < text.length) {
+        val chStart = i
+        val cp = text.codePointAt(i)
+        i += Character.charCount(cp)
+        while (i < text.length && Character.getType(text.codePointAt(i)) == Character.NON_SPACING_MARK.toInt()) {
+            i += Character.charCount(text.codePointAt(i))
+        }
+        val folded = foldForSearch(text.substring(chStart, i))
+        for (fc in folded) {
+            foldedBuilder.append(fc)
+            origStarts.add(chStart)
+            origEnds.add(i)
+        }
+    }
+    val foldedText = foldedBuilder.toString()
+    val ranges = mutableListOf<IntRange>()
+    var fStart = 0
+    while (fStart < foldedText.length) {
+        val fIdx = foldedText.indexOf(foldedNeedle, startIndex = fStart)
+        if (fIdx < 0) break
+        val fEnd = fIdx + foldedNeedle.length - 1
+        ranges.add(origStarts[fIdx] until origEnds[fEnd])
+        fStart = fIdx + foldedNeedle.length
+    }
+    return ranges
 }
 
 private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE }
@@ -164,11 +231,17 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
     BackHandler(enabled = searching) { closeSearch() }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    val latestOnSearchMessages by rememberUpdatedState(actions.onSearchMessages)
     LaunchedEffect(searching) {
         if (searching) scrollBehavior.state.heightOffset = 0f
     }
+    LaunchedEffect(searching, query) {
+        latestOnSearchMessages(if (searching) query else "")
+    }
     // The chat list shows conversations; contacts you never talked to are under search and "New chat".
-    val chats = remember(state.threads) { state.threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 } }
+    val chats = remember(state.threads, state.drafts) {
+        state.threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 || !state.drafts[it.ref.key].isNullOrBlank() }
+    }
     val unreadChatCount = remember(chats) { chats.count { it.unread > 0 } }
     val visibleChats = remember(chats, filter, searching) {
         if (searching) chats else filterChats(chats, filter)
@@ -192,7 +265,22 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
     }
 
     Scaffold(
-        modifier = if (searching) Modifier else Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        modifier = Modifier
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when {
+                    event.isCtrlPressed && event.key == Key.K -> {
+                        searching = true
+                        true
+                    }
+                    searching && event.key == Key.Escape -> {
+                        closeSearch()
+                        true
+                    }
+                    else -> false
+                }
+            }
+            .then(if (searching) Modifier else Modifier.nestedScroll(scrollBehavior.nestedScrollConnection)),
         topBar = {
             if (searching) {
                 SearchTopBar(query = query, onQuery = { query = it }, onClose = closeSearch)
@@ -265,11 +353,12 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                 ),
                 modifier = Modifier.fillMaxSize(),
             ) {
-            if (searching && folded.isNotEmpty()) {
-                val chatHits = matches.filter { it.lastMessage != null }
-                val contactHits = matches.filter { it.lastMessage == null && it.kind == "user" }.sortedBy { foldForSearch(it.name) }
-                val groupHits = matches.filter { it.lastMessage == null && it.kind == "group" }.sortedBy { foldForSearch(it.name) }
-                if (matches.isEmpty()) {
+            if (searching && query.isNotBlank()) {
+                val chatHits = matches.filter { it.lastMessage != null || !state.drafts[it.ref.key].isNullOrBlank() }
+                val contactHits = matches.filter { it.lastMessage == null && state.drafts[it.ref.key].isNullOrBlank() && it.kind == "user" }.sortedBy { foldForSearch(it.name) }
+                val groupHits = matches.filter { it.lastMessage == null && state.drafts[it.ref.key].isNullOrBlank() && it.kind == "group" }.sortedBy { foldForSearch(it.name) }
+                val messageHits = state.messageSearchResults
+                if (matches.isEmpty() && !state.messageSearchBusy && messageHits.isEmpty()) {
                     item(key = "no-results") {
                         Text(
                             "No results for “${query.trim()}”",
@@ -286,6 +375,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                             thread = thread,
                             selected = thread.key == selectedKey,
                             typing = state.typing[thread.key],
+                            draft = state.drafts[thread.ref.key],
                             swipeEnabled = false,
                             onClick = { actions.onOpen(thread) },
                             onLongClick = {},
@@ -300,6 +390,24 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                 if (groupHits.isNotEmpty()) {
                     item(key = "h-group-hits") { SectionHeader("Groups") }
                     items(groupHits.take(MAX_RESULTS), key = { it.key }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
+                }
+                if (state.messageSearchBusy || messageHits.isNotEmpty()) {
+                    item(key = "h-message-hits") {
+                        MessagesSectionHeader(busy = state.messageSearchBusy)
+                    }
+                    items(
+                        items = messageHits,
+                        key = { hit -> "msg:${hit.ref.key}:${hit.message.id}:${hit.message.ts}" },
+                    ) { hit ->
+                        MessageSearchHitRow(
+                            hit = hit,
+                            query = query.trim(),
+                            onClick = {
+                                closeSearch()
+                                actions.onOpenSearchHit(hit)
+                            },
+                        )
+                    }
                 }
             } else {
                 val status = state.status
@@ -347,6 +455,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                                 thread = thread,
                                 selected = thread.key == selectedKey,
                                 typing = state.typing[thread.key],
+                                draft = state.drafts[thread.ref.key],
                                 swipeEnabled = true,
                                 onClick = { actions.onOpen(thread) },
                                 onLongClick = { sheetFor = thread },
@@ -360,6 +469,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                             thread = thread,
                             selected = thread.key == selectedKey,
                             typing = state.typing[thread.key],
+                            draft = state.drafts[thread.ref.key],
                             swipeEnabled = true,
                             onClick = { actions.onOpen(thread) },
                             onLongClick = { sheetFor = thread },
@@ -560,6 +670,7 @@ private fun ConversationRow(
     /** The chat open beside the list (tablets). */
     selected: Boolean = false,
     typing: TypingInfo?,
+    draft: String? = null,
     swipeEnabled: Boolean = true,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -759,7 +870,9 @@ private fun ConversationRow(
                     Spacer(Modifier.height(2.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         val mentioned = last?.mentionsMe == true && unread
-                        val thumb = if (typing == null && last?.recalled != true) {
+                        val draftSnippet = formatDraftSnippet(draft)
+                        val showDraft = typing == null && draftSnippet != null
+                        val thumb = if (typing == null && !showDraft && last?.recalled != true) {
                             last?.attachment?.thumb?.takeIf { it.isNotBlank() }
                         } else {
                             null
@@ -777,23 +890,43 @@ private fun ConversationRow(
                             )
                             Spacer(Modifier.width(6.dp))
                         }
-                        Text(
-                            text = when {
-                                typing != null -> if (thread.kind == "group" && typing.name.isNotBlank()) "${typing.name} is typing…" else "typing…"
-                                else -> preview(last)
-                            },
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = if (unread && typing == null) FontWeight.SemiBold else FontWeight.Normal,
-                            color = when {
-                                typing != null -> colors.primary
-                                unread -> colors.onSurface
-                                else -> colors.onSurfaceVariant
-                            },
-                            fontStyle = if (typing == null && last?.recalled == true) FontStyle.Italic else FontStyle.Normal,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
+                        if (showDraft) {
+                            val draftAnnotated = remember(draftSnippet, colors.primary, colors.onSurfaceVariant) {
+                                buildAnnotatedString {
+                                    withStyle(SpanStyle(color = colors.primary, fontWeight = FontWeight.SemiBold)) {
+                                        append("Draft: ")
+                                    }
+                                    withStyle(SpanStyle(color = colors.onSurfaceVariant, fontWeight = FontWeight.Normal)) {
+                                        append(draftSnippet)
+                                    }
+                                }
+                            }
+                            Text(
+                                text = draftAnnotated,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            Text(
+                                text = when {
+                                    typing != null -> if (thread.kind == "group" && typing.name.isNotBlank()) "${typing.name} is typing…" else "typing…"
+                                    else -> preview(last)
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (unread && typing == null) FontWeight.SemiBold else FontWeight.Normal,
+                                color = when {
+                                    typing != null -> colors.primary
+                                    unread -> colors.onSurface
+                                    else -> colors.onSurfaceVariant
+                                },
+                                fontStyle = if (typing == null && last?.recalled == true) FontStyle.Italic else FontStyle.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
                         if (mentioned) {
                             Spacer(Modifier.width(8.dp))
                             CountBadge("@", colors.primary, colors.onPrimary)
@@ -809,6 +942,120 @@ private fun ConversationRow(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun MessagesSectionHeader(busy: Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Messages",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (busy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(14.dp),
+                strokeWidth = 2.dp,
+            )
+        }
+    }
+}
+
+private fun windowSnippet(text: String, ranges: List<IntRange>): String {
+    val first = ranges.firstOrNull() ?: return text
+    if (first.first <= 24) return text
+    var cut = (first.first - 16).coerceAtLeast(0)
+    val space = text.indexOf(' ', startIndex = cut)
+    if (space in cut..(cut + 8) && space < first.first) {
+        cut = space + 1
+    }
+    return "…" + text.substring(cut)
+}
+
+@Composable
+private fun MessageSearchHitRow(
+    hit: MessageSearchHit,
+    query: String,
+    onClick: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    val displayName = hit.threadName.ifBlank { hit.message.fromName.ifBlank { hit.threadId } }
+    val rawSnippet = remember(hit.message.text, hit.message.attachment?.title) {
+        hit.message.text
+            .ifBlank { hit.message.attachment?.title.orEmpty() }
+            .replace(WHITESPACE_REGEX, " ")
+            .trim()
+    }
+    val annotatedSnippet = remember(rawSnippet, query, colors.primary) {
+        val initialRanges = findHighlightRanges(rawSnippet, query)
+        val windowed = windowSnippet(rawSnippet, initialRanges)
+        val ranges = if (windowed === rawSnippet) initialRanges else findHighlightRanges(windowed, query)
+        buildAnnotatedString {
+            var cursor = 0
+            for (range in ranges) {
+                if (range.first > cursor) {
+                    append(windowed.substring(cursor, range.first))
+                }
+                withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, color = colors.primary)) {
+                    append(windowed.substring(range.first, range.last + 1))
+                }
+                cursor = range.last + 1
+            }
+            if (cursor < windowed.length) {
+                append(windowed.substring(cursor))
+            }
+        }
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 72.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Avatar(
+            name = displayName,
+            url = hit.threadAvatar,
+            key = hit.ref.key,
+            isGroup = hit.threadKind == "group",
+            size = 52.dp,
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = displayName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = formatListTime(hit.message.ts),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = annotatedSnippet,
+                style = MaterialTheme.typography.bodyMedium,
+                color = colors.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

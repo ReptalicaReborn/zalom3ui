@@ -73,6 +73,21 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
         }),
     );
 
+    /**
+     * One voice recording, accepted either as a raw request body (optional `?name=voice.m4a`, matching `/attachments`)
+     * or as `multipart/form-data` with field `voice`. Mounted before express.json() so raw binary bodies arrive intact.
+     */
+    api.post(
+        "/threads/:kind/:id/voice",
+        express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
+        wrap(async (req, res) => {
+            const kind = parseKind(req.params.kind);
+            const file = extractVoiceUpload(req);
+            await session.sendVoice(kind, req.params.id, file);
+            res.status(201).end();
+        }),
+    );
+
     api.use(express.json({ limit: "64kb" }));
 
     api.get("/status", (_req, res) => {
@@ -192,6 +207,18 @@ export function createServer(config: Config, session: ZaloSession): http.Server 
             await session.fetchGroupHistory(id).catch((err) => console.warn("Group history failed:", err));
         }
         res.json({ thread: session.store.getThread(kind, id) ?? null, messages: session.store.getMessages(kind, id, { before, limit }) });
+    }));
+
+    api.get("/search", wrap(async (req, res) => {
+        const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+        if (!q) throw new HttpError(400, "q is required");
+        let limit = 50;
+        if (req.query.limit !== undefined) {
+            const parsed = positiveInt(req.query.limit);
+            if (parsed === undefined) throw new HttpError(400, "limit must be a positive integer");
+            limit = parsed;
+        }
+        res.json({ results: session.store.searchMessages(q, limit) });
     }));
 
     api.get("/stickers", wrap(async (req, res) => {
@@ -819,4 +846,79 @@ export function parseMentions(input: unknown, text: string): MentionInfo[] | und
         if (p < 0 || l <= 0 || p + l > text.length) throw new HttpError(400, "mention is outside the text");
         return { uid, pos: p, len: l };
     });
+}
+
+const CRLF_CRLF = Buffer.from("\r\n\r\n");
+const LF_LF = Buffer.from("\n\n");
+
+function extractVoiceUpload(req: Request): { buffer: Buffer; originalname: string } {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        throw new HttpError(400, "Voice file is required");
+    }
+    const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
+    if (/^multipart\/form-data\b/i.test(contentType)) {
+        const match = /boundary=(?:"([^"]+)"|([^\s;]+))/i.exec(contentType);
+        const boundary = match?.[1] ?? match?.[2];
+        if (!boundary) throw new HttpError(400, "Invalid multipart boundary");
+        const part = findMultipartFile(req.body, boundary, "voice");
+        if (!part || part.buffer.length === 0) throw new HttpError(400, "Voice file is required");
+        return part;
+    }
+    const name = typeof req.query.name === "string" && req.query.name.trim() ? path.basename(req.query.name.trim()) : "voice.m4a";
+    return { buffer: req.body, originalname: name };
+}
+
+function findMultipartFile(
+    body: Buffer,
+    boundary: string,
+    fieldName: string,
+): { buffer: Buffer; originalname: string } | null {
+    const delim = Buffer.from(`--${boundary}`);
+    let pos = body.indexOf(delim);
+    while (pos !== -1) {
+        pos += delim.length;
+        if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break;
+        if (body[pos] === 0x0d && body[pos + 1] === 0x0a) pos += 2;
+        else if (body[pos] === 0x0a) pos += 1;
+        else break;
+
+        const crlfIdx = body.indexOf(CRLF_CRLF, pos);
+        const lfIdx = body.indexOf(LF_LF, pos);
+        let headerEnd = -1;
+        let sepLen = 0;
+        if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx < lfIdx)) {
+            headerEnd = crlfIdx;
+            sepLen = 4;
+        } else if (lfIdx !== -1) {
+            headerEnd = lfIdx;
+            sepLen = 2;
+        }
+        if (headerEnd === -1) break;
+
+        const headersText = body.subarray(pos, headerEnd).toString("utf8");
+        const dataStart = headerEnd + sepLen;
+        const nextBoundary = body.indexOf(delim, dataStart);
+        if (nextBoundary === -1) break;
+
+        let dataEnd = nextBoundary;
+        if (dataEnd >= dataStart + 2 && body[dataEnd - 2] === 0x0d && body[dataEnd - 1] === 0x0a) {
+            dataEnd -= 2;
+        } else if (dataEnd >= dataStart + 1 && body[dataEnd - 1] === 0x0a) {
+            dataEnd -= 1;
+        }
+
+        const dispLine = headersText.split(/\r?\n/).find((line) => /^content-disposition\s*:/i.test(line));
+        if (dispLine) {
+            const nameMatch = /;\s*name=(?:"([^"]*)"|([^\s;]+))/i.exec(dispLine);
+            const name = nameMatch?.[1] ?? nameMatch?.[2];
+            if (name === fieldName) {
+                const fileMatch = /;\s*filename=(?:"([^"]*)"|([^\s;]+))/i.exec(dispLine);
+                const rawFilename = fileMatch?.[1] ?? fileMatch?.[2] ?? "";
+                const originalname = rawFilename.trim() ? path.basename(rawFilename.trim()) : "voice.m4a";
+                return { buffer: body.subarray(dataStart, dataEnd), originalname };
+            }
+        }
+        pos = nextBoundary;
+    }
+    return null;
 }

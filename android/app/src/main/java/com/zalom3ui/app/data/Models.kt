@@ -282,6 +282,39 @@ data class ThreadRef(val kind: String, val id: String) {
     val key: String get() = "$kind:$id"
 }
 
+/** One hit from `GET /api/search?q=...`. */
+@Serializable
+data class MessageSearchHit(
+    val threadId: String,
+    val threadKind: String,
+    val threadName: String = "",
+    val threadAvatar: String = "",
+    val message: ChatMessage,
+) {
+    val ref: ThreadRef get() = ThreadRef(threadKind, threadId)
+}
+
+typealias QuotedMessage = Quote
+typealias MentionDraft = Mention
+
+/** Optimistic outgoing message kept in [com.zalom3ui.app.ui.ChatState.pending] until sent or dismissed. */
+data class PendingMessage(
+    val localId: String,
+    val text: String,
+    val ts: Long,
+    val quote: QuotedMessage? = null,
+    val quoteId: String? = null,
+    val mentions: List<MentionDraft> = emptyList(),
+    val failed: Boolean = false,
+    val error: String? = null,
+)
+
+/** Text and/or media URIs shared into Zalỏ from another app via ACTION_SEND / ACTION_SEND_MULTIPLE. */
+data class PendingShare(
+    val text: String? = null,
+    val uris: List<android.net.Uri> = emptyList(),
+)
+
 /** Zalo's six quick reactions, in the order the official app shows them. */
 val QUICK_REACTIONS = listOf(
     "heart" to "❤️",

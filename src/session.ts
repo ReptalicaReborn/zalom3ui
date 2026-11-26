@@ -169,6 +169,7 @@ const RESUME_RETRY_MIN_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 60_000;
 const SESSION_EXPIRED = "Your Zalo session has ended. Log in again with the QR code.";
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp"]);
+const AUDIO_EXTENSIONS = new Set(["m4a", "aac", "mp3", "ogg", "opus", "wav", "amr", "3gp", "webm"]);
 const STICKER_SEARCH_LIMIT = 30;
 const MAX_STICKERS_CACHE = 500;
 const MAX_GROUP_NAME = 100;
@@ -1332,6 +1333,30 @@ export class ZaloSession extends EventEmitter<SessionEvents> {
         );
         // The message itself comes back through the listener, which stores it.
         return res.attachment.map((a) => String(a.msgId));
+    }
+
+    /** Uploads an audio clip and sends it as a real Zalo voice message. */
+    async sendVoice(
+        kind: ThreadKind,
+        threadId: string,
+        file: { buffer: Buffer; originalname: string },
+    ): Promise<void> {
+        const api = this.requireApi();
+        if (!file.buffer || file.buffer.length === 0) throw new HttpError(400, "The voice recording is empty");
+        const rawName = path.basename(file.originalname.trim());
+        const baseName = rawName && rawName !== "." && rawName !== ".." && !rawName.startsWith(".") ? rawName : "voice.m4a";
+        const ext = path.extname(baseName).slice(1).toLowerCase();
+        const filename = (AUDIO_EXTENSIONS.has(ext) ? baseName : `${baseName}.m4a`) as `${string}.${string}`;
+        const uploaded = await api.uploadAttachment(
+            [{ data: file.buffer, filename, metadata: { totalSize: file.buffer.length } }],
+            threadId,
+            toThreadType(kind),
+        );
+        const first = uploaded[0];
+        const voiceUrl = first && "fileUrl" in first && typeof first.fileUrl === "string" ? first.fileUrl : "";
+        if (!voiceUrl) throw new HttpError(502, "Failed to upload voice recording");
+        // The message itself comes back through the listener (selfListen), which stores it.
+        await api.sendVoice({ voiceUrl }, threadId, toThreadType(kind));
     }
 
     /** Zalo's sticker search ("hi", "love", "cảm ơn"…), with the image of each. */
