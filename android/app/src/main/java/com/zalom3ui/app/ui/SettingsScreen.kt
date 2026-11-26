@@ -467,7 +467,7 @@ fun SettingsScreen(
                                 headlineContent = { Text("Clear call log") },
                             )
                         },
-                    ) + replayDebugItems(),
+                    ) + replayDebugItems() + socketLogItems(),
                 )
             }
             Spacer(Modifier.height(28.dp))
