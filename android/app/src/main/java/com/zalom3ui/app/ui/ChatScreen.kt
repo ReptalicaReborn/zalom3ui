@@ -69,7 +69,7 @@ import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.outlined.AddCircleOutline
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Poll
@@ -770,32 +770,41 @@ private fun MessageList(
         lastSeenNewestId = newestId
     }
 
-    val topVisibleTs by remember(reversed, typing != null) {
+    val floatingDateTs by remember(reversed, typing != null) {
         derivedStateOf {
+            if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
             val offset = if (typing != null) 1 else 0
-            val topItem = listState.layoutInfo.visibleItemsInfo
+            val layout = listState.layoutInfo
+            val topItem = layout.visibleItemsInfo
                 .lastOrNull { it.index >= offset && (it.index - offset) < reversed.size }
-            topItem?.let { reversed.getOrNull(it.index - offset)?.ts }
+                ?: return@derivedStateOf null
+            val topIndex = topItem.index - offset
+            val msg = reversed.getOrNull(topIndex) ?: return@derivedStateOf null
+            val older = reversed.getOrNull(topIndex + 1)
+            val hasInlineDayHeader = older == null || !sameDay(older.ts, msg.ts)
+            // If this day's inline header is already visible at the top of the viewport, don't duplicate it with a pill.
+            val inlineHeaderVisible = hasInlineDayHeader && (topItem.offset + topItem.size) <= layout.viewportEndOffset
+            if (inlineHeaderVisible) null else msg.ts
         }
     }
     var showDatePill by remember { mutableStateOf(false) }
-    LaunchedEffect(listState.isScrollInProgress) {
-        if (listState.isScrollInProgress) {
+    LaunchedEffect(listState.isScrollInProgress, floatingDateTs) {
+        if (listState.isScrollInProgress && floatingDateTs != null) {
             showDatePill = true
         } else if (showDatePill) {
-            delay(1200)
+            delay(800)
             showDatePill = false
         }
     }
     var lastTopTs by remember { mutableStateOf<Long?>(null) }
-    topVisibleTs?.let { lastTopTs = it }
+    floatingDateTs?.let { lastTopTs = it }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val maxBubble = maxWidth * 0.78f
         LazyColumn(
             state = listState,
             reverseLayout = true,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 12.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             if (typing != null) {
@@ -834,7 +843,7 @@ private fun MessageList(
         }
 
         AnimatedVisibility(
-            visible = showDatePill && lastTopTs != null,
+            visible = showDatePill && floatingDateTs != null && lastTopTs != null,
             enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()),
             exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
@@ -856,6 +865,14 @@ private fun MessageList(
             }
         }
 
+        if (LocalUltraExpressive.current) {
+            FourXBadge(
+                size = 86.dp,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp),
+            )
+        }
+
+        val ultra = LocalUltraExpressive.current
         AnimatedVisibility(
             visible = showJump,
             enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleIn(MaterialTheme.motionScheme.fastSpatialSpec()),
@@ -871,7 +888,14 @@ private fun MessageList(
                     containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                     contentColor = MaterialTheme.colorScheme.onSurface,
                     shape = CircleShape,
-                ) { Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Jump to latest") }
+                    modifier = if (ultra) Modifier.size(76.dp) else Modifier,
+                ) {
+                    Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = "Jump to latest",
+                        modifier = if (ultra) Modifier.size(40.dp) else Modifier,
+                    )
+                }
                 if (newWhileScrolledUp > 0) {
                     CountBadge(
                         text = if (newWhileScrolledUp > 99) "99+" else "$newWhileScrolledUp",
@@ -1715,14 +1739,20 @@ private fun Composer(
                 }
             }
         }
+        val ultra = LocalUltraExpressive.current
         Row(
-            Modifier.padding(start = 4.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
+            Modifier.padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            Box(Modifier.padding(bottom = 4.dp)) {
-                IconButton(onClick = { attachSheet = true }) {
-                    Icon(Icons.Outlined.AddCircleOutline, contentDescription = "Attach", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+            FilledIconButton(
+                onClick = { attachSheet = true },
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = colors.outgoing,
+                    contentColor = colors.onOutgoing,
+                ),
+                modifier = Modifier.padding(end = 8.dp).size(if (ultra) 88.dp else 48.dp),
+            ) {
+                Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(if (ultra) 46.dp else 26.dp))
             }
             Surface(
                 shape = RoundedCornerShape(24.dp),
@@ -1779,12 +1809,13 @@ private fun Composer(
                 }
             }
             AnimatedVisibility(
-                visible = value.text.isNotBlank(),
+                visible = value.text.isNotBlank() || ultra,
                 enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleIn(MaterialTheme.motionScheme.fastSpatialSpec()),
                 exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleOut(MaterialTheme.motionScheme.fastSpatialSpec()),
             ) {
                 FilledIconButton(
                     onClick = {
+                        if (value.text.isBlank()) return@FilledIconButton
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         val sentText = value.text
                         onSend(sentText, mentioned.toList()) {
@@ -1794,13 +1825,21 @@ private fun Composer(
                             }
                         }
                     },
-                    enabled = !sending,
+                    enabled = !sending && value.text.isNotBlank(),
                     colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = colors.outgoing,
-                        contentColor = colors.onOutgoing,
+                        containerColor = if (ultra) Color(0xFFFF9EA8) else colors.outgoing,
+                        contentColor = if (ultra) Color(0xFF1F1114) else colors.onOutgoing,
+                        disabledContainerColor = if (ultra) Color(0xFFFF9EA8).copy(alpha = 0.72f) else colors.outgoing.copy(alpha = 0.38f),
+                        disabledContentColor = if (ultra) Color(0xFF1F1114).copy(alpha = 0.72f) else colors.onOutgoing.copy(alpha = 0.38f),
                     ),
-                    modifier = Modifier.padding(start = 8.dp).size(48.dp),
-                ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send") }
+                    modifier = Modifier.padding(start = 8.dp).size(if (ultra) 116.dp else 48.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send",
+                        modifier = Modifier.size(if (ultra) 56.dp else 24.dp),
+                    )
+                }
             }
         }
         if (showEmoji) {

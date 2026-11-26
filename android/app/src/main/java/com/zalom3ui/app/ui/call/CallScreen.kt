@@ -60,6 +60,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.zalom3ui.app.ui.Avatar
+import com.zalom3ui.app.ui.LocalUltraExpressive
 import com.zalom3ui.app.ui.avatarColors
 import kotlinx.coroutines.delay
 
@@ -369,12 +370,13 @@ private fun LabeledButton(
     } else {
         1f
     }
+    val ultra = LocalUltraExpressive.current
     val combinedScale = pressScale * idleScale
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         M3Surface(
             onClick = onClick,
             modifier = Modifier
-                .size(72.dp)
+                .size(if (ultra) 112.dp else 72.dp)
                 .graphicsLayer {
                     scaleX = combinedScale
                     scaleY = combinedScale
@@ -386,7 +388,7 @@ private fun LabeledButton(
             interactionSource = interactionSource,
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Icon(icon, contentDescription = label, modifier = Modifier.size(32.dp))
+                Icon(icon, contentDescription = label, modifier = Modifier.size(if (ultra) 54.dp else 32.dp))
             }
         }
         Text(
@@ -402,6 +404,7 @@ private fun LabeledButton(
 @Composable
 private fun HangUpButton(onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
+    val ultra = LocalUltraExpressive.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
@@ -418,7 +421,7 @@ private fun HangUpButton(onClick: () -> Unit) {
         M3Surface(
             onClick = onClick,
             modifier = Modifier
-                .size(width = 88.dp, height = 64.dp)
+                .size(width = if (ultra) 156.dp else 88.dp, height = if (ultra) 104.dp else 64.dp)
                 .graphicsLayer {
                     scaleX = scale
                     scaleY = scale
@@ -430,7 +433,7 @@ private fun HangUpButton(onClick: () -> Unit) {
             interactionSource = interactionSource,
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.CallEnd, contentDescription = "Hang up", modifier = Modifier.size(32.dp))
+                Icon(Icons.Filled.CallEnd, contentDescription = "Hang up", modifier = Modifier.size(if (ultra) 54.dp else 32.dp))
             }
         }
         Text(
