@@ -18,6 +18,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Chat
+import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PersonRemove
 import androidx.compose.material3.AlertDialog
@@ -25,16 +26,18 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MediumFlexibleTopAppBar
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -45,30 +48,46 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.zalom3ui.app.ui.call.CallActivity
 import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.FriendRequest
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.Person
 
-/** Friends whose name contains [query] (diacritics optional), by name. */
-fun filterPeople(people: List<Person>, query: String): List<Person> {
-    val q = foldForSearch(query.trim())
-    return people.filter { q.isEmpty() || foldForSearch(it.name).contains(q) }.sortedBy { foldForSearch(it.name) }
+private val SYSTEM_CONTACT_NAMES = setOf("zalo", "zalo security", "zalo official")
+
+/** Official/system accounts (such as "Zalo") that shouldn't clutter the human friends list. */
+internal fun isSystemContact(person: Person): Boolean {
+    val trimmed = person.name.trim().lowercase()
+    return person.id == "0" || trimmed in SYSTEM_CONTACT_NAMES
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** Friends whose name contains [query] (diacritics optional), by name, excluding official/system accounts. */
+fun filterPeople(people: List<Person>, query: String): List<Person> {
+    val q = foldForSearch(query.trim())
+    return people
+        .filter { !isSystemContact(it) && (q.isEmpty() || foldForSearch(it.name).contains(q)) }
+        .sortedBy { foldForSearch(it.name) }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun PeopleScaffold(title: String, onBack: () -> Unit, actions: @Composable () -> Unit = {}, content: @Composable (Modifier) -> Unit) {
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     Scaffold(
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
-            TopAppBar(
+            MediumFlexibleTopAppBar(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
                 actions = { actions() },
+                scrollBehavior = scrollBehavior,
             )
         },
     ) { padding -> content(Modifier.padding(padding)) }
@@ -183,6 +202,7 @@ fun FriendsScreen(
     onMessage: (Person) -> Unit,
 ) {
     LaunchedEffect(Unit) { onLoad() }
+    val context = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
     val shown = remember(friends, query) { filterPeople(friends, query) }
     val grouped = remember(shown) { shown.groupBy { friendLetter(it.name) }.toSortedMap(compareBy({ it == "#" }, { it })) }
@@ -252,7 +272,9 @@ fun FriendsScreen(
                         Avatar(person.name, person.avatar, key = "user:${person.id}", isGroup = false, size = 44.dp)
                         Spacer(Modifier.width(16.dp))
                         Text(person.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        IconButton(onClick = { onMessage(person) }) { Icon(Icons.AutoMirrored.Outlined.Chat, contentDescription = "Message ${person.name}") }
+                        IconButton(onClick = { context.startActivity(CallActivity.outgoingIntent(context, person.id, person.name, person.avatar, video = false)) }) {
+                            Icon(Icons.Outlined.Call, contentDescription = "Call ${person.name}")
+                        }
                     }
                 }
             }

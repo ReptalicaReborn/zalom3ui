@@ -33,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -121,6 +122,12 @@ fun EmojiStickerDrawer(
                 Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                val toggleColors = ToggleButtonDefaults.tonalToggleButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    checkedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                    checkedContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
                     modifier = Modifier.weight(1f),
@@ -129,6 +136,7 @@ fun EmojiStickerDrawer(
                         checked = !showStickers,
                         onCheckedChange = { showStickers = false },
                         shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
+                        colors = toggleColors,
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
                     ) {
                         Icon(Icons.Outlined.EmojiEmotions, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -139,6 +147,7 @@ fun EmojiStickerDrawer(
                         checked = showStickers,
                         onCheckedChange = { showStickers = true },
                         shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
+                        colors = toggleColors,
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
                     ) {
                         Icon(Icons.Outlined.Mood, contentDescription = null, modifier = Modifier.size(18.dp))

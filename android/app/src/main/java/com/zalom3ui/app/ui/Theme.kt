@@ -129,6 +129,31 @@ private val AccentPalettes: Map<ChatAccent, AccentPalette> = mapOf(
         darkOnOutgoing = Color(0xFFFFFFFF),
         darkTintedBg = Color(0xFF11151E),
     ),
+    ChatAccent.REPTDOC_GOLD to AccentPalette(
+        swatch = Color(0xFFE6C275),
+        lightPrimary = Color(0xFF8C6616),
+        lightOnPrimary = Color(0xFFFFFFFF),
+        lightPrimaryContainer = Color(0xFFF6E3B7),
+        lightOnPrimaryContainer = Color(0xFF2B1D00),
+        lightSecondary = Color(0xFF6B5D47),
+        lightOnSecondary = Color(0xFFFFFFFF),
+        lightSecondaryContainer = Color(0xFFF2E2C9),
+        lightOnSecondaryContainer = Color(0xFF241A0B),
+        lightOutgoing = Color(0xFF9C7219),
+        lightOnOutgoing = Color(0xFFFFFFFF),
+        lightTintedBg = Color(0xFFFAF6EE),
+        darkPrimary = Color(0xFFE6C275),
+        darkOnPrimary = Color(0xFF1A1206),
+        darkPrimaryContainer = Color(0xFF2A2419),
+        darkOnPrimaryContainer = Color(0xFFE6C275),
+        darkSecondary = Color(0xFFC9C0B5),
+        darkOnSecondary = Color(0xFF1A1206),
+        darkSecondaryContainer = Color(0xFF221E1A),
+        darkOnSecondaryContainer = Color(0xFFEAE1D9),
+        darkOutgoing = Color(0xFFE6C275),
+        darkOnOutgoing = Color(0xFF1A1206),
+        darkTintedBg = Color(0xFF1B1710),
+    ),
     ChatAccent.CRIMSON to AccentPalette(
         swatch = Color(0xFFC93B4B),
         lightPrimary = Color(0xFFC93B4B),
@@ -406,24 +431,25 @@ val LocalChatColors = staticCompositionLocalOf {
     )
 }
 
-/** Whether the app is drawn dark, from the theme setting or the system. */
+/** Whether the app is drawn dark, from the Dark mode setting or the system. */
 @Composable
 fun isAppInDarkTheme(appearance: Appearance): Boolean = when (appearance.themeMode) {
     ThemeMode.SYSTEM -> isSystemInDarkTheme()
     ThemeMode.LIGHT -> false
-    ThemeMode.DARK, ThemeMode.REPTDOC_GOLD -> true
+    ThemeMode.DARK -> true
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> Unit) {
     val dark = isAppInDarkTheme(appearance)
-    val gold = appearance.themeMode == ThemeMode.REPTDOC_GOLD
-    val dynamic = !gold && appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    val dynamic = appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    val gold = !dynamic && appearance.accent == ChatAccent.REPTDOC_GOLD
+    val goldDark = gold && dark
     val context = LocalContext.current
     val palette = accentPalette(appearance.accent)
     val colors: ColorScheme = when {
-        gold -> GoldColors
+        goldDark -> GoldColors
         dynamic && dark -> dynamicDarkColorScheme(context)
         dynamic -> dynamicLightColorScheme(context)
         dark -> DarkColors.copy(
@@ -448,8 +474,8 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
         )
     }
     val chat = when {
-        gold -> ChatColors(
-            background = GoldBg,
+        goldDark -> ChatColors(
+            background = if (appearance.tintedBackground) palette.darkTintedBg else GoldBg,
             outgoing = Gold,
             onOutgoing = GoldOn,
             incoming = GoldSurface2,
