@@ -60,25 +60,15 @@ pub fn decode_xz(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
         return Err(LzmaError::InvalidData("Not an .xz stream".into()));
     }
 
-    // ZDB4.0 pads plaintext with 0..15 zero bytes to reach a 16-byte AES block boundary.
-    // A valid .xz stream always ends with the 2-byte footer magic "YZ" (0x59, 0x5A)
-    // followed optionally by 4-byte-aligned zero stream padding. Trim trailing zeros so
-    // non-4-byte-aligned AES block padding does not confuse `lzma_rs::xz_decompress`.
-    let trimmed = if src.len() >= 24 {
-        let mut end = src.len();
-        while end > 12 && src[end - 1] == 0 {
-            end -= 1;
-        }
-        if end >= 24 && src[end - 2] == 0x59 && src[end - 1] == 0x5a {
-            &src[..end]
-        } else {
-            src
-        }
-    } else {
-        src
+    // ZDB4.0 decrypts AES-256-CBC with NoPadding, leaving 0..16 bytes of zero, PKCS#7,
+    // or block-remainder padding after the .xz stream footer ("YZ"). Parse the exact
+    // single-stream boundary (header + blocks + index + 12-byte footer) so trailing
+    // AES padding never triggers `Unexpected data after last XZ block` in `lzma-rs`.
+    let stream_end = match validate_and_find_xz_stream_end(src)? {
+        Some(end) => end,
+        None => find_xz_footer_fallback(src).unwrap_or(src.len()),
     };
-
-    validate_xz_range_coder_start(trimmed)?;
+    let trimmed = &src[..stream_end];
 
     let mut reader = Cursor::new(trimmed);
     let mut writer = BoundedWriter::new(64 * 1024, max_output);
@@ -92,6 +82,20 @@ pub fn decode_xz(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
             }
         }
     }
+}
+
+fn find_xz_footer_fallback(src: &[u8]) -> Option<usize> {
+    if src.len() < 24 {
+        return None;
+    }
+    let flags = &src[6..8];
+    let min_end = src.len().saturating_sub(32).max(24);
+    for end in (min_end..=src.len()).rev() {
+        if src[end - 2] == 0x59 && src[end - 1] == 0x5a && &src[end - 4..end - 2] == flags {
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn read_xz_varint(src: &[u8], pos: usize) -> Result<(u64, usize), LzmaError> {
@@ -109,19 +113,22 @@ fn read_xz_varint(src: &[u8], pos: usize) -> Result<(u64, usize), LzmaError> {
 }
 
 /// Validates that compressed LZMA2 chunks in single-filter `.xz` blocks begin with the
-/// spec-mandated `0x00` range-coder init byte (`lzma-rs` skips this check).
-fn validate_xz_range_coder_start(src: &[u8]) -> Result<(), LzmaError> {
+/// spec-mandated `0x00` range-coder init byte (`lzma-rs` skips this check), and returns
+/// the exact byte offset immediately after the 12-byte `.xz` stream footer (`"YZ"`).
+fn validate_and_find_xz_stream_end(src: &[u8]) -> Result<Option<usize>, LzmaError> {
     let check_size = match src[7] & 0x0f {
         0 => 0usize,
         1 => 4,
         4 => 8,
         10 => 32,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let mut pos = 12usize;
+    let mut saw_index = false;
     while pos < src.len() {
         let size_byte = src[pos];
         if size_byte == 0 {
+            saw_index = true;
             break;
         }
         let header_size = (usize::from(size_byte) + 1) * 4;
@@ -138,11 +145,11 @@ fn validate_xz_range_coder_start(src: &[u8]) -> Result<(), LzmaError> {
         }
         let filters = (flags & 0x03) + 1;
         if filters != 1 {
-            return Ok(());
+            return Ok(None);
         }
         let (filter_id, _) = read_xz_varint(src, p)?;
         if filter_id != 0x21 {
-            return Ok(());
+            return Ok(None);
         }
         pos += header_size;
 
@@ -194,7 +201,33 @@ fn validate_xz_range_coder_start(src: &[u8]) -> Result<(), LzmaError> {
         let pad = (4 - (pos % 4)) % 4;
         pos = pos.saturating_add(pad).saturating_add(check_size);
     }
-    Ok(())
+
+    if !saw_index {
+        return Ok(None);
+    }
+
+    // Parse Index (0x00 indicator + record count + 2 varints per record + 0..3 pad + 4B CRC32)
+    // followed by the 12-byte Stream Footer (4B CRC32 + 4B Backward Size + 2B Flags + "YZ").
+    let index_start = pos;
+    pos += 1; // index indicator 0x00
+    let (num_records, next) = read_xz_varint(src, pos)?;
+    pos = next;
+    for _ in 0..num_records {
+        pos = read_xz_varint(src, pos)?.1; // Unpadded Size
+        pos = read_xz_varint(src, pos)?.1; // Uncompressed Size
+    }
+    let idx_pad = (4 - ((pos - index_start) % 4)) % 4;
+    pos = pos.saturating_add(idx_pad).saturating_add(4); // Index CRC32
+    let footer_end = pos.saturating_add(12);
+    if footer_end <= src.len()
+        && src[footer_end - 2] == 0x59
+        && src[footer_end - 1] == 0x5a
+        && src[footer_end - 4..footer_end - 2] == src[6..8]
+    {
+        Ok(Some(footer_end))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Decodes a raw `.lzma` ("lzma_alone") stream with a hard cap of `max_output` decoded bytes.
@@ -338,6 +371,29 @@ mod tests {
             let dec = decode_lzma_auto(&padded, DEFAULT_MAX_OUTPUT).unwrap();
             assert_eq!(dec, expected, "failed with {pad} trailing zero bytes");
         }
+    }
+
+    #[test]
+    fn xz_sync_body_with_pkcs7_and_nonzero_trailing_bytes() {
+        let raw = fixture("sync_body.xz");
+        let expected_1001 = fixture("sync_1001.db");
+        let expected_777 = fixture("sync_group_777.db");
+        let mut expected = Vec::with_capacity(expected_1001.len() + expected_777.len());
+        expected.extend_from_slice(&expected_1001);
+        expected.extend_from_slice(&expected_777);
+
+        // PKCS#7 padding (1..=16 bytes of pad length value) after the YZ footer.
+        for pad in 1u8..=16 {
+            let mut padded = raw.clone();
+            padded.extend(std::iter::repeat_n(pad, pad as usize));
+            let dec = decode_lzma_auto(&padded, DEFAULT_MAX_OUTPUT).unwrap();
+            assert_eq!(dec, expected, "failed with PKCS#7 pad={pad}");
+        }
+
+        // Arbitrary non-zero trailing bytes (including fake "YZ" bytes in the tail).
+        let mut junk = raw.clone();
+        junk.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x59, 0x5a, 0x07, 0x07]);
+        assert_eq!(decode_lzma_auto(&junk, DEFAULT_MAX_OUTPUT).unwrap(), expected);
     }
 
     #[test]
