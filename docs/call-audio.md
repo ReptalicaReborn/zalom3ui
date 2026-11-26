@@ -1,12 +1,12 @@
 # Call audio on Android — contracts between the pieces
 
-Zalỏ's server (Node, in the `:node` process) owns the call: Zalo's signalling, the UDP connection to Zalo's media
+Zalỏ's core (Rust, `libzalocore.so`, running inside the app's process) owns the call: Zalo's signalling, the UDP connection to Zalo's media
 server (zrtc), SRTP. It hands **Opus frames** to the app and takes Opus frames from it. The app (Kotlin) owns the
 microphone, the speaker, the Opus codec and the call screen. See `docs/calls.md` for the protocol itself.
 
 ```
- mic ─► AudioRecord ─► OpusEncoder ─► CallAudioLink ──ws──► server ─► SRTP ─► zrtc UDP ─► Zalo
- speaker ◄─ AudioTrack ◄─ OpusDecoder ◄─ JitterBuffer ◄─ CallAudioLink ◄──ws── server ◄─ … ◄─ Zalo
+ mic ─► AudioRecord ─► OpusEncoder ─► CallAudioLink ──link──► core ─► SRTP ─► zrtc UDP ─► Zalo
+ speaker ◄─ AudioTrack ◄─ OpusDecoder ◄─ JitterBuffer ◄─ CallAudioLink ◄──link── core ◄─ … ◄─ Zalo
 ```
 
 Audio format everywhere: **Opus, 16 kHz, mono, 20 ms frames (320 samples), ~20 kbit/s**, RTP payload type 112.
@@ -59,10 +59,11 @@ class CallAudioEngine(context: Context, codec: FrameCodec, send: (ByteArray) -> 
   CONTENT_TYPE_SPEECH)`. `AudioManager.MODE_IN_COMMUNICATION` and audio focus while running; speaker via
   `setCommunicationDevice` (API 31+) or `isSpeakerphoneOn`.
 
-## 3. Link to the server (`CallAudioLink`)
+## 3. Link to the core (`CallAudioLink`)
 
-WebSocket `ws://127.0.0.1:<port>/ws/call-audio?token=<local token>` (same port and token as the event socket,
-`LocalServer.url(context)` / `SettingsStore(context).localToken()`). Binary messages only:
+When Zalo runs on the phone, `CallAudioLink` uses `NativeAudioTransport`: an in-process handle from `ZaloCore`
+(`audioOpen` / `audioSend` / `audioNext` / `audioClose`, see `rust/zalo-android/src/lib.rs`). With a server elsewhere it
+uses the WebSocket `ws(s)://<server>/ws/call-audio?token=<token>` instead. Both carry the same binary messages:
 
 | Direction | Bytes |
 |---|---|

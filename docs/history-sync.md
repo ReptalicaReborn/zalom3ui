@@ -3,12 +3,12 @@
 A fresh login only has the history Zalo's servers replay (recent messages, and for groups a bit more). Zalo PC can ask
 the official Zalo app on the phone to hand over its chat history: the phone shows a prompt, then uploads an encrypted
 backup, which the PC downloads, decrypts and imports. This document is the protocol as far as we know it, what is
-confirmed and what is a guess, and what a real test needs. Code: `src/historysync.ts` (the flow), `src/zdb.ts`
-(crypto and container), `src/lzma.ts`, `src/sqliteread.ts`, `src/syncimport.ts` (the backup's contents), `ui/HistorySync.kt`
+confirmed and what is a guess, and what a real test needs. Code: `rust/zalo-server/src/routes/history_sync.rs` (the flow), `rust/zalo-media/src/sync/zdb.rs`
+(crypto and container), `rust/zalo-media/src/sync/lzma.rs`, `rust/zalo-media/src/sync/sqliteread.rs`, `rust/zalo-media/src/sync/syncimport.rs` (the backup's contents), `ui/HistorySync.kt`
 (the app).
 
 **Sources.** *Confirmed from code* means written in the Zalos project (`src/core/sync/mobile_history_sync.cpp`,
-`src/core/crypto/db_cross.cpp`, `src/core/network/zalo_session.cpp`, MIT; we mirror it, our TypeScript is our own) and,
+`src/core/crypto/db_cross.cpp`, `src/core/network/zalo_session.cpp`, MIT; we mirror it, our Rust is our own) and,
 where marked **[PC]**, also in Zalo PC's own web bundle. *Guessed* means neither source says it, or it differs in our
 setting (Zalo Web instead of Zalo PC). Nothing here has been run against a real phone yet.
 
@@ -31,7 +31,7 @@ Zalỏ server                         Zalo servers                    phone (off
 
 All three are `GET`s to the **file service** (`zpw_service_map.file[0]`, Zalo PC calls it `getFileDomain()`), at
 `<file host>/api/message/<endpoint>?zpw_ver=…&zpw_type=…&params=<AES(JSON)>`, with the usual zca-js parameter
-encryption (the same as every other zca-js call; `src/voicecall.ts` does it for calls). The answer is the usual
+encryption (the same as every other zca-js call; `rust/zalo-proto/src/api/voicecall.rs` does it for calls). The answer is the usual
 `{error_code, data}`.
 
 | Endpoint | Parameters | Zalo PC command id |
@@ -57,8 +57,8 @@ encryption (the same as every other zca-js call; `src/voicecall.ts` does it for 
 ## 3. Events from the phone (confirmed from code, **[PC]** for the predicates)
 
 They arrive as **controls** (`act_type` / `act` / `data`) like friend and group events: on the chat socket as `cmd 601`
-(zca-js decodes it but drops these), and, for accounts that use it, from the control-channel poll (`src/ctrlpoll.ts`).
-We read both (`session.ts` hooks, `historysync.ts` `syncControlOf`). `content.data` may be a JSON string.
+(zca-js decodes it but drops these), and, for accounts that use it, from the control-channel poll (`rust/zalo-proto/src/api/ctrlpoll.rs`).
+We read both (`session.rs` and the control poller in `routes/calls.rs`, then `sync_control_of` in `routes/history_sync.rs`). `content.data` may be a JSON string.
 
 `act_type` `syncmsgmb`, matched to our sync by `data.public_key === ours` and `data.pc_name === ours`:
 
@@ -90,8 +90,8 @@ so the first tries may fail: Zalos retries HTTP 400, 404, 408, 429, 5xx and netw
 
 1. **Key.** `encrypted_key` is base64 of RSAES-PKCS1-v1_5 (`RSA_PKCS1_PADDING`) under our public key. Zalo PC:
    `privateDecrypt(key, RSA_PKCS1_PADDING, encrypted_key, {input: "base64", output: format ? "hex" : "base64"})`
-   **[PC]**: the plaintext key is turned into **text**, hex for `db_format` 1, base64 for 0. Node 20.11+ refuses PKCS#1
-   v1.5 private-key decryption, so `rsaDecryptPkcs1` does a raw RSA operation and removes the padding itself.
+   **[PC]**: the plaintext key is turned into **text**, hex for `db_format` 1, base64 for 0. We decrypt with the `rsa`
+   crate's PKCS#1 v1.5 (`zdb.rs`).
 2. **AES key** = the first 32 characters of that text, ASCII `a-z` made `A-Z`, as bytes, zero-padded
    (`DbCross::deriveAes256Key`). For a 16-byte hex key that is the 32 upper-case hex characters.
 3. **Cipher**: AES-256-CBC, IV all zero, **restarted every 0x10000 bytes** (each 64 KiB chunk decrypts independently),
@@ -102,7 +102,7 @@ so the first tries may fail: Zalos retries HTTP 400, 404, 408, 429, 5xx and netw
    stream** that decompresses to all files back to back, in table order. Names with `..`, a leading `/` or a backslash
    are refused.
 5. **LZMA**: liblzma's `lzma_auto_decoder` is used, so either `.xz` (LZMA2) or the old `.lzma` stream. Guess: which one
-   the phone really sends isn't written anywhere; `src/lzma.ts` reads both (xz with a single LZMA2 filter only, checksums
+   the phone really sends isn't written anywhere; `rust/zalo-media/src/sync/lzma.rs` reads both (xz with a single LZMA2 filter only, checksums
    skipped).
 
 ## 6. Contents (confirmed from code)
@@ -110,8 +110,8 @@ so the first tries may fail: Zalos retries HTTP 400, 404, 408, 429, 5xx and netw
 Files `<id>.db`, `group_<id>.db` or `g<id>.db` (id = digits): one SQLite database per conversation, with a table
 `ChatContent` (rows for messages). Used columns (first match wins): `GlbMsgId`/`GlobalMsgId`/`MsgId`, `CliMsgId`,
 `MsgType`, `TimeStamp`/`Ts`, `SenderId`/`FromId`/`FromUid`, `MsgContent`/`Message`, `TTL`, `BinNet` (blob), `MsgStatus`.
-Zalos reads rows `WHERE MsgStatus > 0 AND CliMsgId NOT NULL ORDER BY TimeStamp`; so do we (in JS: `src/sqliteread.ts`
-is a small read-only SQLite file reader, because the phone's embedded Node 18 has no SQLite).
+Zalos reads rows `WHERE MsgStatus > 0 AND CliMsgId NOT NULL ORDER BY TimeStamp`; so do we (in `rust/zalo-media/src/sync/sqliteread.rs`
+is a small read-only SQLite file reader, so the app needs no libsqlite3).
 
 - **Sender**: `"0"` means sent from this account (as in live messages), else the plain user id.
 - **Ids**: The phone backup uses plain 8–9 digit ids, whereas Zalo Web (`zca-js`) and Zalo PC use 18–19 digit

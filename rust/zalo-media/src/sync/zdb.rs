@@ -390,7 +390,7 @@ mod tests {
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/fixtures")
+            .join("../fixtures")
             .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()))
     }
