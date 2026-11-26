@@ -1953,10 +1953,15 @@ impl ZaloSession {
 
     /// Sets which chat the user is currently viewing (90s TTL), or clears it when `None`.
     pub fn set_presence(&self, kind: Option<ThreadKind>, thread_id: Option<&str>) {
+        self.set_presence_at(kind, thread_id, now_ms());
+    }
+
+    /// [`Self::set_presence`] with the current time (epoch ms) passed in.
+    pub fn set_presence_at(&self, kind: Option<ThreadKind>, thread_id: Option<&str>, now: i64) {
         if let Ok(mut s) = self.inner.write() {
             s.viewing = match (kind, thread_id) {
                 (Some(k), Some(id)) if !id.is_empty() => {
-                    Some((thread_key(k, id), now_ms() + VIEWING_TTL_MS))
+                    Some((thread_key(k, id), now + VIEWING_TTL_MS))
                 }
                 _ => None,
             };
@@ -1964,10 +1969,14 @@ impl ZaloSession {
     }
 
     pub fn should_notify(&self, msg: &ChatMessage, is_old: bool) -> bool {
+        self.should_notify_at(msg, is_old, now_ms())
+    }
+
+    /// [`Self::should_notify`] with the current time (epoch ms) passed in.
+    pub fn should_notify_at(&self, msg: &ChatMessage, is_old: bool, now: i64) -> bool {
         if is_old || msg.is_self || msg.recalled {
             return false;
         }
-        let now = now_ms();
         if now - msg.ts > NOTIFY_MAX_AGE_MS {
             return false;
         }
@@ -3352,5 +3361,7 @@ mod reconnect_tests;
 mod session_tests;
 #[cfg(test)]
 mod login_tests;
+#[cfg(test)]
+mod features_tests;
 #[cfg(test)]
 mod test_support;
