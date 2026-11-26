@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Only loopback (the on-phone server) and the Android emulator host may use cleartext HTTP.
+  Only loopback and the Android emulator host (a server on the dev machine) may use cleartext HTTP.
   Remote self-hosted servers must use HTTPS (reverse proxy, Tailscale, etc.).
 -->
 <network-security-config>
