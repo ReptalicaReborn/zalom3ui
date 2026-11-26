@@ -25,12 +25,14 @@ import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ContainedLoadingIndicator
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -65,15 +67,17 @@ import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.MuteOption
 
 /**
- * Round avatar: the Zalo picture when there is one, else the first letter on a tinted circle.
+ * Person or group avatar: the Zalo picture when there is one, else the first letter on a tinted surface.
+ * People are clipped to a circle while groups use a soft expressive squircle.
  * [key] picks the tint, so a person keeps the same color everywhere.
  */
 @Composable
 fun Avatar(name: String, url: String, key: String, isGroup: Boolean, size: Dp = 48.dp, modifier: Modifier = Modifier) {
+    val shape = if (isGroup) RoundedCornerShape((size.value * 0.30f).dp) else CircleShape
     val fallback = @Composable {
         val colors = avatarColors(key)
         Box(
-            Modifier.size(size).clip(CircleShape).background(colors.container),
+            Modifier.size(size).clip(shape).background(colors.container),
             contentAlignment = Alignment.Center,
         ) {
             if (isGroup && name.isBlank()) {
@@ -95,7 +99,7 @@ fun Avatar(name: String, url: String, key: String, isGroup: Boolean, size: Dp = 
             model = url,
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            modifier = modifier.size(size).clip(CircleShape),
+            modifier = modifier.size(size).clip(shape),
             loading = { fallback() },
             error = { fallback() },
         )
@@ -208,6 +212,44 @@ fun SectionHeader(text: String, modifier: Modifier = Modifier) {
     )
 }
 
+/**
+ * Corner shape for an item inside a Material 3 Expressive grouped settings section:
+ * 24.dp outer corners and 6.dp inner stacked corners.
+ */
+fun expressiveGroupItemShape(index: Int, count: Int): RoundedCornerShape = when {
+    count <= 1 -> RoundedCornerShape(24.dp)
+    index == 0 -> RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp, bottomStart = 6.dp, bottomEnd = 6.dp)
+    index == count - 1 -> RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp, bottomStart = 24.dp, bottomEnd = 24.dp)
+    else -> RoundedCornerShape(6.dp)
+}
+
+/**
+ * Material 3 Expressive grouped card container for stacked settings items (24.dp outer corners,
+ * 6.dp inner stacked corners, 4.dp gaps, surfaceContainerLow).
+ */
+@Composable
+fun ExpressiveSettingsGroup(
+    items: List<@Composable () -> Unit>,
+    modifier: Modifier = Modifier,
+) {
+    if (items.isEmpty()) return
+    Column(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        items.forEachIndexed { index, item ->
+            Surface(
+                shape = expressiveGroupItemShape(index, items.size),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                item()
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun LoadingScreen(label: String? = null) {
     Column(
@@ -215,7 +257,7 @@ fun LoadingScreen(label: String? = null) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        CircularProgressIndicator()
+        ContainedLoadingIndicator()
         if (label != null) {
             Spacer(Modifier.height(16.dp))
             Text(label, style = MaterialTheme.typography.bodyLarge)
@@ -227,6 +269,7 @@ fun LoadingScreen(label: String? = null) {
  * "Starting Zalo…" for the on-phone server. If it takes long, says what's in the way and offers a restart and the
  * startup log (phones that block background services leave it here).
  */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun StartingScreen(since: Long, error: String?, onRestart: () -> Unit, onShareLog: () -> Unit) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -242,7 +285,7 @@ fun StartingScreen(since: Long, error: String?, onRestart: () -> Unit, onShareLo
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        CircularProgressIndicator()
+        ContainedLoadingIndicator()
         Spacer(Modifier.height(16.dp))
         Text("Starting Zalo…", style = MaterialTheme.typography.bodyLarge)
         if (slow) {
