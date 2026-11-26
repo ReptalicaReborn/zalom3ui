@@ -69,7 +69,7 @@ import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.outlined.AddCircleOutline
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Poll
@@ -1725,13 +1725,18 @@ private fun Composer(
             }
         }
         Row(
-            Modifier.padding(start = 4.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
+            Modifier.padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            Box(Modifier.padding(bottom = 4.dp)) {
-                IconButton(onClick = { attachSheet = true }) {
-                    Icon(Icons.Outlined.AddCircleOutline, contentDescription = "Attach", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+            FilledIconButton(
+                onClick = { attachSheet = true },
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = colors.outgoing,
+                    contentColor = colors.onOutgoing,
+                ),
+                modifier = Modifier.padding(end = 8.dp).size(48.dp),
+            ) {
+                Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(26.dp))
             }
             Surface(
                 shape = RoundedCornerShape(24.dp),
