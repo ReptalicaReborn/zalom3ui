@@ -1,6 +1,7 @@
 //! Core Zalỏ server library: configuration, errors, logging, wire types, persistent `ChatStore`,
 //! `ZaloSession`, and Axum HTTP/WebSocket server.
 
+pub mod api;
 pub mod config;
 pub mod errors;
 pub mod http;
@@ -9,6 +10,9 @@ pub mod routes;
 pub mod session;
 pub mod store;
 pub mod types;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use std::future::Future;
 use std::sync::Arc;
