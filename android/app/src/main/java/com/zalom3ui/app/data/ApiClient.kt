@@ -69,6 +69,52 @@ class ApiClient internal constructor(private val transport: Transport) {
 
     suspend fun logout(): SessionStatus = post("logout")
 
+    // ---- Stay connected: pause / resume the chat listener ----
+
+    /** Stops the chat listener without logging out (no auto-reconnect while paused). No-op when logged out. */
+    suspend fun listenerPause(): SessionStatus = post("listener", "pause")
+
+    /** Starts the chat listener again after [listenerPause]; the replay of missed messages follows. */
+    suspend fun listenerResume(): SessionStatus = post("listener", "resume")
+
+    /**
+     * Opens or extends the window in which replayed messages newer than [triggerTs] (epoch ms) minus 2 minutes notify.
+     * Closes by itself after [ttlMs].
+     */
+    suspend fun setNotifyWindow(triggerTs: Long, ttlMs: Long) {
+        httpPut("notify-window", body = buildJsonObject {
+            put("triggerTs", triggerTs)
+            put("ttlMs", ttlMs)
+        }.toString())
+    }
+
+    suspend fun clearNotifyWindow() {
+        httpDelete("notify-window")
+    }
+
+    // ---- Replay test (docs/replay-test.md) ----
+
+    /** What Zalo replayed at each connect, newest first. Ids, counts and timestamps only. */
+    suspend fun replayLog(): String {
+        val (code, body) = transport.execute("GET", path("debug", "replay-log")).let { it.code to it.body }
+        if (code !in 200..299) throw ApiException("HTTP $code", code)
+        return body
+    }
+
+    suspend fun clearReplayLog() {
+        httpDelete("debug", "replay-log")
+    }
+
+    /** `"null"`, `"newest"` or `"page"`: which `lastId` the replay requests carry. */
+    suspend fun replayMode(): String {
+        val body = transport.execute("GET", path("debug", "replay-mode")).let { it.body }
+        return json.parseToJsonElement(body).jsonObject["mode"]?.jsonPrimitive?.content ?: "null"
+    }
+
+    suspend fun setReplayMode(mode: String) {
+        httpPut("debug", "replay-mode", body = buildJsonObject { put("mode", mode) }.toString())
+    }
+
     // ---- Polls ----
 
     suspend fun createPoll(groupId: String, request: CreatePollRequest): PollDetail =
@@ -162,7 +208,9 @@ class ApiClient internal constructor(private val transport: Transport) {
         open: () -> InputStream,
     ) {
         val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
-        execute<Unit>("POST", path("threads", kind, id, "attachments", query = query), ApiBody.Stream(mimeType, length, open), upload = true)
+        InFlightWork.track {
+            execute<Unit>("POST", path("threads", kind, id, "attachments", query = query), ApiBody.Stream(mimeType, length, open), upload = true)
+        }
     }
 
     /** Full-text search across messages on the server (`GET /api/search?q=...&limit=...`). */
@@ -174,7 +222,9 @@ class ApiClient internal constructor(private val transport: Transport) {
 
     /** Uploads a recorded voice message (`POST /api/threads/:kind/:id/voice`, multipart field `"voice"`). */
     suspend fun sendVoice(ref: ThreadRef, file: File) {
-        execute<Unit>("POST", path("threads", ref.kind, ref.id, "voice"), ApiBody.VoiceFile(file, AUDIO_MP4), upload = true)
+        InFlightWork.track {
+            execute<Unit>("POST", path("threads", ref.kind, ref.id, "voice"), ApiBody.VoiceFile(file, AUDIO_MP4), upload = true)
+        }
     }
 
     suspend fun stickers(query: String): List<StickerInfo> = get("stickers", query = listOf("q" to query))
