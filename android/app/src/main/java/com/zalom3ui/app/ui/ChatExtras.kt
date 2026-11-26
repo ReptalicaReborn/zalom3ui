@@ -4,13 +4,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -20,9 +20,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearWavyProgressIndicator
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -45,10 +47,15 @@ import kotlinx.coroutines.delay
 /** Words Zalo's sticker search knows well, offered before anything is typed. */
 val STICKER_SUGGESTIONS = listOf("hi", "ok", "haha", "love", "cảm ơn", "buồn", "chúc ngủ ngon", "yêu", "giận", "wow")
 
-/** Zalo's sticker search: type a word (or pick one), tap a sticker to send it. */
-@OptIn(ExperimentalMaterial3Api::class)
+/** Shared sticker search bar, suggestion chips, and adaptive grid used by both [StickerSheet] and [EmojiStickerDrawer]. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-fun StickerSheet(search: StickerSearch, onSearch: (String) -> Unit, onPick: (StickerInfo) -> Unit, onDismiss: () -> Unit) {
+fun StickerPickerContent(
+    search: StickerSearch,
+    onSearch: (String) -> Unit,
+    onPick: (StickerInfo) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var query by rememberSaveable { mutableStateOf(search.query.ifEmpty { STICKER_SUGGESTIONS.first() }) }
     // Debounced, so typing a word doesn't search every letter.
     LaunchedEffect(query) {
@@ -57,48 +64,63 @@ fun StickerSheet(search: StickerSearch, onSearch: (String) -> Unit, onPick: (Sti
             if (query.trim() != search.query) onSearch(query)
         }
     }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(bottom = 16.dp)) {
-            SearchPill(
-                query = query,
-                onQuery = { query = it },
-                placeholder = "Search stickers",
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.padding(vertical = 8.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
-            ) {
-                items(STICKER_SUGGESTIONS) { word ->
-                    FilterChip(selected = query.trim() == word, onClick = { query = word }, label = { Text(word) })
-                }
+    Column(modifier) {
+        SearchPill(
+            query = query,
+            onQuery = { query = it },
+            placeholder = "Search stickers",
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(vertical = 6.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp),
+        ) {
+            items(STICKER_SUGGESTIONS) { word ->
+                FilterChip(selected = query.trim() == word, onClick = { query = word }, label = { Text(word) })
             }
-            Box(Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 420.dp)) {
-                when {
-                    search.loading && search.results.isEmpty() -> CircularProgressIndicator(Modifier.align(Alignment.Center))
-                    search.results.isEmpty() && search.query.isNotEmpty() && !search.loading -> Text(
-                        "No stickers for \"${search.query}\"",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.align(Alignment.Center),
-                    )
-                    else -> LazyVerticalGrid(
-                        columns = GridCells.Adaptive(88.dp),
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                    ) {
-                        items(search.results, key = { it.id }) { sticker ->
-                            StickerImage(
-                                sticker.url,
-                                Modifier
-                                    .padding(4.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { onPick(sticker) },
-                            )
-                        }
+        }
+        Box(Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(min = 160.dp)) {
+            when {
+                search.loading && search.results.isEmpty() -> LoadingIndicator(Modifier.align(Alignment.Center))
+                search.results.isEmpty() && search.query.isNotEmpty() && !search.loading -> Text(
+                    "No stickers for \"${search.query}\"",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+                else -> LazyVerticalGrid(
+                    columns = GridCells.Adaptive(88.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                ) {
+                    items(search.results, key = { it.id }) { sticker ->
+                        StickerImage(
+                            sticker.url,
+                            Modifier
+                                .padding(4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onPick(sticker) },
+                        )
                     }
                 }
             }
+            if (search.loading && search.results.isNotEmpty()) {
+                LinearWavyProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
+            }
         }
+    }
+}
+
+/** Zalo's sticker search: type a word (or pick one), tap a sticker to send it. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun StickerSheet(search: StickerSearch, onSearch: (String) -> Unit, onPick: (StickerInfo) -> Unit, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        StickerPickerContent(
+            search = search,
+            onSearch = onSearch,
+            onPick = onPick,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 320.dp, max = 520.dp).padding(bottom = 16.dp),
+        )
     }
 }
 
@@ -153,15 +175,16 @@ fun LeaveGroupDialog(name: String, onDismiss: () -> Unit, onLeave: (silent: Bool
     )
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun UploadingNote(count: Int) {
-    Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-        Spacer(Modifier.width(8.dp))
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
         Text(
             if (count == 1) "Sending 1 file…" else "Sending $count files…",
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(4.dp))
+        LinearWavyProgressIndicator(Modifier.fillMaxWidth())
     }
 }

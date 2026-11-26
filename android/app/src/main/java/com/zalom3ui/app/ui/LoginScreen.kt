@@ -32,16 +32,19 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -55,13 +58,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.zalom3ui.app.data.SessionStatus
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun LoginScreen(
     status: SessionStatus,
@@ -120,7 +124,11 @@ fun LoginScreen(
                 when {
                     qr != null -> {
                         Spacer(Modifier.height(8.dp))
-                        Text("Scan to log in", style = MaterialTheme.typography.headlineMedium, textAlign = TextAlign.Center)
+                        Text(
+                            "Scan to log in",
+                            style = MaterialTheme.typography.headlineMedium,
+                            textAlign = TextAlign.Center,
+                        )
                         Spacer(Modifier.height(8.dp))
                         Text(
                             when {
@@ -138,13 +146,13 @@ fun LoginScreen(
                             filterQuality = FilterQuality.None,
                             modifier = Modifier
                                 .size(260.dp)
-                                .background(Color.White, RoundedCornerShape(20.dp))
-                                .padding(14.dp),
+                                .background(Color.White, RoundedCornerShape(28.dp))
+                                .padding(16.dp),
                         )
                     }
                     status.state == "logging_in" -> {
                         Spacer(Modifier.height(96.dp))
-                        CircularProgressIndicator()
+                        ContainedLoadingIndicator()
                         Spacer(Modifier.height(24.dp))
                         Text(
                             if (status.retrying) "Waiting for a connection…" else "Logging in…",
@@ -152,9 +160,12 @@ fun LoginScreen(
                         )
                     }
                     else -> {
+                        val heroShape = MaterialShapes.Cookie9Sided.toShape()
                         Spacer(Modifier.height(48.dp))
                         Box(
-                            Modifier.size(120.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                            Modifier
+                                .size(132.dp)
+                                .background(MaterialTheme.colorScheme.primaryContainer, heroShape),
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
@@ -165,7 +176,11 @@ fun LoginScreen(
                             )
                         }
                         Spacer(Modifier.height(32.dp))
-                        Text("Chat with Zalo, your way", style = MaterialTheme.typography.headlineMedium, textAlign = TextAlign.Center)
+                        Text(
+                            "Chat with Zalo, your way",
+                            style = MaterialTheme.typography.headlineMedium,
+                            textAlign = TextAlign.Center,
+                        )
                         Spacer(Modifier.height(12.dp))
                         Text(
                             "Log in like Zalo on a computer: get a QR code here and confirm it in the Zalo app.",
@@ -179,6 +194,7 @@ fun LoginScreen(
                 status.error?.let { error ->
                     Spacer(Modifier.height(20.dp))
                     Card(
+                        shape = RoundedCornerShape(24.dp),
                         colors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.errorContainer,
                             contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -199,28 +215,60 @@ fun LoginScreen(
             // Actions sit at the bottom, full width, within easy reach of the thumb.
             Column(
                 Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 when {
                     qr != null -> {
-                        Button(onClick = { saveWithPermission() }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        Button(
+                            onClick = { saveWithPermission() },
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                        ) {
                             Icon(Icons.Outlined.Download, null, Modifier.size(18.dp))
                             Spacer(Modifier.size(8.dp))
-                            Text("Save image")
+                            Text("Save image", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                         }
-                        OutlinedButton(onClick = { scope.launch { QrActions.share(context, qr) } }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        OutlinedButton(
+                            onClick = { scope.launch { QrActions.share(context, qr) } },
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                        ) {
                             Icon(Icons.Outlined.Share, null, Modifier.size(18.dp))
                             Spacer(Modifier.size(8.dp))
-                            Text("Share")
+                            Text("Share", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                         }
                     }
                     status.retrying -> {
-                        Button(onClick = onRetry, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Retry now") }
-                        OutlinedButton(onClick = onLogin, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Use a QR code instead") }
+                        Button(
+                            onClick = onRetry,
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                        ) {
+                            Text("Retry now", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                        }
+                        OutlinedButton(
+                            onClick = onLogin,
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                        ) {
+                            Text("Use a QR code instead", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                     status.state == "logged_out" -> {
-                        Button(onClick = onLogin, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Get QR code") }
-                        TextButton(onClick = { showHelp = true }, modifier = Modifier.fillMaxWidth()) { Text("How does this work?") }
+                        Button(
+                            onClick = onLogin,
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                        ) {
+                            Text("Get QR code", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                        }
+                        TextButton(
+                            onClick = { showHelp = true },
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("How does this work?", style = MaterialTheme.typography.labelLarge)
+                        }
                     }
                 }
             }
@@ -231,10 +279,11 @@ fun LoginScreen(
 @Composable
 private fun LoginHelp(onClose: () -> Unit) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
         modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth(),
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(18.dp)) {
             Text("How to log in", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             val steps = listOf(
@@ -246,11 +295,19 @@ private fun LoginHelp(onClose: () -> Unit) {
             )
             steps.forEachIndexed { i, step ->
                 Row(Modifier.padding(vertical = 4.dp)) {
-                    Text("${i + 1}.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(end = 8.dp))
+                    Text(
+                        "${i + 1}.",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 2.dp, end = 8.dp),
+                    )
                     Text(step, style = MaterialTheme.typography.bodyMedium)
                 }
             }
-            TextButton(onClick = onClose, modifier = Modifier.align(Alignment.End)) { Text("Got it") }
+            TextButton(onClick = onClose, shape = CircleShape, modifier = Modifier.align(Alignment.End)) {
+                Text("Got it")
+            }
         }
     }
 }
