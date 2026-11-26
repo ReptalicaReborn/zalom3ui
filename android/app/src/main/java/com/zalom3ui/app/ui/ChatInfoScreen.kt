@@ -83,7 +83,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.MuteOption
@@ -322,21 +323,19 @@ fun ChatInfoScreen(
                                             }
                                         },
                                 ) {
-                                    SubcomposeAsyncImage(
+                                    // Icon under the thumbnail while it loads or if it fails; hidden once it is in.
+                                    var loaded by remember(item.thumbUrl) { mutableStateOf(false) }
+                                    if (!loaded) {
+                                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                    AsyncImage(
                                         model = item.thumbUrl,
                                         contentDescription = if (item.isVideo) "Video" else "Photo",
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.fillMaxSize(),
-                                        loading = {
-                                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                                Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-                                        },
-                                        error = {
-                                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                                Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-                                        },
+                                        onState = { loaded = it is AsyncImagePainter.State.Success },
                                     )
                                     if (item.isVideo) {
                                         Surface(
@@ -675,14 +674,18 @@ private fun HeroAvatar(name: String, url: String, key: String, isGroup: Boolean)
     if (url.isBlank()) {
         fallback()
     } else {
-        SubcomposeAsyncImage(
-            model = url,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.size(92.dp).clip(shape),
-            loading = { fallback() },
-            error = { fallback() },
-        )
+        // Picture over the initials; the initials hide once it is in, so transparent pictures don't show them through.
+        var loaded by remember(url) { mutableStateOf(false) }
+        Box(Modifier.size(92.dp).clip(shape)) {
+            if (!loaded) fallback()
+            AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.matchParentSize(),
+                onState = { loaded = it is AsyncImagePainter.State.Success },
+            )
+        }
     }
 }
 

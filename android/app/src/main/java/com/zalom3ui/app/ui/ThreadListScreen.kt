@@ -94,6 +94,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.Key
@@ -122,10 +123,11 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import com.zalom3ui.app.R
 import com.zalom3ui.app.data.MessageSearchHit
 import com.zalom3ui.app.data.MuteOption
+import com.zalom3ui.app.data.SessionStatus
 import com.zalom3ui.app.data.ThreadSummary
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -215,9 +217,27 @@ internal fun findHighlightRanges(text: String, query: String): List<IntRange> {
 
 private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE }
 
+/**
+ * The chat list. It takes only the parts of [UiState] it shows, so it skips recomposing when anything else changes;
+ * each row gets only its own typing and draft, so a change in one chat redraws only that row.
+ */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: String? = null) {
+fun ThreadListScreen(
+    threads: List<ThreadSummary>,
+    /** Draft text by [com.zalom3ui.app.data.ThreadRef.key]. */
+    drafts: Map<String, String>,
+    /** Who is typing, by thread key. */
+    typing: Map<String, TypingInfo>,
+    status: SessionStatus?,
+    connectionError: String?,
+    /** Friend requests waiting for an answer, for the badge on Contacts. */
+    pendingRequests: Int,
+    messageSearchResults: List<MessageSearchHit>,
+    messageSearchBusy: Boolean,
+    actions: ThreadListActions,
+    selectedKey: String? = null,
+) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf(ChatFilter.ALL) }
@@ -239,16 +259,16 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
         latestOnSearchMessages(if (searching) query else "")
     }
     // The chat list shows conversations; contacts you never talked to are under search and "New chat".
-    val chats = remember(state.threads, state.drafts) {
-        state.threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 || !state.drafts[it.ref.key].isNullOrBlank() }
+    val chats = remember(threads, drafts) {
+        threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 || !drafts[it.ref.key].isNullOrBlank() }
     }
     val unreadChatCount = remember(chats) { chats.count { it.unread > 0 } }
     val visibleChats = remember(chats, filter, searching) {
         if (searching) chats else filterChats(chats, filter)
     }
     val folded = foldForSearch(query.trim())
-    val matches = remember(state.threads, folded) {
-        if (folded.isEmpty()) emptyList() else state.threads.filter { foldForSearch(it.name).contains(folded) }
+    val matches = remember(threads, folded) {
+        if (folded.isEmpty()) emptyList() else threads.filter { foldForSearch(it.name).contains(folded) }
     }
 
     val onRowAction: (ThreadSummary, RowAction) -> Unit = { thread, action ->
@@ -289,9 +309,9 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     navigationIcon = {
                         IconButton(onClick = actions.onSettings) {
                             Avatar(
-                                name = state.status?.ownName.orEmpty(),
-                                url = state.status?.ownAvatar.orEmpty(),
-                                key = state.status?.ownId ?: "me",
+                                name = status?.ownName.orEmpty(),
+                                url = status?.ownAvatar.orEmpty(),
+                                key = status?.ownId ?: "me",
                                 isGroup = false,
                                 size = 32.dp,
                             )
@@ -307,8 +327,7 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     },
                     actions = {
                         IconButton(onClick = actions.onContacts) {
-                            val pending = state.friendRequests?.size ?: 0
-                            BadgedBox(badge = { if (pending > 0) Badge { Text(pending.toString()) } }) {
+                            BadgedBox(badge = { if (pendingRequests > 0) Badge { Text(pendingRequests.toString()) } }) {
                                 Icon(Icons.Outlined.People, contentDescription = "Contacts")
                             }
                         }
@@ -354,12 +373,12 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                 modifier = Modifier.fillMaxSize(),
             ) {
             if (searching && query.isNotBlank()) {
-                val chatHits = matches.filter { it.lastMessage != null || !state.drafts[it.ref.key].isNullOrBlank() }
-                val contactHits = matches.filter { it.lastMessage == null && state.drafts[it.ref.key].isNullOrBlank() && it.kind == "user" }.sortedBy { foldForSearch(it.name) }
-                val groupHits = matches.filter { it.lastMessage == null && state.drafts[it.ref.key].isNullOrBlank() && it.kind == "group" }.sortedBy { foldForSearch(it.name) }
-                val messageHits = state.messageSearchResults
-                if (matches.isEmpty() && !state.messageSearchBusy && messageHits.isEmpty()) {
-                    item(key = "no-results") {
+                val chatHits = matches.filter { it.lastMessage != null || !drafts[it.ref.key].isNullOrBlank() }
+                val contactHits = matches.filter { it.lastMessage == null && drafts[it.ref.key].isNullOrBlank() && it.kind == "user" }.sortedBy { foldForSearch(it.name) }
+                val groupHits = matches.filter { it.lastMessage == null && drafts[it.ref.key].isNullOrBlank() && it.kind == "group" }.sortedBy { foldForSearch(it.name) }
+                val messageHits = messageSearchResults
+                if (matches.isEmpty() && !messageSearchBusy && messageHits.isEmpty()) {
+                    item(key = "no-results", contentType = "no-results") {
                         Text(
                             "No results for “${query.trim()}”",
                             style = MaterialTheme.typography.bodyLarge,
@@ -369,13 +388,13 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     }
                 }
                 if (chatHits.isNotEmpty()) {
-                    item(key = "h-chat-hits") { SectionHeader("Chats") }
-                    items(chatHits, key = { it.key }) { thread ->
+                    item(key = "h-chat-hits", contentType = "header") { SectionHeader("Chats") }
+                    items(chatHits, key = { it.key }, contentType = { "thread" }) { thread ->
                         ConversationRow(
                             thread = thread,
                             selected = thread.key == selectedKey,
-                            typing = state.typing[thread.key],
-                            draft = state.drafts[thread.ref.key],
+                            typing = typing[thread.key],
+                            draft = drafts[thread.ref.key],
                             swipeEnabled = false,
                             onClick = { actions.onOpen(thread) },
                             onLongClick = {},
@@ -384,20 +403,21 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     }
                 }
                 if (contactHits.isNotEmpty()) {
-                    item(key = "h-contact-hits") { SectionHeader("Contacts") }
-                    items(contactHits.take(MAX_RESULTS), key = { it.key }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
+                    item(key = "h-contact-hits", contentType = "header") { SectionHeader("Contacts") }
+                    items(contactHits.take(MAX_RESULTS), key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
                 }
                 if (groupHits.isNotEmpty()) {
-                    item(key = "h-group-hits") { SectionHeader("Groups") }
-                    items(groupHits.take(MAX_RESULTS), key = { it.key }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
+                    item(key = "h-group-hits", contentType = "header") { SectionHeader("Groups") }
+                    items(groupHits.take(MAX_RESULTS), key = { it.key }, contentType = { "contact" }) { ContactRow(it, onClick = { actions.onOpen(it) }) }
                 }
-                if (state.messageSearchBusy || messageHits.isNotEmpty()) {
-                    item(key = "h-message-hits") {
-                        MessagesSectionHeader(busy = state.messageSearchBusy)
+                if (messageSearchBusy || messageHits.isNotEmpty()) {
+                    item(key = "h-message-hits", contentType = "message-hits-header") {
+                        MessagesSectionHeader(busy = messageSearchBusy)
                     }
                     items(
                         items = messageHits,
                         key = { hit -> "msg:${hit.ref.key}:${hit.message.id}:${hit.message.ts}" },
+                        contentType = { "message-hit" },
                     ) { hit ->
                         MessageSearchHitRow(
                             hit = hit,
@@ -410,18 +430,17 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     }
                 }
             } else {
-                val status = state.status
-                if (status?.state == "disconnected" || state.connectionError != null) {
-                    item(key = "banner") {
+                if (status?.state == "disconnected" || connectionError != null) {
+                    item(key = "banner", contentType = "banner") {
                         StatusBanner(
-                            text = state.connectionError ?: status?.error ?: "Disconnected from Zalo",
+                            text = connectionError ?: status?.error ?: "Disconnected from Zalo",
                             action = if (status?.state == "disconnected") "Reconnect" else null,
                             onAction = actions.onReconnect,
                         )
                     }
                 }
                 if (!searching && chats.isNotEmpty()) {
-                    item(key = "filter-bar") {
+                    item(key = "filter-bar", contentType = "filter-bar") {
                         ChatFilterBar(
                             selected = filter,
                             unreadCount = unreadChatCount,
@@ -430,9 +449,9 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     }
                 }
                 if (chats.isEmpty()) {
-                    item(key = "empty") { EmptyChats() }
+                    item(key = "empty", contentType = "empty") { EmptyChats() }
                 } else if (visibleChats.isEmpty()) {
-                    item(key = "empty-filtered") {
+                    item(key = "empty-filtered", contentType = "empty") {
                         val (title, subtitle) = when (filter) {
                             ChatFilter.UNREAD -> "All caught up" to "No unread conversations right now."
                             ChatFilter.GROUPS -> "No group chats" to "Group conversations you join or create appear here."
@@ -449,27 +468,27 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     val pinned = visibleChats.filter { it.pinned }
                     val others = visibleChats.filterNot { it.pinned }
                     if (pinned.isNotEmpty()) {
-                        item(key = "h-pinned") { SectionHeader("Pinned") }
-                        items(pinned, key = { it.key }) { thread ->
+                        item(key = "h-pinned", contentType = "header") { SectionHeader("Pinned") }
+                        items(pinned, key = { it.key }, contentType = { "thread" }) { thread ->
                             ConversationRow(
                                 thread = thread,
                                 selected = thread.key == selectedKey,
-                                typing = state.typing[thread.key],
-                                draft = state.drafts[thread.ref.key],
+                                typing = typing[thread.key],
+                                draft = drafts[thread.ref.key],
                                 swipeEnabled = true,
                                 onClick = { actions.onOpen(thread) },
                                 onLongClick = { sheetFor = thread },
                                 onAction = { onRowAction(thread, it) },
                             )
                         }
-                        if (others.isNotEmpty()) item(key = "h-chats") { SectionHeader("Chats") }
+                        if (others.isNotEmpty()) item(key = "h-chats", contentType = "header") { SectionHeader("Chats") }
                     }
-                    items(others, key = { it.key }) { thread ->
+                    items(others, key = { it.key }, contentType = { "thread" }) { thread ->
                         ConversationRow(
                             thread = thread,
                             selected = thread.key == selectedKey,
-                            typing = state.typing[thread.key],
-                            draft = state.drafts[thread.ref.key],
+                            typing = typing[thread.key],
+                            draft = drafts[thread.ref.key],
                             swipeEnabled = true,
                             onClick = { actions.onOpen(thread) },
                             onLongClick = { sheetFor = thread },
@@ -878,15 +897,16 @@ private fun ConversationRow(
                             null
                         }
                         if (thumb != null) {
-                            SubcomposeAsyncImage(
+                            val thumbPlaceholder = remember(colors.surfaceContainerHigh) { ColorPainter(colors.surfaceContainerHigh) }
+                            AsyncImage(
                                 model = thumb,
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
                                     .size(20.dp)
                                     .clip(RoundedCornerShape(4.dp)),
-                                loading = { Box(Modifier.fillMaxSize().background(colors.surfaceContainerHigh)) },
-                                error = { Box(Modifier.fillMaxSize().background(colors.surfaceContainerHigh)) },
+                                placeholder = thumbPlaceholder,
+                                error = thumbPlaceholder,
                             )
                             Spacer(Modifier.width(6.dp))
                         }

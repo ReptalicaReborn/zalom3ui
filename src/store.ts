@@ -589,9 +589,10 @@ export function parseAttachment(msgType: string, content: Record<string, unknown
     return shows || kind !== "other" ? attachment : undefined;
 }
 
-type Snapshot = {
+/** `meta.json`: everything but the messages. */
+type Meta = {
+    version?: number;
     threads: Record<string, ThreadInfo>;
-    messages: Record<string, StoredMessage[]>;
     readUpTo: Record<string, number>;
     pinned?: string[];
     mutedUntil?: Record<string, number>;
@@ -600,11 +601,37 @@ type Snapshot = {
     messageCap?: number;
 };
 
+/** The old single-file cache (`messages.json`), read once to move it to the per-thread layout. */
+type Snapshot = Meta & { messages: Record<string, StoredMessage[]> };
+
+/** `threads/<hex of the thread key>.json`: one chat's messages. */
+type ThreadFile = { key: string; messages: StoredMessage[] };
+
+const META_FILE = "meta.json";
+const THREADS_DIR = "threads";
+const THREAD_FILE = /^[0-9a-f]+\.json$/;
+
+/** A message's text, title and description folded for search, with the strings they were folded from. */
+type SearchText = {
+    text: string;
+    title: string | undefined;
+    description: string | undefined;
+    foldedText: string;
+    foldedTitle: string | undefined;
+    foldedDescription: string | undefined;
+};
+
 /**
- * In-memory cache of threads and messages, snapshotted to disk.
+ * In-memory cache of threads and messages, saved to disk.
  *
  * Zalo Web has no history endpoint for 1:1 chats, so this cache is the
  * client's only long-term history for direct messages.
+ *
+ * Given `data/messages.json`, it saves to `data/messages/`: `meta.json` (threads, read markers, pins, mutes, the
+ * message limit) and one `threads/<hex of the thread key>.json` per chat. A save writes only the files whose contents
+ * changed, so a new message rewrites its own chat and not the whole cache. An old single-file `messages.json` is
+ * moved to this layout on first load and kept as `messages.json.migrated` until the next start reads the new layout
+ * cleanly.
  */
 export class ChatStore {
     private threads = new Map<string, ThreadInfo>();
@@ -618,8 +645,30 @@ export class ChatStore {
     private saveTimer: NodeJS.Timeout | null = null;
     ownId: string | null = null;
     private messageCap = MAX_MESSAGES_PER_THREAD;
+    /** Unread incoming messages per thread at the read marker they were counted at; dropped when the thread's messages change. */
+    private unreadCounts = new Map<string, { readTs: number; count: number }>();
+    /** Folded search text per message, so a search does not fold every message again. Never saved. */
+    private searchText = new WeakMap<StoredMessage, SearchText>();
+    /** The per-thread layout, in a directory beside the old single file; null for a cache kept in memory only. */
+    private readonly paths: { meta: string; threads: string } | null;
+    /** Threads whose file must be rewritten (or removed when they have no messages left). */
+    private dirtyThreads = new Set<string>();
+    private metaDirty = false;
+    /** After [clear]: remove every thread file, including ones this process never loaded. */
+    private wipe = false;
+    /** What an async save is writing now. A sync flush writes these again, as that save may not finish before exit. */
+    private writingThreads = new Set<string>();
+    private writingMeta = false;
+    private saving = false;
+    /** The latest write (or removal) of each file. An async write overtaken by a newer one is dropped, not renamed in. */
+    private fileSeq = new Map<string, number>();
+    private seq = 0;
+    /** While moving an old single-file cache: threads not written yet. meta.json, which marks the move done, waits for them. */
+    private pendingMigration: Set<string> | null = null;
 
     constructor(private readonly file: string | null = null) {
+        const dir = file === null ? null : file.endsWith(".json") ? file.slice(0, -".json".length) : `${file}.d`;
+        this.paths = dir === null ? null : { meta: path.join(dir, META_FILE), threads: path.join(dir, THREADS_DIR) };
         this.load();
     }
 
@@ -631,7 +680,7 @@ export class ChatStore {
             name: info.name || prev?.name || info.id,
             avatar: info.avatar || prev?.avatar || "",
         });
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     getThread(kind: ThreadKind, id: string): ThreadInfo | undefined {
@@ -663,12 +712,13 @@ export class ChatStore {
             if (this.index.get(m.id) === key) this.index.delete(m.id);
         }
         this.messages.delete(key);
+        this.threadChanged(key);
         this.threads.delete(key);
         this.readUpTo.delete(key);
         this.markedUnread.delete(key);
         this.pinned.delete(key);
         this.mutedUntil.delete(key);
-        this.scheduleSave();
+        this.metaChanged();
         return true;
     }
 
@@ -710,6 +760,7 @@ export class ChatStore {
             }
         }
         if (targetList.length > 0) this.messages.set(toKey, targetList);
+        this.threadChanged(toKey);
         if (!targetInfo) {
             this.threads.set(toKey, { id: toId, kind, name: toId, avatar: "" });
         }
@@ -718,12 +769,13 @@ export class ChatStore {
         if (mergedRead > 0) this.readUpTo.set(toKey, mergedRead);
 
         this.messages.delete(fromKey);
+        this.threadChanged(fromKey);
         this.threads.delete(fromKey);
         this.readUpTo.delete(fromKey);
         this.markedUnread.delete(fromKey);
         this.pinned.delete(fromKey);
         this.mutedUntil.delete(fromKey);
-        this.scheduleSave();
+        this.metaChanged();
         return true;
     }
 
@@ -731,7 +783,7 @@ export class ChatStore {
     allowMessages(cap: number): void {
         if (cap > this.messageCap) {
             this.messageCap = cap;
-            this.scheduleSave();
+            this.metaChanged();
         }
     }
 
@@ -750,13 +802,17 @@ export class ChatStore {
         list.splice(i, 0, msg);
         this.index.set(msg.id, key);
         let evictedSelf = false;
+        let evictedOthers = false;
         if (list.length > this.messageCap) {
             for (const dropped of list.splice(0, list.length - this.messageCap)) {
                 this.index.delete(dropped.id);
                 if (dropped.id === msg.id) evictedSelf = true;
+                else evictedOthers = true;
             }
         }
         this.messages.set(key, list);
+        // Only this message falling off at once leaves the list as it was.
+        if (!evictedSelf || evictedOthers) this.threadChanged(key);
         if (evictedSelf) return false;
 
         const existingThread = this.threads.get(key);
@@ -768,21 +824,19 @@ export class ChatStore {
                 name: msg.threadKind === "user" && !msg.isSelf ? msg.fromName || msg.threadId : msg.threadId,
                 avatar: "",
             });
+            this.metaChanged();
         } else if (msg.threadKind === "user" && !msg.isSelf && msg.fromName && existingThread.name === existingThread.id) {
             existingThread.name = msg.fromName;
+            this.metaChanged();
         }
-        if (opts.history) {
-            this.scheduleSave();
-            return true;
-        }
+        if (opts.history) return true;
         const prevReadUpTo = this.readUpTo.get(key) ?? 0;
         if (msg.isSelf) {
             if (msg.ts > prevReadUpTo) this.markRead(msg.threadKind, msg.threadId, msg.ts);
         } else if (msg.ts > prevReadUpTo) {
             // A new incoming message supersedes a manual "mark as unread".
-            this.markedUnread.delete(key);
+            if (this.markedUnread.delete(key)) this.metaChanged();
         }
-        this.scheduleSave();
         return true;
     }
 
@@ -799,7 +853,7 @@ export class ChatStore {
         for (const m of list) if (importedIds.has(m.id) && m.ts < firstLiveUnread && m.ts > upTo) upTo = m.ts;
         if (upTo > readTs) {
             this.readUpTo.set(key, upTo);
-            this.scheduleSave();
+            this.metaChanged();
         }
     }
 
@@ -828,10 +882,11 @@ export class ChatStore {
             const thread = this.threads.get(key);
             for (const m of list) {
                 if (m.recalled) continue;
+                const s = this.searchTextOf(m);
                 const hit =
-                    foldForSearch(m.text).includes(needle) ||
-                    (m.attachment?.title !== undefined && foldForSearch(m.attachment.title).includes(needle)) ||
-                    (m.attachment?.description !== undefined && foldForSearch(m.attachment.description).includes(needle));
+                    s.foldedText.includes(needle) ||
+                    (s.foldedTitle !== undefined && s.foldedTitle.includes(needle)) ||
+                    (s.foldedDescription !== undefined && s.foldedDescription.includes(needle));
                 if (hit) matches.push({ thread, msg: m });
             }
         }
@@ -870,10 +925,10 @@ export class ChatStore {
         const key = this.index.get(msgId);
         const list = key ? this.messages.get(key) : undefined;
         const i = list?.findIndex((m) => m.id === msgId) ?? -1;
-        if (!list || i < 0) return undefined;
+        if (!key || !list || i < 0) return undefined;
         const [removed] = list.splice(i, 1);
         this.index.delete(msgId);
-        this.scheduleSave();
+        this.threadChanged(key);
         return removed;
     }
 
@@ -887,7 +942,8 @@ export class ChatStore {
         msgId: string,
         receipt: { deliveredTo?: string[]; seenBy?: string[] },
     ): StoredMessage[] {
-        const list = this.messages.get(threadKey(kind, threadId)) ?? [];
+        const key = threadKey(kind, threadId);
+        const list = this.messages.get(key) ?? [];
         const target = list.find((m) => m.id === msgId);
         if (!target) return [];
         const affected = kind === "user" ? list.filter((m) => m.isSelf && m.ts <= target.ts) : [target];
@@ -901,7 +957,7 @@ export class ChatStore {
             m.seenBy = seenBy;
             changed.push(m);
         }
-        if (changed.length) this.scheduleSave();
+        if (changed.length) this.markDirty(key);
         return changed;
     }
 
@@ -916,26 +972,27 @@ export class ChatStore {
     markRead(kind: ThreadKind, id: string, upTo: number = Date.now()): boolean {
         const key = threadKey(kind, id);
         const wasMarkedUnread = this.markedUnread.delete(key);
-        if ((this.readUpTo.get(key) ?? 0) < upTo) this.readUpTo.set(key, upTo);
-        this.scheduleSave();
+        const advanced = (this.readUpTo.get(key) ?? 0) < upTo;
+        if (advanced) this.readUpTo.set(key, upTo);
+        if (wasMarkedUnread || advanced) this.metaChanged();
         return wasMarkedUnread;
     }
 
     markUnread(kind: ThreadKind, id: string): void {
         this.markedUnread.add(threadKey(kind, id));
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     setPinned(kind: ThreadKind, id: string, pinned: boolean): void {
         const key = threadKey(kind, id);
         if (pinned) this.pinned.add(key);
         else this.pinned.delete(key);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     replacePinned(keys: string[]): void {
         this.pinned = new Set(keys);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     /** `until`: epoch ms, -1 for indefinitely, null to unmute. */
@@ -943,12 +1000,12 @@ export class ChatStore {
         const key = threadKey(kind, id);
         if (until === null) this.mutedUntil.delete(key);
         else this.mutedUntil.set(key, until);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     replaceMuted(entries: [string, number][]): void {
         this.mutedUntil = new Map(entries);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     isMuted(kind: ThreadKind, id: string, now = Date.now()): boolean {
@@ -961,8 +1018,9 @@ export class ChatStore {
         const key = threadKey(kind, id);
         for (const m of this.messages.get(key) ?? []) this.index.delete(m.id);
         this.messages.delete(key);
+        this.threadChanged(key);
         this.markedUnread.delete(key);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     /** Forgets a conversation entirely (a group I left): its messages, pin, mute and read state. */
@@ -973,7 +1031,7 @@ export class ChatStore {
         this.readUpTo.delete(key);
         this.pinned.delete(key);
         this.mutedUntil.delete(key);
-        this.scheduleSave();
+        this.metaChanged();
     }
 
     lastMessage(kind: ThreadKind, id: string): StoredMessage | undefined {
@@ -984,8 +1042,7 @@ export class ChatStore {
         const out: ThreadSummary[] = [];
         for (const [key, info] of this.threads) {
             const list = this.messages.get(key) ?? [];
-            const readTs = this.readUpTo.get(key) ?? 0;
-            const unread = list.filter((m) => !m.isSelf && m.ts > readTs).length;
+            const unread = this.unreadCount(key, list);
             const last = list.at(-1);
             const summary: ThreadSummary = {
                 ...info,
@@ -1027,53 +1084,163 @@ export class ChatStore {
         this.mutedUntil.clear();
         this.markedUnread.clear();
         this.index.clear();
-        this.scheduleSave();
+        this.unreadCounts.clear();
+        this.wipe = true;
+        this.metaChanged();
     }
 
+    /**
+     * Saves what changed, synchronously: for shutdown, logout and fatal errors. Otherwise changes are saved in the
+     * background a moment after they happen.
+     */
     flush(): void {
         if (this.saveTimer) {
             clearTimeout(this.saveTimer);
             this.saveTimer = null;
         }
-        if (!this.file) return;
-        try {
-            const snapshot: Snapshot = {
-                threads: Object.fromEntries(this.threads),
-                messages: Object.fromEntries(this.messages),
-                readUpTo: Object.fromEntries(this.readUpTo),
-                pinned: [...this.pinned],
-                mutedUntil: Object.fromEntries(this.mutedUntil),
-                markedUnread: [...this.markedUnread],
-                ...(this.messageCap > MAX_MESSAGES_PER_THREAD ? { messageCap: this.messageCap } : {}),
-            };
-            fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-            const tmp = `${this.file}.tmp`;
-            fs.writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 });
-            fs.renameSync(tmp, this.file);
-        } catch (err) {
-            console.warn(`Could not save message cache ${this.file}:`, err);
-        }
+        // A background save still writing these may not finish before the process exits: write them again now.
+        for (const key of this.writingThreads) this.dirtyThreads.add(key);
+        if (this.writingMeta) this.metaDirty = true;
+        this.saveSync();
     }
 
     private update(msgId: string, fn: (m: StoredMessage) => void): StoredMessage | undefined {
+        const key = this.index.get(msgId);
         const m = this.getMessage(msgId);
-        if (!m) return undefined;
+        if (!key || !m) return undefined;
         fn(m);
-        this.scheduleSave();
+        this.searchText.delete(m);
+        this.markDirty(key);
         return m;
     }
 
+    /** The thread's messages changed (added, removed, moved or evicted). */
+    private threadChanged(key: string): void {
+        this.unreadCounts.delete(key);
+        this.markDirty(key);
+    }
+
+    /** Something saved in the thread's file changed. */
+    private markDirty(key: string): void {
+        if (!this.paths) return;
+        this.dirtyThreads.add(key);
+        this.scheduleSave();
+    }
+
+    /** Threads, read markers, pins, mutes or the message limit changed. */
+    private metaChanged(): void {
+        if (!this.paths) return;
+        this.metaDirty = true;
+        this.scheduleSave();
+    }
+
+    /** Incoming messages after the read marker, as `list.filter((m) => !m.isSelf && m.ts > readTs).length`, cached. */
+    private unreadCount(key: string, list: StoredMessage[]): number {
+        const readTs = this.readUpTo.get(key) ?? 0;
+        const cached = this.unreadCounts.get(key);
+        if (cached && cached.readTs === readTs) return cached.count;
+        let count = 0;
+        for (const m of list) if (!m.isSelf && m.ts > readTs) count++;
+        this.unreadCounts.set(key, { readTs, count });
+        return count;
+    }
+
+    private searchTextOf(m: StoredMessage): SearchText {
+        const title = m.attachment?.title;
+        const description = m.attachment?.description;
+        let s = this.searchText.get(m);
+        if (!s || s.text !== m.text || s.title !== title || s.description !== description) {
+            s = {
+                text: m.text,
+                title,
+                description,
+                foldedText: foldForSearch(m.text),
+                foldedTitle: title === undefined ? undefined : foldForSearch(title),
+                foldedDescription: description === undefined ? undefined : foldForSearch(description),
+            };
+            this.searchText.set(m, s);
+        }
+        return s;
+    }
+
     private load(): void {
-        if (!this.file || !fs.existsSync(this.file)) return;
+        if (!this.file || !this.paths) return;
+        const { meta, threads } = this.paths;
+        // Left by a crash in the middle of a write.
+        for (const dir of [path.dirname(meta), threads]) {
+            for (const name of listDir(dir)) if (name.endsWith(".tmp")) removeQuietly(path.join(dir, name));
+        }
+        if (!fs.existsSync(meta) && fs.existsSync(this.file)) {
+            this.migrateLegacy(this.file);
+            return;
+        }
+        let metaLoaded = false;
+        if (fs.existsSync(meta)) {
+            try {
+                this.applyMeta(JSON.parse(fs.readFileSync(meta, "utf8")) as Meta);
+                metaLoaded = true;
+            } catch (err) {
+                backUpCorrupt(meta, err);
+            }
+        }
+        let allRead = metaLoaded;
+        // One unreadable chat is backed up and skipped; the others still load.
+        for (const name of listDir(threads)) {
+            if (!THREAD_FILE.test(name)) continue;
+            // The name is the key, so the file read is the one the next save of that chat replaces.
+            const key = Buffer.from(name.slice(0, -".json".length), "hex").toString("utf8");
+            const file = threadFile(this.paths, key);
+            if (path.basename(file) !== name) continue;
+            try {
+                const data = JSON.parse(fs.readFileSync(file, "utf8")) as ThreadFile;
+                if (!Array.isArray(data.messages)) throw new Error("No message list");
+                this.messages.set(key, data.messages);
+                for (const m of data.messages) this.index.set(m.id, key);
+            } catch (err) {
+                allRead = false;
+                backUpCorrupt(file, err);
+            }
+        }
+        // The new layout loaded cleanly after a migration: the old single-file copy is no longer needed (it can be tens
+        // of MB on a phone). Kept while anything failed to read, as the only other copy.
+        if (allRead) removeQuietly(`${this.file}.migrated`);
+        if (!metaLoaded) {
+            // Only a history import lets a chat grow past the usual limit; its raised limit was in meta.json too.
+            for (const list of this.messages.values()) {
+                if (list.length > this.messageCap) this.messageCap = Math.max(list.length, HISTORY_MESSAGES_PER_THREAD);
+            }
+        }
+        // Messages whose thread is not in meta.json: saved just before a crash, or meta.json was unreadable.
+        for (const [key, list] of this.messages) {
+            const last = list.at(-1);
+            if (!last || this.threads.has(key)) continue;
+            this.threads.set(key, { id: last.threadId, kind: last.threadKind, name: last.threadId, avatar: "" });
+            // Without the saved read markers, all of the history would show as unread.
+            if (!metaLoaded) this.readUpTo.set(key, last.ts);
+            this.metaChanged();
+        }
+    }
+
+    private applyMeta(meta: Meta): void {
+        const threads = new Map(Object.entries(meta.threads ?? {}));
+        const readUpTo = new Map(Object.entries(meta.readUpTo ?? {}));
+        const pinned = new Set(meta.pinned ?? []);
+        const mutedUntil = new Map(Object.entries(meta.mutedUntil ?? {}));
+        const markedUnread = new Set(meta.markedUnread ?? []);
+        this.threads = threads;
+        this.readUpTo = readUpTo;
+        this.pinned = pinned;
+        this.mutedUntil = mutedUntil;
+        this.markedUnread = markedUnread;
+        if (typeof meta.messageCap === "number" && meta.messageCap > MAX_MESSAGES_PER_THREAD) this.messageCap = meta.messageCap;
+    }
+
+    /** Reads the old single-file cache and saves it in the per-thread layout, keeping the old file as `.migrated`. */
+    private migrateLegacy(file: string): void {
         try {
-            const snapshot = JSON.parse(fs.readFileSync(this.file, "utf8")) as Snapshot;
-            this.threads = new Map(Object.entries(snapshot.threads ?? {}));
+            const snapshot = JSON.parse(fs.readFileSync(file, "utf8")) as Snapshot;
+            this.applyMeta(snapshot);
             this.messages = new Map(Object.entries(snapshot.messages ?? {}));
-            this.readUpTo = new Map(Object.entries(snapshot.readUpTo ?? {}));
-            this.pinned = new Set(snapshot.pinned ?? []);
-            this.mutedUntil = new Map(Object.entries(snapshot.mutedUntil ?? {}));
-            this.markedUnread = new Set(snapshot.markedUnread ?? []);
-            if (typeof snapshot.messageCap === "number" && snapshot.messageCap > MAX_MESSAGES_PER_THREAD) this.messageCap = snapshot.messageCap;
             for (const [key, list] of this.messages) for (const m of list) this.index.set(m.id, key);
         } catch (err) {
             this.threads.clear();
@@ -1083,20 +1250,241 @@ export class ChatStore {
             this.mutedUntil.clear();
             this.markedUnread.clear();
             this.index.clear();
-            const backup = `${this.file}.corrupt.${Date.now()}`;
-            try {
-                fs.renameSync(this.file, backup);
-                console.warn(`Backed up unreadable message cache ${this.file} to ${backup}:`, err);
-            } catch {
-                console.warn(`Ignoring unreadable message cache ${this.file}:`, err);
-            }
+            this.unreadCounts.clear();
+            backUpCorrupt(file, err);
+            return;
+        }
+        // Until every chat is written, meta.json (whose presence means "moved") is not, and the old file stays.
+        this.pendingMigration = new Set(this.messages.keys());
+        for (const key of this.messages.keys()) this.dirtyThreads.add(key);
+        this.metaDirty = true;
+        if (!this.saveSync()) this.scheduleSave();
+    }
+
+    /** The moved cache is fully saved: keep the old single file only as a backup. */
+    private retireLegacy(): void {
+        if (!this.pendingMigration || !this.file) return;
+        this.pendingMigration = null;
+        try {
+            fs.renameSync(this.file, `${this.file}.migrated`);
+        } catch (err) {
+            console.warn(`Could not rename the old message cache ${this.file}:`, err);
         }
     }
 
     private scheduleSave(): void {
-        if (!this.file || this.saveTimer) return;
-        this.saveTimer = setTimeout(() => this.flush(), 2000);
+        if (!this.paths || this.saveTimer) return;
+        this.saveTimer = setTimeout(() => {
+            this.saveTimer = null;
+            this.saveInBackground().catch((err) => console.warn("Could not save message cache:", err));
+        }, 2000);
         this.saveTimer.unref();
+    }
+
+    /** Writes the changed files now, blocking. Returns whether all of them were written. */
+    private saveSync(): boolean {
+        const paths = this.paths;
+        if (!paths) return true;
+        let ok = true;
+        const fail = (err: unknown) => {
+            if (ok) console.warn(`Could not save message cache ${path.dirname(paths.meta)}:`, err);
+            ok = false;
+        };
+        try {
+            fs.mkdirSync(paths.threads, { recursive: true, mode: 0o700 });
+            if (this.wipe) this.wipeFiles(paths);
+        } catch (err) {
+            fail(err);
+            return false;
+        }
+        for (const key of [...this.dirtyThreads]) {
+            this.dirtyThreads.delete(key);
+            try {
+                const file = threadFile(paths, key);
+                const json = this.threadJson(key);
+                if (json === null) this.removeFile(file);
+                else this.writeSync(file, json);
+                this.pendingMigration?.delete(key);
+            } catch (err) {
+                this.dirtyThreads.add(key);
+                fail(err);
+            }
+        }
+        // Written last, so that a thread saved before a crash is found again (see [load]).
+        if (this.metaDirty && !this.pendingMigration?.size) {
+            this.metaDirty = false;
+            try {
+                this.writeSync(paths.meta, this.metaJson());
+                this.retireLegacy();
+            } catch (err) {
+                this.metaDirty = true;
+                fail(err);
+            }
+        }
+        return ok && !this.metaDirty;
+    }
+
+    /**
+     * Writes the changed files without blocking the event loop: one at a time, and never two saves at once. A sync
+     * [flush] in the middle wins: this save then drops what it was writing.
+     */
+    private async saveInBackground(): Promise<void> {
+        const paths = this.paths;
+        if (!paths) return;
+        if (this.saving) {
+            this.scheduleSave();
+            return;
+        }
+        this.saving = true;
+        let ok = true;
+        const fail = (err: unknown) => {
+            if (ok) console.warn(`Could not save message cache ${path.dirname(paths.meta)}:`, err);
+            ok = false;
+        };
+        try {
+            fs.mkdirSync(paths.threads, { recursive: true, mode: 0o700 });
+            if (this.wipe) this.wipeFiles(paths);
+            for (const key of [...this.dirtyThreads]) {
+                // Saved meanwhile by a sync flush.
+                if (!this.dirtyThreads.delete(key)) continue;
+                this.writingThreads.add(key);
+                try {
+                    const file = threadFile(paths, key);
+                    const json = this.threadJson(key);
+                    let written = true;
+                    if (json === null) this.removeFile(file);
+                    else written = await this.writeAsync(file, json);
+                    if (written) this.pendingMigration?.delete(key);
+                } catch (err) {
+                    this.dirtyThreads.add(key);
+                    fail(err);
+                } finally {
+                    this.writingThreads.delete(key);
+                }
+            }
+            if (this.metaDirty && !this.pendingMigration?.size) {
+                this.metaDirty = false;
+                this.writingMeta = true;
+                try {
+                    if (await this.writeAsync(paths.meta, this.metaJson())) this.retireLegacy();
+                } catch (err) {
+                    this.metaDirty = true;
+                    fail(err);
+                } finally {
+                    this.writingMeta = false;
+                }
+            }
+        } catch (err) {
+            fail(err);
+        } finally {
+            this.saving = false;
+        }
+    }
+
+    /** The thread's file contents, or null when it has no messages left and its file should go. */
+    private threadJson(key: string): string | null {
+        const list = this.messages.get(key);
+        if (!list?.length) return null;
+        const data: ThreadFile = { key, messages: list };
+        return JSON.stringify(data);
+    }
+
+    private metaJson(): string {
+        const meta: Meta = {
+            version: 1,
+            threads: Object.fromEntries(this.threads),
+            readUpTo: Object.fromEntries(this.readUpTo),
+            pinned: [...this.pinned],
+            mutedUntil: Object.fromEntries(this.mutedUntil),
+            markedUnread: [...this.markedUnread],
+            ...(this.messageCap > MAX_MESSAGES_PER_THREAD ? { messageCap: this.messageCap } : {}),
+        };
+        return JSON.stringify(meta);
+    }
+
+    /** After [clear] (logging out): removes every thread file and the old single-file cache. */
+    private wipeFiles(paths: { threads: string }): void {
+        for (const name of listDir(paths.threads)) if (THREAD_FILE.test(name)) this.removeFile(path.join(paths.threads, name));
+        if (this.file) {
+            fs.rmSync(this.file, { force: true });
+            fs.rmSync(`${this.file}.migrated`, { force: true });
+        }
+        this.pendingMigration = null;
+        this.wipe = false;
+    }
+
+    /** Each write or removal of a file gets a new number; an async write renames its file in only if it is still the latest. */
+    private nextSeq(file: string): number {
+        this.fileSeq.set(file, ++this.seq);
+        return this.seq;
+    }
+
+    /** Writes through a temporary file, so a crash never leaves a half-written file. */
+    private writeSync(file: string, data: string): void {
+        const tmp = `${file}.${this.nextSeq(file)}.tmp`;
+        try {
+            fs.writeFileSync(tmp, data, { mode: 0o600 });
+            fs.renameSync(tmp, file);
+        } catch (err) {
+            removeQuietly(tmp);
+            throw err;
+        }
+    }
+
+    /** Like [writeSync] without blocking on the write. Returns false when a newer write of the file overtook it. */
+    private async writeAsync(file: string, data: string): Promise<boolean> {
+        const seq = this.nextSeq(file);
+        const tmp = `${file}.${seq}.tmp`;
+        try {
+            await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+            if (this.fileSeq.get(file) !== seq) {
+                removeQuietly(tmp);
+                return false;
+            }
+            // Renamed synchronously: nothing can write the file between this check and the rename.
+            fs.renameSync(tmp, file);
+            return true;
+        } catch (err) {
+            removeQuietly(tmp);
+            throw err;
+        }
+    }
+
+    private removeFile(file: string): void {
+        this.nextSeq(file);
+        fs.rmSync(file, { force: true });
+    }
+}
+
+/** A thread's file: named by the hex of its key, which is safe on any filesystem, case-insensitive ones included. */
+function threadFile(paths: { threads: string }, key: string): string {
+    return path.join(paths.threads, `${Buffer.from(key, "utf8").toString("hex")}.json`);
+}
+
+function listDir(dir: string): string[] {
+    try {
+        return fs.readdirSync(dir);
+    } catch {
+        return [];
+    }
+}
+
+function removeQuietly(file: string): void {
+    try {
+        fs.rmSync(file, { force: true });
+    } catch {
+        // Best effort: a leftover temporary file is removed on the next start.
+    }
+}
+
+/** Moves an unreadable cache file aside instead of overwriting it. */
+function backUpCorrupt(file: string, err: unknown): void {
+    const backup = `${file}.corrupt.${Date.now()}`;
+    try {
+        fs.renameSync(file, backup);
+        console.warn(`Backed up unreadable message cache ${file} to ${backup}:`, err);
+    } catch {
+        console.warn(`Ignoring unreadable message cache ${file}:`, err);
     }
 }
 

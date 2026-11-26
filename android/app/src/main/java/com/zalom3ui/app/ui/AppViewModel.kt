@@ -140,6 +140,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    /**
+     * Drafts as last typed, by [ThreadRef.key]. A keystroke only changes this map: the disk and [UiState.drafts] (the chat
+     * list's "Draft:") follow once typing pauses ([draftSaves]), the chat closes or the app goes to the background.
+     */
+    private val latestDrafts = HashMap<String, String>(_state.value.drafts)
+    private val draftSaves = HashMap<String, Job>()
+
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
     val pollEvents: SharedFlow<Long> = _pollEvents
@@ -182,15 +189,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(appearance = appearance) }
     }
 
+    /** Called on every keystroke, so it only notes the text; saving it waits for typing to pause. */
     fun setDraft(ref: ThreadRef, text: String) {
         val key = ref.key
-        val current = _state.value.drafts[key].orEmpty()
+        val current = latestDrafts[key].orEmpty()
         if (current == text || (current.isEmpty() && text.isBlank())) return
-        settingsStore.saveDraft(key, text)
-        _state.update { s ->
-            val updated = if (text.isBlank()) s.drafts - key else s.drafts + (key to text)
-            s.copy(drafts = updated)
+        if (text.isBlank()) {
+            latestDrafts.remove(key)
+        } else {
+            latestDrafts[key] = text
         }
+        draftSaves.remove(key)?.cancel()
+        draftSaves[key] = viewModelScope.launch {
+            delay(DRAFT_SAVE_DEBOUNCE_MS)
+            draftSaves.remove(key)
+            commitDraft(key)
+        }
+    }
+
+    /** The chat's draft as last typed, including text not saved yet. */
+    fun draft(ref: ThreadRef): String = latestDrafts[ref.key].orEmpty()
+
+    /** Empties the chat's draft at once (its message was sent), so a pending save can't bring the text back. */
+    private fun clearDraft(ref: ThreadRef) {
+        val key = ref.key
+        draftSaves.remove(key)?.cancel()
+        latestDrafts.remove(key)
+        commitDraft(key)
+    }
+
+    /** Saves every draft still waiting for typing to pause. */
+    private fun flushDrafts() {
+        if (draftSaves.isEmpty()) return
+        val keys = draftSaves.keys.toList()
+        draftSaves.values.forEach { it.cancel() }
+        draftSaves.clear()
+        keys.forEach { commitDraft(it) }
+    }
+
+    /** Writes the chat's latest draft to disk and [UiState.drafts], unless they already have it. */
+    private fun commitDraft(key: String) {
+        val text = latestDrafts[key].orEmpty()
+        if (_state.value.drafts[key].orEmpty() == text) return
+        settingsStore.saveDraft(key, text)
+        _state.update { it.copy(drafts = withDraft(it.drafts, key, text)) }
     }
 
     fun setChatAccent(ref: ThreadRef, accent: ChatAccent?) {
@@ -374,6 +416,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopLiveUpdates() {
         visible = false
+        // Going to the background: save drafts now rather than after the typing pause, in case the app is killed.
+        flushDrafts()
         liveJob?.cancel()
         liveJob = null
         presenceJob?.cancel()
@@ -384,6 +428,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Out of sight: messages of the open chat notify again.
         val api = client ?: return
         viewModelScope.launch { withContext(NonCancellable) { runCatching { api.setPresence(null) } } }
+    }
+
+    override fun onCleared() {
+        // The scope's pending saves are cancelled by now; save their drafts directly.
+        flushDrafts()
+        super.onCleared()
     }
 
     fun login() = launchApi { api ->
@@ -426,6 +476,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Chat ----
 
     fun openChat(thread: ThreadSummary) {
+        // On a tablet this leaves the chat beside the list without closing it: its draft shows in the list at once.
+        flushDrafts()
         _state.update { it.copy(chat = ChatState(thread.kind, thread.id, thread.name)) }
         if (visible) viewModelScope.launch { runCatching { client?.setPresence(thread.ref) } }
         launchApi(onDone = { updateChat(thread.ref) { it.copy(loading = false) } }) { api ->
@@ -449,6 +501,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Closes the open chat, unless another one was opened since [ref] was. */
     fun closeChat(ref: ThreadRef? = null) {
+        flushDrafts()
         val closing = _state.value.chat?.ref
         _state.update { if (ref == null || it.chat?.ref == ref) it.copy(chat = null, scrollToMsgId = null) else it }
         if (closing != null && _state.value.chat == null) viewModelScope.launch { runCatching { client?.setPresence(null) } }
@@ -487,7 +540,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             mentions = mentions,
         )
         updateChat(chat.ref) { it.copy(pending = it.pending + item) }
-        setDraft(chat.ref, "")
+        clearDraft(chat.ref)
         onSent()
         sendPending(chat.ref, item)
     }
@@ -923,7 +976,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val threads = if (status.isLoggedIn) api.threads() else emptyList()
         val sync = if (status.isLoggedIn) runCatching { api.historySyncStatus() }.getOrNull() else null
         _state.update {
-            it.copy(status = status, threads = threads, connectionError = null, startupError = null, historySync = sync ?: it.historySync)
+            it.copy(
+                status = status,
+                threads = keepUnchanged(it.threads, threads),
+                connectionError = null,
+                startupError = null,
+                historySync = sync ?: it.historySync,
+            )
         }
         _state.value.chat?.let { chat ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE)
@@ -1026,7 +1085,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refreshThreads(api: ApiClient) {
         val threads = api.threads()
-        _state.update { it.copy(threads = threads) }
+        _state.update { it.copy(threads = keepUnchanged(it.threads, threads)) }
     }
 
     private suspend fun markRead(api: ApiClient, ref: ThreadRef) {
@@ -1036,7 +1095,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             throw e
         } catch (_: Exception) {
         }
-        _state.update { s -> s.copy(threads = s.threads.map { if (it.ref == ref) it.copy(unread = 0) else it }) }
+        _state.update { s -> s.copy(threads = s.threads.map { if (it.ref == ref && it.unread != 0) it.copy(unread = 0) else it }) }
     }
 
     private fun updateChat(ref: ThreadRef, fn: (ChatState) -> ChatState) {
@@ -1073,6 +1132,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val LOCAL_BOOT_GRACE_MS = 45_000L
         private const val LOCAL_BOOT_RETRY_MS = 1_000L
         private const val MESSAGE_SEARCH_DEBOUNCE_MS = 250L
+        /** How long typing must pause before a draft is saved. */
+        private const val DRAFT_SAVE_DEBOUNCE_MS = 500L
         private const val PAGE_SIZE = 30
         private const val MAX_CHAT_MESSAGES = 300
 
@@ -1098,6 +1159,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             return found.sortedBy { it.pos }
+        }
+
+        /** [drafts] with [key]'s draft set to [text] (removed when blank); the same map when that changes nothing. */
+        fun withDraft(drafts: Map<String, String>, key: String, text: String): Map<String, String> = when {
+            text.isBlank() -> if (key in drafts) drafts - key else drafts
+            drafts[key] == text -> drafts
+            else -> drafts + (key to text)
+        }
+
+        /**
+         * [fresh] (just loaded from the server) with each thread that didn't change replaced by its instance in [current],
+         * and [current] itself when nothing changed, so the chat list redraws only the rows that did.
+         */
+        fun keepUnchanged(current: List<ThreadSummary>, fresh: List<ThreadSummary>): List<ThreadSummary> {
+            if (current.isEmpty() || fresh.isEmpty()) return fresh
+            val byKey = current.associateBy { it.key }
+            val merged = fresh.map { t -> byKey[t.key]?.takeIf { it == t } ?: t }
+            return if (merged.size == current.size && merged.indices.all { merged[it] === current[it] }) current else merged
         }
 
         fun sortThreads(threads: List<ThreadSummary>): List<ThreadSummary> =
