@@ -1,17 +1,12 @@
 package com.zalom3ui.app.ui
 
 import android.widget.Toast
-import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.AnimatedContentScope
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
@@ -42,6 +37,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavController
+import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -213,30 +211,12 @@ private fun AppNav(vm: AppViewModel) {
         startDestination = Routes.HOME,
         enterTransition = { slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it / 4 } + fadeIn() },
         exitTransition = { fadeOut() },
-        // Linear timing + delayed fade prevents predictive back from jumping/fading out on small edge touches.
-        popEnterTransition = {
-            scaleIn(
-                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
-                initialScale = 0.96f,
-            ) + fadeIn(
-                animationSpec = tween(durationMillis = 280, easing = LinearEasing),
-                initialAlpha = 0.85f,
-            )
-        },
-        popExitTransition = {
-            scaleOut(
-                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
-                targetScale = 0.92f,
-                transformOrigin = TransformOrigin(pivotFractionX = 0.5f, pivotFractionY = 0.5f),
-            ) + slideOutHorizontally(
-                animationSpec = tween(durationMillis = 320, easing = LinearEasing),
-            ) { it / 16 } + fadeOut(
-                animationSpec = tween(durationMillis = 160, delayMillis = 160, easing = LinearEasing),
-            )
-        },
+        // Back slides the screen off to the right under the finger, revealing the previous one (PredictiveBack.kt).
+        popEnterTransition = { backSlideIn() },
+        popExitTransition = { backSlideOut() },
     ) {
         // Each destination collects state itself so it never renders a stale capture.
-        composable(Routes.HOME) {
+        screen(Routes.HOME, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             val status = state.status
             val connectionError = state.connectionError
@@ -311,7 +291,7 @@ private fun AppNav(vm: AppViewModel) {
                 ) }
             }
         }
-        composable(Routes.NEW_CHAT) {
+        screen(Routes.NEW_CHAT, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             LaunchedEffect(Unit) { vm.loadFriendRequests() }
             ContactsScreen(
@@ -331,7 +311,7 @@ private fun AppNav(vm: AppViewModel) {
                 ),
             )
         }
-        composable(Routes.NEW_GROUP) {
+        screen(Routes.NEW_GROUP, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             var busy by remember { mutableStateOf(false) }
             FriendPickerScreen(
@@ -353,7 +333,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.CONTACTS) {
+        screen(Routes.CONTACTS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             FriendsScreen(
                 friends = state.friends,
@@ -374,7 +354,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.ADD_FRIEND) {
+        screen(Routes.ADD_FRIEND, nav) {
             AddFriendScreen(
                 onBack = { nav.safePopBackStack(Routes.ADD_FRIEND) },
                 onFind = vm::findUser,
@@ -386,7 +366,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.MEMBERS) {
+        screen(Routes.MEMBERS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             val chat = state.chat
             GroupMembersScreen(
@@ -403,7 +383,7 @@ private fun AppNav(vm: AppViewModel) {
                 onRemove = vm::removeMember,
             )
         }
-        composable(Routes.ADD_MEMBERS) {
+        screen(Routes.ADD_MEMBERS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             var busy by remember { mutableStateOf(false) }
             LaunchedEffect(Unit) { vm.loadMembers() }
@@ -425,7 +405,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.CHAT) { entry ->
+        screen(Routes.CHAT, nav) { entry ->
             val state by vm.state.collectAsStateWithLifecycle()
             // Close the chat once this screen leaves the back stack (not when covered by "Forward").
             LaunchedEffect(entry) {
@@ -454,7 +434,7 @@ private fun AppNav(vm: AppViewModel) {
                 )
             }
         }
-        composable(Routes.CHAT_INFO) {
+        screen(Routes.CHAT_INFO, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             val chat = state.chat
             if (chat == null) {
@@ -499,7 +479,7 @@ private fun AppNav(vm: AppViewModel) {
                 )
             }
         }
-        composable(Routes.FORWARD) { entry ->
+        screen(Routes.FORWARD, nav) { entry ->
             val state by vm.state.collectAsStateWithLifecycle()
             val many = state.forwardingMany
             val msg = state.selected
@@ -531,7 +511,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.SHARE) { entry ->
+        screen(Routes.SHARE, nav) { entry ->
             val state by vm.state.collectAsStateWithLifecycle()
             LaunchedEffect(entry) {
                 entry.lifecycle.addObserver(LifecycleEventObserver { _, event ->
@@ -550,7 +530,7 @@ private fun AppNav(vm: AppViewModel) {
                 },
             )
         }
-        composable(Routes.SETTINGS) {
+        screen(Routes.SETTINGS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             SettingsScreen(
                 current = state.settings,
@@ -582,6 +562,13 @@ private fun AppNav(vm: AppViewModel) {
     }
     }
 }
+
+/** A destination whose screen follows the back gesture and slides away (see [BackSlideFrame]). */
+private fun NavGraphBuilder.screen(
+    route: String,
+    nav: NavController,
+    content: @Composable AnimatedContentScope.(NavBackStackEntry) -> Unit,
+) = composable(route) { entry -> BackSlideFrame(nav, entry) { content(entry) } }
 
 /**
  * Pops the top destination only while it is still active and another destination sits beneath it.

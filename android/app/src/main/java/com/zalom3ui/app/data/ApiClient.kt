@@ -1,9 +1,11 @@
 package com.zalom3ui.app.data
 
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -489,7 +491,9 @@ class ApiClient(serverUrl: String, private val token: String?) {
                 .getOrNull()
             throw ApiException(message ?: "HTTP $code", code)
         }
-        return if (T::class == Unit::class) Unit as T else json.decodeFromString<T>(body)
+        if (T::class == Unit::class) return Unit as T
+        // Off the main thread: callers run on the UI dispatcher, and the chat list alone can be a large document.
+        return withContext(Dispatchers.Default) { json.decodeFromString<T>(body) }
     }
 
     internal fun url(vararg segments: String, query: List<Pair<String, String>> = emptyList()): HttpUrl =
