@@ -164,6 +164,9 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
     BackHandler(enabled = searching) { closeSearch() }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    LaunchedEffect(searching) {
+        if (searching) scrollBehavior.state.heightOffset = 0f
+    }
     // The chat list shows conversations; contacts you never talked to are under search and "New chat".
     val chats = remember(state.threads) { state.threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 } }
     val unreadChatCount = remember(chats) { chats.count { it.unread > 0 } }
@@ -188,64 +191,50 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
         }
     }
 
-    val topBarEffectsSpec = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
-    val topBarSlideSpec = MaterialTheme.motionScheme.fastSpatialSpec<IntOffset>()
-    val topBarSizeSpec = MaterialTheme.motionScheme.fastSpatialSpec<IntSize>()
-
     Scaffold(
         modifier = if (searching) Modifier else Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
-            AnimatedContent(
-                targetState = searching,
-                transitionSpec = {
-                    (fadeIn(topBarEffectsSpec) + slideInVertically(topBarSlideSpec) { -it / 4 })
-                        .togetherWith(fadeOut(topBarEffectsSpec))
-                        .using(SizeTransform(clip = false) { _, _ -> topBarSizeSpec })
-                },
-                label = "TopBarSearchTransition",
-            ) { isSearching ->
-                if (isSearching) {
-                    SearchTopBar(query = query, onQuery = { query = it }, onClose = closeSearch)
-                } else {
-                    MediumFlexibleTopAppBar(
-                        navigationIcon = {
-                            IconButton(onClick = actions.onSettings) {
-                                Avatar(
-                                    name = state.status?.ownName.orEmpty(),
-                                    url = state.status?.ownAvatar.orEmpty(),
-                                    key = state.status?.ownId ?: "me",
-                                    isGroup = false,
-                                    size = 32.dp,
-                                )
-                            }
-                        },
-                        title = {
-                            Text(
-                                text = stringResource(R.string.app_name),
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
+            if (searching) {
+                SearchTopBar(query = query, onQuery = { query = it }, onClose = closeSearch)
+            } else {
+                MediumFlexibleTopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = actions.onSettings) {
+                            Avatar(
+                                name = state.status?.ownName.orEmpty(),
+                                url = state.status?.ownAvatar.orEmpty(),
+                                key = state.status?.ownId ?: "me",
+                                isGroup = false,
+                                size = 32.dp,
                             )
-                        },
-                        actions = {
-                            IconButton(onClick = actions.onContacts) {
-                                val pending = state.friendRequests?.size ?: 0
-                                BadgedBox(badge = { if (pending > 0) Badge { Text(pending.toString()) } }) {
-                                    Icon(Icons.Outlined.People, contentDescription = "Contacts")
-                                }
+                        }
+                    },
+                    title = {
+                        Text(
+                            text = stringResource(R.string.app_name),
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    actions = {
+                        IconButton(onClick = actions.onContacts) {
+                            val pending = state.friendRequests?.size ?: 0
+                            BadgedBox(badge = { if (pending > 0) Badge { Text(pending.toString()) } }) {
+                                Icon(Icons.Outlined.People, contentDescription = "Contacts")
                             }
-                            IconButton(onClick = { searching = true }) {
-                                Icon(Icons.Outlined.Search, contentDescription = "Search")
-                            }
-                            OverflowMenu(
-                                hasUnread = unreadChatCount > 0,
-                                onMarkAllRead = actions.onMarkAllRead,
-                                onSettings = actions.onSettings,
-                            )
-                        },
-                        scrollBehavior = scrollBehavior,
-                    )
-                }
+                        }
+                        IconButton(onClick = { searching = true }) {
+                            Icon(Icons.Outlined.Search, contentDescription = "Search")
+                        }
+                        OverflowMenu(
+                            hasUnread = unreadChatCount > 0,
+                            onMarkAllRead = actions.onMarkAllRead,
+                            onSettings = actions.onSettings,
+                        )
+                    },
+                    scrollBehavior = scrollBehavior,
+                )
             }
         },
         floatingActionButton = {
@@ -341,7 +330,12 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                             ChatFilter.GROUPS -> "No group chats" to "Group conversations you join or create appear here."
                             ChatFilter.ALL -> "No chats yet" to "New messages appear here. Tap the pencil to write to a friend or group."
                         }
-                        EmptyChats(title = title, subtitle = subtitle)
+                        EmptyChats(
+                            title = title,
+                            subtitle = subtitle,
+                            actionLabel = if (filter != ChatFilter.ALL) "View all chats" else null,
+                            onAction = if (filter != ChatFilter.ALL) ({ filter = ChatFilter.ALL }) else null,
+                        )
                     }
                 } else {
                     val pinned = visibleChats.filter { it.pinned }
@@ -707,6 +701,7 @@ private fun ConversationRow(
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .defaultMinSize(minHeight = 72.dp)
                     .then(if (selected) Modifier.clip(RoundedCornerShape(16.dp)) else Modifier)
                     .background(rowBackground)
                     .combinedClickable(onClick = onClick, onLongClick = onLongClick)
@@ -746,6 +741,7 @@ private fun ConversationRow(
                                 Text(
                                     formatListTime(last.ts),
                                     style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Normal,
                                     color = if (unread) colors.primary else colors.onSurfaceVariant,
                                 )
                             }
@@ -787,6 +783,7 @@ private fun ConversationRow(
                                 else -> preview(last)
                             },
                             style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (unread && typing == null) FontWeight.SemiBold else FontWeight.Normal,
                             color = when {
                                 typing != null -> colors.primary
                                 unread -> colors.onSurface
@@ -982,6 +979,8 @@ fun StatusBanner(text: String, action: String?, onAction: () -> Unit) {
 private fun EmptyChats(
     title: String = "No chats yet",
     subtitle: String = "New messages appear here. Tap the pencil to write to a friend or group.",
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
 ) {
     Box(Modifier.fillMaxWidth().padding(top = 88.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1008,6 +1007,11 @@ private fun EmptyChats(
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(horizontal = 32.dp),
             )
+            if (actionLabel != null && onAction != null) {
+                TextButton(onClick = onAction) {
+                    Text(actionLabel)
+                }
+            }
         }
     }
 }
