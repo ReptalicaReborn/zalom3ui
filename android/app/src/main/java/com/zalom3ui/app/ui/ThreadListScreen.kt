@@ -250,20 +250,32 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
         },
         floatingActionButton = {
             if (!searching) {
+                val ultra = LocalUltraExpressive.current
                 FloatingActionButton(
                     onClick = actions.onNewChat,
-                    shape = RoundedCornerShape(20.dp),
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.size(56.dp),
-                ) { Icon(Icons.Outlined.Edit, contentDescription = "New chat") }
+                    shape = if (ultra) MaterialShapes.SoftBurst.toShape() else RoundedCornerShape(20.dp),
+                    containerColor = if (ultra) Color(0xFFFF9EA8) else MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = if (ultra) Color(0xFF1F1114) else MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(if (ultra) 116.dp else 56.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Edit,
+                        contentDescription = "New chat",
+                        modifier = Modifier.size(if (ultra) 54.dp else 24.dp),
+                    )
+                }
             }
         },
     ) { padding ->
-        LazyColumn(
-            contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 120.dp),
-            modifier = Modifier.fillMaxSize(),
-        ) {
+        val ultra = LocalUltraExpressive.current
+        Box(Modifier.fillMaxSize()) {
+            LazyColumn(
+                contentPadding = PaddingValues(
+                    top = padding.calculateTopPadding(),
+                    bottom = padding.calculateBottomPadding() + if (ultra) 180.dp else 120.dp,
+                ),
+                modifier = Modifier.fillMaxSize(),
+            ) {
             if (searching && folded.isNotEmpty()) {
                 val chatHits = matches.filter { it.lastMessage != null }
                 val contactHits = matches.filter { it.lastMessage == null && it.kind == "user" }.sortedBy { foldForSearch(it.name) }
@@ -362,6 +374,15 @@ fun ThreadListScreen(state: UiState, actions: ThreadListActions, selectedKey: St
                     }
                 }
             }
+            }
+            if (ultra && !searching) {
+                FourXBadge(
+                    size = 86.dp,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = padding.calculateTopPadding() + 4.dp, end = 12.dp),
+                )
+            }
         }
     }
 
@@ -421,6 +442,7 @@ private fun ChatFilterBar(
                 else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
             }
             val isSelected = selected == filter
+            val ultra = LocalUltraExpressive.current
             ToggleButton(
                 checked = isSelected,
                 onCheckedChange = { onSelect(filter) },
@@ -431,15 +453,16 @@ private fun ChatFilterBar(
                     checkedContainerColor = colors.primaryContainer,
                     checkedContentColor = colors.onPrimaryContainer,
                 ),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = if (ultra) 18.dp else 6.dp),
                 modifier = Modifier
                     .weight(1f)
+                    .then(if (ultra) Modifier.height(76.dp) else Modifier)
                     .semantics { role = Role.RadioButton },
             ) {
                 Text(
                     text = label,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    style = if (ultra) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelLarge,
+                    fontWeight = if (isSelected || ultra) FontWeight.Bold else FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

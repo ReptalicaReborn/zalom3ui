@@ -865,6 +865,14 @@ private fun MessageList(
             }
         }
 
+        if (LocalUltraExpressive.current) {
+            FourXBadge(
+                size = 86.dp,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp),
+            )
+        }
+
+        val ultra = LocalUltraExpressive.current
         AnimatedVisibility(
             visible = showJump,
             enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleIn(MaterialTheme.motionScheme.fastSpatialSpec()),
@@ -880,7 +888,14 @@ private fun MessageList(
                     containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                     contentColor = MaterialTheme.colorScheme.onSurface,
                     shape = CircleShape,
-                ) { Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Jump to latest") }
+                    modifier = if (ultra) Modifier.size(76.dp) else Modifier,
+                ) {
+                    Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = "Jump to latest",
+                        modifier = if (ultra) Modifier.size(40.dp) else Modifier,
+                    )
+                }
                 if (newWhileScrolledUp > 0) {
                     CountBadge(
                         text = if (newWhileScrolledUp > 99) "99+" else "$newWhileScrolledUp",
@@ -1724,6 +1739,7 @@ private fun Composer(
                 }
             }
         }
+        val ultra = LocalUltraExpressive.current
         Row(
             Modifier.padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
@@ -1734,9 +1750,9 @@ private fun Composer(
                     containerColor = colors.outgoing,
                     contentColor = colors.onOutgoing,
                 ),
-                modifier = Modifier.padding(end = 8.dp).size(48.dp),
+                modifier = Modifier.padding(end = 8.dp).size(if (ultra) 88.dp else 48.dp),
             ) {
-                Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(26.dp))
+                Icon(Icons.Rounded.Add, contentDescription = "Attach", modifier = Modifier.size(if (ultra) 46.dp else 26.dp))
             }
             Surface(
                 shape = RoundedCornerShape(24.dp),
@@ -1793,12 +1809,13 @@ private fun Composer(
                 }
             }
             AnimatedVisibility(
-                visible = value.text.isNotBlank(),
+                visible = value.text.isNotBlank() || ultra,
                 enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleIn(MaterialTheme.motionScheme.fastSpatialSpec()),
                 exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()) + scaleOut(MaterialTheme.motionScheme.fastSpatialSpec()),
             ) {
                 FilledIconButton(
                     onClick = {
+                        if (value.text.isBlank()) return@FilledIconButton
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         val sentText = value.text
                         onSend(sentText, mentioned.toList()) {
@@ -1808,13 +1825,21 @@ private fun Composer(
                             }
                         }
                     },
-                    enabled = !sending,
+                    enabled = !sending && value.text.isNotBlank(),
                     colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = colors.outgoing,
-                        contentColor = colors.onOutgoing,
+                        containerColor = if (ultra) Color(0xFFFF9EA8) else colors.outgoing,
+                        contentColor = if (ultra) Color(0xFF1F1114) else colors.onOutgoing,
+                        disabledContainerColor = if (ultra) Color(0xFFFF9EA8).copy(alpha = 0.72f) else colors.outgoing.copy(alpha = 0.38f),
+                        disabledContentColor = if (ultra) Color(0xFF1F1114).copy(alpha = 0.72f) else colors.onOutgoing.copy(alpha = 0.38f),
                     ),
-                    modifier = Modifier.padding(start = 8.dp).size(48.dp),
-                ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send") }
+                    modifier = Modifier.padding(start = 8.dp).size(if (ultra) 116.dp else 48.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send",
+                        modifier = Modifier.size(if (ultra) 56.dp else 24.dp),
+                    )
+                }
             }
         }
         if (showEmoji) {

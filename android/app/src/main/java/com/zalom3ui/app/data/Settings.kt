@@ -45,6 +45,8 @@ data class Appearance(
     val dynamicColor: Boolean = false,
     val accent: ChatAccent = ChatAccent.ULTRAMARINE,
     val tintedBackground: Boolean = false,
+    /** Easter egg: hilariously oversized Material 3 Expressive buttons ("4x faster!"). */
+    val ultraExpressive: Boolean = false,
 )
 
 /** Server settings, kept in app-private storage shared by the UI and the on-phone server process. */
@@ -82,6 +84,7 @@ class SettingsStore(context: Context) {
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
             accent = ChatAccent.fromKey(prefs.getString(KEY_CHAT_ACCENT, null)),
             tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
+            ultraExpressive = prefs.getBoolean(KEY_ULTRA_EXPRESSIVE, false),
         )
     }
 
@@ -92,6 +95,7 @@ class SettingsStore(context: Context) {
             .putBoolean(KEY_DYNAMIC_COLOR, appearance.dynamicColor)
             .putString(KEY_CHAT_ACCENT, appearance.accent.key)
             .putBoolean(KEY_CHAT_TINTED_BG, appearance.tintedBackground)
+            .putBoolean(KEY_ULTRA_EXPRESSIVE, appearance.ultraExpressive)
             .apply()
     }
 
@@ -172,5 +176,6 @@ class SettingsStore(context: Context) {
         const val KEY_COLOR_THEME = "color_theme"
         const val KEY_CHAT_ACCENT = "chat_accent"
         const val KEY_CHAT_TINTED_BG = "chat_tinted_bg"
+        const val KEY_ULTRA_EXPRESSIVE = "ultra_expressive"
     }
 }

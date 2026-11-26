@@ -485,7 +485,10 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
             dark = false,
         )
     }
-    CompositionLocalProvider(LocalChatColors provides chat) {
+    CompositionLocalProvider(
+        LocalChatColors provides chat,
+        LocalUltraExpressive provides appearance.ultraExpressive,
+    ) {
         MaterialExpressiveTheme(
             colorScheme = colors,
             motionScheme = MotionScheme.expressive(),
@@ -495,6 +498,9 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
         )
     }
 }
+
+/** Easter egg: true when "4x faster mode" (hilariously oversized M3 Expressive buttons) is enabled. */
+val LocalUltraExpressive = staticCompositionLocalOf { false }
 
 /** A letter avatar's colors: a soft tint behind a strong letter of the same hue. */
 @Immutable

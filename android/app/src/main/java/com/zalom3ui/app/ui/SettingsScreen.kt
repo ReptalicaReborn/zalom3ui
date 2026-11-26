@@ -114,6 +114,8 @@ fun SettingsScreen(
     var showToken by remember { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
     var pickTheme by rememberSaveable { mutableStateOf(false) }
+    var previewTaps by rememberSaveable { mutableStateOf(0) }
+    var easterEggUnlocked by rememberSaveable { mutableStateOf(appearance.ultraExpressive) }
     val edited = ServerSettings(onDevice, serverUrl.trim(), token.trim())
     val changed = edited != current
     val urlValid = onDevice || ApiClient.normalizeServerUrl(serverUrl) != null
@@ -171,6 +173,7 @@ fun SettingsScreen(
 
             SectionHeader("Appearance")
             val isGold = appearance.themeMode == ThemeMode.REPTDOC_GOLD
+            val showEasterEgg = easterEggUnlocked || appearance.ultraExpressive
             val appearanceItems = buildList<@Composable () -> Unit> {
                 add {
                     Column(
@@ -179,7 +182,26 @@ fun SettingsScreen(
                             .padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                     ) {
-                        MiniChatPreview()
+                        MiniChatPreview(
+                            ultraExpressive = appearance.ultraExpressive,
+                            onTap = {
+                                if (!showEasterEgg) {
+                                    previewTaps++
+                                    if (previewTaps >= 5) {
+                                        easterEggUnlocked = true
+                                        onAppearance(appearance.copy(ultraExpressive = true))
+                                    }
+                                }
+                            },
+                        )
+                        if (!showEasterEgg && previewTaps in 2..4) {
+                            val left = 5 - previewTaps
+                            Text(
+                                "Tap $left more ${if (left == 1) "time" else "times"} to make the app 4x faster…",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                         if (!isGold) {
                             AccentSwatchPicker(
                                 selected = appearance.accent,
@@ -234,6 +256,27 @@ fun SettingsScreen(
                                 },
                             )
                         }
+                    }
+                }
+                if (showEasterEgg) {
+                    add {
+                        ListItem(
+                            modifier = Modifier.clickable {
+                                onAppearance(appearance.copy(ultraExpressive = !appearance.ultraExpressive))
+                            },
+                            colors = transparentListItemColors,
+                            leadingContent = { FourXBadge(size = 36.dp, compact = true) },
+                            headlineContent = { Text("4x faster mode") },
+                            supportingContent = {
+                                Text("Easter egg · Users spot key buttons up to 4x faster (M3 Expressive™)")
+                            },
+                            trailingContent = {
+                                Switch(
+                                    checked = appearance.ultraExpressive,
+                                    onCheckedChange = { onAppearance(appearance.copy(ultraExpressive = it)) },
+                                )
+                            },
+                        )
                     }
                 }
             }
@@ -477,78 +520,94 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun MiniChatPreview() {
+private fun MiniChatPreview(
+    ultraExpressive: Boolean = false,
+    onTap: () -> Unit = {},
+) {
     val chat = LocalChatColors.current
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = chat.background,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            Modifier
+    Box(Modifier.fillMaxWidth()) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = chat.background,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
+            modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .clip(RoundedCornerShape(18.dp))
+                .clickable(onClick = onTap),
         ) {
-            Box(
+            Column(
                 Modifier
-                    .align(Alignment.Start)
-                    .widthIn(max = 260.dp)
-                    .background(
-                        chat.incoming,
-                        RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 6.dp, bottomEnd = 18.dp),
-                    )
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        "How does the new theme look?",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = chat.onIncoming,
-                    )
-                    Text(
-                        "10:41",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = chat.onIncoming.copy(alpha = 0.65f),
-                        modifier = Modifier.align(Alignment.End),
-                    )
-                }
-            }
-            Box(
-                Modifier
-                    .align(Alignment.End)
-                    .widthIn(max = 260.dp)
-                    .background(
-                        chat.outgoing,
-                        RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 6.dp),
-                    )
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        "Crisp, calm, and expressive.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = chat.onOutgoing,
-                    )
-                    Row(
-                        modifier = Modifier.align(Alignment.End),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            "10:42",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = chat.onOutgoing.copy(alpha = 0.80f),
+                Box(
+                    Modifier
+                        .align(Alignment.Start)
+                        .widthIn(max = 260.dp)
+                        .background(
+                            chat.incoming,
+                            RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 6.dp, bottomEnd = 18.dp),
                         )
-                        DeliveryIcon(
-                            state = Delivery.READ,
-                            tint = chat.onOutgoing.copy(alpha = 0.90f),
-                            background = chat.outgoing,
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            if (ultraExpressive) "Whoa, why are the buttons so huge?" else "How does the new theme look?",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = chat.onIncoming,
+                        )
+                        Text(
+                            "10:41",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = chat.onIncoming.copy(alpha = 0.65f),
+                            modifier = Modifier.align(Alignment.End),
                         )
                     }
                 }
+                Box(
+                    Modifier
+                        .align(Alignment.End)
+                        .widthIn(max = 260.dp)
+                        .background(
+                            chat.outgoing,
+                            RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 6.dp),
+                        )
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            if (ultraExpressive) "4x faster spotting. Pure science." else "Crisp, calm, and expressive.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = chat.onOutgoing,
+                        )
+                        Row(
+                            modifier = Modifier.align(Alignment.End),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                "10:42",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = chat.onOutgoing.copy(alpha = 0.80f),
+                            )
+                            DeliveryIcon(
+                                state = Delivery.READ,
+                                tint = chat.onOutgoing.copy(alpha = 0.90f),
+                                background = chat.outgoing,
+                            )
+                        }
+                    }
+                }
             }
+        }
+        if (ultraExpressive) {
+            FourXBadge(
+                size = 68.dp,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 4.dp, end = 4.dp),
+            )
         }
     }
 }
