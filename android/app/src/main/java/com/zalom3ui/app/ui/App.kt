@@ -225,7 +225,13 @@ private fun AppNav(vm: AppViewModel) {
             }
         }
     }
-    LaunchedEffect(signedIn) { if (signedIn) vm.loadFriendRequests() }
+    // Not needed for the first frame: wait until the chat list has drawn.
+    LaunchedEffect(signedIn) {
+        if (signedIn) {
+            kotlinx.coroutines.delay(800)
+            vm.loadFriendRequests()
+        }
+    }
     // Turning a tablet (or resizing a window) moves an open chat between its own screen and the pane.
     LaunchedEffect(wide) {
         val route = nav.currentDestination?.route

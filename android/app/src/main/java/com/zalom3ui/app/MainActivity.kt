@@ -4,11 +4,13 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.ViewTreeObserver
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -32,11 +34,15 @@ import com.zalom3ui.app.security.AppLock
 import com.zalom3ui.app.security.AppLockPolicy
 import com.zalom3ui.app.security.AppLockScreen
 import com.zalom3ui.app.server.ConversationShortcuts
+import com.zalom3ui.app.server.StartupLog
+import com.zalom3ui.app.server.StartupTiming
+import com.zalom3ui.app.server.ZaloCore
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
 import com.zalom3ui.app.ui.AppViewModel
 import com.zalom3ui.app.ui.VoicePlayback
 import com.zalom3ui.app.ui.isAppInDarkTheme
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val viewModel: AppViewModel by viewModels()
@@ -44,11 +50,27 @@ class MainActivity : ComponentActivity() {
     private var isLocked by mutableStateOf(false)
     private var lockError by mutableStateOf<String?>(null)
     private var lockPromptGeneration by mutableStateOf(0)
+    private var processStartUptimeMs = 0L
+    private var trackStartup = false
+    private var firstFrameUptimeMs = 0L
+    private var fullyDrawnReported = false
+    private var notificationPermissionAsked = false
+    private var firstEdgeToEdgePass = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        processStartUptimeMs = android.os.Process.getStartUptimeMillis()
+        trackStartup = StartupTiming.isColdStart(
+            processStartUptimeMs, SystemClock.uptimeMillis(), hasSavedState = savedInstanceState != null,
+        ) && StartupTiming.claim()
         val settings = SettingsStore(this)
+        // Start the on-phone core now, in parallel with the first frame (it used to start with the first API call).
+        // Only for an activity launch: a start from a notification or broadcast keeps its own path.
+        if (settings.load().onDevice) {
+            val app = applicationContext
+            Thread({ runCatching { ZaloCore.ensureStarted(app) } }, "core-start").apply { isDaemon = true }.start()
+        }
         AppLock.applyScreenSecurity(this, settings.screenSecurity)
         if (savedInstanceState != null) {
             isLocked = savedInstanceState.getBoolean(KEY_LOCKED, false)
@@ -64,6 +86,14 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            // Once the chat list has data: report fully drawn and time the start; the notification permission is asked
+            // afterwards (or after a short wait when there is no list yet), so neither competes with the first frames.
+            val hasThreads = state.threads.isNotEmpty()
+            LaunchedEffect(hasThreads) {
+                if (hasThreads) onListData(state.threads.size) else delay(NOTIFICATION_ASK_FALLBACK_MS)
+                delay(NOTIFICATION_ASK_DELAY_MS)
+                requestNotificationPermissionOnce()
+            }
             val userReducedMotion by viewModel.reducedMotion.collectAsStateWithLifecycle()
             var systemReduced by remember { mutableStateOf(systemReducedMotion(this@MainActivity)) }
             LifecycleResumeEffect(Unit) {
@@ -74,7 +104,11 @@ class MainActivity : ComponentActivity() {
             val dark = isAppInDarkTheme(state.appearance)
             // Status/navigation bar icons follow the app's theme, which can differ from the system's.
             DisposableEffect(dark) {
-                enableEdgeToEdge(
+                // onCreate already applied the system-default style, which is identical when the app's theme matches the system's.
+                val systemDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+                val redundant = firstEdgeToEdgePass && dark == systemDark
+                firstEdgeToEdgePass = false
+                if (!redundant) enableEdgeToEdge(
                     statusBarStyle = if (dark) {
                         SystemBarStyle.dark(Color.TRANSPARENT)
                     } else {
@@ -104,7 +138,41 @@ class MainActivity : ComponentActivity() {
         }
         handleOpenChat(intent)
         handleShareIntent(intent)
-        // Lets the on-phone server show its "connected" and message notifications (Android 13+).
+        if (trackStartup) {
+            val decor = window.decorView
+            decor.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    firstFrameUptimeMs = SystemClock.uptimeMillis()
+                    decor.viewTreeObserver.removeOnPreDrawListener(this)
+                    return true
+                }
+            })
+        }
+    }
+
+    /** The chat list has its first data on screen. */
+    private fun onListData(threads: Int) {
+        val now = SystemClock.uptimeMillis()
+        if (!fullyDrawnReported) {
+            fullyDrawnReported = true
+            reportFullyDrawn()
+        }
+        if (trackStartup) {
+            trackStartup = false
+            val line = StartupTiming.format(
+                firstFrameMs = StartupTiming.sinceStart(processStartUptimeMs, firstFrameUptimeMs),
+                coreReadyMs = StartupTiming.sinceStart(processStartUptimeMs, StartupTiming.coreReadyUptimeMs),
+                listDataMs = now - processStartUptimeMs,
+                threads = threads,
+            )
+            StartupLog.write(this, line)
+        }
+    }
+
+    /** Lets the on-phone server show its "connected" and message notifications (Android 13+); asked once per start until granted. */
+    private fun requestNotificationPermissionOnce() {
+        if (notificationPermissionAsked) return
+        notificationPermissionAsked = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -218,6 +286,8 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val EXTRA_KIND = "open_kind"
         private const val EXTRA_ID = "open_id"
+        private const val NOTIFICATION_ASK_DELAY_MS = 400L
+        private const val NOTIFICATION_ASK_FALLBACK_MS = 2_500L
         private const val KEY_LOCKED = "app_lock_locked"
         private const val KEY_LAST_BG_MS = "app_lock_last_bg_ms"
 

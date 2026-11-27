@@ -7,6 +7,8 @@ import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * What happened while the on-phone Zalo core started: the app asking for the service, the core starting, and any
@@ -22,8 +24,26 @@ object StartupLog {
     /** The core's own log output (written by libzalocore.so, see the `logFile` argument of its start). */
     fun serverLog(context: Context): File = File(File(context.filesDir, "zalo").apply { mkdirs() }, "server.log")
 
-    @Synchronized
+    /** One ordered background writer, so callers (often the main thread) never wait for the file lock or the disk. */
+    private val executor = Executors.newSingleThreadExecutor { r -> Thread(r, "startup-log").apply { isDaemon = true } }
+
+    /** Only used on the [executor] thread. */
+    private val timeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+    /** Queues [line] (stamped now) for the log file; returns at once. [flush] waits until it is on disk. */
     fun write(context: Context, line: String) {
+        val app = context.applicationContext ?: context
+        val now = System.currentTimeMillis()
+        val pid = android.os.Process.myPid()
+        runCatching { executor.execute { writeNow(app, now, pid, line) } }
+    }
+
+    /** Waits (briefly) for every line written so far to reach the file. Not for the writer thread itself. */
+    fun flush() {
+        runCatching { executor.submit {}.get(2, TimeUnit.SECONDS) }
+    }
+
+    private fun writeNow(context: Context, timeMs: Long, pid: Int, line: String) {
         runCatching {
             val f = file(context)
             RandomAccessFile(f, "rw").use { raf ->
@@ -40,8 +60,8 @@ object StartupLog {
                         raf.setLength((tail.size - start).toLong())
                     }
                     raf.seek(raf.length())
-                    val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-                    raf.write("$time [${android.os.Process.myPid()}] $line\n".toByteArray(Charsets.UTF_8))
+                    val time = timeFormat.format(Date(timeMs))
+                    raf.write("$time [$pid] $line\n".toByteArray(Charsets.UTF_8))
                 }
             }
         }
@@ -49,10 +69,13 @@ object StartupLog {
 
     fun error(context: Context, what: String, e: Throwable) {
         write(context, "$what: ${e.javaClass.name}: ${e.message}\n" + e.stackTrace.take(8).joinToString("\n") { "    at $it" })
+        // Errors often come right before the process dies: get them on disk now, not just queued.
+        flush()
     }
 
     /** Everything worth sending when the core doesn't start: phone, app, startup steps and the core's output. */
     fun report(context: Context): String = buildString {
+        flush()
         val info = runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull()
         appendLine("Zalỏ ${info?.versionName} (${context.packageName})")
         appendLine("Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.SUPPORTED_ABIS.joinToString()}")
