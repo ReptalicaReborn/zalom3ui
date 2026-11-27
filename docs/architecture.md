@@ -241,6 +241,17 @@ is live (`Messages`); on 510/1 it is part of the paged replay (`OldMessages`), a
 history outside the paged replay (`OldPageMessages`: stored, never notifies). The normalizer follows the TS `toRawMessage`
 (a null id falls through to the next id field, a numeric `msgType` is kept as a string, an unusable `ts` becomes now).
 
+**What a real test showed, and asking after an empty frame.** When an Official Account OTP reached the phone, the
+web session got one `cmd=501` frame with every list empty (`msgs`, `pageMsgs`, ...): Zalo signals that something changed
+but leaves the message out. The code still reaches Zalỏ through *Codes from Zalo's notifications* (confirmed on a real
+phone, with Copy, and Zalo's duplicate notification hidden). To get it without the official app, the session answers
+such an empty 501 by asking for missed messages, the same replay request it sends on connect (`request_old_messages`,
+1:1, `lastId` null). It does so at most once per 30 s, never within 30 s of connecting, and opens a one-minute notify
+window so a recent message in the answer still notifies. The answer (the next 1:1 replay batch within 15 s) is kept out
+of the connect's replay report. The socket log marks the frame with `zalỏ: empty frame: asked Zalo for missed
+messages`; the next `cmd=510` entry shows whether the answer held the message. Whether Zalo includes OA messages in
+that answer is what a real test will tell.
+
 **Socket log.** Each decoded frame produces a structure-only `FrameReport` (`zalo-proto/src/framelog.rs`) that the
 listener sends as `WsEvent::Frame` before the frame's other events; `ZaloSession` keeps the last 500 in
 `socket_log.rs` and appends them to `socket-log.jsonl` (compacted, so it survives a restart). One entry has: time,
