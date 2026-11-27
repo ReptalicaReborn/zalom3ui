@@ -248,8 +248,12 @@ version, cmd, subCmd, whether a handler consumed the frame (`handled`) or it fel
 and `data` key names, every array with its length and whether any handler reads it, for control frames the
 `act_type/act`, and per message item the `msgType`, the keys of `content` (or `string`, `string>{keys}` for JSON in a
 string, `number`, ...), whether `uidFrom` is 0 / own / other, and the outcome: message, undo or dropped with the reason
-(`no msgId`, `thread id empty/0`, `undo content`, `not an object`, `own message (selfListen off)`). Message text, content
-values, names and phone numbers are never recorded; every string from the wire is reduced to `[A-Za-z0-9._:-]`.
+(`no msgId`, `thread id empty/0`, `undo content`, `not an object`, `own message (selfListen off)`). Non-array fields
+of the payload and of `data` are listed as `values:` (numbers and booleans in full, e.g. `more=1`,
+`lastActionId=…`; strings only as `str(N)`, their length; objects as their key names). A frame that can't be decoded
+also shows its outer wrapper (`envelope: encrypt=2, data=str(N)`) and a short reason (`why:`). The server's echo of
+the keepalive ping (cmd 2) is shown as a handled frame, not an error. Message text, content values, names and phone
+numbers are never recorded; every string from the wire is reduced to `[A-Za-z0-9._:-]`.
 `GET /api/debug/socket-log` renders it (newest first), `DELETE` clears it; *Settings → Developer → Socket log* views,
 copies, shares and clears it.
 

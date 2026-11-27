@@ -152,11 +152,20 @@ fn render_entry(out: &mut String, r: &FrameReport) {
     if let Some(e) = r.error {
         out.push_str(&format!("  error: {e}\n"));
     }
+    if let Some(d) = &r.error_detail {
+        out.push_str(&format!("  why: {d}\n"));
+    }
+    if !r.envelope.is_empty() {
+        out.push_str(&format!("  envelope: {}\n", r.envelope.join(", ")));
+    }
     if !r.payload_keys.is_empty() {
         out.push_str(&format!("  keys: {}\n", r.payload_keys.join(",")));
     }
     if !r.data_keys.is_empty() {
         out.push_str(&format!("  data keys: {}\n", r.data_keys.join(",")));
+    }
+    if !r.scalars.is_empty() {
+        out.push_str(&format!("  values: {}\n", r.scalars.join(", ")));
     }
     if !r.acts.is_empty() {
         out.push_str(&format!("  act: {}\n", r.acts.join(", ")));
@@ -197,6 +206,21 @@ fn render_entry(out: &mut String, r: &FrameReport) {
 
 // `FrameReport` holds `&'static str` fields, so reading it back from disk goes through an owned
 // mirror whose strings are mapped onto the known static values (anything else is `?`).
+/// Keeps the characters a `key=value` description uses (`[A-Za-z0-9._:-=(){}[],]`), caps it, and
+/// turns anything else into `?`.
+fn safe_entry(s: &str) -> String {
+    s.chars()
+        .take(200)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._:-=(){}[],".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 struct ReportOwned {
     ts: i64,
@@ -215,6 +239,12 @@ struct ReportOwned {
     acts: Vec<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    scalars: Vec<String>,
+    #[serde(default)]
+    envelope: Vec<String>,
+    #[serde(rename = "errorDetail", default)]
+    error_detail: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -301,6 +331,10 @@ impl ReportOwned {
                 .collect(),
             acts: self.acts,
             error: self.error.as_deref().map(|e| pick(e, &errors)),
+            // Written by us already reduced to safe tokens; re-reduce in case the file was edited.
+            scalars: self.scalars.iter().map(|s| safe_entry(s)).collect(),
+            envelope: self.envelope.iter().map(|s| safe_entry(s)).collect(),
+            error_detail: self.error_detail.as_deref().map(|d| zalo_proto::framelog::safe_token(d, 80)),
         }
     }
 }

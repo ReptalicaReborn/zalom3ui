@@ -170,6 +170,43 @@ pub struct FrameReport {
     /// Decode problem class (no payload text), when the frame could not be decoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'static str>,
+    /// Non-array fields of the payload and of `data` as `key=value`: numbers and booleans in full
+    /// (flags, counts, ids such as `more`, `queueStatus`, `lastActionId`), strings only as their
+    /// length, objects as their key names. Never message text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scalars: Vec<String>,
+    /// For a frame that could not be decoded: the outer `{ encrypt, data, ... }` wrapper described the
+    /// same way (key names, `encrypt` value, `data` type and length).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub envelope: Vec<String>,
+    /// Why decoding failed, reduced to a safe token (our own error text, no payload).
+    #[serde(rename = "errorDetail", default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+}
+
+/// Describes one JSON value without revealing text: numbers and booleans in full, strings as
+/// `str(N)` (their length in characters), objects as `{key,...}`, arrays as `[N]`.
+pub fn describe_scalar(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => safe_token(&n.to_string(), 24),
+        Value::String(s) => format!("str({})", s.chars().count()),
+        Value::Array(a) => format!("[{}]", a.len()),
+        Value::Object(o) => format!("{{{}}}", sorted_keys(o).join(",")),
+    }
+}
+
+fn push_scalars(out: &mut Vec<String>, obj: &serde_json::Map<String, Value>, skip_objects: bool) {
+    let mut names: Vec<&String> = obj.keys().collect();
+    names.sort();
+    for name in names.into_iter().take(MAX_KEYS) {
+        let v = &obj[name];
+        if v.is_array() || (skip_objects && v.is_object()) {
+            continue;
+        }
+        out.push(format!("{}={}", safe_token(name, 32), describe_scalar(v)));
+    }
 }
 
 impl FrameReport {
@@ -185,17 +222,33 @@ impl FrameReport {
             arrays: Vec::new(),
             acts: Vec::new(),
             error: None,
+            scalars: Vec::new(),
+            envelope: Vec::new(),
+            error_detail: None,
         }
+    }
+
+    /// Describes the outer wrapper of a frame whose payload could not be decoded, plus why.
+    pub fn describe_envelope(&mut self, parsed: &Value, why: &str) {
+        if let Some(o) = parsed.as_object() {
+            push_scalars(&mut self.envelope, o, false);
+        } else {
+            self.envelope.push(format!("body={}", describe_scalar(parsed)));
+        }
+        self.error_detail = Some(safe_token(why, 80));
     }
 
     /// Fills keys, array lengths and control acts from the decoded payload.
     pub fn describe_payload(&mut self, decoded: &Value, inner: &Value) {
         if let Some(o) = decoded.as_object() {
             self.payload_keys = sorted_keys(o);
+            // `data` itself is described below; other payload fields (error_code, ...) here.
+            push_scalars(&mut self.scalars, o, true);
         }
         if let Some(o) = inner.as_object() {
             if !std::ptr::eq(decoded, inner) {
                 self.data_keys = sorted_keys(o);
+                push_scalars(&mut self.scalars, o, false);
             }
             let mut names: Vec<&String> = o.keys().collect();
             names.sort();
