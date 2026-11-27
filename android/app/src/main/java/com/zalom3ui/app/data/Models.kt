@@ -413,6 +413,14 @@ sealed interface ServerEvent {
     data class MessageDeleted(val thread: ThreadRef, val id: String) : ServerEvent
     data class Typing(val thread: ThreadRef, val uid: String, val name: String) : ServerEvent
     data object ThreadsChanged : ServerEvent
+    /** Byte progress of one outgoing upload in [thread]; [done] means that upload finished (or failed). Sent ~10 times a second. */
+    data class UploadProgress(
+        val thread: ThreadRef,
+        val uploadId: String,
+        val sent: Long,
+        val total: Long,
+        val done: Boolean,
+    ) : ServerEvent
     /** A poll was created, voted on or closed: reload it if it is on screen. */
     data class PollChanged(val pollId: Long) : ServerEvent
 }

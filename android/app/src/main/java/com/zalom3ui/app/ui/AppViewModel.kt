@@ -153,6 +153,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
     val pollEvents: SharedFlow<Long> = _pollEvents
 
+    /** Live upload bytes per chat, from the core's `upload_progress` events. Only touched on the main thread. */
+    private var uploads: UploadsByChat = emptyMap()
+    private val _uploadProgress = MutableStateFlow<Map<String, Float>>(emptyMap())
+    /**
+     * Overall upload progress (0..1) by [ThreadRef.key]. Deliberately NOT part of [UiState]: it ticks ~10 times a second
+     * and only the "Sending…" note reads it, so the chat does not recompose per tick.
+     */
+    val uploadProgress: StateFlow<Map<String, Float>> = _uploadProgress.asStateFlow()
+
+    private fun setUploads(next: UploadsByChat) {
+        if (next === uploads) return
+        uploads = next
+        val progress = uploadProgressByChat(next)
+        if (progress != _uploadProgress.value) _uploadProgress.value = progress
+    }
+
+    private fun onUploadProgress(event: ServerEvent.UploadProgress) {
+        // Uploads start from the open chat; ignore leftovers for any other one.
+        if (_state.value.chat?.ref != event.thread) return
+        setUploads(applyUploadProgress(uploads, event))
+    }
+
+    /** Once a chat has nothing uploading, drop any progress the core never closed with `done`. */
+    private fun clearUploadsIfIdle(ref: ThreadRef) {
+        val chat = _state.value.chat?.takeIf { it.ref == ref }
+        if (chat == null || chat.uploading == 0) setUploads(clearUploads(uploads, ref.key))
+    }
+
     private fun pollApi(): ApiClient = client ?: throw ApiException("Not connected to the server")
 
     suspend fun loadPoll(pollId: Long): PollDetail = pollApi().poll(pollId)
@@ -682,11 +710,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         file?.let { f -> withContext(NonCancellable + Dispatchers.IO) { runCatching { f.cleanup() } } }
                         remaining--
                         updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
+                        clearUploadsIfIdle(chat.ref)
                     }
                 }
             } finally {
                 if (remaining > 0) {
                     updateChat(chat.ref) { it.copy(uploading = (it.uploading - remaining).coerceAtLeast(0)) }
+                    clearUploadsIfIdle(chat.ref)
                 }
             }
         }
@@ -715,6 +745,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 withContext(NonCancellable + Dispatchers.IO) { runCatching { file.delete() } }
                 updateChat(chat.ref) { it.copy(uploading = (it.uploading - 1).coerceAtLeast(0)) }
+                clearUploadsIfIdle(chat.ref)
             }
         }
     }
@@ -1012,6 +1043,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             is ServerEvent.Typing -> onTyping(event)
             is ServerEvent.PollChanged -> _pollEvents.tryEmit(event.pollId)
+            is ServerEvent.UploadProgress -> onUploadProgress(event)
             is HistorySyncEvent -> {
                 val sync = event.status
                 _state.update { it.copy(historySync = sync, historySyncShown = it.historySyncShown || sync.isFinished) }

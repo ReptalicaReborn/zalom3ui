@@ -2706,7 +2706,7 @@ private fun Composer(
     val lockThresholdPx = with(density) { 72.dp.toPx() }
 
     Column(Modifier.background(colors.background).navigationBarsPadding().imePadding()) {
-        if (uploading > 0) UploadingNote(uploading)
+        if (uploading > 0) UploadingNoteHost(threadKey, uploading)
         if (isRecording && !recordingLocked) {
             val lockProgress = (-slideOffsetY / lockThresholdPx).coerceIn(0f, 1f)
             Box(

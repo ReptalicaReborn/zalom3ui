@@ -12,6 +12,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,10 +33,13 @@ import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -458,8 +462,9 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(formatDuration(shownPos.toLong()), color = Color.White)
-                            Slider(
+                            WavySeekBar(
                                 value = shownPos.coerceIn(0f, total.coerceAtLeast(1).toFloat()),
+                                valueRange = 0f..total.coerceAtLeast(1).toFloat(),
                                 onValueChange = {
                                     dragging = true
                                     dragValue = it
@@ -468,8 +473,8 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
                                     controller.seekTo(dragValue.toInt())
                                     dragging = false
                                 },
-                                valueRange = 0f..total.coerceAtLeast(1).toFloat(),
                                 enabled = controller.ready,
+                                waving = isPlaying && !controller.buffering && !controller.completed,
                                 modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
                             )
                             Text(formatDuration(total.toLong()), color = Color.White)
@@ -479,4 +484,58 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * Material 3 Expressive seek bar: a standard [Slider] (drag, tap-to-seek, accessibility, 44dp touch target, vertical pill
+ * thumb with the M3 gap) whose active track is a wavy progress line. The wave travels while [waving] and flattens
+ * (amplitude animates to 0, travel stops) when paused, buffering or finished; the inactive track is flat.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun WavySeekBar(
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+    enabled: Boolean,
+    waving: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val colors = SliderDefaults.colors(
+        thumbColor = Color.White,
+        disabledThumbColor = Color.White.copy(alpha = 0.38f),
+    )
+    Slider(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        enabled = enabled,
+        onValueChangeFinished = onValueChangeFinished,
+        colors = colors,
+        interactionSource = interactionSource,
+        valueRange = valueRange,
+        thumb = {
+            SliderDefaults.Thumb(interactionSource = interactionSource, colors = colors, enabled = enabled)
+        },
+        track = { sliderState ->
+            val span = sliderState.valueRange.endInclusive - sliderState.valueRange.start
+            LinearWavyProgressIndicator(
+                progress = {
+                    if (span <= 0f) 0f
+                    else ((sliderState.value - sliderState.valueRange.start) / span).coerceIn(0f, 1f)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                color = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
+                trackColor = Color.White.copy(alpha = 0.3f),
+                // Room for the 4dp thumb plus the M3 6dp gap on each side.
+                gapSize = 16.dp,
+                stopSize = 0.dp,
+                amplitude = { if (waving) 1f else 0f },
+                wavelength = 32.dp,
+                waveSpeed = if (waving) 24.dp else 0.dp,
+            )
+        },
+    )
 }

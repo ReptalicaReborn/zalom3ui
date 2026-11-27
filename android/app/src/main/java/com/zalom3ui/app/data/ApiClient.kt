@@ -447,6 +447,20 @@ class ApiClient internal constructor(private val transport: Transport) {
             "message_deleted" -> ServerEvent.MessageDeleted(obj.threadRef(), obj.string("id"))
             "typing" -> ServerEvent.Typing(obj.threadRef(), obj.string("uid"), obj.string("name"))
             "threads" -> ServerEvent.ThreadsChanged
+            "upload_progress" -> {
+                val uploadId = obj.string("uploadId")
+                if (uploadId.isEmpty()) {
+                    null
+                } else {
+                    ServerEvent.UploadProgress(
+                        thread = obj.threadRef(),
+                        uploadId = uploadId,
+                        sent = obj["sent"]?.jsonPrimitive?.longOrNull ?: 0L,
+                        total = obj["total"]?.jsonPrimitive?.longOrNull ?: 0L,
+                        done = obj["done"]?.jsonPrimitive?.booleanOrNull == true,
+                    )
+                }
+            }
             "poll" -> obj["pollId"]?.jsonPrimitive?.longOrNull?.let { ServerEvent.PollChanged(it) }
             "history_sync" -> HistorySyncEvent(json.decodeFromJsonElement(HistorySyncStatus.serializer(), obj))
             else -> null
