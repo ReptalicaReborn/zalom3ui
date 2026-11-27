@@ -748,6 +748,12 @@ pub struct SessionStatus {
     pub error: Option<String>,
     #[serde(default)]
     pub retrying: bool,
+    /// True while `logging_in` is the reconnect of a *saved* session (the cold-start resume,
+    /// including its offline retry waits), as opposed to a fresh QR login. The chats are already
+    /// on the phone then, so a client can show them while this is set. Never true outside
+    /// `logging_in`; absent in older cores, hence the default.
+    #[serde(default)]
+    pub resuming: bool,
 }
 
 impl Default for SessionStatus {
@@ -761,6 +767,7 @@ impl Default for SessionStatus {
             own_avatar: None,
             error: None,
             retrying: false,
+            resuming: false,
         }
     }
 }
@@ -1082,6 +1089,32 @@ mod tests {
         assert_eq!(sv["state"], "awaiting_qr_scan");
         assert_eq!(sv["qrImage"], "data:image/png;base64,AAA");
         assert_eq!(sv["retrying"], false);
+        assert_eq!(sv["resuming"], false);
         assert!(sv["ownId"].is_null());
+
+        // `resuming` is camelCase on the wire and optional on the way in (status JSON from an
+        // older core, or saved before the field existed, has none).
+        let resuming = SessionStatus {
+            state: SessionState::LoggingIn,
+            resuming: true,
+            ..Default::default()
+        };
+        let rv = serde_json::to_value(&resuming).unwrap();
+        assert_eq!(rv["resuming"], true);
+        let back: SessionStatus = serde_json::from_value(rv).unwrap();
+        assert!(back.resuming);
+        let old: SessionStatus = serde_json::from_value(json!({
+            "state": "logging_in",
+            "qrImage": null,
+            "scannedBy": null,
+            "ownId": null,
+            "ownName": null,
+            "ownAvatar": null,
+            "error": null,
+            "retrying": true,
+        }))
+        .unwrap();
+        assert!(old.retrying);
+        assert!(!old.resuming);
     }
 }

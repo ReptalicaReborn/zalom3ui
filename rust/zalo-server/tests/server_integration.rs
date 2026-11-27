@@ -126,6 +126,7 @@ async fn auth_security_headers_and_csrf_checks() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["state"], "logged_out");
     assert_eq!(body["retrying"], false);
+    assert_eq!(body["resuming"], false);
 
     // 4. Query ?token= -> 200
     let resp = client
@@ -338,6 +339,7 @@ async fn websocket_events_and_call_audio_close_code() {
     assert_eq!(ev["type"], "status");
     assert_eq!(ev["status"]["state"], "logged_out");
     assert_eq!(ev["status"]["retrying"], false);
+    assert_eq!(ev["status"]["resuming"], false);
     let _ = ws_stream.close(None).await;
 
     // 3. WS /ws/call-audio closes cleanly with code 1008 when no call is active

@@ -321,7 +321,8 @@ private fun AppNav(vm: AppViewModel) {
                     },
                 )
                 status == null -> LoadingScreen("Connecting…")
-                !status.isLoggedIn -> LoginScreen(
+                // A saved session still reconnecting in the background opens into the saved chats (see homeGateFor).
+                homeGateFor(status, state.threads.isNotEmpty()) == HomeGate.Login -> LoginScreen(
                     status = status,
                     onLogin = vm::login,
                     onRetry = vm::retryLogin,
@@ -366,6 +367,7 @@ private fun AppNav(vm: AppViewModel) {
                         drafts = state.drafts,
                         typing = state.typing,
                         status = state.status,
+                        connectionNote = connectionNoteFor(state.status),
                         connectionError = state.connectionError,
                         pendingRequests = state.friendRequests?.size ?: 0,
                         messageSearchResults = state.messageSearchResults,

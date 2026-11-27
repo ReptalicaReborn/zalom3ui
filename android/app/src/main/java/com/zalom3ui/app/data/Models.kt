@@ -16,9 +16,21 @@ data class SessionStatus(
     val error: String? = null,
     /** A saved session couldn't reach Zalo and is being retried; a QR login can replace it. */
     val retrying: Boolean = false,
+    /**
+     * `logging_in` is the saved session reconnecting in the background (cold start, retry waits included), not a
+     * fresh QR login: the chats are already on the phone. Absent from older cores, where it stays false.
+     */
+    val resuming: Boolean = false,
 ) {
     /** Logged in, whether or not the chat listener is connected (a paused session is still logged in). */
     val isLoggedIn: Boolean get() = state == "ready" || state == "disconnected" || state == "paused"
+
+    /**
+     * The saved session is reconnecting in the background and nothing else needs the user: show the saved chats with a
+     * "Connecting…" note instead of the login screen (ui/HomeGate.kt). False for a QR login, a rejected session and
+     * when logged in.
+     */
+    fun connectingWithSavedSession(): Boolean = state == "logging_in" && resuming && qrImage == null
 
     /** The chat listener was stopped on purpose ("Stay connected"); not an error, and not "opened somewhere else". */
     val isPaused: Boolean get() = state == "paused"

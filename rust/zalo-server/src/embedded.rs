@@ -621,6 +621,101 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The cold-start case: the saved session is still logging in (`resuming`), but the chats
+    /// are on the phone and the reads that show them must not wait for the login.
+    #[tokio::test]
+    async fn chats_are_served_from_the_store_while_the_saved_session_is_still_resuming() {
+        use crate::testing::{FakeLogin, LoginStep};
+        use crate::types::{StoredMessage, ThreadInfo, ThreadKind};
+
+        let dir = temp_dir("zalo-embedded-resuming");
+        fs::write(
+            dir.join("credentials.json"),
+            r#"{"imei":"i","cookie":[],"userAgent":"ua"}"#,
+        )
+        .unwrap();
+        let store = ChatStore::in_memory();
+        store.upsert_thread(ThreadInfo {
+            id: "100".into(),
+            kind: ThreadKind::User,
+            name: "Alice".into(),
+            avatar: String::new(),
+        });
+        let message: StoredMessage = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "threadId": "100",
+            "threadKind": "user",
+            "fromId": "100",
+            "ts": 1_700_000_000_000i64,
+            "text": "saved earlier",
+        }))
+        .unwrap();
+        assert!(store.add_message(message));
+
+        // The login never finishes: Zalo is still being reached.
+        let login = FakeLogin::new(vec![LoginStep::cookie(|_| Box::pin(std::future::pending()))]);
+        let session = Arc::new(ZaloSession::with_login(
+            store.clone(),
+            dir.clone(),
+            true,
+            login,
+        ));
+        let state = AppState {
+            config: Arc::new(Config::from_lookup(|_| None).unwrap()),
+            session: Arc::clone(&session),
+            store: store.clone(),
+        };
+        let calls = crate::routes::calls::start_manager(&state);
+        let history_sync = crate::routes::history_sync::start_manager(state.clone());
+        session.start();
+        let (shutdown_tx, _) = watch::channel(false);
+        let core = EmbeddedCore {
+            state,
+            calls,
+            history_sync,
+            session: Arc::clone(&session),
+            store,
+            shutdown_tx,
+        };
+
+        let res = call(&core, "GET", "/api/status", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v["state"], "logging_in");
+        assert_eq!(v["resuming"], true);
+
+        let res = call(&core, "GET", "/api/threads", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["name"], "Alice");
+        assert_eq!(v[0]["lastMessage"]["text"], "saved earlier");
+
+        let res = call(&core, "GET", "/api/threads/user/100/messages", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(v["messages"][0]["text"], "saved earlier");
+
+        // Reading a chat marks it read locally; the receipt to Zalo is skipped, not an error.
+        let res = call(&core, "POST", "/api/threads/user/100/read", None, vec![]).await;
+        assert_eq!(res.status, 204);
+
+        // Sending needs the login: a plain 409 the app can queue and retry.
+        let res = call(
+            &core,
+            "POST",
+            "/api/threads/user/100/messages",
+            Some("application/json"),
+            br#"{"text":"hi"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, 409);
+
+        core.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn events_start_with_status_then_stream_broadcasts_and_close_on_shutdown() {
         let dir = temp_dir("zalo-embedded-events");
