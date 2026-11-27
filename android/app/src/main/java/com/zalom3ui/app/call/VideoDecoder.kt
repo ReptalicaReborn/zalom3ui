@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.SystemClock
 import android.view.Surface
+import java.nio.ByteBuffer
 
 /**
  * Decodes the other side's H.264 (Annex B access units from [CallAudioLink]) onto a [Surface] with the hardware decoder.
@@ -33,6 +34,7 @@ class VideoDecoder(
     private var codec: MediaCodec? = null
     private var timeBase = 0L
     private var lastTs = -1L
+    private var activeSps: ByteArray? = null
 
     private val worker = Thread({ run() }, "video-decoder").apply { isDaemon = true; start() }
 
@@ -166,6 +168,10 @@ class VideoDecoder(
     }
 
     private fun feed(f: Frame) {
+        if (f.key && codec != null && spsChanged(f.data)) {
+            // The sender moved to another resolution (new SPS): start a fresh codec on this key frame, which carries it.
+            releaseCodec()
+        }
         var c = codec
         if (c == null) {
             if (!f.key) return
@@ -179,7 +185,7 @@ class VideoDecoder(
             }
             if (!targetSurface.isValid) return
             c = try {
-                open(targetSurface)
+                open(targetSurface, f.data)
             } catch (_: Exception) {
                 failed()
                 return
@@ -193,6 +199,7 @@ class VideoDecoder(
                 return
             }
             codec = c
+            activeSps = AnnexB.findNal(f.data, 7)
             timeBase = 0
             lastTs = -1
         }
@@ -224,20 +231,35 @@ class VideoDecoder(
         return (timeBase + ts) * 1_000_000L / 90_000L
     }
 
-    private fun open(s: Surface): MediaCodec {
+    /** True when the SPS in this key frame describes another picture size than the one the codec was opened for. */
+    private fun spsChanged(au: ByteArray): Boolean {
+        val now = AnnexB.findNal(au, 7) ?: return false
+        val old = activeSps ?: return false
+        val a = AnnexB.spsSize(old)
+        val b = AnnexB.spsSize(now)
+        return if (a != null && b != null) a != b else !old.contentEquals(now)
+    }
+
+    private fun open(s: Surface, keyFrame: ByteArray): MediaCodec {
+        val sps = AnnexB.findNal(keyFrame, 7)
+        val pps = AnnexB.findNal(keyFrame, 8)
+        val size = sps?.let { AnnexB.spsSize(it) } ?: Pair(640, 480)
+        // Room for the other side to change resolution (or orientation) without rebuilding the codec.
+        val maxDim = maxOf(1920, size.first, size.second)
+        fun base(maxW: Int, maxH: Int) = MediaFormat.createVideoFormat(MIME, size.first, size.second).apply {
+            setInteger(MediaFormat.KEY_MAX_WIDTH, maxW)
+            setInteger(MediaFormat.KEY_MAX_HEIGHT, maxH)
+            if (sps != null && pps != null) {
+                setByteBuffer("csd-0", ByteBuffer.wrap(AnnexB.withStartCode(sps)))
+                setByteBuffer("csd-1", ByteBuffer.wrap(AnnexB.withStartCode(pps)))
+            }
+        }
         val formats = listOf(
-            MediaFormat.createVideoFormat(MIME, 640, 480).apply {
-                // Room for the other side to change resolution without rebuilding the codec.
-                setInteger(MediaFormat.KEY_MAX_WIDTH, 1280)
-                setInteger(MediaFormat.KEY_MAX_HEIGHT, 720)
-                // Show frames as they arrive (Android 11+ decoders that support it).
-                setInteger("low-latency", 1)
-            },
-            MediaFormat.createVideoFormat(MIME, 640, 480).apply {
-                setInteger(MediaFormat.KEY_MAX_WIDTH, 1280)
-                setInteger(MediaFormat.KEY_MAX_HEIGHT, 720)
-            },
-            MediaFormat.createVideoFormat(MIME, 640, 480),
+            // Show frames as they arrive (Android 11+ decoders that support it).
+            base(maxDim, maxDim).apply { setInteger("low-latency", 1) },
+            base(maxDim, maxDim),
+            base(1280, 1280),
+            MediaFormat.createVideoFormat(MIME, size.first, size.second),
         )
         var lastError: Exception? = null
         for (format in formats) {
@@ -304,6 +326,7 @@ class VideoDecoder(
     private fun releaseCodec() {
         val c = codec ?: return
         codec = null
+        activeSps = null
         runCatching { c.stop() }
         runCatching { c.release() }
     }
