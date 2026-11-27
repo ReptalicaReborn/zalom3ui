@@ -12,8 +12,8 @@ pub use rtcp::{
 };
 pub use srtp::{derive_key, rtp_header, RtpHeader, SrtpContext, SrtpError, AUTH_TAG_LEN};
 pub use video::{
-    nal_units, packetize_frame, AssemblerStats, KeyNeededReason, VideoAssembler, VideoFrame,
-    VideoPacket, MAX_CHUNK, VIDEO_DELTA_PT, VIDEO_KEY_PT,
+    nal_units, packetize_frame, AssembledFrame, AssemblerStats, KeyNeededReason, VideoAssembler,
+    VideoFrame, VideoPacket, MAX_CHUNK, VIDEO_DELTA_PT, VIDEO_KEY_PT,
 };
 pub use zrtcclient::{
     parse_server, AudioStats, ControlSummary, MediaCall, MediaCallOptions, MediaEvent, MediaServer,

@@ -292,35 +292,38 @@ pub fn redact_for_trace(value: &Value) -> Value {
     redact_walk(value, 0).0
 }
 
-/// Rotating JSONL call trace (`<data_dir>/call-trace.jsonl`, rotates at 2 MiB to `.1`).
-pub struct CallTrace {
+struct CallTraceInner {
     file: PathBuf,
-    lock: Mutex<()>,
+    pending: Mutex<Vec<String>>,
+    flush_scheduled: std::sync::atomic::AtomicBool,
+    io_lock: Mutex<()>,
 }
 
-impl CallTrace {
-    pub fn new(data_dir: impl AsRef<Path>) -> Self {
-        Self {
-            file: data_dir.as_ref().join("call-trace.jsonl"),
-            lock: Mutex::new(()),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.file
-    }
-
-    /// Redacts `entry`, adds an ISO-8601 `"at"` timestamp, and appends a JSON line.
-    pub fn record(&self, entry: &Value) {
-        let Ok(_guard) = self.lock.lock() else {
+impl CallTraceInner {
+    fn flush_pending(&self) {
+        use std::sync::atomic::Ordering;
+        let Ok(_io) = self.io_lock.lock() else {
             return;
         };
-        if let Err(err) = self.record_inner(entry) {
-            tracing::warn!("Call log: {err}");
+        loop {
+            let batch = {
+                let Ok(mut p) = self.pending.lock() else {
+                    self.flush_scheduled.store(false, Ordering::Release);
+                    return;
+                };
+                self.flush_scheduled.store(false, Ordering::Release);
+                if p.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *p)
+            };
+            if let Err(err) = self.append_batch(&batch) {
+                tracing::warn!("Call log: {err}");
+            }
         }
     }
 
-    fn record_inner(&self, entry: &Value) -> io::Result<()> {
+    fn append_batch(&self, lines: &[String]) -> io::Result<()> {
         if let Some(parent) = self.file.parent() {
             create_dir_private(parent)?;
         }
@@ -329,29 +332,18 @@ impl CallTrace {
                 let _ = fs::rename(&self.file, backup_path(&self.file));
             }
         }
-        let safe = redact_for_trace(entry);
-        let at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let mut obj = Map::new();
-        obj.insert("at".to_string(), Value::String(at));
-        match safe {
-            Value::Object(m) => {
-                for (k, v) in m {
-                    obj.insert(k, v);
-                }
-            }
-            other => {
-                obj.insert("value".to_string(), other);
-            }
-        }
-        let mut line = serde_json::to_string(&Value::Object(obj))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        line.push('\n');
         let mut f = open_append_private(&self.file)?;
-        f.write_all(line.as_bytes())
+        for line in lines {
+            f.write_all(line.as_bytes())?;
+        }
+        Ok(())
     }
 
-    /// Reads the rotated backup (if present) followed by the current trace file.
-    pub fn read(&self) -> String {
+    fn read_sync(&self) -> String {
+        self.flush_pending();
+        let Ok(_io) = self.io_lock.lock() else {
+            return String::new();
+        };
         let mut out = String::new();
         for p in [backup_path(&self.file), self.file.clone()] {
             if let Ok(s) = fs::read_to_string(&p) {
@@ -361,14 +353,115 @@ impl CallTrace {
         out
     }
 
-    /// Removes both the active trace file and its `.1` backup.
-    pub fn clear(&self) {
-        let Ok(_guard) = self.lock.lock() else {
+    fn clear_sync(&self) {
+        let Ok(_io) = self.io_lock.lock() else {
             return;
         };
+        if let Ok(mut p) = self.pending.lock() {
+            p.clear();
+        }
         for p in [self.file.clone(), backup_path(&self.file)] {
             let _ = fs::remove_file(p);
         }
+    }
+}
+
+fn format_trace_line(entry: &Value) -> io::Result<String> {
+    let safe = redact_for_trace(entry);
+    let at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut obj = Map::new();
+    obj.insert("at".to_string(), Value::String(at));
+    match safe {
+        Value::Object(m) => {
+            for (k, v) in m {
+                obj.insert(k, v);
+            }
+        }
+        other => {
+            obj.insert("value".to_string(), other);
+        }
+    }
+    let mut line = serde_json::to_string(&Value::Object(obj))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// Rotating JSONL call trace (`<data_dir>/call-trace.jsonl`, rotates at 2 MiB to `.1`).
+#[derive(Clone)]
+pub struct CallTrace {
+    inner: std::sync::Arc<CallTraceInner>,
+}
+
+impl CallTrace {
+    pub fn new(data_dir: impl AsRef<Path>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(CallTraceInner {
+                file: data_dir.as_ref().join("call-trace.jsonl"),
+                pending: Mutex::new(Vec::new()),
+                flush_scheduled: std::sync::atomic::AtomicBool::new(false),
+                io_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.file
+    }
+
+    /// Redacts `entry`, adds an ISO-8601 `"at"` timestamp, and appends a JSON line.
+    /// When called inside a Tokio runtime, disk I/O is offloaded to `spawn_blocking`.
+    pub fn record(&self, entry: &Value) {
+        use std::sync::atomic::Ordering;
+        let line = match format_trace_line(entry) {
+            Ok(l) => l,
+            Err(err) => {
+                tracing::warn!("Call log: {err}");
+                return;
+            }
+        };
+        if let Ok(mut p) = self.inner.pending.lock() {
+            p.push(line);
+        } else {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if self
+                .inner
+                .flush_scheduled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let inner = std::sync::Arc::clone(&self.inner);
+                handle.spawn_blocking(move || inner.flush_pending());
+            }
+        } else {
+            self.inner.flush_pending();
+        }
+    }
+
+    /// Reads the rotated backup (if present) followed by the current trace file.
+    pub fn read(&self) -> String {
+        self.inner.read_sync()
+    }
+
+    /// Reads the call trace on a blocking thread pool task so async handlers never stall.
+    pub async fn read_async(&self) -> String {
+        let inner = std::sync::Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || inner.read_sync())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Removes both the active trace file and its `.1` backup.
+    pub fn clear(&self) {
+        self.inner.clear_sync();
+    }
+
+    /// Removes both trace files on a blocking thread pool task so async handlers never stall.
+    pub async fn clear_async(&self) {
+        let inner = std::sync::Arc::clone(&self.inner);
+        let _ = tokio::task::spawn_blocking(move || inner.clear_sync()).await;
     }
 }
 

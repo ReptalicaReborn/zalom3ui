@@ -1,7 +1,8 @@
 //! Message normalization, attachment parsing, OTP detection, Vietnamese diacritic-insensitive
 //! search, and crash-safe per-thread persistence (`ChatStore`), matching `src/store.ts`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
+use regex_lite::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -18,8 +19,8 @@ use crate::log::create_dir_private;
 use crate::types::{
     is_local_device_uri, reaction_by_code, sanitize_remote_url, thread_key, Attachment,
     AttachmentKind, CallInfo, ChatMessage, MentionInfo, MessageSearchHit, MessageStatus, PollRef,
-    QuoteInfo, RawRef, ReactionInfo, StickerRef, StoredMessage, ThreadInfo, ThreadKind,
-    ThreadSummary, STICKER_IMAGE_URL,
+    QuoteInfo, RawRef, ReactionInfo, SearchCache, StickerRef, StoredMessage, ThreadInfo,
+    ThreadKind, ThreadSummary, STICKER_IMAGE_URL,
 };
 
 pub const MAX_MESSAGES_PER_THREAD: usize = 500;
@@ -148,16 +149,28 @@ pub fn fold_diacritics(s: &str) -> String {
     out
 }
 
-/// Folds text for diacritic-insensitive, case-insensitive Vietnamese search.
+/// Folds text for diacritic-insensitive, case-insensitive Vietnamese search in a single pass.
 pub fn fold_for_search(s: &str) -> String {
-    fold_diacritics(s).to_lowercase()
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if let Some(c) = fold_char(ch) {
+            if c.is_ascii() {
+                out.push(c.to_ascii_lowercase());
+            } else {
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---- OTP extraction ----
 //
 // The same algorithm (and the same test vectors) lives in Kotlin: `extractOtpCode` in
 // `ui/MessageContent.kt`. Keep them in step. It works on diacritic-folded lowercase text, one line
-// at a time, and never uses look-around (the `regex` crate has none).
+// at a time, and never uses look-around (the `regex-lite` crate has none).
 //
 //  1. a strong keyword (OTP, "ma xac thuc", "verification code", ...) followed, in the same
 //     sentence and within 100 characters, by the first *code-like* number;
@@ -184,6 +197,11 @@ const OTP_BEFORE_WINDOW: usize = 24;
 
 fn otp_re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pattern).expect("valid OTP regex"))
+}
+
+fn otp_strong_re() -> &'static Regex {
+    static STRONG: OnceLock<Regex> = OnceLock::new();
+    otp_re(&STRONG, OTP_STRONG)
 }
 
 /// A numeric token (`[0-9]+` with `.,/:-` joins) in a folded line.
@@ -279,12 +297,11 @@ fn otp_clip(s: &str, max: usize) -> &str {
 }
 
 fn otp_in_line(line: &str) -> Option<String> {
-    static STRONG: OnceLock<Regex> = OnceLock::new();
     static WEAK: OnceLock<Regex> = OnceLock::new();
     static BEFORE: OnceLock<Regex> = OnceLock::new();
     static TOKEN: OnceLock<Regex> = OnceLock::new();
     static SENTENCE: OnceLock<Regex> = OnceLock::new();
-    let strong = otp_re(&STRONG, OTP_STRONG);
+    let strong = otp_strong_re();
     let weak = otp_re(&WEAK, OTP_WEAK);
     let before = otp_re(&BEFORE, OTP_BEFORE);
     let sentence = otp_re(&SENTENCE, OTP_SENTENCE_END);
@@ -343,12 +360,11 @@ fn otp_in_line(line: &str) -> Option<String> {
 /// Extracts a one-time code (4-8 digits) from message or notification text; see the section
 /// comment for the rules. Returns the digits only ("482 910" -> "482910").
 pub fn extract_otp_code(text: &str) -> Option<String> {
-    static STRONG: OnceLock<Regex> = OnceLock::new();
-    if text.trim().is_empty() {
+    if text.bytes().filter(|b| b.is_ascii_digit()).take(3).count() < 3 {
         return None;
     }
     let folded = fold_for_search(text);
-    let strong = otp_re(&STRONG, OTP_STRONG);
+    let strong = otp_strong_re();
     let mut prev_strong = false;
     for line in folded.lines() {
         let line = line.trim();
@@ -370,14 +386,6 @@ pub fn extract_otp_code(text: &str) -> Option<String> {
 }
 
 // ---- Message normalization & attachment parsing ----
-
-fn call_action_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^recommened\.(misscall|calling|receivecall|calltime)$")
-            .expect("valid call action regex")
-    })
-}
 
 fn kind_by_msg_type(msg_type: &str) -> AttachmentKind {
     match msg_type {
@@ -602,8 +610,15 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
 
     // 3. Call log (`recommened.misscall|calling|receivecall|calltime` or `call.voice`/`call.video`)
     let action = non_empty_str(content_map.get("action")).unwrap_or_default();
+    let is_call_action = matches!(
+        action.as_str(),
+        "recommened.misscall"
+            | "recommened.calling"
+            | "recommened.receivecall"
+            | "recommened.calltime"
+    );
     let is_call_msg_type = msg_type == "call.voice" || msg_type == "call.video";
-    if call_action_re().is_match(&action) || is_call_msg_type {
+    if is_call_action || is_call_msg_type {
         let reason = val_to_i64(params.get("reason"));
         let seconds = first_pos_f64(&[params.get("duration"), content_map.get("duration")]);
         let missed = if !action.is_empty() {
@@ -1073,6 +1088,7 @@ pub fn normalize_message(
             at: val_to_i64(raw_data.get("at")),
             cmd: val_to_i64(raw_data.get("cmd")),
         }),
+        search_folded: SearchCache::default(),
     };
 
     if let Value::String(s) = content_val {
@@ -1254,10 +1270,11 @@ where
     Ok(out)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MetaFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[allow(dead_code)]
     version: Option<u32>,
     #[serde(default)]
     threads: HashMap<String, ThreadInfo>,
@@ -1269,7 +1286,20 @@ struct MetaFile {
     muted_until: HashMap<String, i64>,
     #[serde(default)]
     marked_unread: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    message_cap: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaFileRef<'a> {
+    version: u32,
+    threads: &'a HashMap<String, ThreadInfo>,
+    read_up_to: &'a HashMap<String, i64>,
+    pinned: Vec<&'a str>,
+    muted_until: &'a HashMap<String, i64>,
+    marked_unread: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     message_cap: Option<usize>,
 }
 
@@ -1292,12 +1322,20 @@ struct LegacySnapshot {
     message_cap: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadFile {
     #[serde(default)]
+    #[allow(dead_code)]
     key: String,
     messages: Vec<StoredMessage>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadFileRef<'a> {
+    key: &'a str,
+    messages: &'a [StoredMessage],
 }
 
 // ---- ChatStore ----
@@ -1350,8 +1388,6 @@ struct StoreState {
     index: HashMap<String, String>,
     own_id: Option<String>,
     message_cap: usize,
-    /// Cached unread incoming count per thread at the read marker it was computed for.
-    unread_counts: HashMap<String, (i64, usize)>,
     /// Dirty tracking for incremental persistence.
     dirty_threads: HashSet<String>,
     meta_dirty: bool,
@@ -1368,7 +1404,6 @@ impl StoreState {
     }
 
     fn thread_changed(&mut self, key: &str, has_paths: bool) {
-        self.unread_counts.remove(key);
         self.mark_dirty(key, has_paths);
     }
 
@@ -1392,33 +1427,28 @@ impl StoreState {
         }
     }
 
-    fn unread_count(&mut self, key: &str) -> usize {
+    fn unread_count(&self, key: &str) -> usize {
         let read_ts = self.read_up_to.get(key).copied().unwrap_or(0);
-        if let Some(&(cached_ts, count)) = self.unread_counts.get(key) {
-            if cached_ts == read_ts {
-                return count;
-            }
-        }
-        let count = self
-            .messages
+        self.messages
             .get(key)
-            .map(|list| list.iter().filter(|m| !m.is_self && m.ts > read_ts).count())
-            .unwrap_or(0);
-        self.unread_counts.insert(key.to_string(), (read_ts, count));
-        count
+            .map(|list| {
+                let start = list.partition_point(|m| m.ts <= read_ts);
+                list[start..].iter().filter(|m| !m.is_self).count()
+            })
+            .unwrap_or(0)
     }
 
     fn meta_json(&self) -> String {
-        let mut pinned: Vec<String> = self.pinned.iter().cloned().collect();
-        pinned.sort();
-        let mut marked_unread: Vec<String> = self.marked_unread.iter().cloned().collect();
-        marked_unread.sort();
-        let meta = MetaFile {
-            version: Some(1),
-            threads: self.threads.clone(),
-            read_up_to: self.read_up_to.clone(),
+        let mut pinned: Vec<&str> = self.pinned.iter().map(String::as_str).collect();
+        pinned.sort_unstable();
+        let mut marked_unread: Vec<&str> = self.marked_unread.iter().map(String::as_str).collect();
+        marked_unread.sort_unstable();
+        let meta = MetaFileRef {
+            version: 1,
+            threads: &self.threads,
+            read_up_to: &self.read_up_to,
             pinned,
-            muted_until: self.muted_until.clone(),
+            muted_until: &self.muted_until,
             marked_unread,
             message_cap: if self.message_cap > MAX_MESSAGES_PER_THREAD {
                 Some(self.message_cap)
@@ -1434,9 +1464,9 @@ impl StoreState {
         if list.is_empty() {
             return None;
         }
-        let tf = ThreadFile {
-            key: key.to_string(),
-            messages: list.clone(),
+        let tf = ThreadFileRef {
+            key,
+            messages: list.as_slice(),
         };
         serde_json::to_string(&tf).ok()
     }
@@ -1953,6 +1983,17 @@ impl ChatStore {
         self.find_message(msg_id)
     }
 
+    /// O(1) count of cached messages in a conversation.
+    pub fn message_count(&self, kind: ThreadKind, id: &str) -> usize {
+        let key = thread_key(kind, id);
+        self.inner
+            .state
+            .read()
+            .ok()
+            .and_then(|s| s.messages.get(&key).map(Vec::len))
+            .unwrap_or(0)
+    }
+
     /// Returns up to `limit` (clamped to `1..=500`, default 50) public messages in chronological
     /// order, optionally older than `before` (exclusive).
     pub fn get_messages(
@@ -1970,12 +2011,12 @@ impl ChatStore {
         let Some(list) = s.messages.get(&key) else {
             return Vec::new();
         };
-        let filtered: Vec<&StoredMessage> = match before {
-            Some(ts) => list.iter().filter(|m| m.ts < ts).collect(),
-            None => list.iter().collect(),
+        let end = match before {
+            Some(ts) => list.partition_point(|m| m.ts < ts),
+            None => list.len(),
         };
-        let start = filtered.len().saturating_sub(cap);
-        filtered[start..]
+        let start = end.saturating_sub(cap);
+        list[start..end]
             .iter()
             .map(|m| to_public_message(m, s.own_id.as_deref()))
             .collect()
@@ -1989,45 +2030,97 @@ impl ChatStore {
         if needle.is_empty() {
             return Vec::new();
         }
+        let needle_has_nul = needle.contains('\0');
         let cap = limit.unwrap_or(50).clamp(1, 100);
         let Ok(s) = self.inner.state.read() else {
             return Vec::new();
         };
         let own = s.own_id.as_deref();
-        let mut matches: Vec<(Option<&ThreadInfo>, &StoredMessage)> = Vec::new();
+
+        // Min-heap of the top `cap` newest matches: `(Reverse(ts), seq, thread, msg)`.
+        // A plain wrapper avoids requiring `Ord` on references.
+        struct HeapEntry<'a> {
+            ts: i64,
+            seq: usize,
+            thread: Option<&'a ThreadInfo>,
+            msg: &'a StoredMessage,
+        }
+        impl PartialEq for HeapEntry<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.ts == other.ts && self.seq == other.seq
+            }
+        }
+        impl Eq for HeapEntry<'_> {}
+        impl PartialOrd for HeapEntry<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for HeapEntry<'_> {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Min-heap by `ts` so `peek()` is the oldest match in the top-K.
+                Reverse((self.ts, self.seq)).cmp(&Reverse((other.ts, other.seq)))
+            }
+        }
+
+        let mut heap: BinaryHeap<HeapEntry<'_>> = BinaryHeap::with_capacity(cap + 1);
+        let mut seq = 0usize;
+
         for (key, list) in &s.messages {
             let thread = s.threads.get(key);
-            for m in list {
+            for m in list.iter().rev() {
                 if m.recalled {
                     continue;
                 }
-                let hit = fold_for_search(&m.text).contains(&needle)
-                    || m.attachment
-                        .as_ref()
-                        .and_then(|a| a.title.as_deref())
-                        .is_some_and(|t| fold_for_search(t).contains(&needle))
-                    || m.attachment
-                        .as_ref()
-                        .and_then(|a| a.description.as_deref())
-                        .is_some_and(|d| fold_for_search(d).contains(&needle));
+                if heap.len() == cap {
+                    if let Some(oldest) = heap.peek() {
+                        if m.ts < oldest.ts {
+                            continue;
+                        }
+                    }
+                }
+                let haystack = m.search_folded.get_or_init(|| build_search_folded(m));
+                let hit = if !needle_has_nul {
+                    haystack.contains(&needle)
+                } else {
+                    haystack.split('\0').any(|part| part.contains(&needle))
+                };
                 if hit {
-                    matches.push((thread, m));
+                    seq += 1;
+                    if heap.len() < cap {
+                        heap.push(HeapEntry {
+                            ts: m.ts,
+                            seq,
+                            thread,
+                            msg: m,
+                        });
+                    } else if let Some(mut oldest) = heap.peek_mut() {
+                        if m.ts > oldest.ts {
+                            *oldest = HeapEntry {
+                                ts: m.ts,
+                                seq,
+                                thread,
+                                msg: m,
+                            };
+                        }
+                    }
                 }
             }
         }
-        matches.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
-        matches
-            .into_iter()
-            .take(cap)
-            .map(|(thread, m)| MessageSearchHit {
-                thread_id: m.thread_id.clone(),
-                thread_kind: m.thread_kind,
-                thread_name: thread
+
+        let mut top = heap.into_vec();
+        top.sort_by(|a, b| b.ts.cmp(&a.ts));
+        top.into_iter()
+            .map(|e| MessageSearchHit {
+                thread_id: e.msg.thread_id.clone(),
+                thread_kind: e.msg.thread_kind,
+                thread_name: e
+                    .thread
                     .filter(|t| !t.name.is_empty())
                     .map(|t| t.name.clone())
-                    .unwrap_or_else(|| m.thread_id.clone()),
-                thread_avatar: thread.map(|t| t.avatar.clone()).unwrap_or_default(),
-                message: to_public_message(m, own),
+                    .unwrap_or_else(|| e.msg.thread_id.clone()),
+                thread_avatar: e.thread.map(|t| t.avatar.clone()).unwrap_or_default(),
+                message: to_public_message(e.msg, own),
             })
             .collect()
     }
@@ -2074,6 +2167,7 @@ impl ChatStore {
             msg.quote = None;
             msg.mentions.clear();
             msg.reactions = None;
+            msg.search_folded.clear();
             let cloned = msg.clone();
             s.mark_dirty(&key, has_paths);
             cloned
@@ -2109,6 +2203,9 @@ impl ChatStore {
         delivered_to: &[String],
         seen_by: &[String],
     ) -> Vec<StoredMessage> {
+        if delivered_to.is_empty() && seen_by.is_empty() {
+            return Vec::new();
+        }
         let has_paths = self.inner.paths.is_some();
         let changed = {
             let Ok(mut s) = self.inner.state.write() else {
@@ -2118,29 +2215,26 @@ impl ChatStore {
             let Some(list) = s.messages.get_mut(&key) else {
                 return Vec::new();
             };
-            let Some(target_ts) = list.iter().find(|m| m.id == msg_id).map(|m| m.ts) else {
+            let Some(target_pos) = list.iter().rposition(|m| m.id == msg_id) else {
                 return Vec::new();
             };
+            let target_ts = list[target_pos].ts;
             let mut out = Vec::new();
-            for m in list.iter_mut() {
-                let affected = if kind == ThreadKind::User {
-                    m.is_self && m.ts <= target_ts
-                } else {
-                    m.id == msg_id
-                };
-                if !affected {
-                    continue;
+            if kind == ThreadKind::Group {
+                if merge_receipts(&mut list[target_pos], delivered_to, seen_by) {
+                    out.push(list[target_pos].clone());
                 }
-                let prev_deliv = m.delivered_to.as_ref().map_or(0, Vec::len);
-                let prev_seen = m.seen_by.as_ref().map_or(0, Vec::len);
-                let new_deliv = union_strings(m.delivered_to.as_deref(), delivered_to);
-                let new_seen = union_strings(m.seen_by.as_deref(), seen_by);
-                if new_deliv.len() == prev_deliv && new_seen.len() == prev_seen {
-                    continue;
+            } else {
+                let end = list.partition_point(|m| m.ts <= target_ts);
+                for m in list[..end].iter_mut().rev() {
+                    if !m.is_self {
+                        continue;
+                    }
+                    if merge_receipts(m, delivered_to, seen_by) {
+                        out.push(m.clone());
+                    }
                 }
-                m.delivered_to = Some(new_deliv);
-                m.seen_by = Some(new_seen);
-                out.push(m.clone());
+                out.reverse();
             }
             if !out.is_empty() {
                 s.mark_dirty(&key, has_paths);
@@ -2337,39 +2431,44 @@ impl ChatStore {
 
     /// Lists all conversations evaluated at timestamp `now` (for deterministic mute expiry checks).
     pub fn list_threads_at(&self, now: i64) -> Vec<ThreadSummary> {
-        let Ok(mut s) = self.inner.state.write() else {
-            return Vec::new();
+        let mut keyed: Vec<(String, ThreadSummary)> = {
+            let Ok(s) = self.inner.state.read() else {
+                return Vec::new();
+            };
+            let own = s.own_id.as_deref();
+            let mut out = Vec::with_capacity(s.threads.len());
+            for (key, info) in &s.threads {
+                let unread = s.unread_count(key);
+                let last_message = s
+                    .messages
+                    .get(key)
+                    .and_then(|list| list.last())
+                    .map(|m| to_public_message(m, own));
+                let marked = if s.marked_unread.contains(key) { 1 } else { 0 };
+                let pinned = s.pinned.contains(key);
+                let muted_until = s
+                    .muted_until
+                    .get(key)
+                    .copied()
+                    .filter(|&u| u == -1 || u > now);
+                let lower = info.name.to_lowercase();
+                out.push((
+                    lower,
+                    ThreadSummary {
+                        id: info.id.clone(),
+                        kind: info.kind,
+                        name: info.name.clone(),
+                        avatar: info.avatar.clone(),
+                        last_message,
+                        unread: unread.max(marked),
+                        pinned,
+                        muted_until,
+                    },
+                ));
+            }
+            out
         };
-        let keys: Vec<String> = s.threads.keys().cloned().collect();
-        let own = s.own_id.clone();
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let unread = s.unread_count(&key);
-            let info = s.threads[&key].clone();
-            let last_message = s
-                .messages
-                .get(&key)
-                .and_then(|list| list.last())
-                .map(|m| to_public_message(m, own.as_deref()));
-            let marked = if s.marked_unread.contains(&key) { 1 } else { 0 };
-            let pinned = s.pinned.contains(&key);
-            let muted_until = s
-                .muted_until
-                .get(&key)
-                .copied()
-                .filter(|&u| u == -1 || u > now);
-            out.push(ThreadSummary {
-                id: info.id,
-                kind: info.kind,
-                name: info.name,
-                avatar: info.avatar,
-                last_message,
-                unread: unread.max(marked),
-                pinned,
-                muted_until,
-            });
-        }
-        out.sort_by(|a, b| {
+        keyed.sort_by(|(a_low, a), (b_low, b)| {
             b.pinned
                 .cmp(&a.pinned)
                 .then_with(|| {
@@ -2377,14 +2476,9 @@ impl ChatStore {
                     let a_ts = a.last_message.as_ref().map_or(0, |m| m.ts);
                     b_ts.cmp(&a_ts)
                 })
-                .then_with(|| {
-                    a.name
-                        .to_lowercase()
-                        .cmp(&b.name.to_lowercase())
-                        .then_with(|| a.name.cmp(&b.name))
-                })
+                .then_with(|| a_low.cmp(b_low).then_with(|| a.name.cmp(&b.name)))
         });
-        out
+        keyed.into_iter().map(|(_, t)| t).collect()
     }
 
     /// Converts a `StoredMessage` to a public `ChatMessage` using this store's `own_id`.
@@ -2404,7 +2498,6 @@ impl ChatStore {
             s.muted_until.clear();
             s.marked_unread.clear();
             s.index.clear();
-            s.unread_counts.clear();
             s.dirty_threads.clear();
             s.pending_migration = None;
             s.wipe = true;
@@ -2632,27 +2725,23 @@ impl ChatStore {
             return false;
         };
 
-        // Snapshot everything dirty under a brief write lock, then release the state lock before I/O.
-        let (do_wipe, thread_jobs, want_meta, mut pending_mig) = {
+        // Drain only dirty keys and flags under a brief write lock; serialize each thread under
+        // a short read lock so writers and readers are never blocked across large serializations.
+        let (do_wipe, dirty_keys, want_meta, mut pending_mig) = {
             let Ok(mut s) = self.inner.state.write() else {
                 return false;
             };
             let do_wipe = s.wipe;
             let dirty_keys: Vec<String> = s.dirty_threads.drain().collect();
-            let mut jobs = Vec::with_capacity(dirty_keys.len());
-            for key in dirty_keys {
-                let json = s.thread_json(&key);
-                jobs.push((key, json));
-            }
             let want_meta = s.meta_dirty;
             if want_meta {
                 s.meta_dirty = false;
             }
             let pending_mig = s.pending_migration.clone();
-            (do_wipe, jobs, want_meta, pending_mig)
+            (do_wipe, dirty_keys, want_meta, pending_mig)
         };
 
-        if !do_wipe && thread_jobs.is_empty() && !want_meta {
+        if !do_wipe && dirty_keys.is_empty() && !want_meta {
             return true;
         }
 
@@ -2678,7 +2767,7 @@ impl ChatStore {
                 if do_wipe {
                     s.wipe = true;
                 }
-                for (key, _) in thread_jobs {
+                for key in dirty_keys {
                     s.dirty_threads.insert(key);
                 }
                 if want_meta {
@@ -2704,7 +2793,11 @@ impl ChatStore {
         }
 
         let mut failed_threads = Vec::new();
-        for (key, json_opt) in thread_jobs {
+        for key in dirty_keys {
+            let json_opt = match self.inner.state.read() {
+                Ok(s) => s.thread_json(&key),
+                Err(_) => return false,
+            };
             let file = paths.thread_file(&key);
             let res = match json_opt {
                 None => {
@@ -2810,14 +2903,54 @@ impl ChatStore {
     }
 }
 
-fn union_strings(existing: Option<&[String]>, extra: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = existing.unwrap_or(&[]).to_vec();
-    for item in extra {
-        if !out.contains(item) {
-            out.push(item.clone());
-        }
+fn build_search_folded(m: &StoredMessage) -> String {
+    let title = m.attachment.as_ref().and_then(|a| a.title.as_deref());
+    let desc = m.attachment.as_ref().and_then(|a| a.description.as_deref());
+    let mut out = fold_for_search(&m.text);
+    if let Some(t) = title {
+        out.push('\0');
+        out.push_str(&fold_for_search(t));
+    }
+    if let Some(d) = desc {
+        out.push('\0');
+        out.push_str(&fold_for_search(d));
     }
     out
+}
+
+fn has_missing_items(existing: Option<&[String]>, extra: &[String]) -> bool {
+    if extra.is_empty() {
+        return false;
+    }
+    let slice = existing.unwrap_or(&[]);
+    extra.iter().any(|item| !slice.contains(item))
+}
+
+fn extend_unique(target: &mut Option<Vec<String>>, extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    let vec = target.get_or_insert_with(Vec::new);
+    for item in extra {
+        if !vec.contains(item) {
+            vec.push(item.clone());
+        }
+    }
+}
+
+fn merge_receipts(m: &mut StoredMessage, delivered_to: &[String], seen_by: &[String]) -> bool {
+    let need_deliv = has_missing_items(m.delivered_to.as_deref(), delivered_to);
+    let need_seen = has_missing_items(m.seen_by.as_deref(), seen_by);
+    if !need_deliv && !need_seen {
+        return false;
+    }
+    if need_deliv {
+        extend_unique(&mut m.delivered_to, delivered_to);
+    }
+    if need_seen {
+        extend_unique(&mut m.seen_by, seen_by);
+    }
+    true
 }
 
 fn is_hex_thread_file(name: &str) -> bool {

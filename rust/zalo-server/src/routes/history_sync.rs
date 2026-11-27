@@ -23,9 +23,9 @@ use tracing::warn;
 use url::Url;
 
 use zalo_media::sync::{
-    backup_key_text, conversation_files, convert_conversation, decrypt_backup_key,
-    describe_senders, generate_sync_keypair, read_conversation, unpack_backup, BackupConversation,
-    BackupError, BackupIdMap, SyncKeyPair, DEFAULT_MAX_OUTPUT,
+    backup_key_text, conversation_files_owned, convert_conversation, decrypt_backup_key,
+    describe_senders, generate_sync_keypair, read_conversation, unpack_backup_owned,
+    BackupConversation, BackupError, BackupIdMap, SyncKeyPair, DEFAULT_MAX_OUTPUT,
 };
 use zalo_proto::{parse_json_keeping_bigints, NoisedIdsReply, ProtoError};
 
@@ -528,6 +528,16 @@ impl HistorySyncDeps for SessionSyncDeps {
     }
 
     fn on_status_change(&self, status: &HistorySyncStatus) {
+        if matches!(
+            status.state,
+            SyncState::Idle | SyncState::WaitingForPhone | SyncState::Done | SyncState::Failed
+        ) {
+            if let Ok(mut map) = self.member_names.write() {
+                map.clear();
+                map.shrink_to_fit();
+            }
+        }
+
         let mut ev = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
         if let Some(obj) = ev.as_object_mut() {
             obj.insert("type".to_string(), Value::String("history_sync".into()));
@@ -1058,9 +1068,9 @@ impl HistorySyncManager {
             let plain_key = decrypt_backup_key(&keys.private_key, &encrypted_key)
                 .ok_or_else(|| BackupError("the backup key could not be decrypted".into()))?;
             let key_text = backup_key_text(&plain_key, format);
-            let files = unpack_backup(&bytes, &key_text, DEFAULT_MAX_OUTPUT)?;
+            let files = unpack_backup_owned(bytes, &key_text, DEFAULT_MAX_OUTPUT)?;
             let total_files = files.len();
-            let conversations = conversation_files(&files);
+            let conversations = conversation_files_owned(files);
             Ok::<_, BackupError>((total_files, conversations))
         })
         .await
@@ -1104,10 +1114,11 @@ impl HistorySyncManager {
             _ => String::new(),
         };
 
-        // Parse every SQLite conversation DB first so we can batch-resolve plain→noised IDs.
+        // Parse every SQLite conversation DB first so we can batch-resolve plain→noised IDs,
+        // consuming `conversations` so each raw SQLite buffer is freed immediately after parsing.
         let mut parsed: Vec<BackupConversation> = Vec::new();
         let mut unreadable = 0usize;
-        for file in &conversations {
+        for file in conversations {
             if !self.is_generation(gen) {
                 return Ok(());
             }
@@ -1243,9 +1254,10 @@ impl HistorySyncManager {
         let mut done = 0usize;
         let mut imported_chats = 0usize;
         let mut unmapped_chats = 0usize;
-        let total_convs = parsed.len().max(1);
+        let parsed_len = parsed.len();
+        let total_convs = parsed_len.max(1);
 
-        for conv in &parsed {
+        for conv in parsed {
             if !self.is_generation(gen) {
                 return Ok(());
             }
@@ -1284,7 +1296,7 @@ impl HistorySyncManager {
             if done < 3 {
                 self.log(format!(
                     "senders {}",
-                    describe_senders(conv, &own_id, &my_plain_uid)
+                    describe_senders(&conv, &own_id, &my_plain_uid)
                 ));
             }
 
@@ -1303,7 +1315,7 @@ impl HistorySyncManager {
             }
 
             let conv_counts = import_conversation_into_store(
-                conv,
+                &conv,
                 &own_id,
                 store,
                 |uid| self.deps.name_of(uid),
@@ -1318,7 +1330,6 @@ impl HistorySyncManager {
             }
             done += 1;
             let progress = (60 + (39 * done) / total_convs).min(99) as u8;
-            let parsed_len = parsed.len();
             self.update_status(|st| {
                 st.state = SyncState::Importing;
                 st.progress = progress;
@@ -1330,7 +1341,7 @@ impl HistorySyncManager {
         let chat_count = if imported_chats > 0 {
             imported_chats
         } else {
-            parsed.len().saturating_sub(unmapped_chats)
+            parsed_len.saturating_sub(unmapped_chats)
         };
         total.conversations = chat_count;
         self.log(format!(
@@ -1572,19 +1583,30 @@ pub fn router(state: AppState) -> Router<AppState> {
     let manager = HistorySyncManager::for_session(state.clone());
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let mut rx = state.session.subscribe_history_sync_controls();
+        let mut state_rx = state.session.subscribe_state();
         let mgr_bg = Arc::clone(&manager);
         handle.spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(val) => {
-                        if let Some(ctrl) = sync_control_of(&val) {
-                            mgr_bg.handle_control(ctrl);
+                tokio::select! {
+                    ev = rx.recv() => match ev {
+                        Ok(val) => {
+                            if let Some(ctrl) = sync_control_of(&val) {
+                                mgr_bg.handle_control(ctrl);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "History sync control receiver lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *state_rx.borrow_and_update() == crate::types::SessionState::LoggedOut {
+                            mgr_bg.cancel();
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "History sync control receiver lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -1931,6 +1953,7 @@ mod tests {
             delivered_to: None,
             seen_by: None,
             raw: None,
+            search_folded: Default::default(),
         });
 
         let conv = read_conversation(&fixture("sync_1001.db"), "1001", false)
@@ -1985,6 +2008,7 @@ mod tests {
             delivered_to: None,
             seen_by: None,
             raw: None,
+            search_folded: Default::default(),
         });
         import_conversation_into_store(&conv, OWN, &store2, |_| String::new(), None);
         assert_eq!(

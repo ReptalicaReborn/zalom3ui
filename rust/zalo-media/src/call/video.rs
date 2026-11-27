@@ -3,7 +3,7 @@
 //! frames > 1068 bytes split into 1068-byte chunks prefixed `[0x1c, flag]`
 //! (`0x80` first, `0x00` middle, `0x40` last), RTP marker bit on the final packet.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 pub const VIDEO_KEY_PT: u8 = 98;
 pub const VIDEO_DELTA_PT: u8 = 97;
@@ -22,6 +22,13 @@ pub struct VideoFrame {
     pub key: bool,
     pub timestamp: u32,
     pub data: Vec<u8>,
+}
+
+/// Reassembled frame paired with the 32-bit bitmask of H.264 NAL unit types present in `frame.data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledFrame {
+    pub frame: VideoFrame,
+    pub nal_types_mask: u32,
 }
 
 /// Incoming RTP video packet fed into [`VideoAssembler`].
@@ -88,32 +95,49 @@ pub fn packetize_frame(annex_b: &[u8], max_chunk: usize) -> Result<Vec<Vec<u8>>,
     Ok(out)
 }
 
-/// Extracts NAL units (without start codes) from an Annex-B buffer.
-pub fn nal_units(annex_b: &[u8]) -> Vec<&[u8]> {
-    let mut starts = Vec::new();
+/// Calls `f` for each NAL unit (without start codes) in an Annex-B buffer without allocating.
+fn for_each_nal_unit<'a>(annex_b: &'a [u8], mut f: impl FnMut(&'a [u8])) {
+    let len = annex_b.len();
     let mut i = 0usize;
-    while i + 2 < annex_b.len() {
+    let mut cur_start: Option<usize> = None;
+
+    while i + 2 < len {
+        if annex_b[i + 2] > 1 {
+            i += 3;
+            continue;
+        }
         if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
-            starts.push(i + 3);
+            if let Some(start) = cur_start {
+                let mut end = i;
+                while end > start && annex_b[end - 1] == 0 {
+                    end -= 1;
+                }
+                if end > start {
+                    f(&annex_b[start..end]);
+                }
+            }
+            cur_start = Some(i + 3);
             i += 3;
         } else {
             i += 1;
         }
     }
-    let mut out = Vec::with_capacity(starts.len());
-    for (k, &start) in starts.iter().enumerate() {
-        let mut end = if k + 1 < starts.len() {
-            starts[k + 1] - 3
-        } else {
-            annex_b.len()
-        };
+
+    if let Some(start) = cur_start {
+        let mut end = len;
         while end > start && annex_b[end - 1] == 0 {
             end -= 1;
         }
         if end > start {
-            out.push(&annex_b[start..end]);
+            f(&annex_b[start..end]);
         }
     }
+}
+
+/// Extracts NAL units (without start codes) from an Annex-B buffer.
+pub fn nal_units(annex_b: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    for_each_nal_unit(annex_b, |u| out.push(u));
     out
 }
 
@@ -133,6 +157,7 @@ struct Ready {
     key: bool,
     data: Vec<u8>,
     timestamp: u32,
+    nal_types_mask: u32,
     last: i64,
     since: i64,
 }
@@ -178,6 +203,11 @@ impl VideoAssembler {
         !self.started || self.need_key
     }
 
+    /// True when at least one partial or reordered frame is currently buffered.
+    pub fn has_buffered_frames(&self) -> bool {
+        !self.ready.is_empty() || !self.pending.is_empty()
+    }
+
     /// Maps a 16-bit sequence number to a monotonic extended index nearest `max_idx`.
     fn extend(&self, seq: u16) -> i64 {
         let seq_i = seq as i64;
@@ -196,9 +226,23 @@ impl VideoAssembler {
     }
 
     /// Feeds one RTP video packet, invoking `on_frame` and `on_key_needed` as frames become ready.
-    pub fn push<F, K>(&mut self, pkt: VideoPacket<'_>, now_ms: i64, mut on_frame: F, mut on_key_needed: K)
+    pub fn push<F, K>(&mut self, pkt: VideoPacket<'_>, now_ms: i64, mut on_frame: F, on_key_needed: K)
     where
         F: FnMut(VideoFrame),
+        K: FnMut(KeyNeededReason),
+    {
+        self.push_assembled(pkt, now_ms, |af| on_frame(af.frame), on_key_needed);
+    }
+
+    /// Like [`push`], but yields [`AssembledFrame`] including `nal_types_mask` to avoid rescanning NALs.
+    pub fn push_assembled<F, K>(
+        &mut self,
+        pkt: VideoPacket<'_>,
+        now_ms: i64,
+        mut on_frame: F,
+        mut on_key_needed: K,
+    ) where
+        F: FnMut(AssembledFrame),
         K: FnMut(KeyNeededReason),
     {
         if (pkt.payload_type != VIDEO_KEY_PT && pkt.payload_type != VIDEO_DELTA_PT) || pkt.payload.is_empty() {
@@ -261,16 +305,14 @@ impl VideoAssembler {
             }
             if pkt.marker {
                 f.end = Some(idx);
-                let to_drop: Vec<i64> = f.parts.range((idx + 1)..).map(|(&k, _)| k).collect();
-                for k in to_drop {
-                    if let Some(removed) = f.parts.remove(&k) {
-                        f.bytes -= removed.len();
+                if f.max_idx.is_some_and(|m| m > idx) {
+                    let to_drop: Vec<i64> = f.parts.range((idx + 1)..).map(|(&k, _)| k).collect();
+                    for k in to_drop {
+                        if let Some(removed) = f.parts.remove(&k) {
+                            f.bytes -= removed.len();
+                        }
                     }
-                }
-                if let Some(m) = f.max_idx {
-                    if m > idx {
-                        f.max_idx = Some(idx);
-                    }
+                    f.max_idx = Some(idx);
                 }
             }
             f.end.is_some()
@@ -283,9 +325,18 @@ impl VideoAssembler {
     }
 
     /// Lets the reorder window expire when no packet arrives to trigger it.
-    pub fn tick<F, K>(&mut self, now_ms: i64, mut on_frame: F, mut on_key_needed: K)
+    pub fn tick<F, K>(&mut self, now_ms: i64, mut on_frame: F, on_key_needed: K)
     where
         F: FnMut(VideoFrame),
+        K: FnMut(KeyNeededReason),
+    {
+        self.tick_assembled(now_ms, |af| on_frame(af.frame), on_key_needed);
+    }
+
+    /// Like [`tick`], yielding [`AssembledFrame`] with `nal_types_mask`.
+    pub fn tick_assembled<F, K>(&mut self, now_ms: i64, mut on_frame: F, mut on_key_needed: K)
+    where
+        F: FnMut(AssembledFrame),
         K: FnMut(KeyNeededReason),
     {
         self.flush(now_ms, &mut on_frame, &mut on_key_needed);
@@ -313,44 +364,69 @@ impl VideoAssembler {
         }
 
         let (_, f) = self.pending.remove(pos);
-        let mut data = Vec::with_capacity(f.bytes);
-        for part in f.parts.values() {
-            if is_fragment(part) {
-                data.extend_from_slice(&part[2..]);
-            } else {
-                data.extend_from_slice(part);
+        let mut data = if f.parts.len() == 1 {
+            let mut part = f.parts.into_values().next().unwrap();
+            if is_fragment(&part) {
+                part.drain(..2);
             }
-        }
+            part
+        } else {
+            let mut data = Vec::with_capacity(f.bytes);
+            for part in f.parts.values() {
+                if is_fragment(part) {
+                    data.extend_from_slice(&part[2..]);
+                } else {
+                    data.extend_from_slice(part);
+                }
+            }
+            data
+        };
 
-        let mut types = HashSet::new();
-        for u in nal_units(&data) {
+        let mut types_mask: u32 = 0;
+        let sps_slot = &mut self.sps;
+        let pps_slot = &mut self.pps;
+        for_each_nal_unit(&data, |u| {
             if u.is_empty() {
-                continue;
+                return;
             }
             let t = u[0] & 0x1f;
-            types.insert(t);
+            types_mask |= 1u32 << t;
             if t == 7 {
-                self.sps = Some(u.to_vec());
+                *sps_slot = Some(u.to_vec());
             } else if t == 8 {
-                self.pps = Some(u.to_vec());
+                *pps_slot = Some(u.to_vec());
             }
-        }
+        });
 
-        let key = f.key || types.contains(&5) || types.contains(&7);
+        let has_type = |mask: u32, t: u8| (mask & (1u32 << t)) != 0;
+        let key = f.key || has_type(types_mask, 5) || has_type(types_mask, 7);
         if key {
             if let Some(ref sps) = self.sps {
-                let missing_sps = !types.contains(&7);
-                let missing_pps = !types.contains(&8) && self.pps.is_some();
+                let missing_sps = !has_type(types_mask, 7);
+                let missing_pps = !has_type(types_mask, 8) && self.pps.is_some();
                 if missing_sps || missing_pps {
-                    let mut pre = Vec::new();
+                    let extra = (if missing_sps {
+                        START_CODE.len() + sps.len()
+                    } else {
+                        0
+                    }) + (if missing_pps {
+                        self.pps
+                            .as_ref()
+                            .map_or(0, |p| START_CODE.len() + p.len())
+                    } else {
+                        0
+                    });
+                    let mut pre = Vec::with_capacity(extra + data.len());
                     if missing_sps {
                         pre.extend_from_slice(START_CODE);
                         pre.extend_from_slice(sps);
+                        types_mask |= 1u32 << 7;
                     }
                     if missing_pps {
                         if let Some(ref pps) = self.pps {
                             pre.extend_from_slice(START_CODE);
                             pre.extend_from_slice(pps);
+                            types_mask |= 1u32 << 8;
                         }
                     }
                     pre.extend_from_slice(&data);
@@ -365,6 +441,7 @@ impl VideoAssembler {
                 key,
                 data,
                 timestamp,
+                nal_types_mask: types_mask,
                 last: end_idx,
                 since: now_ms,
             },
@@ -379,7 +456,7 @@ impl VideoAssembler {
 
     fn flush<F, K>(&mut self, now_ms: i64, on_frame: &mut F, on_key_needed: &mut K)
     where
-        F: FnMut(VideoFrame),
+        F: FnMut(AssembledFrame),
         K: FnMut(KeyNeededReason),
     {
         loop {
@@ -417,7 +494,7 @@ impl VideoAssembler {
 
     fn emit<F, K>(&mut self, fr: Ready, on_frame: &mut F, on_key_needed: &mut K)
     where
-        F: FnMut(VideoFrame),
+        F: FnMut(AssembledFrame),
         K: FnMut(KeyNeededReason),
     {
         self.last_idx = Some(fr.last);
@@ -433,10 +510,13 @@ impl VideoAssembler {
             if fr.key {
                 self.stats.keys += 1;
             }
-            on_frame(VideoFrame {
-                key: fr.key,
-                timestamp: fr.timestamp,
-                data: fr.data,
+            on_frame(AssembledFrame {
+                frame: VideoFrame {
+                    key: fr.key,
+                    timestamp: fr.timestamp,
+                    data: fr.data,
+                },
+                nal_types_mask: fr.nal_types_mask,
             });
         }
 

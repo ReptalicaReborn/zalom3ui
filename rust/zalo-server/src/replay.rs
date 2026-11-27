@@ -321,17 +321,81 @@ struct ClockFile {
     last_seen_ms: Option<i64>,
 }
 
+struct DiskWriter {
+    pending: Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>,
+    flush_scheduled: std::sync::atomic::AtomicBool,
+    io_lock: Mutex<()>,
+}
+
+impl DiskWriter {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pending: Mutex::new(std::collections::HashMap::new()),
+            flush_scheduled: std::sync::atomic::AtomicBool::new(false),
+            io_lock: Mutex::new(()),
+        })
+    }
+
+    fn write_value(self: &std::sync::Arc<Self>, path: PathBuf, value: &impl Serialize) {
+        use std::sync::atomic::Ordering;
+        let Ok(payload) = serde_json::to_vec(value) else {
+            return;
+        };
+        if let Ok(mut map) = self.pending.lock() {
+            map.insert(path, payload);
+        } else {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if self
+                .flush_scheduled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let writer = std::sync::Arc::clone(self);
+                handle.spawn_blocking(move || writer.flush_sync());
+            }
+        } else {
+            self.flush_sync();
+        }
+    }
+
+    fn flush_sync(&self) {
+        use std::sync::atomic::Ordering;
+        let Ok(_io) = self.io_lock.lock() else {
+            return;
+        };
+        loop {
+            let batch = {
+                let Ok(mut map) = self.pending.lock() else {
+                    self.flush_scheduled.store(false, Ordering::Release);
+                    return;
+                };
+                self.flush_scheduled.store(false, Ordering::Release);
+                if map.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *map)
+            };
+            for (path, payload) in batch {
+                write_atomic_bytes(&path, &payload);
+            }
+        }
+    }
+}
+
 /// Tracks the last listener disconnect (persisted, so it survives process death) to tell how long
 /// we were offline when the next `Connected` arrives.
 struct ListenerClock {
     path: PathBuf,
+    writer: std::sync::Arc<DiskWriter>,
     process_start_ms: i64,
     state: ClockFile,
     last_seen_written_ms: i64,
 }
 
 impl ListenerClock {
-    fn open(dir: &Path, now: i64) -> Self {
+    fn open(dir: &Path, now: i64, writer: std::sync::Arc<DiskWriter>) -> Self {
         let path = dir.join(CLOCK_FILE);
         let state = fs::read_to_string(&path)
             .ok()
@@ -339,6 +403,7 @@ impl ListenerClock {
             .unwrap_or_default();
         Self {
             path,
+            writer,
             process_start_ms: now,
             state,
             last_seen_written_ms: 0,
@@ -346,7 +411,7 @@ impl ListenerClock {
     }
 
     fn save(&self) {
-        write_atomic(&self.path, &self.state);
+        self.writer.write_value(self.path.clone(), &self.state);
     }
 
     /// Offline duration at `now` and where it started; then marks us connected.
@@ -380,11 +445,9 @@ impl ListenerClock {
     }
 }
 
-/// Writes `value` as JSON to `path` atomically (temp file in the same directory, then rename).
-fn write_atomic(path: &Path, value: &impl Serialize) {
-    let Ok(payload) = serde_json::to_vec(value) else {
-        return;
-    };
+/// Writes `payload` to `path` atomically (temp file in the same directory, then rename).
+/// Diagnostic files skip `fsync` to avoid flash stalls on mobile devices.
+fn write_atomic_bytes(path: &Path, payload: &[u8]) {
     if let Some(parent) = path.parent() {
         if create_dir_private(parent).is_err() {
             return;
@@ -393,8 +456,7 @@ fn write_atomic(path: &Path, value: &impl Serialize) {
     let tmp = path.with_extension("json.tmp");
     let result = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(&payload)?;
-        f.sync_all()?;
+        f.write_all(payload)?;
         drop(f);
         fs::rename(&tmp, path)
     })();
@@ -420,6 +482,7 @@ struct HubState {
 /// Replay reports, mode and listener clock for one session (all persisted in the data dir).
 pub struct ReplayHub {
     dir: PathBuf,
+    writer: std::sync::Arc<DiskWriter>,
     mode: Mutex<ReplayMode>,
     state: Mutex<HubState>,
 }
@@ -435,12 +498,14 @@ impl ReplayHub {
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .and_then(|v| v.get("mode").and_then(ReplayMode::parse))
             .unwrap_or_default();
+        let writer = DiskWriter::new();
         Self {
             dir: dir.to_path_buf(),
+            writer: std::sync::Arc::clone(&writer),
             mode: Mutex::new(mode),
             state: Mutex::new(HubState {
                 reports,
-                clock: ListenerClock::open(dir, now),
+                clock: ListenerClock::open(dir, now, writer),
             }),
         }
     }
@@ -456,10 +521,16 @@ impl ReplayHub {
     /// Sets and persists the replay-request mode.
     pub fn set_mode(&self, mode: ReplayMode) {
         *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
-        write_atomic(
-            &self.dir.join(MODE_FILE),
+        self.writer.write_value(
+            self.dir.join(MODE_FILE),
             &serde_json::json!({ "mode": mode.as_str() }),
         );
+    }
+
+    /// Waits for any queued replay/clock/mode writes to reach disk (on a blocking thread).
+    pub async fn flush(&self) {
+        let writer = std::sync::Arc::clone(&self.writer);
+        let _ = tokio::task::spawn_blocking(move || writer.flush_sync()).await;
     }
 
     /// Starts the report for a `Connected` and says which `lastId` to request for each kind.
@@ -590,7 +661,8 @@ impl ReplayHub {
     }
 
     fn save(&self, st: &HubState) {
-        write_atomic(&self.dir.join(REPORTS_FILE), &st.reports);
+        self.writer
+            .write_value(self.dir.join(REPORTS_FILE), &st.reports);
     }
 }
 

@@ -13,7 +13,8 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use zalo_proto::framelog::FrameReport;
@@ -23,16 +24,108 @@ pub const MAX_ENTRIES: usize = 500;
 /// The file is rewritten down to [`MAX_ENTRIES`] lines once it reaches this many.
 const COMPACT_AT: usize = MAX_ENTRIES * 2;
 const FILE_NAME: &str = "socket-log.jsonl";
+const FLUSH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 struct Inner {
     entries: VecDeque<FrameReport>,
     file_lines: usize,
+    pending_lines: Vec<String>,
+    pending_clear: bool,
+    flush_scheduled: bool,
+}
+
+struct SharedLog {
+    file: PathBuf,
+    inner: Mutex<Inner>,
+    io_lock: Mutex<()>,
+}
+
+fn is_keepalive_ping_reply(report: &FrameReport) -> bool {
+    report.version == 1
+        && report.cmd == 2
+        && report.error.is_none()
+        && report.arrays.is_empty()
+}
+
+impl SharedLog {
+    fn flush_disk(&self) {
+        let Ok(_io) = self.io_lock.lock() else {
+            return;
+        };
+
+        enum Action {
+            None,
+            Clear,
+            Append(Vec<String>),
+            Compact(String),
+        }
+
+        let (do_clear, action) = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.flush_scheduled = false;
+            let do_clear = inner.pending_clear;
+            inner.pending_clear = false;
+            let lines = std::mem::take(&mut inner.pending_lines);
+
+            if lines.is_empty() {
+                (do_clear, if do_clear { Action::Clear } else { Action::None })
+            } else if inner.file_lines + lines.len() >= COMPACT_AT {
+                let mut text = String::new();
+                for r in &inner.entries {
+                    if !is_keepalive_ping_reply(r) {
+                        if let Ok(line) = serde_json::to_string(r) {
+                            text.push_str(&line);
+                            text.push('\n');
+                        }
+                    }
+                }
+                inner.file_lines = inner
+                    .entries
+                    .iter()
+                    .filter(|r| !is_keepalive_ping_reply(r))
+                    .count();
+                (false, Action::Compact(text))
+            } else {
+                inner.file_lines += lines.len();
+                (do_clear, Action::Append(lines))
+            }
+        };
+
+        if do_clear {
+            let _ = fs::remove_file(&self.file);
+        }
+        match action {
+            Action::None | Action::Clear => {}
+            Action::Append(lines) => {
+                if let Some(parent) = self.file.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.file) {
+                    for line in &lines {
+                        if writeln!(f, "{line}").is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Action::Compact(text) => {
+                if let Some(parent) = self.file.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let tmp = self.file.with_extension("jsonl.tmp");
+                if fs::write(&tmp, text).is_ok() {
+                    let _ = fs::rename(&tmp, &self.file);
+                }
+            }
+        }
+    }
 }
 
 /// Bounded in-memory log with a JSONL file behind it.
 pub struct SocketLog {
-    file: PathBuf,
-    inner: Mutex<Inner>,
+    shared: Arc<SharedLog>,
 }
 
 impl SocketLog {
@@ -53,48 +146,99 @@ impl SocketLog {
             }
         }
         Self {
-            file,
-            inner: Mutex::new(Inner { entries, file_lines }),
+            shared: Arc::new(SharedLog {
+                file,
+                inner: Mutex::new(Inner {
+                    entries,
+                    file_lines,
+                    pending_lines: Vec::new(),
+                    pending_clear: false,
+                    flush_scheduled: false,
+                }),
+                io_lock: Mutex::new(()),
+            }),
         }
     }
 
-    /// Records one frame (and appends it to the file). Never panics, never blocks on I/O errors.
+    /// Records one frame (and persists non-keepalive frames to disk).
+    /// When running inside Tokio, JSONL append and compaction are batched on `spawn_blocking`
+    /// so WS frame dispatch never blocks on filesystem I/O.
     pub fn record(&self, report: FrameReport) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
+        let persist_line = if is_keepalive_ping_reply(&report) {
+            None
+        } else {
+            serde_json::to_string(&report).ok()
         };
-        if let Ok(line) = serde_json::to_string(&report) {
-            self.append_line(&mut inner, &line);
+
+        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+        let mut schedule_async = false;
+        let mut flush_sync_now = false;
+
+        {
+            let Ok(mut inner) = self.shared.inner.lock() else {
+                return;
+            };
+            if inner.entries.len() == MAX_ENTRIES {
+                inner.entries.pop_front();
+            }
+            inner.entries.push_back(report);
+            if let Some(line) = persist_line {
+                inner.pending_lines.push(line);
+                if tokio_handle.is_some() {
+                    if !inner.flush_scheduled {
+                        inner.flush_scheduled = true;
+                        schedule_async = true;
+                    }
+                } else {
+                    flush_sync_now = true;
+                }
+            }
         }
-        if inner.entries.len() == MAX_ENTRIES {
-            inner.entries.pop_front();
-        }
-        inner.entries.push_back(report);
-        if inner.file_lines >= COMPACT_AT {
-            self.compact(&mut inner);
+
+        if schedule_async {
+            if let Some(handle) = tokio_handle {
+                let shared = Arc::clone(&self.shared);
+                handle.spawn(async move {
+                    tokio::time::sleep(FLUSH_DEBOUNCE).await;
+                    let _ = tokio::task::spawn_blocking(move || shared.flush_disk()).await;
+                });
+            }
+        } else if flush_sync_now {
+            self.shared.flush_disk();
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|i| i.entries.len()).unwrap_or(0)
+        self.shared.inner.lock().map(|i| i.entries.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Drops all entries and the file.
+    /// Drops all entries and removes the backing file.
     pub fn clear(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
+        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+        {
+            let Ok(mut inner) = self.shared.inner.lock() else {
+                return;
+            };
             inner.entries.clear();
             inner.file_lines = 0;
-            let _ = fs::remove_file(&self.file);
+            inner.pending_lines.clear();
+            inner.pending_clear = true;
+        }
+        if let Some(handle) = tokio_handle {
+            let shared = Arc::clone(&self.shared);
+            handle.spawn_blocking(move || shared.flush_disk());
+        } else {
+            self.shared.flush_disk();
         }
     }
 
     /// Plain-text rendering, newest first.
     pub fn render_text(&self) -> String {
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(inner) = self.shared.inner.lock() else {
             return String::new();
         };
         let mut out = String::new();
@@ -110,31 +254,6 @@ impl SocketLog {
             render_entry(&mut out, r);
         }
         out
-    }
-
-    fn append_line(&self, inner: &mut Inner, line: &str) {
-        if let Some(parent) = self.file.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.file) {
-            if writeln!(f, "{line}").is_ok() {
-                inner.file_lines += 1;
-            }
-        }
-    }
-
-    fn compact(&self, inner: &mut Inner) {
-        let tmp = self.file.with_extension("jsonl.tmp");
-        let mut text = String::new();
-        for r in &inner.entries {
-            if let Ok(line) = serde_json::to_string(r) {
-                text.push_str(&line);
-                text.push('\n');
-            }
-        }
-        if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &self.file).is_ok() {
-            inner.file_lines = inner.entries.len();
-        }
     }
 }
 

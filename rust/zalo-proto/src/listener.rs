@@ -15,9 +15,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::crypto::{decode_event_payload, parse_json_keeping_bigints};
+use crate::crypto::{
+    decode_event_payload, decode_event_payload_with_cipher, parse_json_keeping_bigints, EventCipher,
+};
 use crate::error::{ProtoError, Result};
-use crate::framelog::{FrameReport, ItemReport};
+use crate::framelog::{FrameReport, ItemReport, MAX_ITEMS};
 use crate::http::ZaloHttp;
 use crate::types::{FileDonePayload, RawWsMessage, ThreadType, WsEvent, ZaloContext};
 
@@ -382,6 +384,7 @@ async fn run_listener_loop(
         let _ = event_tx.send(WsEvent::Connected);
         let (mut ws_sink, mut ws_read) = ws_stream.split();
         let mut cipher_key: Option<String> = None;
+        let mut event_cipher: Option<EventCipher> = None;
         let mut ping_active = false;
         let mut ping_interval =
             tokio::time::interval(Duration::from_millis(policy.ping_interval_ms));
@@ -423,7 +426,13 @@ async fn run_listener_loop(
                 msg = ws_read.next() => {
                     match msg {
                         Some(Ok(Message::Binary(bytes))) => {
-                            let (events, frame_report) = dispatch_frame_traced(&bytes, &mut cipher_key, &ctx, self_listen);
+                            let (events, frame_report) = dispatch_frame_traced_with_cipher(
+                                &bytes,
+                                &mut cipher_key,
+                                &mut event_cipher,
+                                &ctx,
+                                self_listen,
+                            );
                             if let Some(report) = frame_report {
                                 let _ = event_tx.send(WsEvent::Frame(report));
                             }
@@ -557,11 +566,29 @@ pub fn dispatch_frame_traced(
     ctx: &ZaloContext,
     self_listen: bool,
 ) -> (Vec<WsEvent>, Option<FrameReport>) {
+    dispatch_frame_traced_with_cipher(frame, cipher_key, &mut None, ctx, self_listen)
+}
+
+fn dispatch_frame_traced_with_cipher(
+    frame: &[u8],
+    cipher_key: &mut Option<String>,
+    event_cipher: &mut Option<EventCipher>,
+    ctx: &ZaloContext,
+    self_listen: bool,
+) -> (Vec<WsEvent>, Option<FrameReport>) {
     let Some((version, cmd, sub_cmd)) = decode_frame_header(frame) else {
         return (Vec::new(), None);
     };
     let mut report = FrameReport::new(version, cmd, sub_cmd);
-    let events = dispatch_body(frame, (version, cmd, sub_cmd), cipher_key, ctx, self_listen, &mut report);
+    let events = dispatch_body(
+        frame,
+        (version, cmd, sub_cmd),
+        cipher_key,
+        event_cipher,
+        ctx,
+        self_listen,
+        &mut report,
+    );
     (events, Some(report))
 }
 
@@ -569,6 +596,7 @@ fn dispatch_body(
     frame: &[u8],
     (version, cmd, sub_cmd): (u8, u16, u8),
     cipher_key: &mut Option<String>,
+    event_cipher: &mut Option<EventCipher>,
     ctx: &ZaloContext,
     self_listen: bool,
     report: &mut FrameReport,
@@ -594,6 +622,7 @@ fn dispatch_body(
     if version == 1 && cmd == 1 && sub_cmd == 1 {
         if let Some(key) = parsed.get("key").and_then(|v| v.as_str()) {
             *cipher_key = Some(key.to_string());
+            *event_cipher = EventCipher::from_base64_key(key).ok();
             return vec![WsEvent::CipherKey(key.to_string())];
         }
     }
@@ -624,7 +653,11 @@ fn dispatch_body(
             .get("data")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ProtoError::WebSocket("missing data string".into()))?;
-        decode_event_payload(encrypt, data, cipher_key.as_deref())
+        if event_cipher.is_some() {
+            decode_event_payload_with_cipher(encrypt, data, event_cipher.as_ref())
+        } else {
+            decode_event_payload(encrypt, data, cipher_key.as_deref())
+        }
     };
 
     let own_id = ctx.uid.as_str();
@@ -1105,48 +1138,72 @@ fn collect_list(
     let Some(list) = inner.get(name).and_then(|v| v.as_array()) else {
         return;
     };
-    let mut items = Vec::with_capacity(list.len().min(32));
+    let mut items = Vec::with_capacity(list.len().min(MAX_ITEMS));
     for item in list {
-        let mut ir = ItemReport::describe(item, ctl.own_id);
+        let mut ir = (items.len() < MAX_ITEMS).then(|| ItemReport::describe(item, ctl.own_id));
         let undo = is_undo_content(item.get("content"));
         match mode {
             ListMode::WsLive | ListMode::WsOld => {
                 if !item.is_object() {
-                    ir.dropped("not an object");
+                    if let Some(ir) = ir.as_mut() {
+                        ir.dropped("not an object");
+                    }
                 } else if mode == ListMode::WsLive && undo {
                     match normalize_ws_message(item, thread_type, ctl.own_id, false) {
                         Some(u) if !u.is_self || ctl.self_listen => {
                             out.undos.push(u);
-                            ir.undo();
+                            if let Some(ir) = ir.as_mut() {
+                                ir.undo();
+                            }
                         }
-                        _ => ir.dropped("own undo (selfListen off)"),
+                        _ => {
+                            if let Some(ir) = ir.as_mut() {
+                                ir.dropped("own undo (selfListen off)");
+                            }
+                        }
                     }
                 } else {
                     match normalize_ws_message(item, thread_type, ctl.own_id, true) {
                         Some(m) if mode == ListMode::WsOld || !m.is_self || ctl.self_listen => {
                             if m.thread_id.is_empty() || m.thread_id == "0" {
                                 // Kept as before; the store decides. Flag it for the log.
-                                ir.note = Some("thread id empty/0");
+                                if let Some(ir) = ir.as_mut() {
+                                    ir.note = Some("thread id empty/0");
+                                }
                             }
                             out.msgs.push(m);
-                            ir.kept();
+                            if let Some(ir) = ir.as_mut() {
+                                ir.kept();
+                            }
                         }
-                        _ => ir.dropped("own message (selfListen off)"),
+                        _ => {
+                            if let Some(ir) = ir.as_mut() {
+                                ir.dropped("own message (selfListen off)");
+                            }
+                        }
                     }
                 }
             }
             ListMode::Page => match try_normalize_page(item, thread_type, ctl.own_id) {
                 Ok(m) => {
-                    if is_e2ee_type(item.get("msgType").and_then(|v| v.as_str())) {
-                        ir.note = Some("e2ee-masked");
+                    if let Some(ir) = ir.as_mut() {
+                        if is_e2ee_type(item.get("msgType").and_then(|v| v.as_str())) {
+                            ir.note = Some("e2ee-masked");
+                        }
+                        ir.kept();
                     }
                     out.msgs.push(m);
-                    ir.kept();
                 }
-                Err(reason) => ir.dropped(reason),
+                Err(reason) => {
+                    if let Some(ir) = ir.as_mut() {
+                        ir.dropped(reason);
+                    }
+                }
             },
         }
-        items.push(ir);
+        if let Some(ir) = ir {
+            items.push(ir);
+        }
     }
     report.set_items(name, items);
 }

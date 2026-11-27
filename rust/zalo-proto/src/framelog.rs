@@ -12,18 +12,22 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Max items described per array (the length is always exact).
-const MAX_ITEMS: usize = 20;
+pub(crate) const MAX_ITEMS: usize = 20;
 const MAX_KEYS: usize = 24;
 
 /// Keeps `[A-Za-z0-9._:-]` and caps the length; anything else becomes `?`. Used for every
 /// wire-supplied string that ends up in the log (keys, msgType, act, ids).
 pub fn safe_token(s: &str, max: usize) -> String {
-    let mut out: String = s
-        .chars()
-        .take(max)
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '?' })
-        .collect();
-    if s.chars().count() > max {
+    let mut out = String::with_capacity(s.len().min(max + 1));
+    let mut chars = s.chars();
+    for c in chars.by_ref().take(max) {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+            out.push(c);
+        } else {
+            out.push('?');
+        }
+    }
+    if chars.next().is_some() {
         out.push('~');
     }
     out
@@ -60,19 +64,28 @@ pub fn describe_content(content: Option<&Value>) -> String {
 
 /// `zero` (uidFrom 0 = own account), `own`, `other` or `missing`.
 pub fn uid_class(uid_from: Option<&Value>, own_id: &str) -> &'static str {
-    let s = match uid_from {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => String::new(),
-    };
-    if s.is_empty() {
-        "missing"
-    } else if s == "0" {
-        "zero"
-    } else if !own_id.is_empty() && s == own_id {
-        "own"
-    } else {
-        "other"
+    match uid_from {
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                "missing"
+            } else if s == "0" {
+                "zero"
+            } else if !own_id.is_empty() && s == own_id {
+                "own"
+            } else {
+                "other"
+            }
+        }
+        Some(Value::Number(n)) => {
+            if n.as_u64() == Some(0) || n.as_i64() == Some(0) {
+                "zero"
+            } else if !own_id.is_empty() && n.to_string() == own_id {
+                "own"
+            } else {
+                "other"
+            }
+        }
+        _ => "missing",
     }
 }
 
@@ -287,6 +300,8 @@ impl FrameReport {
             a.read = true;
             if items.len() > MAX_ITEMS {
                 items.truncate(MAX_ITEMS);
+                a.items_truncated = true;
+            } else if a.len > MAX_ITEMS {
                 a.items_truncated = true;
             }
             a.items = items;

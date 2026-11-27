@@ -17,10 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::call::rtcp::{
     parse_rtcp, pli, receiver_report, sdes_cname, sender_report, ReceiveStats, RtcpPacket,
 };
-use crate::call::srtp::{rtp_header, SrtpContext};
+use crate::call::srtp::{rtp_header, SrtpContext, AUTH_TAG_LEN};
 use crate::call::video::{
-    nal_units, packetize_frame, AssemblerStats, VideoAssembler, VideoFrame, VideoPacket, MAX_CHUNK,
-    VIDEO_DELTA_PT, VIDEO_KEY_PT,
+    packetize_frame, AssembledFrame, AssemblerStats, VideoAssembler, VideoFrame, VideoPacket,
+    MAX_CHUNK, VIDEO_DELTA_PT, VIDEO_KEY_PT,
 };
 use crate::call::zrtc::{self, cmd, kind, InitCallParams, Packet};
 
@@ -244,6 +244,19 @@ fn ip_matches(from: IpAddr, target: IpAddr) -> bool {
     }
 }
 
+fn media_kind_name(k: u8) -> Option<&'static str> {
+    match k {
+        kind::AUDIO => Some("media_3"),
+        kind::AUDIO_IN => Some("media_4"),
+        kind::AUDIO_RTCP => Some("media_5"),
+        kind::AUDIO_FEC => Some("media_7"),
+        kind::VIDEO => Some("media_13"),
+        kind::VIDEO_IN => Some("media_14"),
+        kind::VIDEO_RTCP => Some("media_15"),
+        _ => None,
+    }
+}
+
 /// Pure protocol state machine driving one call's media session.
 pub(crate) struct MediaEngine {
     opts: MediaCallOptions,
@@ -253,6 +266,7 @@ pub(crate) struct MediaEngine {
     pub nat_address: Option<String>,
     srtp: SrtpContext,
     video_srtp: SrtpContext,
+    rx_scratch: Vec<u8>,
     ssrc: u32,
     video_ssrc: u32,
     seq: u16,
@@ -312,6 +326,7 @@ impl MediaEngine {
             nat_address: None,
             srtp,
             video_srtp,
+            rx_scratch: Vec::with_capacity(1500),
             ssrc: audio_ssrc,
             video_ssrc,
             seq: rng.gen_range(0..0x8000),
@@ -342,23 +357,47 @@ impl MediaEngine {
         })
     }
 
+    /// True when the 50 ms video reorder/PLI timer needs to run (false on audio-only calls).
+    pub fn needs_video_tick(&self) -> bool {
+        self.incoming_video.is_some()
+            && (self.assembler.has_buffered_frames() || self.assembler.waiting_for_key())
+    }
+
     fn emit_log(&self, entry: Value) {
         let _ = self.event_tx.send(MediaEvent::Log(entry));
     }
 
     fn count_sent(&mut self, what: &str) {
-        *self.stats.sent.entry(what.to_string()).or_insert(0) += 1;
+        if let Some(c) = self.stats.sent.get_mut(what) {
+            *c += 1;
+        } else {
+            self.stats.sent.insert(what.to_string(), 1);
+        }
     }
 
     fn count_received(&mut self, what: &str) {
-        if !self.stats.received.contains_key(what) {
-            if self.received_key_count >= MAX_RECEIVED_KEYS {
-                *self.stats.received.entry("other_cmd".to_string()).or_insert(0) += 1;
-                return;
-            }
-            self.received_key_count += 1;
+        if let Some(c) = self.stats.received.get_mut(what) {
+            *c += 1;
+            return;
         }
-        *self.stats.received.entry(what.to_string()).or_insert(0) += 1;
+        if self.received_key_count >= MAX_RECEIVED_KEYS {
+            if let Some(c) = self.stats.received.get_mut("other_cmd") {
+                *c += 1;
+            } else {
+                self.stats.received.insert("other_cmd".to_string(), 1);
+            }
+            return;
+        }
+        self.received_key_count += 1;
+        self.stats.received.insert(what.to_string(), 1);
+    }
+
+    fn count_rtcp_type(&mut self, what: &str) {
+        if let Some(c) = self.stats.rtcp.types.get_mut(what) {
+            *c += 1;
+        } else {
+            self.stats.rtcp.types.insert(what.to_string(), 1);
+        }
     }
 
     fn queue_send(&mut self, pkt: Vec<u8>, what: &str, out: &mut Vec<Vec<u8>>) {
@@ -416,13 +455,19 @@ impl MediaEngine {
         if self.closed {
             return;
         }
-        let mut rtp = Vec::with_capacity(12 + opus.len());
-        rtp.push(0x80);
-        rtp.push(OPUS_PT | if self.first_audio { 0x80 } else { 0 });
-        rtp.extend_from_slice(&self.seq.to_be_bytes());
-        rtp.extend_from_slice(&self.ts.to_be_bytes());
-        rtp.extend_from_slice(&self.ssrc.to_be_bytes());
-        rtp.extend_from_slice(opus);
+        let srtp_len = 12 + opus.len() + AUTH_TAG_LEN;
+        if srtp_len > zrtc::MAX_PAYLOAD {
+            return;
+        }
+        let mut pkt = Vec::with_capacity(5 + srtp_len);
+        pkt.push(kind::AUDIO);
+        pkt.extend_from_slice(&token.to_le_bytes());
+        pkt.push(0x80);
+        pkt.push(OPUS_PT | if self.first_audio { 0x80 } else { 0 });
+        pkt.extend_from_slice(&self.seq.to_be_bytes());
+        pkt.extend_from_slice(&self.ts.to_be_bytes());
+        pkt.extend_from_slice(&self.ssrc.to_be_bytes());
+        pkt.extend_from_slice(opus);
 
         self.first_audio = false;
         self.seq = self.seq.wrapping_add(1);
@@ -432,10 +477,8 @@ impl MediaEngine {
         self.sent_packets = self.sent_packets.wrapping_add(1);
         self.sent_octets = self.sent_octets.wrapping_add(opus.len() as u32);
 
-        if let Ok(protected) = self.srtp.protect(&rtp) {
-            if let Ok(pkt) = zrtc::audio(token, &protected) {
-                self.queue_send(pkt, "audio", out);
-            }
+        if self.srtp.protect_in_place(&mut pkt, 5).is_ok() {
+            self.queue_send(pkt, "audio", out);
         }
     }
 
@@ -456,24 +499,26 @@ impl MediaEngine {
         };
         let ts = self.video_timestamp();
         let total = chunks.len();
+        let pt = if key { VIDEO_KEY_PT } else { VIDEO_DELTA_PT };
         for (i, chunk) in chunks.iter().enumerate() {
-            let mut rtp = Vec::with_capacity(12 + chunk.len());
-            rtp.push(0x80);
-            let pt = if key { VIDEO_KEY_PT } else { VIDEO_DELTA_PT };
-            rtp.push(pt | if i + 1 == total { 0x80 } else { 0 });
-            rtp.extend_from_slice(&self.v_seq.to_be_bytes());
-            rtp.extend_from_slice(&ts.to_be_bytes());
-            rtp.extend_from_slice(&self.video_ssrc.to_be_bytes());
-            rtp.extend_from_slice(chunk);
+            let srtp_len = 12 + chunk.len() + AUTH_TAG_LEN;
+            let mut pkt = Vec::with_capacity(5 + srtp_len);
+            pkt.push(kind::VIDEO);
+            pkt.extend_from_slice(&token.to_le_bytes());
+            pkt.push(0x80);
+            pkt.push(pt | if i + 1 == total { 0x80 } else { 0 });
+            pkt.extend_from_slice(&self.v_seq.to_be_bytes());
+            pkt.extend_from_slice(&ts.to_be_bytes());
+            pkt.extend_from_slice(&self.video_ssrc.to_be_bytes());
+            pkt.extend_from_slice(chunk);
 
             self.v_seq = self.v_seq.wrapping_add(1);
             self.v_sent_packets = self.v_sent_packets.wrapping_add(1);
             self.v_sent_octets = self.v_sent_octets.wrapping_add(chunk.len() as u32);
 
-            if let Ok(protected) = self.video_srtp.protect(&rtp) {
-                if let Ok(pkt) = zrtc::video(token, &protected) {
-                    self.queue_send(pkt, "video", out);
-                }
+            if srtp_len <= zrtc::MAX_PAYLOAD && self.video_srtp.protect_in_place(&mut pkt, 5).is_ok()
+            {
+                self.queue_send(pkt, "video", out);
             }
         }
         self.stats.video.sent_frames += 1;
@@ -562,7 +607,7 @@ impl MediaEngine {
         let mut frames = Vec::new();
         let mut asks = Vec::new();
         self.assembler
-            .tick(now, |f| frames.push(f), |w| asks.push(w));
+            .tick_assembled(now, |f| frames.push(f), |w| asks.push(w));
         self.sync_assembler_stats();
         for f in frames {
             self.on_video_frame(f);
@@ -585,14 +630,15 @@ impl MediaEngine {
         v.dropped = a.dropped + r.dropped;
     }
 
-    fn on_video_frame(&mut self, frame: VideoFrame) {
-        for u in nal_units(&frame.data) {
-            if !u.is_empty() {
-                *self.stats.video.nal_types.entry(u[0] & 0x1f).or_insert(0) += 1;
-            }
+    fn on_video_frame(&mut self, assembled: AssembledFrame) {
+        let mut mask = assembled.nal_types_mask;
+        while mask != 0 {
+            let t = mask.trailing_zeros() as u8;
+            *self.stats.video.nal_types.entry(t).or_insert(0) += 1;
+            mask &= mask - 1;
         }
         self.sync_assembler_stats();
-        let _ = self.event_tx.send(MediaEvent::Video(frame));
+        let _ = self.event_tx.send(MediaEvent::Video(assembled.frame));
     }
 
     /// Processes one incoming UDP datagram. Returns `Some(true)` on InitCall success or `Some(false)` on InitCall error.
@@ -684,7 +730,11 @@ impl MediaEngine {
                 token,
                 payload,
             } => {
-                self.count_received(&format!("media_{k}"));
+                if let Some(name) = media_kind_name(k) {
+                    self.count_received(name);
+                } else {
+                    self.count_received(&format!("media_{k}"));
+                }
                 match k {
                     kind::AUDIO_IN => self.on_audio(&payload, now),
                     kind::AUDIO_RTCP => {
@@ -734,13 +784,13 @@ impl MediaEngine {
         for p in parse_rtcp(payload) {
             match p {
                 RtcpPacket::Pli { media_ssrc, .. } => {
-                    *self.stats.rtcp.types.entry("PLI".to_string()).or_insert(0) += 1;
+                    self.count_rtcp_type("PLI");
                     if media_ssrc == self.video_ssrc {
                         self.on_key_request("PLI", now);
                     }
                 }
                 RtcpPacket::Fir { media_ssrc, .. } => {
-                    *self.stats.rtcp.types.entry("FIR".to_string()).or_insert(0) += 1;
+                    self.count_rtcp_type("FIR");
                     if media_ssrc == self.video_ssrc {
                         self.on_key_request("FIR", now);
                     }
@@ -752,7 +802,7 @@ impl MediaEngine {
                     blocks,
                     ..
                 } => {
-                    *self.stats.rtcp.types.entry("SR".to_string()).or_insert(0) += 1;
+                    self.count_rtcp_type("SR");
                     if video {
                         if let Some(inc) = self.incoming_video.as_mut() {
                             if inc.ssrc == ssrc {
@@ -775,7 +825,7 @@ impl MediaEngine {
                     }
                 }
                 RtcpPacket::Rr { blocks, .. } => {
-                    *self.stats.rtcp.types.entry("RR".to_string()).or_insert(0) += 1;
+                    self.count_rtcp_type("RR");
                     if !video {
                         if let Some(about) = blocks.iter().find(|b| b.ssrc == self.ssrc) {
                             self.stats.rtcp.their_view = Some(TheirView {
@@ -787,12 +837,8 @@ impl MediaEngine {
                     }
                 }
                 RtcpPacket::Other { packet_type, .. } => {
-                    *self
-                        .stats
-                        .rtcp
-                        .types
-                        .entry(packet_type.to_string())
-                        .or_insert(0) += 1;
+                    let s = packet_type.to_string();
+                    self.count_rtcp_type(&s);
                 }
             }
         }
@@ -811,11 +857,7 @@ impl MediaEngine {
     fn on_video(&mut self, payload: &[u8], now: i64, out: &mut Vec<Vec<u8>>) {
         self.stats.video.packets += 1;
         self.stats.video.bytes += payload.len() as u64;
-        let Some(rtp) = self.video_srtp.unprotect(payload) else {
-            self.stats.video.failed += 1;
-            return;
-        };
-        let Some(h) = rtp_header(&rtp) else {
+        let Some(h) = self.video_srtp.unprotect_into(payload, &mut self.rx_scratch) else {
             self.stats.video.failed += 1;
             return;
         };
@@ -854,13 +896,13 @@ impl MediaEngine {
 
         let mut frames = Vec::new();
         let mut asks = Vec::new();
-        self.assembler.push(
+        self.assembler.push_assembled(
             VideoPacket {
                 seq: h.seq,
                 timestamp: h.timestamp,
                 payload_type: h.payload_type,
                 marker: h.marker,
-                payload: &rtp[h.header_length..],
+                payload: &self.rx_scratch[h.header_length..],
             },
             now,
             |f| frames.push(f),
@@ -878,9 +920,9 @@ impl MediaEngine {
     fn on_audio(&mut self, payload: &[u8], now: i64) {
         self.stats.audio.packets += 1;
         self.stats.audio.bytes += payload.len() as u64;
-        if rtp_header(payload).is_none() {
+        let Some(h) = self.srtp.unprotect_into(payload, &mut self.rx_scratch) else {
             self.stats.audio.failed += 1;
-            if self.logged_unknown < 5 {
+            if self.logged_unknown < 5 && rtp_header(payload).is_none() {
                 self.logged_unknown += 1;
                 self.emit_log(json!({
                     "kind": "media_not_rtp",
@@ -888,14 +930,6 @@ impl MediaEngine {
                     "bytes": payload.len(),
                 }));
             }
-            return;
-        }
-        let Some(rtp) = self.srtp.unprotect(payload) else {
-            self.stats.audio.failed += 1;
-            return;
-        };
-        let Some(h) = rtp_header(&rtp) else {
-            self.stats.audio.failed += 1;
             return;
         };
         self.stats.audio.decrypted += 1;
@@ -928,17 +962,17 @@ impl MediaEngine {
             }
         }
         self.last_ts = Some(h.timestamp);
-        if rtp.len() > h.header_length {
+        if self.rx_scratch.len() > h.header_length {
             if self.stats.audio.opus_toc.len() < 5 {
                 self.stats
                     .audio
                     .opus_toc
-                    .push(format!("{:02x}", rtp[h.header_length]));
+                    .push(format!("{:02x}", self.rx_scratch[h.header_length]));
             }
             let _ = self.event_tx.send(MediaEvent::Audio {
                 seq: h.seq,
                 timestamp: h.timestamp,
-                opus: rtp[h.header_length..].to_vec(),
+                opus: self.rx_scratch[h.header_length..].to_vec(),
             });
         }
     }
@@ -960,6 +994,7 @@ enum MediaCmd {
         why: String,
         min_gap_ms: i64,
     },
+    GetStats(oneshot::Sender<MediaStats>),
     Close {
         send_end_call: bool,
     },
@@ -1072,6 +1107,18 @@ impl MediaCall {
             .unwrap_or_default()
     }
 
+    /// Queries an exact up-to-the-packet telemetry snapshot directly from the media actor,
+    /// falling back to the last synced snapshot if the loop has already exited.
+    pub async fn stats_async(&self) -> MediaStats {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(MediaCmd::GetStats(tx)).is_ok() {
+            if let Ok(st) = rx.await {
+                return st;
+            }
+        }
+        self.stats()
+    }
+
     /// Returns the server-assigned stream token once joined.
     pub fn token(&self) -> Option<u32> {
         self.shared.read().ok().and_then(|s| s.token)
@@ -1091,11 +1138,33 @@ async fn flush_outbound(socket: &UdpSocket, dest: SocketAddr, out: &mut Vec<Vec<
     }
 }
 
-fn sync_shared(shared: &Arc<RwLock<SharedState>>, engine: &MediaEngine) {
+fn sync_join_shared(shared: &Arc<RwLock<SharedState>>, engine: &MediaEngine) {
     if let Ok(mut s) = shared.write() {
-        s.stats = engine.stats.clone();
         s.token = engine.token;
         s.nat_address = engine.nat_address.clone();
+        s.stats = engine.stats.clone();
+    }
+}
+
+fn sync_stats_only(shared: &Arc<RwLock<SharedState>>, engine: &MediaEngine) {
+    if let Ok(mut s) = shared.write() {
+        s.stats = engine.stats.clone();
+    }
+}
+
+fn next_silence_deadline(last_audio_at: Option<tokio::time::Instant>) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let stall_window = Duration::from_millis(3 * FRAME_MS + 1);
+    match last_audio_at {
+        Some(t) => {
+            let stall_at = t + stall_window;
+            if stall_at > now {
+                stall_at
+            } else {
+                now + Duration::from_millis(FRAME_MS)
+            }
+        }
+        None => now + Duration::from_millis(FRAME_MS),
     }
 }
 
@@ -1111,12 +1180,17 @@ async fn run_media_loop(
 
     let mut joined = false;
     let mut silence_active = false;
+    let mut stats_dirty = false;
+    let mut video_tick_armed = false;
+    let mut last_audio_at: Option<tokio::time::Instant> = None;
     let mut join_reply: Option<oneshot::Sender<Option<u32>>> = None;
     let mut init_pkt: Option<Vec<u8>> = None;
 
     let mut init_retry_tick = tokio::time::interval(Duration::from_secs(3600));
     init_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut join_deadline: Option<tokio::time::Instant> = None;
+    let mut join_deadline_active = false;
+    let join_sleep = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(join_sleep);
 
     let mut ping_tick = tokio::time::interval(Duration::from_millis(engine.opts.ping_ms.max(10)));
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1124,32 +1198,50 @@ async fn run_media_loop(
     rtcp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut video_tick = tokio::time::interval(Duration::from_millis(VIDEO_TICK_MS));
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut silence_tick = tokio::time::interval(Duration::from_millis(FRAME_MS));
-    silence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stats_sync_tick = tokio::time::interval(Duration::from_secs(1));
+    stats_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let silence_sleep = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(silence_sleep);
 
     loop {
+        let need_video = joined && engine.needs_video_tick();
+        if need_video && !video_tick_armed {
+            video_tick.reset();
+        }
+        video_tick_armed = need_video;
+
         tokio::select! {
             res = socket.recv_from(&mut recv_buf) => {
                 match res {
                     Ok((n, from)) => {
                         let now = now_ms();
-                        if let Some(ok) = engine.handle_datagram(&recv_buf[..n], from, now, &mut outbound) {
+                        let join_res = engine.handle_datagram(&recv_buf[..n], from, now, &mut outbound);
+                        stats_dirty = true;
+                        flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                        if let Some(ok) = join_res {
+                            if ok && engine.token.is_some() {
+                                sync_join_shared(&shared, &engine);
+                                stats_dirty = false;
+                            }
                             if let Some(reply) = join_reply.take() {
-                                join_deadline = None;
+                                join_deadline_active = false;
                                 init_pkt = None;
                                 if ok && engine.token.is_some() {
                                     joined = true;
                                     ping_tick.reset();
                                     rtcp_tick.reset();
-                                    video_tick.reset();
+                                    if silence_active {
+                                        silence_sleep.as_mut().reset(next_silence_deadline(last_audio_at));
+                                    }
                                     let _ = reply.send(engine.token);
                                 } else {
+                                    sync_stats_only(&shared, &engine);
+                                    stats_dirty = false;
                                     let _ = reply.send(None);
                                 }
                             }
                         }
-                        flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                        sync_shared(&shared, &engine);
                     }
                     Err(err) => {
                         engine.emit_log(json!({ "kind": "media_socket_error", "error": err.to_string() }));
@@ -1167,13 +1259,14 @@ async fn run_media_loop(
                             Ok(pkt) => {
                                 engine.send_init(&pkt, &mut outbound);
                                 flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                                sync_shared(&shared, &engine);
+                                stats_dirty = true;
                                 init_pkt = Some(pkt);
                                 join_reply = Some(reply);
                                 init_retry_tick = tokio::time::interval(Duration::from_millis(retry_ms.max(10)));
                                 init_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 init_retry_tick.reset();
-                                join_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms));
+                                join_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(timeout_ms));
+                                join_deadline_active = true;
                             }
                             Err(_) => {
                                 let _ = reply.send(None);
@@ -1183,23 +1276,40 @@ async fn run_media_loop(
                     Some(MediaCmd::StartSilence) => {
                         if !engine.closed {
                             silence_active = true;
-                            silence_tick.reset();
+                            if joined {
+                                silence_sleep.as_mut().reset(next_silence_deadline(last_audio_at));
+                            }
                         }
                     }
                     Some(MediaCmd::SendAudio(opus)) => {
+                        let now_inst = tokio::time::Instant::now();
+                        last_audio_at = Some(now_inst);
+                        if silence_active && joined {
+                            silence_sleep.as_mut().reset(now_inst + Duration::from_millis(3 * FRAME_MS + 1));
+                        }
                         engine.send_audio_frame(&opus, now_ms(), &mut outbound);
-                        flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                        sync_shared(&shared, &engine);
+                        if !outbound.is_empty() {
+                            flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                            stats_dirty = true;
+                        }
                     }
                     Some(MediaCmd::SendVideo { key, data }) => {
                         engine.send_video_frame(key, &data, &mut outbound);
-                        flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                        sync_shared(&shared, &engine);
+                        if !outbound.is_empty() {
+                            flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                            stats_dirty = true;
+                        }
                     }
                     Some(MediaCmd::RequestKeyFrame { why, min_gap_ms }) => {
                         engine.request_key_frame(&why, min_gap_ms, now_ms(), &mut outbound);
-                        flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                        sync_shared(&shared, &engine);
+                        if !outbound.is_empty() {
+                            flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                            stats_dirty = true;
+                        }
+                    }
+                    Some(MediaCmd::GetStats(reply)) => {
+                        let st = engine.stats.clone();
+                        let _ = reply.send(st);
                     }
                     Some(MediaCmd::Close { send_end_call }) => {
                         if send_end_call {
@@ -1210,7 +1320,7 @@ async fn run_media_loop(
                         if let Some(reply) = join_reply.take() {
                             let _ = reply.send(None);
                         }
-                        sync_shared(&shared, &engine);
+                        sync_join_shared(&shared, &engine);
                         break;
                     }
                     None => {
@@ -1218,7 +1328,7 @@ async fn run_media_loop(
                         if let Some(reply) = join_reply.take() {
                             let _ = reply.send(None);
                         }
-                        sync_shared(&shared, &engine);
+                        sync_join_shared(&shared, &engine);
                         break;
                     }
                 }
@@ -1228,17 +1338,11 @@ async fn run_media_loop(
                     let clone = pkt.clone();
                     engine.send_init(&clone, &mut outbound);
                     flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                    sync_shared(&shared, &engine);
+                    stats_dirty = true;
                 }
             }
-            _ = async {
-                if let Some(deadline) = join_deadline {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            }, if join_deadline.is_some() => {
-                join_deadline = None;
+            _ = &mut join_sleep, if join_deadline_active => {
+                join_deadline_active = false;
                 init_pkt = None;
                 if let Some(reply) = join_reply.take() {
                     let _ = reply.send(None);
@@ -1247,22 +1351,31 @@ async fn run_media_loop(
             _ = ping_tick.tick(), if joined => {
                 engine.send_ping(&mut outbound);
                 flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                sync_shared(&shared, &engine);
+                stats_dirty = true;
             }
             _ = rtcp_tick.tick(), if joined => {
                 engine.send_rtcp(now_ms(), &mut outbound);
                 flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                sync_shared(&shared, &engine);
+                stats_dirty = true;
             }
-            _ = video_tick.tick(), if joined => {
+            _ = video_tick.tick(), if video_tick_armed => {
                 engine.video_tick(now_ms(), &mut outbound);
-                flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                sync_shared(&shared, &engine);
+                if !outbound.is_empty() {
+                    flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                }
+                stats_dirty = true;
             }
-            _ = silence_tick.tick(), if joined && silence_active => {
+            _ = &mut silence_sleep, if joined && silence_active => {
                 engine.send_silence_if_idle(now_ms(), &mut outbound);
-                flush_outbound(&socket, dest, &mut outbound, &engine).await;
-                sync_shared(&shared, &engine);
+                if !outbound.is_empty() {
+                    flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                    stats_dirty = true;
+                }
+                silence_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(FRAME_MS));
+            }
+            _ = stats_sync_tick.tick(), if stats_dirty => {
+                sync_stats_only(&shared, &engine);
+                stats_dirty = false;
             }
         }
     }
@@ -1548,6 +1661,10 @@ mod tests {
         call.send_video_frame(true, vec![0, 0, 0, 1, 0x65, 0x88, 0x99]);
         call.request_key_frame("app");
         tokio::time::sleep(Duration::from_millis(160)).await;
+        let live_st = call.stats_async().await;
+        assert_eq!(live_st.audio.decrypted, 3);
+        assert_eq!(live_st.video.decrypted, 1);
+        assert_eq!(live_st.video.sent_frames, 1);
         call.close(true);
         tokio::time::sleep(Duration::from_millis(60)).await;
         let _ = done_tx.send(());

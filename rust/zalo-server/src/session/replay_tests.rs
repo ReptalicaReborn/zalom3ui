@@ -138,6 +138,7 @@ async fn the_report_holds_no_message_content() {
         ),
     )
     .await;
+    r.session.replay().flush().await;
     let json_text = serde_json::to_string(&r.session.replay().reports()).unwrap();
     let on_disk = std::fs::read_to_string(r.dir.join("replay-log.json")).unwrap();
     let text = r.session.replay().render_text();
@@ -182,6 +183,7 @@ async fn each_connect_gets_its_own_report_and_offline_time_survives_process_deat
         reason: String::new()
     }));
     settle().await;
+    session.replay().flush().await;
     let file = std::fs::read_to_string(dir.join("listener-state.json")).unwrap();
     assert!(file.contains("disconnectedMs\":1"), "{file}");
 
@@ -406,7 +408,7 @@ async fn pause_flushes_the_store() {
             false,
         )]))
         .await;
-    session.pause();
+    session.pause_async().await;
     let reopened = ChatStore::open(&dir);
     assert!(
         reopened.get_message("1").is_some(),

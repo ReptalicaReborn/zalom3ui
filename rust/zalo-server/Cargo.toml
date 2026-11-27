@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["tcp"]
+# Standalone TCP HTTP/WS server (`run_server`, `ServeDir`, `axum::ws`, `security_middleware`).
+# Disabled by `zalo-android` which uses the in-process `EmbeddedCore` JNI bridge.
+tcp = ["axum/http1", "axum/tokio", "axum/ws", "dep:tower-http"]
 # Recording fake Zalo client and login backend (`zalo_server::testing`) for tests.
 testing = []
 
@@ -14,7 +18,7 @@ tokio.workspace = true
 futures-util.workspace = true
 axum.workspace = true
 tower.workspace = true
-tower-http.workspace = true
+tower-http = { workspace = true, optional = true }
 http.workspace = true
 subtle.workspace = true
 base64.workspace = true
@@ -25,7 +29,7 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-regex.workspace = true
+regex-lite.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 rand.workspace = true
@@ -33,7 +37,7 @@ rustls.workspace = true
 
 [dev-dependencies]
 # Enables the `testing` feature for integration tests.
-zalo-server = { path = ".", features = ["testing"] }
+zalo-server = { path = ".", features = ["testing", "tcp"] }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest.workspace = true
 tokio-tungstenite.workspace = true

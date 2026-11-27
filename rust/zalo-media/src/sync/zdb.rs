@@ -12,13 +12,13 @@ use aes::Aes256;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, InnerIvInit, KeyInit};
 use rand::rngs::OsRng;
 use rsa::pkcs8::EncodePublicKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey};
 
-use super::lzma::decode_lzma_auto;
+use super::lzma::decode_lzma_auto_with_hint;
 use super::sqliteread::is_sqlite;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -125,6 +125,28 @@ pub fn derive_backup_aes_key(key_text: &str) -> [u8; 32] {
     key
 }
 
+fn decrypt_chunks_with_cipher(data: &mut [u8], cipher: &Aes256) -> Result<(), BackupError> {
+    if data.len() % 16 != 0 {
+        return Err(BackupError::new(
+            "The backup is not a whole number of AES blocks",
+        ));
+    }
+    let zero_iv = [0u8; 16];
+    for chunk in data.chunks_mut(CHUNK_SIZE) {
+        let dec = Aes256CbcDec::inner_iv_init(cipher.clone(), (&zero_iv).into());
+        dec.decrypt_padded_mut::<NoPadding>(chunk)
+            .map_err(|_| BackupError::new("AES-256-CBC chunk decryption failed"))?;
+    }
+    Ok(())
+}
+
+/// In-place AES-256-CBC decryption with zero IV restarted every 64 KiB and no padding,
+/// expanding the AES-256 key schedule once across all chunks.
+pub fn decrypt_chunks_in_place(data: &mut [u8], aes_key: &[u8; 32]) -> Result<(), BackupError> {
+    let cipher = Aes256::new(aes_key.into());
+    decrypt_chunks_with_cipher(data, &cipher)
+}
+
 /// Raw AES-256-CBC decryption with zero IV restarted every 64 KiB and no padding.
 pub fn decrypt_chunks_raw(data: &[u8], aes_key: &[u8; 32]) -> Result<Vec<u8>, BackupError> {
     if data.len() % 16 != 0 {
@@ -133,12 +155,7 @@ pub fn decrypt_chunks_raw(data: &[u8], aes_key: &[u8; 32]) -> Result<Vec<u8>, Ba
         ));
     }
     let mut out = data.to_vec();
-    let zero_iv = [0u8; 16];
-    for chunk in out.chunks_mut(CHUNK_SIZE) {
-        let dec = Aes256CbcDec::new(aes_key.into(), (&zero_iv).into());
-        dec.decrypt_padded_mut::<NoPadding>(chunk)
-            .map_err(|_| BackupError::new("AES-256-CBC chunk decryption failed"))?;
-    }
+    decrypt_chunks_in_place(&mut out, aes_key)?;
     Ok(out)
 }
 
@@ -150,57 +167,82 @@ pub fn encrypt_chunks_raw(data: &[u8], aes_key: &[u8; 32]) -> Result<Vec<u8>, Ba
         ));
     }
     let mut out = data.to_vec();
+    let cipher = Aes256::new(aes_key.into());
     let zero_iv = [0u8; 16];
     for chunk in out.chunks_mut(CHUNK_SIZE) {
-        let enc = Aes256CbcEnc::new(aes_key.into(), (&zero_iv).into());
+        let enc = Aes256CbcEnc::inner_iv_init(cipher.clone(), (&zero_iv).into());
         enc.encrypt_padded_mut::<NoPadding>(chunk, chunk.len())
             .map_err(|_| BackupError::new("AES-256-CBC chunk encryption failed"))?;
     }
     Ok(out)
 }
 
-/// Probes optional ±4-byte framing for the `"ZDB4.0"` magic and decrypts the archive
-/// using AES-256-CBC with zero IV reset every 64 KiB.
-pub fn decrypt_zdb_chunks(ciphertext: &[u8], aes_key: &[u8; 32]) -> Result<Vec<u8>, BackupError> {
+fn find_zdb_span(ciphertext: &[u8], cipher: &Aes256) -> Result<(usize, usize), BackupError> {
     let size = ciphertext.len();
     if size < 32 {
         return Err(BackupError::new("The backup file is too small"));
     }
 
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(3);
+    let mut spans = [(0usize, 0usize); 3];
+    let mut span_count = 0usize;
     if size % 16 == 0 {
-        spans.push((0, size));
+        spans[span_count] = (0, size);
+        span_count += 1;
     }
     if size > 4 && (size - 4) % 16 == 0 {
-        spans.push((4, size - 4));
-        spans.push((0, size - 4));
+        spans[span_count] = (4, size - 4);
+        span_count += 1;
+        spans[span_count] = (0, size - 4);
+        span_count += 1;
     }
-    if spans.is_empty() {
+    if span_count == 0 {
         return Err(BackupError::new(
             "The backup file is not a whole number of AES blocks",
         ));
     }
 
     let zero_iv = [0u8; 16];
-    let mut matched_span = None;
-    for &(off, len) in &spans {
+    let mut probe_buf = [0u8; 64];
+    for &(off, len) in &spans[..span_count] {
         let probe_len = len.min(64);
-        let mut probe = ciphertext[off..off + probe_len].to_vec();
-        let dec = Aes256CbcDec::new(aes_key.into(), (&zero_iv).into());
-        if dec.decrypt_padded_mut::<NoPadding>(&mut probe).is_ok()
-            && probe.len() >= 18
-            && &probe[..6] == MAGIC
+        probe_buf[..probe_len].copy_from_slice(&ciphertext[off..off + probe_len]);
+        let dec = Aes256CbcDec::inner_iv_init(cipher.clone(), (&zero_iv).into());
+        if dec
+            .decrypt_padded_mut::<NoPadding>(&mut probe_buf[..probe_len])
+            .is_ok()
+            && probe_len >= 18
+            && &probe_buf[..6] == MAGIC
         {
-            matched_span = Some((off, len));
-            break;
+            return Ok((off, len));
         }
     }
 
-    let Some((off, len)) = matched_span else {
-        return Err(BackupError::new("Wrong key, or not a ZDB4 backup"));
-    };
+    Err(BackupError::new("Wrong key, or not a ZDB4 backup"))
+}
 
-    decrypt_chunks_raw(&ciphertext[off..off + len], aes_key)
+/// Probes optional ±4-byte framing for the `"ZDB4.0"` magic and decrypts the archive
+/// using AES-256-CBC with zero IV reset every 64 KiB.
+pub fn decrypt_zdb_chunks(ciphertext: &[u8], aes_key: &[u8; 32]) -> Result<Vec<u8>, BackupError> {
+    let cipher = Aes256::new(aes_key.into());
+    let (off, len) = find_zdb_span(ciphertext, &cipher)?;
+    let mut out = ciphertext[off..off + len].to_vec();
+    decrypt_chunks_with_cipher(&mut out, &cipher)?;
+    Ok(out)
+}
+
+/// In-place variant of [`decrypt_zdb_chunks`] taking ownership of `ciphertext` with zero full-buffer clone.
+pub fn decrypt_zdb_chunks_owned(
+    mut ciphertext: Vec<u8>,
+    aes_key: &[u8; 32],
+) -> Result<Vec<u8>, BackupError> {
+    let cipher = Aes256::new(aes_key.into());
+    let (off, len) = find_zdb_span(&ciphertext, &cipher)?;
+    if off > 0 {
+        ciphertext.copy_within(off..off + len, 0);
+    }
+    ciphertext.truncate(len);
+    decrypt_chunks_with_cipher(&mut ciphertext, &cipher)?;
+    Ok(ciphertext)
 }
 
 /// A single extracted file entry from a ZDB4.0 archive.
@@ -210,8 +252,10 @@ pub struct ZdbEntry {
     pub data: Vec<u8>,
 }
 
-/// Unpacks an already-decrypted ZDB4.0 archive buffer into its file entries.
-pub fn unpack_zdb(decrypted: &[u8], max_output: usize) -> Result<Vec<ZdbEntry>, BackupError> {
+fn parse_zdb_table(
+    decrypted: &[u8],
+    max_output: usize,
+) -> Result<(Vec<(String, usize)>, usize, usize), BackupError> {
     if decrypted.len() < 18 || &decrypted[..6] != MAGIC {
         return Err(BackupError::new("Wrong key, or not a ZDB4 backup"));
     }
@@ -259,18 +303,10 @@ pub fn unpack_zdb(decrypted: &[u8], max_output: usize) -> Result<Vec<ZdbEntry>, 
         table.push((name, file_size));
     }
 
-    if table.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok((table, pos, total))
+}
 
-    let body = decode_lzma_auto(&decrypted[pos..], max_output)
-        .map_err(|e| BackupError::new(format!("The backup's data is damaged ({e})")))?;
-    if body.len() < total {
-        return Err(BackupError::new(
-            "The backup ended before all its files were read",
-        ));
-    }
-
+fn split_zdb_body(table: Vec<(String, usize)>, body: Vec<u8>) -> Vec<ZdbEntry> {
     let mut files = Vec::with_capacity(table.len());
     let mut at = 0usize;
     for (name, file_size) in table {
@@ -280,7 +316,49 @@ pub fn unpack_zdb(decrypted: &[u8], max_output: usize) -> Result<Vec<ZdbEntry>, 
         });
         at += file_size;
     }
-    Ok(files)
+    files
+}
+
+/// Unpacks an already-decrypted ZDB4.0 archive buffer into its file entries.
+pub fn unpack_zdb(decrypted: &[u8], max_output: usize) -> Result<Vec<ZdbEntry>, BackupError> {
+    let (table, pos, total) = parse_zdb_table(decrypted, max_output)?;
+    if table.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let body = decode_lzma_auto_with_hint(&decrypted[pos..], total, max_output)
+        .map_err(|e| BackupError::new(format!("The backup's data is damaged ({e})")))?;
+    if body.len() < total {
+        return Err(BackupError::new(
+            "The backup ended before all its files were read",
+        ));
+    }
+
+    Ok(split_zdb_body(table, body))
+}
+
+/// Owned variant of [`unpack_zdb`] that drops the decrypted compressed buffer immediately
+/// after LZMA/XZ decompression, minimizing peak RAM before slicing extracted files.
+pub fn unpack_zdb_owned(
+    decrypted: Vec<u8>,
+    max_output: usize,
+) -> Result<Vec<ZdbEntry>, BackupError> {
+    let (table, pos, total) = parse_zdb_table(&decrypted, max_output)?;
+    if table.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let body = decode_lzma_auto_with_hint(&decrypted[pos..], total, max_output)
+        .map_err(|e| BackupError::new(format!("The backup's data is damaged ({e})")))?;
+    drop(decrypted);
+
+    if body.len() < total {
+        return Err(BackupError::new(
+            "The backup ended before all its files were read",
+        ));
+    }
+
+    Ok(split_zdb_body(table, body))
 }
 
 /// Full decrypt + unpack pipeline for an encrypted ZDB4.0 backup.
@@ -291,7 +369,19 @@ pub fn unpack_backup(
 ) -> Result<Vec<ZdbEntry>, BackupError> {
     let key = derive_backup_aes_key(key_text);
     let plain = decrypt_zdb_chunks(encrypted, &key)?;
-    unpack_zdb(&plain, max_output)
+    unpack_zdb_owned(plain, max_output)
+}
+
+/// Owned full decrypt + unpack pipeline: decrypts `encrypted` in place and drops the
+/// compressed archive buffer immediately after LZMA/XZ decoding to minimize peak RAM.
+pub fn unpack_backup_owned(
+    encrypted: Vec<u8>,
+    key_text: &str,
+    max_output: usize,
+) -> Result<Vec<ZdbEntry>, BackupError> {
+    let key = derive_backup_aes_key(key_text);
+    let plain = decrypt_zdb_chunks_owned(encrypted, &key)?;
+    unpack_zdb_owned(plain, max_output)
 }
 
 /// Checks whether an archive entry filename matches a conversation SQLite database:
@@ -340,6 +430,25 @@ pub fn conversation_files(entries: &[ZdbEntry]) -> Vec<ConversationFile> {
                 id,
                 is_group,
                 data: entry.data.clone(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.is_group.cmp(&b.is_group)));
+    out
+}
+
+/// Owned variant of [`conversation_files`] that moves each entry's `data` without cloning.
+pub fn conversation_files_owned(entries: Vec<ZdbEntry>) -> Vec<ConversationFile> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !is_sqlite(&entry.data) {
+            continue;
+        }
+        if let Some((id, is_group)) = is_conversation_db(&entry.name) {
+            out.push(ConversationFile {
+                id,
+                is_group,
+                data: entry.data,
             });
         }
     }
@@ -458,11 +567,19 @@ mod tests {
         let ids: Vec<(&str, bool)> = convs.iter().map(|c| (c.id.as_str(), c.is_group)).collect();
         assert_eq!(ids, vec![("1001", false), ("777", true)]);
 
-        // ±4-byte framing tolerated
+        // ±4-byte framing tolerated (both borrowed and owned in-place pipelines)
         for (pre, suf) in [(4, 0), (0, 4)] {
             let framed = pack_zdb_backup(&specs, &body, KEY_TEXT, pre, suf).unwrap();
             let unpacked = unpack_backup(&framed, KEY_TEXT, DEFAULT_MAX_OUTPUT).unwrap();
             assert_eq!(unpacked.len(), 2);
+            let unpacked_owned = unpack_backup_owned(framed, KEY_TEXT, DEFAULT_MAX_OUTPUT).unwrap();
+            assert_eq!(unpacked_owned, unpacked);
+            let convs_owned = conversation_files_owned(unpacked_owned);
+            let ids_owned: Vec<(&str, bool)> = convs_owned
+                .iter()
+                .map(|c| (c.id.as_str(), c.is_group))
+                .collect();
+            assert_eq!(ids_owned, vec![("1001", false), ("777", true)]);
         }
     }
 

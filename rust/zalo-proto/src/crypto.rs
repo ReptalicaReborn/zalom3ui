@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Read;
 
@@ -27,6 +28,55 @@ type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128Gcm16 = AesGcm<Aes128, U16>;
 type Aes192Gcm16 = AesGcm<Aes192, U16>;
 type Aes256Gcm16 = AesGcm<Aes256, U16>;
+
+/// Cached AES-GCM cipher built once per WebSocket connection from the handshake `cipherKey`.
+pub enum EventCipher {
+    Aes128Gcm16(Aes128Gcm16),
+    Aes192Gcm16(Aes192Gcm16),
+    Aes256Gcm16(Aes256Gcm16),
+}
+
+impl EventCipher {
+    /// Expands a base64-encoded 16-, 24-, or 32-byte AES-GCM key once for reuse across frames.
+    pub fn from_base64_key(cipher_key_b64: &str) -> Result<Self> {
+        let key = B64
+            .decode(cipher_key_b64.trim())
+            .map_err(|e| ProtoError::Crypto(format!("invalid base64 cipher_key: {e}")))?;
+        match key.len() {
+            16 => Ok(Self::Aes128Gcm16(
+                Aes128Gcm16::new_from_slice(&key)
+                    .map_err(|e| ProtoError::Crypto(e.to_string()))?,
+            )),
+            24 => Ok(Self::Aes192Gcm16(
+                Aes192Gcm16::new_from_slice(&key)
+                    .map_err(|e| ProtoError::Crypto(e.to_string()))?,
+            )),
+            32 => Ok(Self::Aes256Gcm16(
+                Aes256Gcm16::new_from_slice(&key)
+                    .map_err(|e| ProtoError::Crypto(e.to_string()))?,
+            )),
+            n => Err(ProtoError::Crypto(format!(
+                "unsupported AES-GCM key length: {n} bytes"
+            ))),
+        }
+    }
+
+    pub fn decrypt(&self, nonce: &[u8; 16], aad: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+        let nonce = Nonce::<U16>::from_slice(nonce);
+        let payload = Payload { msg, aad };
+        match self {
+            Self::Aes128Gcm16(c) => c
+                .decrypt(nonce, payload)
+                .map_err(|e| ProtoError::Crypto(format!("AES-128-GCM decrypt failed: {e}"))),
+            Self::Aes192Gcm16(c) => c
+                .decrypt(nonce, payload)
+                .map_err(|e| ProtoError::Crypto(format!("AES-192-GCM decrypt failed: {e}"))),
+            Self::Aes256Gcm16(c) => c
+                .decrypt(nonce, payload)
+                .map_err(|e| ProtoError::Crypto(format!("AES-256-GCM decrypt failed: {e}"))),
+        }
+    }
+}
 
 const ZCID_KEY: &str = "3FC4F0D2AB50057BCE0D90D9187A22B1";
 const ZERO_IV: [u8; 16] = [0u8; 16];
@@ -178,9 +228,9 @@ pub fn encode_aes_utf8_key(
 
 /// AES-CBC decrypt using raw UTF-8 key bytes (16/24/32 bytes), zero IV, PKCS#7, URL-decoding input first.
 pub fn decode_aes_utf8_key(key_utf8: &str, encoded: &str) -> Result<String> {
-    let decoded_url = urlencoding::decode(encoded)
-        .map(|c| c.into_owned())
-        .unwrap_or_else(|_| encoded.to_string());
+    let decoded_url: Cow<'_, str> = percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .unwrap_or(Cow::Borrowed(encoded));
     let ct = B64
         .decode(decoded_url.trim())
         .map_err(|e| ProtoError::Crypto(format!("base64 decode failed: {e}")))?;
@@ -203,11 +253,19 @@ pub fn decode_aes(secret_key_b64: &str, encoded: &str) -> Result<String> {
     let key = B64
         .decode(secret_key_b64.trim())
         .map_err(|e| ProtoError::Crypto(format!("invalid base64 secret_key: {e}")))?;
-    let mut candidate = encoded.to_string();
+    let mut candidate: Cow<'_, str> = Cow::Borrowed(encoded);
     let mut last_err = ProtoError::Crypto("empty ciphertext".into());
-    for _ in 0..4 {
-        if let Ok(decoded) = urlencoding::decode(&candidate) {
-            candidate = decoded.into_owned();
+    for attempt in 0..4 {
+        let changed = match percent_encoding::percent_decode_str(&candidate).decode_utf8() {
+            Ok(Cow::Owned(s)) => {
+                let diff = s != candidate.as_ref();
+                candidate = Cow::Owned(s);
+                diff
+            }
+            Ok(Cow::Borrowed(_)) | Err(_) => false,
+        };
+        if attempt > 0 && !changed {
+            break;
         }
         match B64.decode(candidate.trim()) {
             Ok(ct) => match aes_cbc_decrypt_raw(&key, &ct) {
@@ -220,6 +278,9 @@ pub fn decode_aes(secret_key_b64: &str, encoded: &str) -> Result<String> {
             Err(e) => {
                 last_err = ProtoError::Crypto(format!("base64 decode failed: {e}"));
             }
+        }
+        if !changed {
+            break;
         }
     }
     Err(last_err)
@@ -268,14 +329,32 @@ fn aes_cbc_decrypt_raw(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Decodes a Zalo WebSocket event payload `{ encrypt, data }`:
+/// Decodes a Zalo WebSocket event payload `{ encrypt, data }` using a pre-built [`EventCipher`]:
 /// - `0`: BigInt-safe JSON parse
 /// - `1`: base64 -> inflate (zlib/gzip/raw-deflate, 2 MiB max cap) -> BigInt-safe JSON parse
 /// - `2`: url-decode -> base64 -> AES-{128,192,256}-GCM (16-byte nonce, 16-byte AAD, 16-byte tag) -> inflate -> BigInt-safe JSON parse
 /// - `3`: same AES-GCM without inflate -> BigInt-safe JSON parse
+pub fn decode_event_payload_with_cipher(
+    encrypt: u8,
+    data: &str,
+    cipher: Option<&EventCipher>,
+) -> Result<Value> {
+    decode_event_payload_inner(encrypt, data, cipher, None)
+}
+
+/// Decodes a Zalo WebSocket event payload `{ encrypt, data }` given a base64 `cipher_key`.
 pub fn decode_event_payload(
     encrypt: u8,
     data: &str,
+    cipher_key_b64: Option<&str>,
+) -> Result<Value> {
+    decode_event_payload_inner(encrypt, data, None, cipher_key_b64)
+}
+
+fn decode_event_payload_inner(
+    encrypt: u8,
+    data: &str,
+    cached_cipher: Option<&EventCipher>,
     cipher_key_b64: Option<&str>,
 ) -> Result<Value> {
     if encrypt == 0 {
@@ -287,12 +366,12 @@ pub fn decode_event_payload(
         )));
     }
 
-    let b64_str = if encrypt == 1 {
-        data.to_string()
+    let b64_str: Cow<'_, str> = if encrypt == 1 {
+        Cow::Borrowed(data)
     } else {
-        urlencoding::decode(data)
-            .map(|c| c.into_owned())
-            .unwrap_or_else(|_| data.to_string())
+        percent_encoding::percent_decode_str(data)
+            .decode_utf8()
+            .unwrap_or(Cow::Borrowed(data))
     };
     let buf = B64
         .decode(b64_str.trim())
@@ -301,49 +380,26 @@ pub fn decode_event_payload(
     let plain = if encrypt == 1 {
         buf
     } else {
-        let key_b64 = cipher_key_b64
-            .ok_or_else(|| ProtoError::Crypto("missing cipher key for encrypted event".into()))?;
+        if cached_cipher.is_none() && cipher_key_b64.is_none() {
+            return Err(ProtoError::Crypto(
+                "missing cipher key for encrypted event".into(),
+            ));
+        }
         if buf.len() < 48 {
             return Err(ProtoError::Crypto(format!(
                 "encrypted event payload too short: {} bytes",
                 buf.len()
             )));
         }
-        let key = B64
-            .decode(key_b64.trim())
-            .map_err(|e| ProtoError::Crypto(format!("invalid base64 cipher_key: {e}")))?;
-        let nonce = Nonce::<U16>::from_slice(&buf[0..16]);
-        let payload = Payload {
-            msg: &buf[32..],
-            aad: &buf[16..32],
-        };
-        match key.len() {
-            16 => {
-                let cipher = Aes128Gcm16::new_from_slice(&key)
-                    .map_err(|e| ProtoError::Crypto(e.to_string()))?;
-                cipher
-                    .decrypt(nonce, payload)
-                    .map_err(|e| ProtoError::Crypto(format!("AES-128-GCM decrypt failed: {e}")))?
-            }
-            24 => {
-                let cipher = Aes192Gcm16::new_from_slice(&key)
-                    .map_err(|e| ProtoError::Crypto(e.to_string()))?;
-                cipher
-                    .decrypt(nonce, payload)
-                    .map_err(|e| ProtoError::Crypto(format!("AES-192-GCM decrypt failed: {e}")))?
-            }
-            32 => {
-                let cipher = Aes256Gcm16::new_from_slice(&key)
-                    .map_err(|e| ProtoError::Crypto(e.to_string()))?;
-                cipher
-                    .decrypt(nonce, payload)
-                    .map_err(|e| ProtoError::Crypto(format!("AES-256-GCM decrypt failed: {e}")))?
-            }
-            n => {
-                return Err(ProtoError::Crypto(format!(
-                    "unsupported AES-GCM key length: {n} bytes"
-                )));
-            }
+        let nonce: &[u8; 16] = buf[0..16].try_into().unwrap();
+        let aad = &buf[16..32];
+        let msg = &buf[32..];
+        if let Some(cipher) = cached_cipher {
+            cipher.decrypt(nonce, aad, msg)?
+        } else {
+            let key_b64 = cipher_key_b64.unwrap();
+            let cipher = EventCipher::from_base64_key(key_b64)?;
+            cipher.decrypt(nonce, aad, msg)?
         }
     };
 
@@ -409,68 +465,68 @@ fn read_limited<R: Read>(mut reader: R, max_bytes: usize) -> std::result::Result
 /// preserving full precision for Zalo's 19-digit IDs (exact port of `src/calls.ts:parseJsonKeepingBigInts`).
 pub fn parse_json_keeping_bigints(text: &str) -> Result<Value> {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len() + 32);
+    let len = bytes.len();
     let mut i = 0usize;
     let mut in_string = false;
+    let mut out: Option<String> = None;
+    let mut chunk_start = 0usize;
 
-    while i < bytes.len() {
+    while i < len {
         let b = bytes[i];
         if in_string {
             if b == b'\\' {
-                out.push('\\');
-                i += 1;
-                if i < bytes.len() {
-                    let ch = text[i..].chars().next().unwrap();
-                    out.push(ch);
-                    i += ch.len_utf8();
-                }
+                // Skip backslash and the following byte (all JSON escapes are ASCII;
+                // UTF-8 continuation bytes never match '"' or '\\').
+                i += 2;
                 continue;
             }
             if b == b'"' {
                 in_string = false;
-                out.push('"');
-                i += 1;
-                continue;
             }
-            let ch = text[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
+            i += 1;
             continue;
         }
 
         if b == b'"' {
             in_string = true;
-            out.push('"');
             i += 1;
             continue;
         }
 
         if b == b'-' || b.is_ascii_digit() {
-            let mut j = i + 1;
-            while j < bytes.len()
-                && matches!(bytes[j], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            let start = i;
+            i += 1;
+            let mut all_digits = true;
+            while i < len
+                && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
             {
-                j += 1;
+                if !bytes[i].is_ascii_digit() {
+                    all_digits = false;
+                }
+                i += 1;
             }
-            let num = &text[i..j];
-            let digits = num.strip_prefix('-').unwrap_or(num);
-            if digits.len() >= 16 && digits.bytes().all(|d| d.is_ascii_digit()) {
-                out.push('"');
-                out.push_str(num);
-                out.push('"');
-            } else {
-                out.push_str(num);
+            let digit_start = if b == b'-' { start + 1 } else { start };
+            if i - digit_start >= 16 && all_digits {
+                let buf = out.get_or_insert_with(|| String::with_capacity(len + 32));
+                buf.push_str(&text[chunk_start..start]);
+                buf.push('"');
+                buf.push_str(&text[start..i]);
+                buf.push('"');
+                chunk_start = i;
             }
-            i = j;
             continue;
         }
 
-        let ch = text[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        i += 1;
     }
 
-    Ok(serde_json::from_str(&out)?)
+    match out {
+        None => Ok(serde_json::from_str(text)?),
+        Some(mut buf) => {
+            buf.push_str(&text[chunk_start..]);
+            Ok(serde_json::from_str(&buf)?)
+        }
+    }
 }
 
 /// Generates a Zalo IMEI UUID: `"{uuid_v4}-{md5_hex(user_agent)}"`.
@@ -560,9 +616,15 @@ mod tests {
         assert_eq!(e32, "wuXfTmtFSR/KcsPsrATX3Uky7MDKQ4NpKX2/Rodrtn4=");
 
         // Including URL-encoded ciphertext on decode
-        assert_eq!(decode_aes(&key16, &urlencoding::encode(&e16)).unwrap(), pt);
+        let enc_e16 =
+            percent_encoding::utf8_percent_encode(&e16, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        let enc_e32 =
+            percent_encoding::utf8_percent_encode(&e32, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        assert_eq!(decode_aes(&key16, &enc_e16).unwrap(), pt);
         assert_eq!(decode_aes(&key24, &e24).unwrap(), pt);
-        assert_eq!(decode_aes(&key32, &urlencoding::encode(&e32)).unwrap(), pt);
+        assert_eq!(decode_aes(&key32, &enc_e32).unwrap(), pt);
     }
 
     #[test]
@@ -593,6 +655,10 @@ mod tests {
         assert_eq!(v2["data"]["msgId"], "1234567890123456789");
         assert_eq!(v2["data"]["text"], "xin chao");
 
+        let cipher32 = EventCipher::from_base64_key(key32).unwrap();
+        let v2_cached = decode_event_payload_with_cipher(2, enc2, Some(&cipher32)).unwrap();
+        assert_eq!(v2_cached, v2);
+
         let enc2_24 = "ABEiM0RVZneImaq7zN3u%2F6q7zN3u%2FwARIjNEVWZ3iJkC1brCNujZZRT3O1cuviuwO9zAUO%2BRgfCFyDyj8gxg%2BUanrZEz8HQ%2B90Qo%2B%2F7zUaw9HMFYE%2F%2BovaorldpyOVnpBvCYeEdY9a0%3D";
         let v2_24 = decode_event_payload(2, enc2_24, Some(key24)).unwrap();
         assert_eq!(v2_24["data"]["msgId"], "1234567890123456789");
@@ -616,6 +682,13 @@ mod tests {
         assert!(v["float"].is_f64());
         assert_eq!(v["str"], "1234567890123456789 \"quoted\"");
         assert_eq!(v["nested"], r#"{"id":9999999999999999999}"#);
+
+        // Fast-path with no >=16-digit unquoted integers (zero-allocation direct serde parse)
+        let fast = r#"{"a":123,"b":"xin chào \"1234567890123456789\"","c":123456789012345}"#;
+        let vf = parse_json_keeping_bigints(fast).unwrap();
+        assert_eq!(vf["a"], 123);
+        assert_eq!(vf["b"], "xin chào \"1234567890123456789\"");
+        assert_eq!(vf["c"], 123456789012345i64);
     }
 
     #[test]

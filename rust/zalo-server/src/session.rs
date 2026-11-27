@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone, Timelike};
 use serde_json::{json, Map, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -28,19 +28,22 @@ use crate::errors::HttpError;
 use crate::log::{create_dir_private, CallTrace};
 use crate::replay::{BatchStats, ReplayHub};
 use crate::socket_log::SocketLog;
-use crate::store::{normalize_message, recalled_message_id, ChatStore};
+use crate::store::{normalize_message, recalled_message_id, to_public_message, ChatStore};
 use crate::types::{
     reaction_code, thread_key, ChatMessage, FoundUser, FriendRequest, GroupMember, MentionInfo,
     MessageSearchHit, Person, PollOptionView, PollView, PollVoter, SessionState, SessionStatus,
     StickerInfo, StoredMessage, ThreadInfo, ThreadKind, ThreadSummary, STICKER_IMAGE_URL,
 };
 
-/// JSON event payload broadcast to all connected `/ws` clients.
-pub type ServerBroadcastEvent = Value;
+/// Pre-serialized JSON event payload broadcast to all connected `/ws` clients.
+pub type ServerBroadcastEvent = Arc<str>;
 
 const GROUP_INFO_BATCH: usize = 50;
 const MEMBER_INFO_BATCH: usize = 100;
 const MEMBERS_CACHE_MS: i64 = 10 * 60_000;
+const MAX_MEMBERS_CACHE: usize = 200;
+const MAX_POLL_GROUPS_CACHE: usize = 500;
+const MAX_LOOKED_UP_USERS: usize = 2_000;
 const SEEN_RECEIPT_LIMIT: usize = 50;
 const RESUME_RETRY_MIN_MS: u64 = 5_000;
 const RESUME_RETRY_MAX_MS: u64 = 60_000;
@@ -223,6 +226,7 @@ struct SessionInner {
     resuming: bool,
     members: HashMap<String, (i64, Vec<GroupMember>)>,
     poll_groups: HashMap<i64, String>,
+    poll_group_order: VecDeque<i64>,
     friend_list: HashMap<String, Person>,
     stickers: HashMap<i64, StickerInfo>,
     sticker_order: VecDeque<i64>,
@@ -238,6 +242,24 @@ struct SessionInner {
     /// answer is still due.
     poke_pull_at: i64,
     poke_pull_pending: bool,
+}
+
+impl SessionInner {
+    fn remember_poll_group(&mut self, poll_id: i64, group_id: String) {
+        if self.poll_groups.contains_key(&poll_id) {
+            self.poll_groups.insert(poll_id, group_id);
+            return;
+        }
+        self.poll_groups.insert(poll_id, group_id);
+        self.poll_group_order.push_back(poll_id);
+        while self.poll_groups.len() > MAX_POLL_GROUPS_CACHE {
+            if let Some(oldest) = self.poll_group_order.pop_front() {
+                self.poll_groups.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// While open, replayed messages may notify (see [`ZaloSession::set_notify_window`]).
@@ -265,6 +287,7 @@ impl Default for SessionInner {
             resuming: false,
             members: HashMap::new(),
             poll_groups: HashMap::new(),
+            poll_group_order: VecDeque::new(),
             friend_list: HashMap::new(),
             stickers: HashMap::new(),
             sticker_order: VecDeque::new(),
@@ -299,6 +322,7 @@ pub struct ZaloSession {
     send_read_receipts: bool,
     inner: RwLock<SessionInner>,
     events_tx: broadcast::Sender<ServerBroadcastEvent>,
+    state_tx: watch::Sender<SessionState>,
     voip_tx: broadcast::Sender<Value>,
     history_sync_tx: broadcast::Sender<Value>,
     listener_closed_tx: broadcast::Sender<ListenerClosed>,
@@ -325,9 +349,10 @@ impl ZaloSession {
         let call_trace = CallTrace::new(&data_dir);
         let replay = ReplayHub::open(&data_dir, now_ms());
         let socket_log = SocketLog::open(&data_dir);
-        let (events_tx, _) = broadcast::channel(512);
-        let (voip_tx, _) = broadcast::channel(128);
-        let (history_sync_tx, _) = broadcast::channel(128);
+        let (events_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = watch::channel(SessionState::LoggedOut);
+        let (voip_tx, _) = broadcast::channel(16);
+        let (history_sync_tx, _) = broadcast::channel(16);
         let (listener_closed_tx, _) = broadcast::channel(16);
         Self {
             store,
@@ -338,6 +363,7 @@ impl ZaloSession {
             send_read_receipts,
             inner: RwLock::new(SessionInner::default()),
             events_tx,
+            state_tx,
             voip_tx,
             history_sync_tx,
             listener_closed_tx,
@@ -414,14 +440,24 @@ impl ZaloSession {
             .ok_or_else(|| HttpError::conflict("No protocol client"))
     }
 
-    /// Broadcasts a JSON event payload to all connected `/ws` clients.
+    /// Broadcasts a JSON event payload to all connected `/ws` clients, serializing once into
+    /// a shared `Arc<str>` (skipping serialization entirely when no client is subscribed).
     pub fn broadcast_event(&self, event: Value) {
-        let _ = self.events_tx.send(event);
+        if self.events_tx.receiver_count() == 0 {
+            return;
+        }
+        let serialized: Arc<str> = event.to_string().into();
+        let _ = self.events_tx.send(serialized);
     }
 
     /// Subscribes to live server broadcast events for `/ws`.
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerBroadcastEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Subscribes to session lifecycle state transitions (`Ready`, `Disconnected`, `LoggedOut`, ...).
+    pub fn subscribe_state(&self) -> watch::Receiver<SessionState> {
+        self.state_tx.subscribe()
     }
 
     /// Subscribes to raw `voip` WebSocket controls (hook for Track 1 calls).
@@ -649,7 +685,7 @@ impl ZaloSession {
                         });
                     }
                     LoginQrEvent::GotLoginInfo(creds) => {
-                        if let Err(e) = session_events.write_credentials(&creds) {
+                        if let Err(e) = session_events.write_credentials_async(creds).await {
                             warn!("Failed to persist credentials.json: {e}");
                         }
                         session_events.patch_status(|st| {
@@ -668,7 +704,7 @@ impl ZaloSession {
                     if !session.is_generation(generation) {
                         return;
                     }
-                    if let Err(e) = session.write_credentials(&creds) {
+                    if let Err(e) = session.write_credentials_async(creds).await {
                         warn!("Failed to persist credentials.json: {e}");
                     }
                     session.on_logged_in(client, generation).await;
@@ -753,6 +789,7 @@ impl ZaloSession {
                 s.client = None;
                 s.members.clear();
                 s.poll_groups.clear();
+                s.poll_group_order.clear();
                 s.friend_list.clear();
                 s.stickers.clear();
                 s.sticker_order.clear();
@@ -763,11 +800,17 @@ impl ZaloSession {
         }
         self.retry_notify.notify_one();
         self.reconnect_wake.notify_waiters();
-        self.call_trace.clear();
         self.store.set_own_id(None);
-        let _ = fs::remove_file(&self.credentials_file);
         self.store.clear();
-        self.store.flush();
+        let call_trace = self.call_trace.clone();
+        let creds_file = self.credentials_file.clone();
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            call_trace.clear();
+            let _ = fs::remove_file(&creds_file);
+            store.flush();
+        })
+        .await;
         self.broadcast_status(&SessionStatus::default());
     }
 
@@ -831,15 +874,10 @@ impl ZaloSession {
             .map_err(proto_to_http_error)
     }
 
-    /// Pauses the chat listener without logging out: stops it, cancels any pending reconnect (so
-    /// nothing reconnects while paused), flushes the store, and moves the status to `paused`.
-    /// Credentials and login stay. REST calls (sending, marking read) still work. Does nothing
-    /// when not logged in. If the saved login is still in flight, the pause applies once it
-    /// completes. Undo with [`Self::resume`].
-    pub fn pause(&self) {
+    fn pause_inner(&self) -> bool {
         let paused_now = {
             let Ok(mut s) = self.inner.write() else {
-                return;
+                return false;
             };
             match s.status.state {
                 SessionState::Ready | SessionState::Disconnected if s.client.is_some() => {
@@ -865,12 +903,37 @@ impl ZaloSession {
         };
         if paused_now {
             self.replay.note_disconnected(now_ms());
-            self.store.flush();
             self.patch_status(|st| {
                 st.state = SessionState::Paused;
                 st.error = None;
                 st.retrying = false;
             });
+        }
+        paused_now
+    }
+
+    /// Pauses the chat listener without logging out: stops it, cancels any pending reconnect (so
+    /// nothing reconnects while paused), flushes the store, and moves the status to `paused`.
+    /// Credentials and login stay. REST calls (sending, marking read) still work. Does nothing
+    /// when not logged in. If the saved login is still in flight, the pause applies once it
+    /// completes. Undo with [`Self::resume`].
+    pub fn pause(&self) {
+        if self.pause_inner() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let store = self.store.clone();
+                handle.spawn_blocking(move || store.flush());
+            } else {
+                self.store.flush();
+            }
+        }
+    }
+
+    /// Async counterpart of [`Self::pause`] that awaits `store.flush()` on `spawn_blocking`
+    /// so the Tokio worker never stalls while guaranteeing persistence before returning.
+    pub async fn pause_async(&self) {
+        if self.pause_inner() {
+            let store = self.store.clone();
+            let _ = tokio::task::spawn_blocking(move || store.flush()).await;
         }
     }
 
@@ -1178,7 +1241,7 @@ impl ZaloSession {
                 }
                 if let Some(poll_id) = poll_id_of_group_event(&ev) {
                     if let Ok(mut s) = self.inner.write() {
-                        s.poll_groups.insert(poll_id, thread_id.clone());
+                        s.remember_poll_group(poll_id, thread_id.clone());
                     }
                     self.broadcast_event(json!({
                         "type": "poll",
@@ -1341,7 +1404,7 @@ impl ZaloSession {
         if let Some(ref poll) = msg.attachment.as_ref().and_then(|a| a.poll.as_ref()) {
             if msg.thread_kind == ThreadKind::Group {
                 if let Ok(mut s) = self.inner.write() {
-                    s.poll_groups.insert(poll.poll_id, msg.thread_id.clone());
+                    s.remember_poll_group(poll.poll_id, msg.thread_id.clone());
                 }
             }
             if poll.event.is_some() {
@@ -1352,33 +1415,54 @@ impl ZaloSession {
             }
         }
 
+        let already_stored = self.store.has_message(&msg.id);
         let outcome = Ingested::Message {
             ts: msg.ts,
             id: msg.id.clone(),
-            already_stored: self.store.has_message(&msg.id),
+            already_stored,
         };
-        if self.store.add_message(msg.clone()) {
-            let public_msg = self.store.to_public(&msg);
-            let notify = self.should_notify(&public_msg, is_old);
-            let mut payload = json!({
-                "type": "message",
-                "message": public_msg,
-                "notify": notify,
-            });
-            if notify {
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert(
-                        "threadName".to_string(),
-                        Value::String(self.thread_name(msg.thread_kind, &msg.thread_id)),
-                    );
+        let public_msg = if already_stored {
+            None
+        } else {
+            Some(to_public_message(&msg, own_id.as_deref()))
+        };
+        if self.store.add_message(msg) {
+            let public_msg = public_msg.or_else(|| {
+                if let Ingested::Message { ref id, .. } = outcome {
+                    self.store
+                        .find_message(id)
+                        .map(|m| to_public_message(&m, own_id.as_deref()))
+                } else {
+                    None
                 }
-            }
-            self.broadcast_event(payload);
+            });
+            if let Some(public_msg) = public_msg {
+                let thread_kind = public_msg.thread_kind;
+                let thread_id = public_msg.thread_id.clone();
+                let notify = self.should_notify(&public_msg, is_old);
+                let mut payload = json!({
+                    "type": "message",
+                    "message": public_msg,
+                    "notify": notify,
+                });
+                if notify {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "threadName".to_string(),
+                            Value::String(self.thread_name(thread_kind, &thread_id)),
+                        );
+                    }
+                }
+                self.broadcast_event(payload);
 
-            if msg.thread_kind == ThreadKind::User {
-                let thread = self.store.get_thread(ThreadKind::User, &msg.thread_id);
-                if thread.as_ref().is_none_or(|t| t.name.is_empty() || t.name == t.id) {
-                    self.resolve_user_thread(msg.thread_id, generation);
+                if thread_kind == ThreadKind::User {
+                    let thread = self.store.get_thread(ThreadKind::User, &thread_id);
+                    if thread
+                        .as_ref()
+                        .is_none_or(|t| t.name.is_empty() || t.name == t.id)
+                    {
+                        self.resolve_user_thread(thread_id, generation);
+                    }
                 }
             }
         }
@@ -1393,7 +1477,13 @@ impl ZaloSession {
             let Ok(mut s) = self.inner.write() else {
                 return;
             };
-            if s.generation != generation || !s.looked_up_users.insert(user_id.clone()) {
+            if s.generation != generation {
+                return;
+            }
+            if s.looked_up_users.len() >= MAX_LOOKED_UP_USERS {
+                s.looked_up_users.clear();
+            }
+            if !s.looked_up_users.insert(user_id.clone()) {
                 return;
             }
             match s.client.as_ref() {
@@ -1404,8 +1494,18 @@ impl ZaloSession {
 
         let session = Arc::clone(self);
         tokio::spawn(async move {
-            let Ok(res) = client.get_user_info(&[user_id], None).await else {
-                return;
+            let res = match client.get_user_info(std::slice::from_ref(&user_id), None).await {
+                Ok(res) => res,
+                Err(err) => {
+                    if is_transient_proto_error(&err) {
+                        if let Ok(mut s) = session.inner.write() {
+                            if s.generation == generation {
+                                s.looked_up_users.remove(&user_id);
+                            }
+                        }
+                    }
+                    return;
+                }
             };
             if !session.is_generation_and_client(generation, &client) {
                 return;
@@ -1993,7 +2093,21 @@ impl ZaloSession {
         list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name)));
 
         if let Ok(mut s) = self.inner.write() {
-            s.members.insert(group_id.to_string(), (now_ms(), list.clone()));
+            let now = now_ms();
+            s.members.retain(|_, (at, _)| now - *at < MEMBERS_CACHE_MS);
+            while s.members.len() >= MAX_MEMBERS_CACHE && !s.members.contains_key(group_id) {
+                let oldest = s
+                    .members
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    s.members.remove(&k);
+                } else {
+                    break;
+                }
+            }
+            s.members.insert(group_id.to_string(), (now, list.clone()));
         }
         Ok(list)
     }
@@ -2007,7 +2121,7 @@ impl ZaloSession {
     ) -> Result<(Option<ThreadInfo>, Vec<ChatMessage>), HttpError> {
         if kind == ThreadKind::Group
             && before.is_none()
-            && self.store.get_messages(kind, id, None, None).len() < 20
+            && self.store.message_count(kind, id) < 20
         {
             if let Err(err) = self.fetch_group_history(id, Some(50)).await {
                 warn!("Group history failed for {id}: {err}");
@@ -3116,7 +3230,7 @@ impl ZaloSession {
         let poll_id = val_to_i64(detail.get("poll_id"));
         if poll_id > 0 {
             if let Ok(mut s) = self.inner.write() {
-                s.poll_groups.insert(poll_id, group_id.to_string());
+                s.remember_poll_group(poll_id, group_id.to_string());
             }
             self.broadcast_event(json!({ "type": "poll", "pollId": poll_id }));
         }
@@ -3376,6 +3490,7 @@ impl ZaloSession {
     }
 
     fn broadcast_status(&self, status: &SessionStatus) {
+        self.state_tx.send_replace(status.state);
         self.broadcast_event(json!({
             "type": "status",
             "status": status,
@@ -3394,26 +3509,33 @@ impl ZaloSession {
         serde_json::from_str::<Credentials>(&text).ok()
     }
 
-    fn write_credentials(&self, creds: &Credentials) -> std::io::Result<()> {
-        if let Some(parent) = self.credentials_file.parent() {
-            create_dir_private(parent)?;
-        }
-        let tmp = self.credentials_file.with_extension("json.tmp");
-        let payload = serde_json::to_vec(creds)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(&payload)?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, &self.credentials_file)
+    async fn write_credentials_async(&self, creds: Credentials) -> std::io::Result<()> {
+        let path = self.credentials_file.clone();
+        tokio::task::spawn_blocking(move || write_credentials_to(&path, &creds))
+            .await
+            .map_err(|e| std::io::Error::other(format!("credentials writer task failed: {e}")))?
     }
+}
+
+fn write_credentials_to(path: &Path, creds: &Credentials) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_private(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let payload = serde_json::to_vec(creds)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(&payload)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)
 }
 
 /// Hooks for tests (`testing` feature): skip the login and drive the listener loop directly.

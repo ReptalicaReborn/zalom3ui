@@ -4,6 +4,7 @@
 //! chains, all record serial types, UTF-8 / UTF-16LE / UTF-16BE text encodings) directly
 //! from an in-memory byte slice with zero native `libsqlite3` dependency.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 const MAX_DEPTH: usize = 40;
@@ -38,6 +39,13 @@ pub type SqlRow = HashMap<String, SqlValue>;
 pub struct SqlTable {
     pub columns: Vec<String>,
     pub rows: Vec<SqlRow>,
+}
+
+/// A compact table representation with column names once and each row stored as indexed values.
+#[derive(Debug, Clone)]
+pub struct SqlTableRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<SqlValue>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,8 +134,11 @@ fn decode_text(bytes: &[u8], encoding: u32) -> String {
     }
 }
 
-/// Decodes one SQLite3 record payload into column values.
-pub fn parse_record(payload: &[u8], encoding: u32) -> Result<Vec<SqlValue>, SqliteError> {
+fn parse_record_with_scratch(
+    payload: &[u8],
+    encoding: u32,
+    serial_types: &mut Vec<u64>,
+) -> Result<Vec<SqlValue>, SqliteError> {
     let (header_end_u64, mut p) = read_varint(payload, 0)?;
     let header_end = usize::try_from(header_end_u64)
         .map_err(|_| SqliteError::new("Corrupt SQLite record"))?;
@@ -135,7 +146,7 @@ pub fn parse_record(payload: &[u8], encoding: u32) -> Result<Vec<SqlValue>, Sqli
         return Err(SqliteError::new("Corrupt SQLite record"));
     }
 
-    let mut serial_types = Vec::new();
+    serial_types.clear();
     while p < header_end {
         let (t, next) = read_varint(payload, p)?;
         serial_types.push(t);
@@ -144,7 +155,7 @@ pub fn parse_record(payload: &[u8], encoding: u32) -> Result<Vec<SqlValue>, Sqli
 
     let mut values = Vec::with_capacity(serial_types.len());
     let mut at = header_end;
-    for t in serial_types {
+    for &t in serial_types.iter() {
         match t {
             0 => values.push(SqlValue::Null),
             1..=6 => {
@@ -199,6 +210,12 @@ pub fn parse_record(payload: &[u8], encoding: u32) -> Result<Vec<SqlValue>, Sqli
     Ok(values)
 }
 
+/// Decodes one SQLite3 record payload into column values.
+pub fn parse_record(payload: &[u8], encoding: u32) -> Result<Vec<SqlValue>, SqliteError> {
+    let mut serial_types = Vec::new();
+    parse_record_with_scratch(payload, encoding, &mut serial_types)
+}
+
 struct Db<'a> {
     buf: &'a [u8],
     h: Header,
@@ -219,14 +236,14 @@ impl<'a> Db<'a> {
         Ok(&self.buf[start..start + self.h.page_size])
     }
 
-    fn payload(&self, page: &[u8], cell_at: usize, total: usize) -> Result<Vec<u8>, SqliteError> {
+    fn payload(&self, page: &'a [u8], cell_at: usize, total: usize) -> Result<Cow<'a, [u8]>, SqliteError> {
         let u = self.h.usable;
         let x = u - 35;
         if total <= x {
             if cell_at.saturating_add(total) > page.len() {
                 return Err(SqliteError::new("Corrupt SQLite cell payload"));
             }
-            return Ok(page[cell_at..cell_at + total].to_vec());
+            return Ok(Cow::Borrowed(&page[cell_at..cell_at + total]));
         }
         if total > MAX_ROW_BYTES {
             return Err(SqliteError::new("SQLite row too large"));
@@ -259,15 +276,13 @@ impl<'a> Db<'a> {
             remaining -= take;
             next = u32::from_be_bytes(pg[0..4].try_into().unwrap());
         }
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 
-    fn collect_rows(
-        &self,
-        root: u32,
-        depth: usize,
-        out: &mut Vec<(i64, Vec<u8>)>,
-    ) -> Result<(), SqliteError> {
+    fn visit_rows<F>(&self, root: u32, depth: usize, on_row: &mut F) -> Result<(), SqliteError>
+    where
+        F: FnMut(i64, &[u8]) -> Result<(), SqliteError>,
+    {
         if depth > MAX_DEPTH {
             return Err(SqliteError::new("SQLite b-tree too deep"));
         }
@@ -294,7 +309,7 @@ impl<'a> Db<'a> {
                     let total = usize::try_from(size_u64)
                         .map_err(|_| SqliteError::new("SQLite row too large"))?;
                     let record = self.payload(page, after_rowid, total)?;
-                    out.push((rowid_u64 as i64, record));
+                    on_row(rowid_u64 as i64, &record)?;
                 }
             }
             0x05 => {
@@ -308,15 +323,48 @@ impl<'a> Db<'a> {
                         return Err(SqliteError::new("Corrupt SQLite cell pointer"));
                     }
                     let child = u32::from_be_bytes(page[ptr..ptr + 4].try_into().unwrap());
-                    self.collect_rows(child, depth + 1, out)?;
+                    self.visit_rows(child, depth + 1, on_row)?;
                 }
                 let right_child =
                     u32::from_be_bytes(page[base + 8..base + 12].try_into().unwrap());
-                self.collect_rows(right_child, depth + 1, out)?;
+                self.visit_rows(right_child, depth + 1, on_row)?;
             }
             _ => return Err(SqliteError::new("Unexpected SQLite page type")),
         }
         Ok(())
+    }
+
+    fn find_table(&self, table: &str) -> Result<Option<(u32, Vec<String>, Option<usize>)>, SqliteError> {
+        let mut found: Option<(u32, String)> = None;
+        let mut serial_types = Vec::new();
+        self.visit_rows(1, 0, &mut |_, record| {
+            if found.is_some() {
+                return Ok(());
+            }
+            let r = parse_record_with_scratch(record, self.h.encoding, &mut serial_types)?;
+            // sqlite_master: type, name, tbl_name, rootpage, sql
+            let is_table = matches!(r.first(), Some(SqlValue::Text(t)) if t == "table");
+            let name_matches =
+                matches!(r.get(1), Some(SqlValue::Text(n)) if n.eq_ignore_ascii_case(table));
+            if is_table && name_matches {
+                let root = match r.get(3) {
+                    Some(SqlValue::Int(n)) if *n >= 1 => *n as u32,
+                    _ => return Err(SqliteError::new("Invalid table root page")),
+                };
+                let sql = match r.get(4) {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                found = Some((root, sql));
+            }
+            Ok(())
+        })?;
+
+        let Some((root, sql)) = found else {
+            return Ok(None);
+        };
+        let (columns, rowid_column) = parse_create_table(&sql)?;
+        Ok(Some((root, columns, rowid_column)))
     }
 }
 
@@ -467,56 +515,61 @@ fn has_word_ci(text: &str, needle: &str) -> bool {
     tokenize_words_ci(text).iter().any(|w| w == needle)
 }
 
+/// Finds `table` (case-insensitive) in `sqlite_master` and returns its columns and rows
+/// as indexed `Vec<SqlValue>` vectors in rowid order (avoiding per-row `HashMap` allocations).
+pub fn read_table_rows(buf: &[u8], table: &str) -> Result<Option<SqlTableRows>, SqliteError> {
+    let db = Db::open(buf)?;
+    let Some((root, columns, rowid_column)) = db.find_table(table)? else {
+        return Ok(None);
+    };
+
+    let col_count = columns.len();
+    let mut rows = Vec::new();
+    let mut serial_types = Vec::new();
+    db.visit_rows(root, 0, &mut |rowid, record| {
+        let mut values = parse_record_with_scratch(record, db.h.encoding, &mut serial_types)?;
+        if values.len() < col_count {
+            values.resize(col_count, SqlValue::Null);
+        } else if values.len() > col_count {
+            values.truncate(col_count);
+        }
+        if let Some(idx) = rowid_column {
+            if idx < values.len() && matches!(values[idx], SqlValue::Null) {
+                values[idx] = SqlValue::Int(rowid);
+            }
+        }
+        rows.push(values);
+        Ok(())
+    })?;
+
+    Ok(Some(SqlTableRows { columns, rows }))
+}
+
 /// Finds `table` (case-insensitive) in `sqlite_master` and returns its columns and rows in rowid order.
 /// Returns `Ok(None)` when the database is valid SQLite3 but contains no such table.
 pub fn read_table(buf: &[u8], table: &str) -> Result<Option<SqlTable>, SqliteError> {
     let db = Db::open(buf)?;
-    let mut master_rows = Vec::new();
-    db.collect_rows(1, 0, &mut master_rows)?;
-
-    let mut found: Option<(u32, String)> = None;
-    for (_, record) in master_rows {
-        let r = parse_record(&record, db.h.encoding)?;
-        // sqlite_master: type, name, tbl_name, rootpage, sql
-        let is_table = matches!(r.first(), Some(SqlValue::Text(t)) if t == "table");
-        let name_matches =
-            matches!(r.get(1), Some(SqlValue::Text(n)) if n.eq_ignore_ascii_case(table));
-        if is_table && name_matches {
-            let root = match r.get(3) {
-                Some(SqlValue::Int(n)) if *n >= 1 => *n as u32,
-                _ => return Err(SqliteError::new("Invalid table root page")),
-            };
-            let sql = match r.get(4) {
-                Some(SqlValue::Text(s)) => s.clone(),
-                _ => String::new(),
-            };
-            found = Some((root, sql));
-            break;
-        }
-    }
-
-    let Some((root, sql)) = found else {
+    let Some((root, columns, rowid_column)) = db.find_table(table)? else {
         return Ok(None);
     };
 
-    let (columns, rowid_column) = parse_create_table(&sql)?;
-    let mut raw_rows = Vec::new();
-    db.collect_rows(root, 0, &mut raw_rows)?;
-
-    let mut rows = Vec::with_capacity(raw_rows.len());
-    for (rowid, record) in raw_rows {
-        let values = parse_record(&record, db.h.encoding)?;
+    let mut rows = Vec::new();
+    let mut serial_types = Vec::new();
+    db.visit_rows(root, 0, &mut |rowid, record| {
+        let values = parse_record_with_scratch(record, db.h.encoding, &mut serial_types)?;
         let mut row = HashMap::with_capacity(columns.len());
+        let mut val_iter = values.into_iter();
         for (i, col) in columns.iter().enumerate() {
-            let val = match values.get(i) {
+            let val = match val_iter.next() {
                 None | Some(SqlValue::Null) if rowid_column == Some(i) => SqlValue::Int(rowid),
-                Some(v) => v.clone(),
+                Some(v) => v,
                 None => SqlValue::Null,
             };
             row.insert(col.clone(), val);
         }
         rows.push(row);
-    }
+        Ok(())
+    })?;
 
     Ok(Some(SqlTable { columns, rows }))
 }

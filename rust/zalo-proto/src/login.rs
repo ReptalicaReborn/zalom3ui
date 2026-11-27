@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use regex::Regex;
 use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -112,9 +111,6 @@ pub async fn login_qr(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_USER_AGENT)
         .to_string();
-    let version_re = Regex::new(r"https://stc-zlogin\.zdn\.vn/main-([\d.]+)\.js")
-        .expect("valid static regex");
-
     loop {
         if abort_rx.try_recv().is_ok() {
             return Err(ProtoError::QrAborted);
@@ -137,10 +133,7 @@ pub async fn login_qr(
                 r = fut => r?,
             };
             let html = resp.text().await?;
-            version_re
-                .captures(&html)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string())
+            extract_login_version(&html)
                 .ok_or_else(|| ProtoError::Login(-1, "Cannot get API login version".into()))?
         };
         info!(version = %login_version, "Got Zalo QR login version");
@@ -729,4 +722,41 @@ fn parse_service_map(v: Option<&Value>) -> HashMap<String, Vec<String>> {
         }
     }
     map
+}
+
+fn extract_login_version(html: &str) -> Option<String> {
+    const PREFIX: &str = "https://stc-zlogin.zdn.vn/main-";
+    let mut search = html;
+    while let Some(idx) = search.find(PREFIX) {
+        let rest = &search[idx + PREFIX.len()..];
+        let scan_len = rest
+            .bytes()
+            .take_while(|&b| b.is_ascii_digit() || b == b'.')
+            .count();
+        if scan_len >= 2
+            && rest.as_bytes()[scan_len - 1] == b'.'
+            && rest[scan_len..].starts_with("js")
+        {
+            return Some(rest[..scan_len - 1].to_string());
+        }
+        search = rest;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_login_version_parses_script_url() {
+        let html = r#"<html><script src="https://stc-zlogin.zdn.vn/main-5.2.1.js"></script></html>"#;
+        assert_eq!(extract_login_version(html).as_deref(), Some("5.2.1"));
+        // Ignores non-matching earlier prefix and finds later valid one
+        let html2 = r#"https://stc-zlogin.zdn.vn/main-abc.js https://stc-zlogin.zdn.vn/main-10.3.js"#;
+        assert_eq!(extract_login_version(html2).as_deref(), Some("10.3"));
+        assert_eq!(extract_login_version("https://stc-zlogin.zdn.vn/main-.js"), None);
+        assert_eq!(extract_login_version("https://stc-zlogin.zdn.vn/main-1.css"), None);
+        assert_eq!(extract_login_version("no script here"), None);
+    }
 }

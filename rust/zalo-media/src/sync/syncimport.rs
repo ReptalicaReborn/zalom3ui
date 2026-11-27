@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
 
-use super::sqliteread::{read_table, SqlRow, SqlValue, SqliteError};
+use super::sqliteread::{read_table_rows, SqlValue, SqliteError};
 
 // ---- BinNet flat TLV parser ----
 
@@ -57,14 +57,14 @@ pub struct BinNet {
     pub mentions: Vec<BinNetMention>,
 }
 
-struct Tlv<'a> {
-    values: HashMap<u32, Vec<&'a [u8]>>,
-    little: bool,
-}
-
-fn parse_tlv_with(buf: &[u8], little: bool) -> Option<HashMap<u32, Vec<&[u8]>>> {
-    let mut values: HashMap<u32, Vec<&[u8]>> = HashMap::new();
+/// Zero-allocation TLV header walk that validates framing and computes the endianness score.
+fn walk_and_score_tlv(buf: &[u8], little: bool) -> Option<i64> {
     let mut off = 0usize;
+    let mut seen_low: u128 = 0; // distinct keys 0..=127
+    let mut seen_0x80 = false;
+    let mut score = 0i64;
+    let mut large_keys = 0i64;
+
     while off + 8 <= buf.len() {
         let key_bytes: [u8; 4] = buf[off..off + 4].try_into().ok()?;
         let len_bytes: [u8; 4] = buf[off + 4..off + 8].try_into().ok()?;
@@ -82,91 +82,107 @@ fn parse_tlv_with(buf: &[u8], little: bool) -> Option<HashMap<u32, Vec<&[u8]>>> 
         if len > buf.len() - off {
             return None;
         }
-        values.entry(key).or_default().push(&buf[off..off + len]);
         off += len;
+
+        if key < 128 {
+            let bit = 1u128 << key;
+            if (seen_low & bit) == 0 {
+                seen_low |= bit;
+                score += 1;
+                if (0x05..=0x0b).contains(&key) {
+                    score += 6;
+                } else if (0x28..=0x37).contains(&key) || (0x40..=0x44).contains(&key) {
+                    score += 4;
+                }
+            }
+        } else if key == 0x80 {
+            if !seen_0x80 {
+                seen_0x80 = true;
+                score += 1;
+            }
+        } else if key > 0x10000 {
+            large_keys += 1;
+        }
     }
     if off != buf.len() && buf.len() - off > 8 {
         return None;
     }
-    Some(values)
+    score -= large_keys * 3;
+    Some(score)
 }
 
-const TOP_KEYS: &[u32] = &[0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b];
-const ATTACH_KEYS: &[u32] = &[
-    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
-    0x37, 0x40, 0x41, 0x42, 0x43, 0x44,
-];
-
-fn score_tlv(values: &HashMap<u32, Vec<&[u8]>>) -> i64 {
-    let mut s = 0i64;
-    for k in TOP_KEYS {
-        if values.contains_key(k) {
-            s += 6;
+/// Validates a TLV buffer under a known endianness without allocating.
+fn is_valid_tlv(buf: &[u8], little: bool) -> bool {
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let len_bytes: [u8; 4] = buf[off + 4..off + 8].try_into().unwrap();
+        let len = if little {
+            u32::from_le_bytes(len_bytes) as usize
+        } else {
+            u32::from_be_bytes(len_bytes) as usize
+        };
+        off += 8;
+        if len > buf.len() - off {
+            return false;
         }
+        off += len;
     }
-    for k in ATTACH_KEYS {
-        if values.contains_key(k) {
-            s += 4;
-        }
-    }
-    for &k in values.keys() {
-        if k <= 0x80 {
-            s += 1;
-        }
-        if k > 0x10000 {
-            s -= 3;
-        }
-    }
-    s
+    off == buf.len() || buf.len() - off <= 8
 }
 
-fn parse_tlv(buf: &[u8]) -> Option<Tlv<'_>> {
-    let le = parse_tlv_with(buf, true);
-    let be = parse_tlv_with(buf, false);
+/// Detects TLV endianness (`Some(true)` = LE, `Some(false)` = BE) without allocating.
+fn detect_tlv_endian(buf: &[u8]) -> Option<bool> {
+    let le = walk_and_score_tlv(buf, true);
+    let be = walk_and_score_tlv(buf, false);
     match (le, be) {
         (None, None) => None,
-        (Some(le_v), None) => Some(Tlv {
-            values: le_v,
-            little: true,
-        }),
-        (None, Some(be_v)) => Some(Tlv {
-            values: be_v,
-            little: false,
-        }),
-        (Some(le_v), Some(be_v)) => {
-            if score_tlv(&be_v) > score_tlv(&le_v) {
-                Some(Tlv {
-                    values: be_v,
-                    little: false,
-                })
-            } else {
-                Some(Tlv {
-                    values: le_v,
-                    little: true,
-                })
-            }
-        }
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (Some(le_score), Some(be_score)) => Some(be_score <= le_score),
     }
 }
 
-fn tlv_int32(t: &Tlv<'_>, key: u32) -> Option<i32> {
-    let v = *t.values.get(&key)?.first()?;
+/// Iterates `(key, value_slice)` entries of a validated TLV buffer without allocating.
+fn for_each_tlv<'a>(buf: &'a [u8], little: bool, mut f: impl FnMut(u32, &'a [u8])) {
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let key_bytes: [u8; 4] = buf[off..off + 4].try_into().unwrap();
+        let len_bytes: [u8; 4] = buf[off + 4..off + 8].try_into().unwrap();
+        let key = if little {
+            u32::from_le_bytes(key_bytes)
+        } else {
+            u32::from_be_bytes(key_bytes)
+        };
+        let len = if little {
+            u32::from_le_bytes(len_bytes) as usize
+        } else {
+            u32::from_be_bytes(len_bytes) as usize
+        };
+        off += 8;
+        if len > buf.len() - off {
+            break;
+        }
+        f(key, &buf[off..off + len]);
+        off += len;
+    }
+}
+
+fn decode_int32(v: &[u8], little: bool) -> Option<i32> {
     if v.len() < 4 {
         return None;
     }
     let bytes: [u8; 4] = v[..4].try_into().ok()?;
-    Some(if t.little {
+    Some(if little {
         i32::from_le_bytes(bytes)
     } else {
         i32::from_be_bytes(bytes)
     })
 }
 
-fn tlv_int64_text(t: &Tlv<'_>, key: u32) -> Option<String> {
-    let v = *t.values.get(&key)?.first()?;
+fn decode_int64_text(v: &[u8], little: bool) -> Option<String> {
     if v.len() >= 8 {
         let bytes: [u8; 8] = v[..8].try_into().ok()?;
-        let n = if t.little {
+        let n = if little {
             i64::from_le_bytes(bytes)
         } else {
             i64::from_be_bytes(bytes)
@@ -175,7 +191,7 @@ fn tlv_int64_text(t: &Tlv<'_>, key: u32) -> Option<String> {
     }
     if v.len() >= 4 {
         let bytes: [u8; 4] = v[..4].try_into().ok()?;
-        let n = if t.little {
+        let n = if little {
             u32::from_le_bytes(bytes)
         } else {
             u32::from_be_bytes(bytes)
@@ -219,53 +235,143 @@ fn decode_tlv_text(v: &[u8]) -> Option<String> {
     None
 }
 
-fn tlv_text(t: &Tlv<'_>, key: u32) -> Option<String> {
-    let v = *t.values.get(&key)?.first()?;
-    decode_tlv_text(v)
+fn sub_tlv_endian(buf: &[u8], inherited_little: bool) -> Option<bool> {
+    if is_valid_tlv(buf, inherited_little) {
+        Some(inherited_little)
+    } else {
+        detect_tlv_endian(buf)
+    }
 }
 
-fn parse_attachment(buf: &[u8]) -> BinNetAttachment {
+fn parse_attachment(buf: &[u8], inherited_little: bool) -> BinNetAttachment {
     let mut out = BinNetAttachment::default();
-    let Some(t) = parse_tlv(buf) else {
+    let Some(little) = sub_tlv_endian(buf, inherited_little) else {
         return out;
     };
-    out.r#type = tlv_text(&t, 0x28).unwrap_or_default();
-    out.cat_id = tlv_int32(&t, 0x29).unwrap_or(0);
-    out.id = tlv_int32(&t, 0x2a).unwrap_or(0);
-    out.ext_info = tlv_text(&t, 0x2b).unwrap_or_default();
-    out.action = tlv_text(&t, 0x2d).unwrap_or_default();
-    out.params = tlv_text(&t, 0x2e).unwrap_or_default();
-    out.title = tlv_text(&t, 0x2f).unwrap_or_default();
-    out.href = tlv_text(&t, 0x30).unwrap_or_default();
-    out.thumb = tlv_text(&t, 0x31).unwrap_or_default();
-    out.description = tlv_text(&t, 0x32).unwrap_or_default();
-    out.size = tlv_text(&t, 0x33).unwrap_or_default();
-    out.ext = tlv_text(&t, 0x34).unwrap_or_default();
+    let mut seen: u16 = 0;
+    for_each_tlv(buf, little, |key, v| {
+        let bit = match key {
+            0x28 => 1u16 << 0,
+            0x29 => 1u16 << 1,
+            0x2a => 1u16 << 2,
+            0x2b => 1u16 << 3,
+            0x2d => 1u16 << 4,
+            0x2e => 1u16 << 5,
+            0x2f => 1u16 << 6,
+            0x30 => 1u16 << 7,
+            0x31 => 1u16 << 8,
+            0x32 => 1u16 << 9,
+            0x33 => 1u16 << 10,
+            0x34 => 1u16 << 11,
+            _ => return,
+        };
+        if (seen & bit) != 0 {
+            return;
+        }
+        seen |= bit;
+        match key {
+            0x28 => out.r#type = decode_tlv_text(v).unwrap_or_default(),
+            0x29 => out.cat_id = decode_int32(v, little).unwrap_or(0),
+            0x2a => out.id = decode_int32(v, little).unwrap_or(0),
+            0x2b => out.ext_info = decode_tlv_text(v).unwrap_or_default(),
+            0x2d => out.action = decode_tlv_text(v).unwrap_or_default(),
+            0x2e => out.params = decode_tlv_text(v).unwrap_or_default(),
+            0x2f => out.title = decode_tlv_text(v).unwrap_or_default(),
+            0x30 => out.href = decode_tlv_text(v).unwrap_or_default(),
+            0x31 => out.thumb = decode_tlv_text(v).unwrap_or_default(),
+            0x32 => out.description = decode_tlv_text(v).unwrap_or_default(),
+            0x33 => out.size = decode_tlv_text(v).unwrap_or_default(),
+            0x34 => out.ext = decode_tlv_text(v).unwrap_or_default(),
+            _ => {}
+        }
+    });
     out
 }
 
-fn parse_quote(buf: &[u8]) -> Option<BinNetQuote> {
-    let t = parse_tlv(buf)?;
-    Some(BinNetQuote {
-        owner_id: tlv_int64_text(&t, 0x50).unwrap_or_default(),
-        cli_msg_type: tlv_int32(&t, 0x53).unwrap_or(0),
-        cli_msg_id: tlv_int64_text(&t, 0x51).unwrap_or_else(|| "0".into()),
-        global_msg_id: tlv_int64_text(&t, 0x52).unwrap_or_else(|| "0".into()),
-        ts: tlv_int64_text(&t, 0x54).unwrap_or_else(|| "0".into()),
-        msg: tlv_text(&t, 0x56).unwrap_or_default(),
-        attach: tlv_text(&t, 0x57).unwrap_or_default(),
-        from_d: tlv_text(&t, 0x5a).unwrap_or_default(),
-    })
+fn parse_quote(buf: &[u8], inherited_little: bool) -> Option<BinNetQuote> {
+    let little = sub_tlv_endian(buf, inherited_little)?;
+    let mut q = BinNetQuote {
+        cli_msg_id: "0".into(),
+        global_msg_id: "0".into(),
+        ts: "0".into(),
+        ..Default::default()
+    };
+    let mut seen: u16 = 0;
+    for_each_tlv(buf, little, |key, v| {
+        let bit = match key {
+            0x50 => 1u16 << 0,
+            0x51 => 1u16 << 1,
+            0x52 => 1u16 << 2,
+            0x53 => 1u16 << 3,
+            0x54 => 1u16 << 4,
+            0x56 => 1u16 << 5,
+            0x57 => 1u16 << 6,
+            0x5a => 1u16 << 7,
+            _ => return,
+        };
+        if (seen & bit) != 0 {
+            return;
+        }
+        seen |= bit;
+        match key {
+            0x50 => q.owner_id = decode_int64_text(v, little).unwrap_or_default(),
+            0x51 => {
+                if let Some(s) = decode_int64_text(v, little) {
+                    q.cli_msg_id = s;
+                }
+            }
+            0x52 => {
+                if let Some(s) = decode_int64_text(v, little) {
+                    q.global_msg_id = s;
+                }
+            }
+            0x53 => q.cli_msg_type = decode_int32(v, little).unwrap_or(0),
+            0x54 => {
+                if let Some(s) = decode_int64_text(v, little) {
+                    q.ts = s;
+                }
+            }
+            0x56 => q.msg = decode_tlv_text(v).unwrap_or_default(),
+            0x57 => q.attach = decode_tlv_text(v).unwrap_or_default(),
+            0x5a => q.from_d = decode_tlv_text(v).unwrap_or_default(),
+            _ => {}
+        }
+    });
+    Some(q)
 }
 
-fn parse_mention(buf: &[u8]) -> Option<BinNetMention> {
-    let t = parse_tlv(buf)?;
-    Some(BinNetMention {
-        uid: tlv_int64_text(&t, 0x65).unwrap_or_else(|| "0".into()),
-        pos: tlv_int32(&t, 0x66).unwrap_or(0),
-        len: tlv_int32(&t, 0x67).unwrap_or(0),
-        r#type: tlv_int32(&t, 0x68).unwrap_or(0),
-    })
+fn parse_mention(buf: &[u8], inherited_little: bool) -> Option<BinNetMention> {
+    let little = sub_tlv_endian(buf, inherited_little)?;
+    let mut m = BinNetMention {
+        uid: "0".into(),
+        ..Default::default()
+    };
+    let mut seen: u8 = 0;
+    for_each_tlv(buf, little, |key, v| {
+        let bit = match key {
+            0x65 => 1u8 << 0,
+            0x66 => 1u8 << 1,
+            0x67 => 1u8 << 2,
+            0x68 => 1u8 << 3,
+            _ => return,
+        };
+        if (seen & bit) != 0 {
+            return;
+        }
+        seen |= bit;
+        match key {
+            0x65 => {
+                if let Some(s) = decode_int64_text(v, little) {
+                    m.uid = s;
+                }
+            }
+            0x66 => m.pos = decode_int32(v, little).unwrap_or(0),
+            0x67 => m.len = decode_int32(v, little).unwrap_or(0),
+            0x68 => m.r#type = decode_int32(v, little).unwrap_or(0),
+            _ => {}
+        }
+    });
+    Some(m)
 }
 
 /// Parses a message's `BinNet` TLV blob. Unreadable or empty blobs yield `BinNet::default()`.
@@ -277,29 +383,47 @@ pub fn parse_bin_net(buf: Option<&[u8]>) -> BinNet {
     if bytes.is_empty() {
         return out;
     }
-    let Some(t) = parse_tlv(bytes) else {
+    let Some(little) = detect_tlv_endian(bytes) else {
         return out;
     };
-    if let Some(list) = t.values.get(&0x06) {
-        for v in list {
+    let mut seen_single: u8 = 0;
+    for_each_tlv(bytes, little, |key, v| match key {
+        0x06 => {
             if v.len() >= 8 {
-                out.attachs.push(parse_attachment(v));
+                out.attachs.push(parse_attachment(v, little));
             }
         }
-    }
-    if let Some(q) = t.values.get(&0x07).and_then(|l| l.first()) {
-        out.quote = parse_quote(q);
-    }
-    if let Some(list) = t.values.get(&0x08) {
-        for v in list {
-            if let Some(m) = parse_mention(v) {
+        0x07 => {
+            if (seen_single & 1) == 0 {
+                seen_single |= 1;
+                out.quote = parse_quote(v, little);
+            }
+        }
+        0x08 => {
+            if let Some(m) = parse_mention(v, little) {
                 out.mentions.push(m);
             }
         }
-    }
-    out.quote_status = tlv_int32(&t, 0x09).unwrap_or(0);
-    out.data_source = tlv_text(&t, 0x0a).unwrap_or_default();
-    out.text = tlv_text(&t, 0x0b).unwrap_or_default();
+        0x09 => {
+            if (seen_single & 2) == 0 {
+                seen_single |= 2;
+                out.quote_status = decode_int32(v, little).unwrap_or(0);
+            }
+        }
+        0x0a => {
+            if (seen_single & 4) == 0 {
+                seen_single |= 4;
+                out.data_source = decode_tlv_text(v).unwrap_or_default();
+            }
+        }
+        0x0b => {
+            if (seen_single & 8) == 0 {
+                seen_single |= 8;
+                out.text = decode_tlv_text(v).unwrap_or_default();
+            }
+        }
+        _ => {}
+    });
     out
 }
 
@@ -327,12 +451,12 @@ pub struct BackupConversation {
     pub columns: Vec<String>,
 }
 
-fn sql_str(v: Option<&SqlValue>) -> String {
+fn take_sql_str(v: Option<&mut SqlValue>) -> String {
     match v {
         None | Some(SqlValue::Null) => String::new(),
         Some(SqlValue::Int(n)) => n.to_string(),
         Some(SqlValue::Float(f)) => f.to_string(),
-        Some(SqlValue::Text(s)) => s.clone(),
+        Some(SqlValue::Text(s)) => std::mem::take(s),
         Some(SqlValue::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
     }
 }
@@ -370,30 +494,49 @@ const OUTGOING_COLUMNS: &[&str] = &[
     "Outgoing",
 ];
 
-fn outgoing_flag(row: &SqlRow) -> Option<bool> {
-    for &name in OUTGOING_COLUMNS {
-        match row.get(name) {
+fn outgoing_flag_indexed(row: &[SqlValue], outgoing_idxs: &[usize]) -> Option<bool> {
+    for &idx in outgoing_idxs {
+        match row.get(idx) {
             None | Some(SqlValue::Null) => continue,
             Some(SqlValue::Int(n)) => return Some(*n != 0),
             Some(SqlValue::Float(f)) if f.is_finite() => return Some(*f != 0.0),
-            Some(v) => {
-                let s = sql_str(Some(v));
+            Some(SqlValue::Text(s)) => {
                 if let Ok(f) = s.trim().parse::<f64>() {
                     if f.is_finite() {
                         return Some(f != 0.0);
                     }
                 }
             }
+            Some(SqlValue::Blob(b)) => {
+                let s = String::from_utf8_lossy(b);
+                if let Ok(f) = s.trim().parse::<f64>() {
+                    if f.is_finite() {
+                        return Some(f != 0.0);
+                    }
+                }
+            }
+            Some(SqlValue::Float(_)) => {}
         }
     }
     None
 }
 
-fn first_col<'a>(row: &'a SqlRow, names: &[&str]) -> Option<&'a SqlValue> {
-    for &n in names {
-        if let Some(v) = row.get(n) {
+fn find_col(columns: &[String], name: &str) -> Option<usize> {
+    columns.iter().position(|c| c == name)
+}
+
+fn find_col_indices(columns: &[String], names: &[&str]) -> Vec<usize> {
+    names
+        .iter()
+        .filter_map(|&n| find_col(columns, n))
+        .collect()
+}
+
+fn first_non_null_idx(row: &[SqlValue], idxs: &[usize]) -> Option<usize> {
+    for &idx in idxs {
+        if let Some(v) = row.get(idx) {
             if !matches!(v, SqlValue::Null) {
-                return Some(v);
+                return Some(idx);
             }
         }
     }
@@ -416,36 +559,61 @@ pub fn read_conversation(
     id: &str,
     is_group: bool,
 ) -> Result<Option<BackupConversation>, SqliteError> {
-    let Some(table) = read_table(db, "ChatContent")? else {
+    let Some(table) = read_table_rows(db, "ChatContent")? else {
         return Ok(None);
     };
-    let has_status = table.columns.iter().any(|c| c == "MsgStatus");
+    let status_idx = find_col(&table.columns, "MsgStatus");
+    let cli_idxs = find_col_indices(&table.columns, &["CliMsgId", "cliMsgId"]);
+    let glb_idxs = find_col_indices(&table.columns, &["GlbMsgId", "GlobalMsgId", "MsgId"]);
+    let bin_idx = find_col(&table.columns, "BinNet");
+    let msg_type_idx = find_col(&table.columns, "MsgType");
+    let ts_idxs = find_col_indices(&table.columns, &["TimeStamp", "Ts"]);
+    let sender_idxs = find_col_indices(&table.columns, &["SenderId", "FromId", "FromUid"]);
+    let outgoing_idxs = find_col_indices(&table.columns, OUTGOING_COLUMNS);
+    let content_idxs = find_col_indices(&table.columns, &["MsgContent", "Message"]);
+    let ttl_idx = find_col(&table.columns, "TTL");
+
     let source_rows = table.rows.len();
     let mut rows = Vec::with_capacity(source_rows);
 
-    for r in &table.rows {
-        if has_status && sql_num(r.get("MsgStatus")) <= 0 {
-            continue;
+    for mut r in table.rows {
+        if let Some(si) = status_idx {
+            if sql_num(r.get(si)) <= 0 {
+                continue;
+            }
         }
-        let cli = sql_str(first_col(r, &["CliMsgId", "cliMsgId"]));
+        let cli_i = first_non_null_idx(&r, &cli_idxs);
+        let cli = take_sql_str(cli_i.and_then(|i| r.get_mut(i)));
         if cli.is_empty() {
             continue;
         }
-        let glb = sql_str(first_col(r, &["GlbMsgId", "GlobalMsgId", "MsgId"]));
-        let bin_bytes = match r.get("BinNet") {
-            Some(SqlValue::Blob(b)) => Some(b.as_slice()),
-            _ => None,
+        let glb_i = first_non_null_idx(&r, &glb_idxs);
+        let glb = take_sql_str(glb_i.and_then(|i| r.get_mut(i)));
+        let bin = match bin_idx.and_then(|i| r.get(i)) {
+            Some(SqlValue::Blob(b)) => parse_bin_net(Some(b.as_slice())),
+            _ => BinNet::default(),
         };
+        let msg_type = sql_num(msg_type_idx.and_then(|i| r.get(i)));
+        let ts = to_millis(sql_num(
+            first_non_null_idx(&r, &ts_idxs).and_then(|i| r.get(i)),
+        ));
+        let outgoing = outgoing_flag_indexed(&r, &outgoing_idxs);
+        let ttl = sql_num(ttl_idx.and_then(|i| r.get(i)));
+        let sender_i = first_non_null_idx(&r, &sender_idxs);
+        let sender_id = take_sql_str(sender_i.and_then(|i| r.get_mut(i)));
+        let content_i = first_non_null_idx(&r, &content_idxs);
+        let text = take_sql_str(content_i.and_then(|i| r.get_mut(i)));
+
         rows.push(BackupRow {
             global_msg_id: glb,
             cli_msg_id: cli,
-            msg_type: sql_num(r.get("MsgType")),
-            ts: to_millis(sql_num(first_col(r, &["TimeStamp", "Ts"]))),
-            sender_id: sql_str(first_col(r, &["SenderId", "FromId", "FromUid"])),
-            outgoing: outgoing_flag(r),
-            text: sql_str(first_col(r, &["MsgContent", "Message"])),
-            ttl: sql_num(r.get("TTL")),
-            bin: parse_bin_net(bin_bytes),
+            msg_type,
+            ts,
+            sender_id,
+            outgoing,
+            text,
+            ttl,
+            bin,
         });
     }
 
@@ -483,6 +651,12 @@ fn type_name(t: i64) -> &'static str {
     }
 }
 
+#[inline]
+fn starts_with_ascii_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 /// Returns `true` for `[Photo]`-style placeholder captions or local Android device URIs/paths.
 pub fn is_placeholder_caption(s: &str) -> bool {
     let trimmed = s.trim();
@@ -492,13 +666,12 @@ pub fn is_placeholder_caption(s: &str) -> bool {
             return true;
         }
     }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("content://")
-        || lower.starts_with("file://")
-        || lower.starts_with("/storage/")
-        || lower.starts_with("/sdcard/")
-        || lower.starts_with("/data/")
-        || lower.starts_with("/mnt/")
+    starts_with_ascii_ci(trimmed, "content://")
+        || starts_with_ascii_ci(trimmed, "file://")
+        || starts_with_ascii_ci(trimmed, "/storage/")
+        || starts_with_ascii_ci(trimmed, "/sdcard/")
+        || starts_with_ascii_ci(trimmed, "/data/")
+        || starts_with_ascii_ci(trimmed, "/mnt/")
 }
 
 fn json_object(raw: &str) -> Map<String, Value> {

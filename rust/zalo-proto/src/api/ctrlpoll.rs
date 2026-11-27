@@ -48,7 +48,7 @@ pub fn poll_cursor(
     let suffix = format!("{ids_b64},1");
     format!(
         "{last_action_id},{last_action_id_other},{}",
-        urlencoding::encode(&suffix)
+        percent_encoding::utf8_percent_encode(&suffix, percent_encoding::NON_ALPHANUMERIC)
     )
 }
 
