@@ -200,6 +200,8 @@ struct SessionInner {
     qr_task: Option<JoinHandle<()>>,
     qr_abort_tx: Option<oneshot::Sender<()>>,
     generation: u64,
+    /// The saved-session resume loop is running (see [`ZaloSession::start`]). Published to clients
+    /// as `status.resuming`, see [`SessionInner::sync_resuming`].
     resuming: bool,
     members: HashMap<String, (i64, Vec<GroupMember>)>,
     group_member_ids: HashMap<String, HashSet<String>>,
@@ -223,6 +225,14 @@ struct SessionInner {
 }
 
 impl SessionInner {
+    /// Brings `status.resuming` in line with the resume loop: set only while it runs *and* the
+    /// state is still `logging_in`. Every write to `status` (see `ZaloSession::patch_status`) and
+    /// every change of `resuming` runs this, so a status never claims a resume that has ended
+    /// (logged in, rejected, logged out, replaced by a QR login) and a QR login never claims one.
+    fn sync_resuming(&mut self) {
+        self.status.resuming = self.resuming && self.status.state == SessionState::LoggingIn;
+    }
+
     fn remember_poll_group(&mut self, poll_id: i64, group_id: String) {
         if self.poll_groups.contains_key(&poll_id) {
             self.poll_groups.insert(poll_id, group_id);
@@ -482,11 +492,16 @@ impl ZaloSession {
 
     /// Attempts to resume from saved `<data_dir>/credentials.json` with offline-resilient backoff
     /// (`5s -> 10s -> 20s -> 40s -> 60s`). If no credentials exist, stays `logged_out`.
+    ///
+    /// The status goes to `logging_in` with `resuming: true` before this returns and stays there
+    /// (retry waits included) until the saved session is logged in, rejected (`logged_out` with
+    /// the "session has ended" error), logged out, or replaced by a QR login. The chats are served
+    /// from the local store the whole time, so a client can show them while this runs.
     pub fn start(self: &Arc<Self>) {
         let Some(creds) = self.read_credentials() else {
             return;
         };
-        let generation = {
+        let (generation, snapshot) = {
             let Ok(mut s) = self.inner.write() else {
                 return;
             };
@@ -499,8 +514,17 @@ impl ZaloSession {
                 return;
             }
             s.resuming = true;
-            s.generation
+            // The resume loop starts with the same patch; doing it here too leaves no window in
+            // which the session looks `logged_out` (or not resuming) to a client that asks first.
+            s.status.state = SessionState::LoggingIn;
+            s.status.qr_image = None;
+            s.status.scanned_by = None;
+            s.status.error = None;
+            s.status.retrying = false;
+            s.sync_resuming();
+            (s.generation, s.status.clone())
         };
+        self.broadcast_status(&snapshot);
         let session = Arc::clone(self);
         let handle = tokio::spawn(async move {
             session.resume_loop(creds, generation).await;
@@ -576,8 +600,10 @@ impl ZaloSession {
             if s.generation == generation {
                 s.resuming = false;
                 s.resume_task = None;
-                if s.status.retrying {
-                    s.status.retrying = false;
+                let was_published = s.status.retrying || s.status.resuming;
+                s.status.retrying = false;
+                s.sync_resuming();
+                if was_published {
                     let snapshot = s.status.clone();
                     drop(s);
                     self.broadcast_status(&snapshot);
@@ -631,6 +657,8 @@ impl ZaloSession {
             s.status.scanned_by = None;
             s.status.error = None;
             s.status.retrying = false;
+            // `s.resuming` was cleared above: a QR login is not a resume of the saved session.
+            s.sync_resuming();
             let snapshot = s.status.clone();
             let gen = s.generation;
             drop(s);
@@ -815,6 +843,7 @@ impl ZaloSession {
             let had_listener = s.listener_handle.is_some();
             s.generation = s.generation.wrapping_add(1);
             s.resuming = false;
+            s.sync_resuming();
             if let Some(tx) = s.qr_abort_tx.take() {
                 let _ = tx.send(());
             }
@@ -4071,6 +4100,8 @@ impl ZaloSession {
                 return;
             };
             f(&mut s.status);
+            // `resuming` is derived, never set by the callers (see `SessionInner::sync_resuming`).
+            s.sync_resuming();
             s.status.clone()
         };
         self.broadcast_status(&snapshot);

@@ -48,6 +48,7 @@ import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.WifiOff
 import androidx.compose.material3.ButtonGroupDefaults
@@ -255,6 +256,8 @@ fun ThreadListScreen(
     /** Who is typing, by thread key. */
     typing: Map<String, TypingInfo>,
     status: SessionStatus?,
+    /** The saved session reconnecting in the background: a slim note above the chats (an enum, so it rarely changes). */
+    connectionNote: ConnectionNote = ConnectionNote.None,
     connectionError: String?,
     /** Friend requests waiting for an answer, for the badge on Contacts. */
     pendingRequests: Int,
@@ -466,6 +469,9 @@ fun ThreadListScreen(
                     }
                 }
             } else {
+                if (connectionNote != ConnectionNote.None) {
+                    item(key = "connecting", contentType = "connecting") { ConnectionNoteRow(connectionNote) }
+                }
                 if (status?.state == "disconnected" || connectionError != null) {
                     item(key = "banner", contentType = "banner") {
                         StatusBanner(
@@ -1339,6 +1345,29 @@ fun MenuEntry(
         leadingIcon = { Icon(icon, null, tint = color) },
         onClick = onClick,
     )
+}
+
+/** A slim, static line (no animation: it can stay up while offline, and spinning costs battery) under the top bar. */
+@Composable
+private fun ConnectionNoteRow(note: ConnectionNote) {
+    val waiting = note == ConnectionNote.WaitingForConnection
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Icon(
+            imageVector = if (waiting) Icons.Outlined.WifiOff else Icons.Outlined.Sync,
+            contentDescription = null,
+            modifier = Modifier.size(14.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = if (waiting) "Waiting for a connection…" else "Connecting…",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable

@@ -612,7 +612,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     firstUnreadId = firstUnread,
                 )
             }
-            markRead(api, thread.ref)
+            // While the saved session still reconnects, Zalo can't be told this chat was seen, and marking it read here
+            // would drop that receipt for good: it is marked once signed in (see the status event).
+            if (_state.value.status?.connectingWithSavedSession() != true) markRead(api, thread.ref)
             val details = runCatching { api.details(thread.kind, thread.id) }.getOrNull()
             if (details?.lastOnline != null) updateChat(thread.ref) { it.copy(lastOnline = details.lastOnline) }
             if (details?.members != null) updateChat(thread.ref) { it.copy(members = details.members) }
@@ -1345,25 +1347,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun refreshAll(api: ApiClient) {
-        // Status and threads are asked together: the threads call only matters when signed in, and its failure is
-        // only raised then (as before, when it was called after the status).
+        // Status and threads are asked together: the threads call only matters when signed in or when the saved session
+        // is still reconnecting (the chats are on the phone, so they show while it does), and its failure is only
+        // raised when signed in (as before, when it was called after the status).
         StartupTiming.mark("refresh-start", SystemClock.uptimeMillis())
-        val (status, threads) = coroutineScope {
+        val (status, fetched) = coroutineScope {
             val statusCall = async { api.status().also { StartupTiming.mark("status-ready", SystemClock.uptimeMillis()) } }
             val threadsCall = async {
                 runCatching { api.threads() }.also { StartupTiming.mark("threads-ready", SystemClock.uptimeMillis()) }
             }
             val status = statusCall.await()
-            status to (if (status.isLoggedIn) threadsCall.await().getOrThrow() else emptyList())
+            val threads: List<ThreadSummary>? = when {
+                status.isLoggedIn -> threadsCall.await().getOrThrow()
+                // Reconnecting: a failure here is not an error and must not empty the list the user is looking at.
+                status.resuming -> threadsCall.await().getOrNull()
+                else -> emptyList()
+            }
+            status to threads
         }
         _state.update {
             it.copy(
                 status = status,
-                threads = keepUnchanged(it.threads, threads),
+                threads = if (fetched == null) it.threads else keepUnchanged(it.threads, fetched),
                 connectionError = null,
                 startupError = null,
             )
         }
+        val threads = fetched.orEmpty()
         StartupTiming.mark("state-applied", SystemClock.uptimeMillis())
         // The sync progress isn't needed for the first paint: fetched after it, in its own update.
         if (status.isLoggedIn) {
@@ -1385,8 +1395,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             is ServerEvent.Status -> {
                 val wasLoggedIn = _state.value.status?.isLoggedIn == true
                 val wasReady = _state.value.status?.state == "ready"
+                val wasConnecting = _state.value.status?.connectingWithSavedSession() == true
                 _state.update { it.copy(status = event.status, connectionError = null) }
-                if (event.status.isLoggedIn && !wasLoggedIn) scheduleRefreshThreads(api)
+                if (event.status.isLoggedIn && !wasLoggedIn) {
+                    scheduleRefreshThreads(api)
+                    // A chat opened while the saved session reconnected: it was not marked read yet (see openChat).
+                    if (wasConnecting) _state.value.chat?.let { markRead(api, it.ref) }
+                }
+                // The saved session was rejected while its chats were showing: the login screen takes over, so a chat
+                // that was opened meanwhile closes with it (its screen pops itself once there is no open chat).
+                if (wasConnecting && !event.status.isLoggedIn && !event.status.connectingWithSavedSession()) closeChat()
                 if (event.status.state == "ready" && (!wasReady || outbox.pendingCount() > 0)) {
                     flushOutbox()
                 }

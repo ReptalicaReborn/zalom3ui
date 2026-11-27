@@ -126,6 +126,7 @@ async fn a_saved_session_that_cant_reach_zalo_is_retried_not_logged_out() {
     let s = session.get_status();
     assert_eq!(s.state, SessionState::LoggingIn);
     assert!(s.retrying);
+    assert!(s.resuming, "still resuming while it waits to retry");
     assert!(
         s.error
             .as_deref()
@@ -145,6 +146,7 @@ async fn a_saved_session_that_cant_reach_zalo_is_retried_not_logged_out() {
     assert_eq!(login.attempts(), 2);
     assert_eq!(s.state, SessionState::LoggedOut);
     assert!(!s.retrying);
+    assert!(!s.resuming, "a rejected saved session is not resuming");
     assert!(
         s.error
             .as_deref()
@@ -174,13 +176,208 @@ async fn a_qr_login_replaces_a_resume_that_is_waiting_to_retry() {
     session.start();
     settle().await;
     assert!(session.get_status().retrying);
+    assert!(session.get_status().resuming);
 
     session.start_qr_login();
+    // The replacement is visible at once, before the QR code arrives.
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggingIn);
+    assert!(!s.resuming, "a QR login is not a resume");
     settle().await;
     let s = session.get_status();
     assert_eq!(s.state, SessionState::AwaitingQrScan);
     assert!(!s.retrying);
+    assert!(!s.resuming);
     assert_eq!(s.qr_image.as_deref(), Some("data:image/png;base64,AAAA"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- `resuming`: a saved session reconnecting in the background ----
+
+/// A cookie login that waits for the returned sender, then signs in as `api`.
+fn cookie_login_held(api: Arc<FakeZaloApi>) -> (LoginStep, oneshot::Sender<()>) {
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let release_rx = Mutex::new(Some(release_rx));
+    let step = LoginStep::cookie(move |_| {
+        let release = release_rx.lock().unwrap().take();
+        let api = Arc::clone(&api);
+        Box::pin(async move {
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            Ok(api as Arc<dyn ZaloApi>)
+        })
+    });
+    (step, release_tx)
+}
+
+/// The `status` events broadcast so far, in order.
+fn statuses(events: &mut broadcast::Receiver<ServerBroadcastEvent>) -> Vec<SessionStatus> {
+    let mut out = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        if v["type"] == "status" {
+            out.push(serde_json::from_value(v["status"].clone()).unwrap());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_saved_session_resumes_in_the_background_and_says_so_until_it_is_logged_in() {
+    let api = FakeZaloApi::new("me");
+    let (step, release) = cookie_login_held(api.clone());
+    let (session, _login, dir) = session_with(vec![step], true);
+    let mut events = session.subscribe_events();
+    assert!(!session.get_status().resuming, "nothing resumes before start");
+
+    session.start();
+    // No settle: a client asking right after `start` already sees the resume, never `logged_out`.
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggingIn);
+    assert!(s.resuming);
+    assert!(!s.retrying);
+    assert!(s.qr_image.is_none());
+
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggingIn);
+    assert!(s.resuming, "still resuming while the login is in flight");
+
+    release.send(()).unwrap();
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::Ready);
+    assert!(!s.resuming);
+    assert!(!s.retrying);
+    assert_eq!(s.own_id.as_deref(), Some("me"));
+
+    // Every status a client saw agrees: resuming exactly while `logging_in`, and the last one is
+    // the settled one.
+    let seen = statuses(&mut events);
+    assert!(seen.len() >= 2, "{seen:?}");
+    for st in &seen {
+        assert_eq!(
+            st.resuming,
+            st.state == SessionState::LoggingIn,
+            "inconsistent status {st:?}"
+        );
+    }
+    assert!(seen.iter().any(|st| st.resuming));
+    let last = seen.last().unwrap();
+    assert_eq!(last.state, SessionState::Ready);
+    assert!(!last.resuming);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn resuming_lasts_through_offline_retries_and_ends_when_the_session_signs_in() {
+    let api = FakeZaloApi::new("me");
+    let (session, login, dir) = session_with(
+        vec![
+            LoginStep::cookie_error(dns_failure),
+            LoginStep::cookie_error(dns_failure),
+            LoginStep::cookie_ok(api.clone()),
+        ],
+        true,
+    );
+    let mut events = session.subscribe_events();
+    session.start();
+    settle().await;
+    let s = session.get_status();
+    assert!(s.retrying && s.resuming, "{s:?}");
+
+    session.retry_now();
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(login.attempts(), 2);
+    assert!(s.retrying && s.resuming, "still offline: {s:?}");
+    assert_eq!(s.state, SessionState::LoggingIn);
+
+    session.retry_now();
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(login.attempts(), 3);
+    assert_eq!(s.state, SessionState::Ready);
+    assert!(!s.resuming);
+    assert!(!s.retrying);
+
+    // `resuming` held in every status between the first and the sign-in.
+    let seen = statuses(&mut events);
+    let ready_at = seen
+        .iter()
+        .position(|st| st.state == SessionState::Ready)
+        .expect("a ready status");
+    assert!(seen[..ready_at].iter().all(|st| st.resuming), "{seen:?}");
+    assert!(seen[ready_at..].iter().all(|st| !st.resuming), "{seen:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_rejected_saved_session_stops_resuming_and_keeps_the_expiry_error() {
+    let (session, _login, dir) = session_with(vec![LoginStep::cookie_error(rejected_session)], true);
+    let mut events = session.subscribe_events();
+    session.start();
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggedOut);
+    assert!(!s.resuming);
+    assert!(!s.retrying);
+    assert_eq!(s.error.as_deref(), Some(SESSION_EXPIRED));
+
+    let seen = statuses(&mut events);
+    let last = seen.last().expect("status events");
+    assert_eq!(last.state, SessionState::LoggedOut);
+    assert!(!last.resuming);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn logging_out_while_a_saved_session_resumes_stops_resuming() {
+    let api = FakeZaloApi::new("me");
+    let (step, _release) = cookie_login_held(api);
+    let (session, _login, dir) = session_with(vec![step], true);
+    let mut events = session.subscribe_events();
+    session.start();
+    settle().await;
+    assert!(session.get_status().resuming);
+
+    session.logout().await;
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggedOut);
+    assert!(!s.resuming);
+    assert_eq!(s.error, None);
+    let seen = statuses(&mut events);
+    let last = seen.last().expect("status events");
+    assert_eq!(last.state, SessionState::LoggedOut);
+    assert!(!last.resuming);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_qr_login_is_never_reported_as_resuming() {
+    let (session, _login, dir) = session_with(vec![qr_showing_until_aborted("AAAA")], false);
+    let mut events = session.subscribe_events();
+    // No saved credentials: `start` has nothing to resume.
+    session.start();
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggedOut);
+    assert!(!s.resuming);
+
+    session.start_qr_login();
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggingIn);
+    assert!(!s.resuming, "the QR login's own logging_in is not a resume");
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::AwaitingQrScan);
+    assert!(!s.resuming);
+
+    let seen = statuses(&mut events);
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|st| !st.resuming), "{seen:?}");
     let _ = fs::remove_dir_all(&dir);
 }
 
