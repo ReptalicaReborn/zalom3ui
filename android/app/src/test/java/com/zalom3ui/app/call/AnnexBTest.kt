@@ -55,4 +55,29 @@ class AnnexBTest {
         assertSame(full, AnnexB.withParameterSets(config, true, full))
         assertSame(idr, AnnexB.withParameterSets(null, true, idr))
     }
+
+    private fun hex(h: String) = ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    @Test
+    fun splitsNalUnitsAndFindsByType() {
+        val units = AnnexB.nalUnits(sps + pps + idr)
+        assertEquals(3, units.size)
+        assertArrayEquals(b(0x67, 1, 2), units[0])
+        assertArrayEquals(b(0x68, 3), units[1])
+        assertArrayEquals(b(0x65, 9, 9), units[2])
+        assertArrayEquals(b(0x68, 3), AnnexB.findNal(sps + pps + idr, 8))
+        assertEquals(null, AnnexB.findNal(delta, 8))
+        assertEquals(emptyList<ByteArray>().size, AnnexB.nalUnits(b(1, 2, 3)).size)
+        assertArrayEquals(b(0, 0, 0, 1, 0x68, 3), AnnexB.withStartCode(b(0x68, 3)))
+    }
+
+    @Test
+    fun readsPictureSizeFromSps() {
+        assertEquals(Pair(640, 480), AnnexB.spsSize(hex("6742001eda0280f640")))
+        assertEquals(Pair(368, 640), AnnexB.spsSize(hex("6742001eda05c14640")))
+        // High profile with a bottom crop of 8 lines: 1920x1088 -> 1920x1080.
+        assertEquals(Pair(1920, 1080), AnnexB.spsSize(hex("6764001eacb403c0113f2a")))
+        assertEquals(null, AnnexB.spsSize(b(0x68, 1, 2, 3)))
+        assertEquals(null, AnnexB.spsSize(b(0x67, 0x42)))
+    }
 }

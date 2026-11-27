@@ -29,7 +29,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.FormatColorFill
@@ -115,8 +117,11 @@ fun SettingsScreen(
     onLogout: () -> Unit,
     reducedMotion: Boolean = false,
     onReducedMotion: (Boolean) -> Unit = {},
+    hideOfficialAccounts: Boolean = false,
+    onHideOfficialAccounts: (Boolean) -> Unit = {},
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
+    onShareStartupLog: () -> Unit = {},
     onSyncHistory: () -> Unit = {},
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
@@ -241,6 +246,23 @@ fun SettingsScreen(
                             Switch(
                                 checked = appearance.tintedBackground,
                                 onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
+                            )
+                        },
+                    )
+                }
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable {
+                            onAppearance(appearance.copy(amoledBlack = !appearance.amoledBlack))
+                        },
+                        colors = transparentListItemColors,
+                        leadingContent = { Icon(Icons.Outlined.Contrast, null) },
+                        headlineContent = { Text("Pure black (AMOLED)") },
+                        supportingContent = { Text("Black backgrounds in dark mode, easier on OLED batteries") },
+                        trailingContent = {
+                            Switch(
+                                checked = appearance.amoledBlack,
+                                onCheckedChange = { onAppearance(appearance.copy(amoledBlack = it)) },
                             )
                         },
                     )
@@ -423,6 +445,29 @@ fun SettingsScreen(
 
             if (current.onDevice) IncomingCallSettings()
 
+            SectionHeader("Chats")
+            ExpressiveSettingsGroup(
+                items = listOf<@Composable () -> Unit>(
+                    {
+                        ListItem(
+                            modifier = Modifier.clickable { onHideOfficialAccounts(!hideOfficialAccounts) },
+                            colors = transparentListItemColors,
+                            leadingContent = { Icon(Icons.Outlined.Campaign, null) },
+                            headlineContent = { Text("Hide official accounts") },
+                            supportingContent = {
+                                Text("News, shops and ZNS notifications won't show in your chat list or notify you")
+                            },
+                            trailingContent = {
+                                Switch(
+                                    checked = hideOfficialAccounts,
+                                    onCheckedChange = onHideOfficialAccounts,
+                                )
+                            },
+                        )
+                    },
+                ),
+            )
+
             // How long Zalo stays connected (only the on-phone core has this choice), and codes from Zalo's notifications.
             StayConnectedSettings(showModes = current.onDevice)
 
@@ -476,6 +521,17 @@ fun SettingsScreen(
                 SectionHeader("Developer")
                 ExpressiveSettingsGroup(
                     items = listOf<@Composable () -> Unit>(
+                        {
+                            ListItem(
+                                modifier = Modifier.clickable(onClick = onShareStartupLog),
+                                colors = transparentListItemColors,
+                                leadingContent = { Icon(Icons.Outlined.Share, null) },
+                                headlineContent = { Text("Share startup log") },
+                                supportingContent = {
+                                    Text("How long the app took to start (one line per cold start), and the core's startup output")
+                                },
+                            )
+                        },
                         {
                             ListItem(
                                 modifier = Modifier.clickable(onClick = onShareCallLog),

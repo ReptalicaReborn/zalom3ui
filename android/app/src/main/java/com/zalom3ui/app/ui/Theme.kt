@@ -515,13 +515,23 @@ fun AppTheme(
             dark = false,
         )
     }
+    // Pure black (AMOLED): only in dark mode; accents, bubbles and text are untouched.
+    val amoled = dark && appearance.amoledBlack
+    val schemeColors = if (amoled) colors.toAmoled() else colors
+    val chatColors = if (amoled) {
+        chat.copy(
+            background = if (appearance.tintedBackground) lerp(Color.Black, colors.primary, 0.06f) else Color.Black,
+        )
+    } else {
+        chat
+    }
     CompositionLocalProvider(
-        LocalChatColors provides chat,
+        LocalChatColors provides chatColors,
         LocalUltraExpressive provides appearance.ultraExpressive,
         LocalReducedMotion provides reducedMotion,
     ) {
         MaterialExpressiveTheme(
-            colorScheme = colors,
+            colorScheme = schemeColors,
             motionScheme = if (reducedMotion) MotionScheme.standard() else MotionScheme.expressive(),
             shapes = if (gold) GoldShapes else ExpressiveShapes,
             typography = ExpressiveTypography,
@@ -529,6 +539,22 @@ fun AppTheme(
         )
     }
 }
+
+/**
+ * "Pure black (AMOLED)": black page and surface, with the surface containers a few steps above black so cards,
+ * sheets and bars still stand apart from the page.
+ */
+private fun ColorScheme.toAmoled(): ColorScheme = copy(
+    background = Color.Black,
+    surface = Color.Black,
+    surfaceDim = Color.Black,
+    surfaceContainerLowest = Color.Black,
+    surfaceContainerLow = Color(0xFF0B0B0C),
+    surfaceContainer = Color(0xFF121214),
+    surfaceContainerHigh = Color(0xFF1A1A1C),
+    surfaceContainerHighest = Color(0xFF222225),
+    surfaceBright = Color(0xFF29292D),
+)
 
 /** Easter egg: true when "4x faster mode" (hilariously oversized M3 Expressive buttons) is enabled. */
 val LocalUltraExpressive = staticCompositionLocalOf { false }

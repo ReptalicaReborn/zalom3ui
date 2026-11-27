@@ -24,7 +24,7 @@ enum class ThemeMode(val label: String) {
 
 enum class ChatAccent(val key: String, val label: String) {
     ULTRAMARINE("ultramarine", "Ultramarine"),
-    REPTDOC_GOLD("gold", "ReptDoc gold"),
+    REPTDOC_GOLD("gold", "Gold"),
     CRIMSON("crimson", "Crimson"),
     FOREST("forest", "Forest"),
     PLUM("plum", "Plum"),
@@ -45,6 +45,8 @@ data class Appearance(
     val dynamicColor: Boolean = false,
     val accent: ChatAccent = ChatAccent.ULTRAMARINE,
     val tintedBackground: Boolean = false,
+    /** "Pure black (AMOLED)": true black backgrounds in dark mode (pixels off on OLED screens). */
+    val amoledBlack: Boolean = false,
     /** Easter egg: hilariously oversized Material 3 Expressive buttons ("4x faster!"). */
     val ultraExpressive: Boolean = false,
 )
@@ -126,6 +128,7 @@ class SettingsStore(context: Context) {
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, false),
             accent = accent,
             tintedBackground = prefs.getBoolean(KEY_CHAT_TINTED_BG, false),
+            amoledBlack = prefs.getBoolean(KEY_AMOLED_BLACK, false),
             ultraExpressive = prefs.getBoolean(KEY_ULTRA_EXPRESSIVE, false),
         )
     }
@@ -137,6 +140,7 @@ class SettingsStore(context: Context) {
             .putBoolean(KEY_DYNAMIC_COLOR, appearance.dynamicColor)
             .putString(KEY_CHAT_ACCENT, appearance.accent.key)
             .putBoolean(KEY_CHAT_TINTED_BG, appearance.tintedBackground)
+            .putBoolean(KEY_AMOLED_BLACK, appearance.amoledBlack)
             .putBoolean(KEY_ULTRA_EXPRESSIVE, appearance.ultraExpressive)
             .apply()
     }
@@ -202,7 +206,15 @@ class SettingsStore(context: Context) {
             prefs.edit().putBoolean(KEY_REDUCED_MOTION, value).apply()
         }
 
+    /** Hide Official Accounts (news, shops, ZNS senders) from the chat list and don't notify for them. */
+    var hideOfficialAccounts: Boolean
+        get() = prefs.getBoolean(KEY_HIDE_OFFICIAL_ACCOUNTS, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HIDE_OFFICIAL_ACCOUNTS, value).apply()
+        }
+
     internal companion object {
+        const val KEY_HIDE_OFFICIAL_ACCOUNTS = "hide_official_accounts"
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
         const val KEY_OTP_FROM_ZALO_NOTIFICATIONS = "otp_from_zalo_notifications"
@@ -214,6 +226,7 @@ class SettingsStore(context: Context) {
         const val KEY_COLOR_THEME = "color_theme"
         const val KEY_CHAT_ACCENT = "chat_accent"
         const val KEY_CHAT_TINTED_BG = "chat_tinted_bg"
+        const val KEY_AMOLED_BLACK = "amoled_black"
         const val KEY_ULTRA_EXPRESSIVE = "ultra_expressive"
         const val KEY_CHAT_ACCENTS = "chat_accents"
         const val KEY_CHAT_DRAFTS = "chat_drafts"

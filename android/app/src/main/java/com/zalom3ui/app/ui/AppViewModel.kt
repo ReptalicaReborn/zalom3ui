@@ -42,6 +42,8 @@ import com.zalom3ui.app.server.ZaloCore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -49,9 +51,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
@@ -153,6 +157,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val latestDrafts = HashMap<String, String>(_state.value.drafts)
     private val draftSaves = HashMap<String, Job>()
 
+    private val _hideOfficialAccounts = MutableStateFlow(settingsStore.hideOfficialAccounts)
+    /** "Hide official accounts": the chat list hides OA chats behind an "Official accounts (N)" row. */
+    val hideOfficialAccounts: StateFlow<Boolean> = _hideOfficialAccounts.asStateFlow()
+
     private val _reducedMotion = MutableStateFlow(settingsStore.reducedMotion)
     /** User preference for reduced motion (combined with system setting at the theme root). */
     val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
@@ -231,6 +239,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var refreshThreadsJob: Job? = null
     private var refreshThreadsPending = false
     private var restartJob: Job? = null
+    /** The foreground-service start waiting for the chat list to draw (see [startLiveUpdates]). */
+    private var serviceStartJob: Job? = null
     private var messageSearchJob: Job? = null
     private var visible = false
     private var lastTypingSent = 0L
@@ -245,6 +255,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setAppearance(appearance: Appearance) {
         settingsStore.saveAppearance(appearance)
         _state.update { it.copy(appearance = appearance) }
+    }
+
+    fun setHideOfficialAccounts(hide: Boolean) {
+        settingsStore.hideOfficialAccounts = hide
+        _hideOfficialAccounts.value = hide
     }
 
     fun setReducedMotion(enabled: Boolean) {
@@ -451,16 +466,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         refreshThreadsJob?.cancel()
         refreshThreadsJob = null
         refreshThreadsPending = false
+        serviceStartJob?.cancel()
+        serviceStartJob = null
         val api = client ?: return
         val onDevice = _state.value.settings.onDevice
         if (onDevice) {
             // Only "Stay connected: Always" runs the foreground service; the other modes connect while the app is open.
-            val refused = if (settingsStore.loadStay().mode.keepsForegroundService) LocalServer.start(getApplication()) else null
+            // The service start is kept out of the first frames: it waits for the chat list to have data (or a short
+            // timeout), and happens at once if the app is hidden before then (see stopLiveUpdates).
+            if (settingsStore.loadStay().mode.keepsForegroundService) {
+                serviceStartJob = viewModelScope.launch {
+                    withTimeoutOrNull(SERVICE_START_MAX_WAIT_MS) { _state.first { it.threads.isNotEmpty() } }
+                    delay(SERVICE_START_AFTER_DATA_MS)
+                    serviceStartJob = null
+                    startServiceNow()
+                }
+            }
             if (localStartedAt == 0L) localStartedAt = System.currentTimeMillis()
             _state.update {
                 it.copy(
                     startingSince = if (it.status == null && it.startingSince == 0L) localStartedAt else it.startingSince,
-                    startupError = refused?.let { e -> "Android didn't start the Zalo service: ${e.message ?: e.javaClass.simpleName}" },
+                    startupError = null,
                 )
             }
         }
@@ -490,8 +516,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun startServiceNow() {
+        val refused = LocalServer.start(getApplication()) ?: return
+        _state.update { it.copy(startupError = "Android didn't start the Zalo service: ${refused.message ?: refused.javaClass.simpleName}") }
+    }
+
     fun stopLiveUpdates() {
         visible = false
+        // A deferred service start must not be lost: do it now, while Android still counts us as just-visible.
+        serviceStartJob?.let { job ->
+            serviceStartJob = null
+            if (job.isActive) {
+                job.cancel()
+                startServiceNow()
+            }
+        }
         // Going to the background: save drafts now rather than after the typing pause, in case the app is killed.
         flushDrafts()
         liveJob?.cancel()
@@ -1303,17 +1342,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun refreshAll(api: ApiClient) {
-        val status = api.status()
-        val threads = if (status.isLoggedIn) api.threads() else emptyList()
-        val sync = if (status.isLoggedIn) runCatching { api.historySyncStatus() }.getOrNull() else null
+        // Status and threads are asked together: the threads call only matters when signed in, and its failure is
+        // only raised then (as before, when it was called after the status).
+        val (status, threads) = coroutineScope {
+            val statusCall = async { api.status() }
+            val threadsCall = async { runCatching { api.threads() } }
+            val status = statusCall.await()
+            status to (if (status.isLoggedIn) threadsCall.await().getOrThrow() else emptyList())
+        }
         _state.update {
             it.copy(
                 status = status,
                 threads = keepUnchanged(it.threads, threads),
                 connectionError = null,
                 startupError = null,
-                historySync = sync ?: it.historySync,
             )
+        }
+        // The sync progress isn't needed for the first paint: fetched after it, in its own update.
+        if (status.isLoggedIn) {
+            viewModelScope.launch {
+                val sync = runCatching { api.historySyncStatus() }.getOrNull()
+                if (sync != null) _state.update { it.copy(historySync = sync) }
+            }
         }
         if (threads.isNotEmpty()) syncShortcutsAsync(threads)
         if (status.state == "ready") flushOutbox()
@@ -1430,6 +1480,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun syncShortcutsAsync(threads: List<ThreadSummary>) {
         val app = getApplication<Application>()
         viewModelScope.launch(Dispatchers.IO) {
+            delay(SHORTCUT_SYNC_DELAY_MS) // not needed while the first frames draw
             runCatching { ConversationShortcuts.syncRecentShortcuts(app, threads) }
         }
     }
@@ -1498,6 +1549,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val RECONNECT_DELAY_MS = 5_000L
         private const val PRESENCE_REFRESH_MS = 30_000L
         private const val LOCAL_BOOT_GRACE_MS = 45_000L
+        /** The foreground service starts this long after the first chat list, or after the max wait if none arrives. */
+        private const val SERVICE_START_AFTER_DATA_MS = 500L
+        private const val SERVICE_START_MAX_WAIT_MS = 2_000L
+        private const val SHORTCUT_SYNC_DELAY_MS = 1_500L
         private const val LOCAL_BOOT_RETRY_MS = 1_000L
         private const val MESSAGE_SEARCH_DEBOUNCE_MS = 250L
         /** How long typing must pause before a draft is saved. */

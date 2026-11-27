@@ -48,6 +48,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.server.StartupLog
@@ -187,6 +188,13 @@ private fun AppNav(vm: AppViewModel) {
             onSetDisappearingTtl = { ttl -> vm.setDisappearingTtl(ref, ttl) },
             onLoadFriends = vm::loadFriends,
             onSendCard = { person -> vm.sendCard(ref, person.id) },
+            onOpenUserChat = { person ->
+                vm.openFriendChat(person)
+                goToChat()
+            },
+            onAddFriend = { person ->
+                vm.sendFriendRequest(FoundUser(id = person.id, name = person.name, avatar = person.avatar), "Hi, I'd like to add you as a friend.") {}
+            },
             onCancelOutbox = vm::cancelOutboxEntry,
             onRetryOutbox = vm::retryOutbox,
         )
@@ -217,7 +225,13 @@ private fun AppNav(vm: AppViewModel) {
             }
         }
     }
-    LaunchedEffect(signedIn) { if (signedIn) vm.loadFriendRequests() }
+    // Not needed for the first frame: wait until the chat list has drawn.
+    LaunchedEffect(signedIn) {
+        if (signedIn) {
+            kotlinx.coroutines.delay(800)
+            vm.loadFriendRequests()
+        }
+    }
     // Turning a tablet (or resizing a window) moves an open chat between its own screen and the pane.
     LaunchedEffect(wide) {
         val route = nav.currentDestination?.route
@@ -270,6 +284,7 @@ private fun AppNav(vm: AppViewModel) {
                     onMute = { thread, option -> vm.setMuted(thread.ref, option) },
                     onMarkRead = { vm.markThreadRead(it.ref) },
                     onMarkUnread = { vm.markUnread(it.ref) },
+                    onHideOfficialAccounts = { vm.setHideOfficialAccounts(true) },
                     onDelete = { vm.deleteConversation(it.ref) },
                     onSearchMessages = vm::searchAllMessages,
                     onOpenSearchHit = { hit ->
@@ -344,7 +359,9 @@ private fun AppNav(vm: AppViewModel) {
                     },
                 ) { selectedKey ->
                     // The fields go in as they are (no copies), so the list skips when none of them changed.
+                    val hideOfficialAccounts by vm.hideOfficialAccounts.collectAsStateWithLifecycle()
                     ThreadListScreen(
+                        hideOfficialAccounts = hideOfficialAccounts,
                         threads = state.threads,
                         drafts = state.drafts,
                         typing = state.typing,
@@ -666,7 +683,10 @@ private fun AppNav(vm: AppViewModel) {
         screen(Routes.SETTINGS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
             val reducedMotionPref by vm.reducedMotion.collectAsStateWithLifecycle()
+            val hideOfficialAccounts by vm.hideOfficialAccounts.collectAsStateWithLifecycle()
             SettingsScreen(
+                hideOfficialAccounts = hideOfficialAccounts,
+                onHideOfficialAccounts = vm::setHideOfficialAccounts,
                 current = state.settings,
                 appearance = state.appearance,
                 profileName = state.status?.ownName,
@@ -693,6 +713,12 @@ private fun AppNav(vm: AppViewModel) {
                 onSyncHistory = vm::startHistorySync,
                 onShareCallLog = { vm.shareCallLog { log -> scope.launch { QrActions.shareCallLog(context, log) } } },
                 onClearCallLog = vm::clearCallLog,
+                onShareStartupLog = {
+                    scope.launch {
+                        val report = withContext(Dispatchers.IO) { StartupLog.report(context) }
+                        QrActions.shareText(context, "zaloo-startup-log.txt", "Share startup log", report)
+                    }
+                },
             )
         }
     }

@@ -1,6 +1,8 @@
 package com.zalom3ui.app.ui
 
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -60,6 +62,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Description
@@ -67,9 +70,11 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LocationOn
+import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingToolbarDefaults
@@ -79,8 +84,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -89,6 +96,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -120,6 +128,7 @@ import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
+import com.zalom3ui.app.data.Person
 import com.zalom3ui.app.data.isLocalMediaUri
 import com.zalom3ui.app.server.OtpClipboard
 import com.zalom3ui.app.server.StartupLog
@@ -137,7 +146,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Kinds drawn as their own content (picture, player, card) instead of a "[Photo]" label. */
-private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll")
+private val SHOWN_KINDS = setOf("photo", "gif", "video", "voice", "file", "link", "embed", "contact", "location", "call", "poll")
 
 /** Whether [AttachmentContent] draws this attachment (otherwise the message shows its text label). */
 fun Attachment.isShown(): Boolean = kind in SHOWN_KINDS &&
@@ -303,13 +312,8 @@ fun AttachmentContent(
             onClick = a.href?.let { href -> { openExternally(context, href) } },
         )
         "link" -> LinkCard(a, onOutgoing, onClick = a.remoteHref?.let { href -> { openExternally(context, href) } })
-        "contact" -> CardRow(
-            icon = { Avatar(a.title.orEmpty(), a.thumb.orEmpty(), key = a.userId ?: a.title.orEmpty(), isGroup = false, size = 40.dp) },
-            title = a.title ?: "Contact",
-            subtitle = "Contact card",
-            onOutgoing = onOutgoing,
-            onClick = null,
-        )
+        "embed" -> EmbedCard(a, onOutgoing)
+        "contact" -> ContactCard(a, onOutgoing)
         "call" -> CallCard(a, onOutgoing)
         "poll" -> a.poll?.let { PollCard(it, onOutgoing) }
         "location" -> CardRow(
@@ -599,7 +603,7 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
             )
         }
         Column(Modifier.padding(12.dp)) {
-            val host = a.remoteHref?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.")
+            val host = a.domain ?: a.remoteHref?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.")
             if (host != null && !isRichCard) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
@@ -648,6 +652,157 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
                 }
             }
         }
+    }
+}
+
+/** Generic rich embed (news, mini-app, article, todo…): thumbnail, source domain, title, description and an "Open" button. */
+@Composable
+private fun EmbedCard(a: Attachment, onOutgoing: Boolean) {
+    val context = LocalContext.current
+    val tint = if (onOutgoing) Color.White.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+    val link = a.remoteHref
+    Column(
+        Modifier
+            .widthIn(max = 280.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(tint)
+            .then(if (link != null) Modifier.clickable { openExternally(context, link) } else Modifier),
+    ) {
+        a.remoteThumb?.let {
+            AsyncImage(
+                model = it,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(140.dp),
+            )
+        }
+        Column(Modifier.padding(12.dp)) {
+            val host = a.domain ?: link?.let { runCatching { Uri.parse(it).host }.getOrNull() }?.removePrefix("www.")
+            if (host != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Link, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(host, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Spacer(Modifier.height(2.dp))
+            }
+            a.title?.let {
+                Text(it, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+            a.description?.let {
+                if (a.title != null) Spacer(Modifier.height(4.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 5, overflow = TextOverflow.Ellipsis)
+            }
+            if (link != null) {
+                Spacer(Modifier.height(10.dp))
+                FilledTonalButton(
+                    onClick = { openExternally(context, link) },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(a.actionLabel ?: "Open", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+// ---- Contact cards ----
+
+/** What a tapped contact card can do; provided by the chat screen, so the card itself stays plain UI. */
+class ContactCardActions(
+    val isFriend: (userId: String) -> Boolean,
+    val onMessage: (Person) -> Unit,
+    val onAddFriend: (Person) -> Unit,
+)
+
+val LocalContactCardActions = staticCompositionLocalOf<ContactCardActions?> { null }
+
+@Composable
+private fun ContactCard(a: Attachment, onOutgoing: Boolean) {
+    var showSheet by remember { mutableStateOf(false) }
+    CardRow(
+        icon = { Avatar(a.title.orEmpty(), a.thumb.orEmpty(), key = a.userId ?: a.title.orEmpty(), isGroup = false, size = 40.dp) },
+        title = a.title ?: "Contact",
+        subtitle = a.phone ?: "Contact card",
+        onOutgoing = onOutgoing,
+        onClick = { showSheet = true },
+    )
+    if (showSheet) ContactSheet(a, onDismiss = { showSheet = false })
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ContactSheet(a: Attachment, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val actions = LocalContactCardActions.current
+    val name = a.title?.takeIf { it.isNotBlank() } ?: "Contact"
+    val person = a.userId?.takeIf { it.isNotBlank() }?.let { Person(id = it, name = name, avatar = a.thumb.orEmpty()) }
+    val phone = a.phone
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState()) {
+        Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Avatar(name, a.thumb.orEmpty(), key = a.userId ?: name, isGroup = false, size = 48.dp)
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    phone?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                }
+            }
+            if (person != null && actions != null) {
+                ContactSheetAction(Icons.Outlined.ChatBubbleOutline, "Message") {
+                    onDismiss()
+                    actions.onMessage(person)
+                }
+                if (!actions.isFriend(person.id)) {
+                    ContactSheetAction(Icons.Outlined.PersonAdd, "Add friend") {
+                        onDismiss()
+                        actions.onAddFriend(person)
+                    }
+                }
+            }
+            if (phone != null) {
+                ContactSheetAction(Icons.Outlined.Call, "Call $phone") {
+                    onDismiss()
+                    try {
+                        context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + phone.filter { it.isDigit() || it == '+' })))
+                    } catch (_: ActivityNotFoundException) {
+                        Toast.makeText(context, "No dialer available", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                ContactSheetAction(Icons.Outlined.ContentCopy, "Copy phone number") {
+                    onDismiss()
+                    context.getSystemService(ClipboardManager::class.java)
+                        ?.setPrimaryClip(ClipData.newPlainText("Phone number", phone))
+                    Toast.makeText(context, "Phone number copied", Toast.LENGTH_SHORT).show()
+                }
+            }
+            if (person == null && phone == null) {
+                Text(
+                    "No details were shared with this card.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContactSheetAction(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, contentDescription = null)
+        Spacer(Modifier.width(16.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge)
     }
 }
 

@@ -193,6 +193,10 @@ dependencies {
     // ProcessLifecycleOwner: the app coming to and leaving the foreground, for "Stay connected: While open".
     implementation("androidx.lifecycle:lifecycle-process:2.8.7")
 
+    // Installs the baseline profile (app rules in src/main/baseline-prof.txt + the libraries' own) on first launch,
+    // so ART compiles the startup path ahead of time: sideloaded APKs get no Play Store cloud profile.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")

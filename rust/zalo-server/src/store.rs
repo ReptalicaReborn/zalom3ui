@@ -904,10 +904,14 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
         kind,
         AttachmentKind::Photo | AttachmentKind::Gif | AttachmentKind::Video
     );
+    // Link previews, todos and anything unrecognised read their fields from several places.
+    let embed_like = matches!(kind, AttachmentKind::Link | AttachmentKind::Other)
+        || msg_type == "chat.todo"
+        || msg_type == "chat.location.new";
     let raw_title = non_empty_str(content_map.get("title"));
-    let title = raw_title.filter(|t| !(is_media && is_local_device_uri(t)));
-    let description = non_empty_str(content_map.get("description"));
-    let href = if is_media {
+    let mut title = raw_title.filter(|t| !(is_media && is_local_device_uri(t)));
+    let mut description = non_empty_str(content_map.get("description"));
+    let mut href = if is_media {
         (if kind == AttachmentKind::Photo {
             remote_str(params.get("hd"))
         } else {
@@ -923,13 +927,34 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
     } else {
         non_empty_str(content_map.get("href"))
     };
-    let thumb = if is_media {
+    let mut thumb = if is_media {
         remote_str(content_map.get("thumb"))
             .or_else(|| remote_str(params.get("thumbUrl")))
             .or_else(|| remote_str(params.get("thumb")))
     } else {
         non_empty_str(content_map.get("thumb"))
     };
+    let mut domain: Option<String> = None;
+    if embed_like {
+        title = title.or_else(|| first_str(content_map, &params, EMBED_TITLE_KEYS));
+        description = description
+            .or_else(|| first_str(content_map, &params, EMBED_DESC_KEYS))
+            .filter(|d| Some(d) != title.as_ref());
+        href = href.or_else(|| first_url(content_map, &params, EMBED_HREF_KEYS));
+        if msg_type == "chat.location.new" && href.is_none() {
+            let lat = first_pos_or_neg_f64(params.get("latitude").or_else(|| params.get("lat")))
+                .or_else(|| first_pos_or_neg_f64(content_map.get("latitude")));
+            let lng = first_pos_or_neg_f64(params.get("longitude").or_else(|| params.get("lng")))
+                .or_else(|| first_pos_or_neg_f64(content_map.get("longitude")));
+            if let (Some(lat), Some(lng)) = (lat, lng) {
+                href = Some(format!("https://maps.google.com/?q={lat},{lng}"));
+            }
+        }
+        thumb = thumb
+            .filter(|t| sanitize_remote_url(t).is_some())
+            .or_else(|| first_url(content_map, &params, EMBED_THUMB_KEYS));
+        domain = embed_domain(&params, href.as_deref());
+    }
     let width = first_pos_u32(&[params.get("width"), params.get("video_width"), params.get("w")]);
     let height =
         first_pos_u32(&[params.get("height"), params.get("video_height"), params.get("h")]);
@@ -937,13 +962,30 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
     let size = first_pos_u64(&[params.get("fileSize"), params.get("size")]);
     let mut file_ext = non_empty_str(params.get("fileExt")).map(|s| s.to_ascii_lowercase());
     let mut user_id = None;
+    let mut phone = None;
 
     if kind == AttachmentKind::Contact {
-        if let Some(Value::String(p)) = content_map.get("params") {
-            if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+        // `params` is either the bare user id, or a JSON object (zca-js style) with the user id
+        // and sometimes a phone number. The key names in the object form are best guesses.
+        match content_map.get("params") {
+            Some(Value::String(p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
                 user_id = Some(p.clone());
             }
+            _ => {
+                user_id = ["user_id", "userId", "uid", "contactUid", "id"]
+                    .iter()
+                    .find_map(|k| {
+                        let v = val_to_string(params.get(*k));
+                        (!v.is_empty()).then_some(v)
+                    });
+            }
         }
+        phone = ["phone", "mobile", "phoneNumber", "phone_number", "sdt"]
+            .iter()
+            .find_map(|k| non_empty_str(params.get(*k)).or_else(|| non_empty_str(content_map.get(*k))))
+            .filter(|p| looks_like_phone(p))
+            .or_else(|| description.as_deref().filter(|d| looks_like_phone(d)).map(str::to_string))
+            .or_else(|| href.as_deref().and_then(phone_from_zalo_me_url));
     }
     if kind == AttachmentKind::File && file_ext.is_none() {
         if let Some(t) = title.as_deref() {
@@ -955,9 +997,13 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
         }
     }
 
+    // Anything that is neither a known kind nor plain text is shown as a generic embed card.
+    if kind == AttachmentKind::Other {
+        kind = AttachmentKind::Embed;
+    }
     let shows =
         title.is_some() || href.is_some() || thumb.is_some() || description.is_some();
-    if shows || kind != AttachmentKind::Other {
+    if shows || kind != AttachmentKind::Embed {
         Some(Attachment {
             kind: Some(kind),
             title,
@@ -970,10 +1016,97 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
             size,
             file_ext,
             user_id,
+            domain,
+            phone,
             ..Default::default()
         })
     } else {
         None
+    }
+}
+
+const EMBED_TITLE_KEYS: &[&str] = &["mediaTitle", "title", "name", "headline", "caption"];
+const EMBED_DESC_KEYS: &[&str] = &["description", "desc", "mediaDesc", "content", "summary", "note"];
+const EMBED_HREF_KEYS: &[&str] = &["href", "url", "link", "src", "redirect_url", "redirectUrl", "actionUrl"];
+const EMBED_THUMB_KEYS: &[&str] = &["thumb", "thumbUrl", "thumb_url", "image", "mediaImage", "icon", "banner"];
+
+/// First non-empty string among `keys`, looked up in the message content and then in `params`.
+fn first_str(content: &Map<String, Value>, params: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        non_empty_str(content.get(*k))
+            .or_else(|| non_empty_str(params.get(*k)))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// Like [`first_str`] but only http(s) URLs qualify.
+fn first_url(content: &Map<String, Value>, params: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| web_url(content.get(*k)).or_else(|| web_url(params.get(*k))))
+}
+
+fn first_pos_or_neg_f64(v: Option<&Value>) -> Option<f64> {
+    match v? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|f| f.is_finite())
+}
+
+/// Host of a URL without `www.`, for the "source" line of an embed.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    let host = host.split(':').next()?.trim().to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    (!host.is_empty()).then_some(host)
+}
+
+fn embed_domain(params: &Map<String, Value>, href: Option<&str>) -> Option<String> {
+    let explicit = ["domain", "src", "source", "provider"]
+        .iter()
+        .find_map(|k| non_empty_str(params.get(*k)))
+        .map(|s| host_of(&s).unwrap_or(s))
+        .filter(|s| !s.contains(' ') && s.len() <= 80);
+    explicit.or_else(|| href.and_then(host_of))
+}
+
+fn looks_like_phone(s: &str) -> bool {
+    let t = s.trim();
+    let digits = t.chars().filter(char::is_ascii_digit).count();
+    (8..=15).contains(&digits)
+        && t.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '.' | '(' | ')'))
+}
+
+/// `https://zalo.me/84901234567` style profile links carry the phone number (guess).
+fn phone_from_zalo_me_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let (host, path) = rest.split_once('/')?;
+    if host.trim_start_matches("www.") != "zalo.me" {
+        return None;
+    }
+    let seg = path.split(['/', '?', '#']).next()?;
+    (seg.len() >= 8 && seg.len() <= 15 && seg.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| seg.to_string())
+}
+
+/// Whether a raw message is a "deleted / recalled" placeholder rather than real content: a
+/// zca-js undo record (`content.deleteMsg`), a deletion msgType, or the placeholder text Zalo
+/// substitutes. Several of these shapes are best guesses (see the tests).
+pub fn is_deleted_payload(msg_type: &str, content: &Value) -> bool {
+    if matches!(
+        msg_type,
+        "chat.undo" | "chat.delete" | "chat.recalled" | "chat.deleted" | "chat.recall" | "undo"
+    ) {
+        return true;
+    }
+    // Text content is never taken as a deletion marker: someone can type "Tin nhắn đã bị xóa".
+    match content {
+        Value::Object(m) => m.contains_key("deleteMsg"),
+        _ => false,
     }
 }
 
@@ -1207,6 +1340,18 @@ pub fn normalize_message(
         search_folded: SearchCache::default(),
     };
 
+    if is_deleted_payload(&msg_type, &content_val) {
+        msg.recalled = true;
+        msg.text = "Message recalled".to_string();
+        msg.quote = None;
+        msg.mentions = Vec::new();
+        if let Some(raw) = msg.raw.as_deref_mut() {
+            raw.content = None;
+            raw.property_ext = None;
+        }
+        return msg;
+    }
+
     if let Value::String(s) = content_val {
         msg.text = s;
         return msg;
@@ -1258,8 +1403,12 @@ pub fn normalize_message(
         }
     }
 
-    let label = known.unwrap_or("[Unsupported message]");
     let att_kind = attachment.as_ref().and_then(|a| a.kind);
+    let label = known.unwrap_or(if att_kind == Some(AttachmentKind::Embed) {
+        "[Link]"
+    } else {
+        "[Unsupported message]"
+    });
     let named_title = attachment
         .as_ref()
         .and_then(|a| a.title.as_deref())
@@ -1404,6 +1553,9 @@ struct MetaFile {
     marked_unread: Vec<String>,
     #[serde(default)]
     message_cap: Option<usize>,
+    /// Thread keys detected as Official Accounts (news / shops / ZNS senders).
+    #[serde(default)]
+    official_accounts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1417,6 +1569,8 @@ struct MetaFileRef<'a> {
     marked_unread: Vec<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_cap: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    official_accounts: Vec<&'a str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1500,6 +1654,8 @@ struct StoreState {
     pinned: HashSet<String>,
     muted_until: HashMap<String, i64>,
     marked_unread: HashSet<String>,
+    /// Thread keys detected as Official Accounts.
+    official_accounts: HashSet<String>,
     /// message id -> thread key
     index: HashMap<String, String>,
     own_id: Option<String>,
@@ -1559,6 +1715,9 @@ impl StoreState {
         pinned.sort_unstable();
         let mut marked_unread: Vec<&str> = self.marked_unread.iter().map(String::as_str).collect();
         marked_unread.sort_unstable();
+        let mut official_accounts: Vec<&str> =
+            self.official_accounts.iter().map(String::as_str).collect();
+        official_accounts.sort_unstable();
         let meta = MetaFileRef {
             version: 1,
             threads: &self.threads,
@@ -1571,6 +1730,7 @@ impl StoreState {
             } else {
                 None
             },
+            official_accounts,
         };
         serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string())
     }
@@ -1593,6 +1753,7 @@ impl StoreState {
         self.pinned = meta.pinned.into_iter().collect();
         self.muted_until = meta.muted_until;
         self.marked_unread = meta.marked_unread.into_iter().collect();
+        self.official_accounts = meta.official_accounts.into_iter().collect();
         if let Some(cap) = meta.message_cap {
             if cap > MAX_MESSAGES_PER_THREAD {
                 self.message_cap = cap;
@@ -1784,6 +1945,7 @@ impl ChatStore {
             s.marked_unread.remove(&key);
             s.pinned.remove(&key);
             s.muted_until.remove(&key);
+            s.official_accounts.remove(&key);
             s.meta_changed(has_paths);
             true
         };
@@ -2541,9 +2703,41 @@ impl ChatStore {
             s.marked_unread.remove(&key);
             s.pinned.remove(&key);
             s.muted_until.remove(&key);
+            s.official_accounts.remove(&key);
             s.meta_changed(has_paths);
         }
         self.schedule_save();
+    }
+
+    /// Flags a 1:1 thread as an Official Account (news / shop / ZNS sender). Sticky: once set it
+    /// is never cleared by later signals. Returns true when the flag was newly set.
+    pub fn mark_official_account(&self, id: &str) -> bool {
+        if id.is_empty() || id == "0" {
+            return false;
+        }
+        let has_paths = self.inner.paths.is_some();
+        let newly = match self.inner.state.write() {
+            Ok(mut s) => {
+                let added = s.official_accounts.insert(thread_key(ThreadKind::User, id));
+                if added {
+                    s.meta_changed(has_paths);
+                }
+                added
+            }
+            Err(_) => false,
+        };
+        if newly {
+            self.schedule_save();
+        }
+        newly
+    }
+
+    pub fn is_official_account(&self, id: &str) -> bool {
+        self.inner
+            .state
+            .read()
+            .map(|s| s.official_accounts.contains(&thread_key(ThreadKind::User, id)))
+            .unwrap_or(false)
     }
 
     pub fn last_message(&self, kind: ThreadKind, id: &str) -> Option<StoredMessage> {
@@ -2574,6 +2768,7 @@ impl ChatStore {
                     .map(|m| to_public_message(m, own));
                 let marked = if s.marked_unread.contains(key) { 1 } else { 0 };
                 let pinned = s.pinned.contains(key);
+                let is_official_account = s.official_accounts.contains(key);
                 let muted_until = s
                     .muted_until
                     .get(key)
@@ -2591,6 +2786,7 @@ impl ChatStore {
                         unread: unread.max(marked),
                         pinned,
                         muted_until,
+                        is_official_account,
                     },
                 ));
             }
@@ -2625,6 +2821,7 @@ impl ChatStore {
             s.pinned.clear();
             s.muted_until.clear();
             s.marked_unread.clear();
+            s.official_accounts.clear();
             s.index.clear();
             s.dirty_threads.clear();
             s.pending_migration = None;
@@ -2804,6 +3001,7 @@ impl ChatStore {
                 muted_until: snapshot.muted_until,
                 marked_unread: snapshot.marked_unread,
                 message_cap: snapshot.message_cap,
+                official_accounts: Vec::new(),
             });
             s.messages = snapshot.messages;
             s.index.clear();
@@ -3578,6 +3776,36 @@ mod tests {
     }
 
     #[test]
+    fn official_account_flag_persists_and_serializes() {
+        let dir = temp_dir("zalo-oa");
+        {
+            let store = ChatStore::open(&dir);
+            store.add_message(make_msg("1", 1000, "oa1", "ad", false));
+            store.add_message(make_msg("2", 1001, "friend", "hi", false));
+            assert!(store.mark_official_account("oa1"));
+            assert!(!store.mark_official_account("oa1"), "second mark is a no-op");
+            assert!(!store.mark_official_account(""));
+            assert!(store.is_official_account("oa1"));
+            let list = store.list_threads();
+            let oa = list.iter().find(|t| t.id == "oa1").unwrap();
+            let fr = list.iter().find(|t| t.id == "friend").unwrap();
+            assert!(oa.is_official_account && !fr.is_official_account);
+            let v = serde_json::to_value(oa).unwrap();
+            assert_eq!(v["isOfficialAccount"], json!(true));
+            store.flush();
+        }
+        let store = ChatStore::open(&dir);
+        assert!(store.is_official_account("oa1"));
+        assert!(!store.is_official_account("friend"));
+        store.delete_thread(ThreadKind::User, "oa1");
+        assert!(!store.is_official_account("oa1"));
+        // Old meta files without the field load with the flag off.
+        let meta: MetaFile = serde_json::from_str(r#"{"version":1,"threads":{}}"#).unwrap();
+        assert!(meta.official_accounts.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn persistence_roundtrip_and_legacy_migration() {
         let dir = temp_dir("zalo-store-test");
         let legacy = dir.join("messages.json");
@@ -3865,6 +4093,151 @@ mod tests {
         assert_eq!(direct_call.kind, Some(AttachmentKind::Call));
         assert_eq!(direct_call.title.as_deref(), Some("Outgoing video call"));
         assert_eq!(direct_call.duration, Some(30_000));
+    }
+
+    fn norm(over: Value) -> StoredMessage {
+        normalize_message(&make_raw(over), ThreadKind::User, "100", false, Some("me"))
+    }
+
+    #[test]
+    fn deleted_and_recalled_payload_shapes_all_become_recalled_messages() {
+        let shapes = [
+            // zca-js undo record delivered as a history message with its own id
+            json!({ "content": { "deleteMsg": 1, "globalMsgId": 77 } }),
+            json!({ "content": { "deleteMsg": 0 } }),
+            // deletion msgTypes (guesses)
+            json!({ "msgType": "chat.undo", "content": { "a": 1 } }),
+            json!({ "msgType": "chat.delete", "content": "" }),
+            json!({ "msgType": "chat.recalled", "content": {} }),
+        ];
+        for over in shapes {
+            let m = norm(json!({
+                "quote": { "msg": "x", "globalMsgId": 1, "ownerId": "1", "fromD": "A" },
+                "mentions": [{ "uid": "1", "pos": 0, "len": 1 }]
+            }));
+            assert!(!m.recalled, "control: plain message stays plain");
+            let mut full = over.clone();
+            full["quote"] = json!({ "msg": "x", "globalMsgId": 1, "ownerId": "1", "fromD": "A" });
+            let m = norm(full);
+            assert!(m.recalled, "{over}");
+            assert_eq!(m.text, "Message recalled");
+            assert!(m.attachment.is_none() && m.quote.is_none() && m.mentions.is_empty());
+            assert!(m.raw.as_ref().unwrap().content.is_none());
+        }
+        // ordinary text is untouched, even when it reads like a deletion notice
+        assert!(!norm(json!({ "content": "tin nhắn" })).recalled);
+        assert!(!norm(json!({ "content": "Tin nhắn đã bị xóa" })).recalled);
+        assert!(!norm(json!({ "content": "Tin nhắn đã được thu hồi" })).recalled);
+    }
+
+    #[test]
+    fn embed_shapes_and_unsupported_fallback() {
+        // recommened.link with params.mediaTitle / domain
+        let m = norm(json!({
+            "msgType": "chat.recommended",
+            "content": {
+                "action": "recommened.link",
+                "href": "https://news.example.com/a/1",
+                "thumb": "https://img.example.com/t.jpg",
+                "params": json!({ "mediaTitle": "Headline", "src": "news.example.com", "desc": "Summary" }).to_string(),
+            }
+        }));
+        let a = m.attachment.unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Link));
+        assert_eq!(a.title.as_deref(), Some("Headline"));
+        assert_eq!(a.description.as_deref(), Some("Summary"));
+        assert_eq!(a.domain.as_deref(), Some("news.example.com"));
+        assert_eq!(m.text, "[Link] Headline");
+
+        // unknown msgType with title/href/thumb in params -> embed, not "[Unsupported message]"
+        let m = norm(json!({
+            "msgType": "chat.mini.app",
+            "content": { "params": { "title": "Mini", "url": "https://www.app.example.org/x", "image": "https://i.example.org/p.png" } }
+        }));
+        let a = m.attachment.unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Embed));
+        assert_eq!(a.href.as_deref(), Some("https://www.app.example.org/x"));
+        assert_eq!(a.thumb.as_deref(), Some("https://i.example.org/p.png"));
+        assert_eq!(a.domain.as_deref(), Some("app.example.org"));
+        assert_eq!(m.text, "Mini");
+
+        // thumb only, unknown type: still an embed, labelled [Link]
+        let m = norm(json!({
+            "msgType": "chat.zzz",
+            "content": { "thumb": "https://i.example.org/p.png" }
+        }));
+        assert_eq!(m.attachment.unwrap().kind, Some(AttachmentKind::Embed));
+        assert_eq!(m.text, "[Link]");
+
+        // unknown recommended action
+        let a = parse_attachment(
+            "chat.recommended",
+            &json!({ "action": "recommened.zzz", "title": "T", "href": "https://x.example/y" }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Embed));
+
+        // todo
+        let a = parse_attachment(
+            "chat.todo",
+            &json!({ "params": json!({ "title": "Buy milk", "note": "2 litres" }).to_string() }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Embed));
+        assert_eq!(a.title.as_deref(), Some("Buy milk"));
+        assert_eq!(a.description.as_deref(), Some("2 litres"));
+
+        // location without href gets a maps link from coordinates
+        let a = parse_attachment(
+            "chat.location.new",
+            &json!({ "title": "Here", "params": json!({ "latitude": "10.5", "longitude": 106.25 }).to_string() }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Location));
+        assert_eq!(a.href.as_deref(), Some("https://maps.google.com/?q=10.5,106.25"));
+
+        // non-http hrefs are not turned into embed links
+        let a = parse_attachment("chat.zzz", &json!({ "title": "T", "params": { "url": "javascript:alert(1)" } }), false).unwrap();
+        assert_eq!(a.href, None);
+
+        // truly nothing to show
+        let m = norm(json!({ "msgType": "chat.zzz", "content": { "foo": 1 } }));
+        assert!(m.attachment.is_none());
+        assert_eq!(m.text, "[Unsupported message]");
+    }
+
+    #[test]
+    fn contact_card_phone_and_user_id_shapes() {
+        let a = parse_attachment(
+            "chat.recommended",
+            &json!({ "action": "recommened.user", "title": "An", "description": "+84 901 234 567", "params": "123456" }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.user_id.as_deref(), Some("123456"));
+        assert_eq!(a.phone.as_deref(), Some("+84 901 234 567"));
+
+        let a = parse_attachment(
+            "chat.recommended",
+            &json!({ "action": "recommened.user", "title": "An", "href": "https://zalo.me/84901234567",
+                     "params": json!({ "user_id": 99, "mobile": "0901234567" }).to_string() }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.kind, Some(AttachmentKind::Contact));
+        assert_eq!(a.user_id.as_deref(), Some("99"));
+        assert_eq!(a.phone.as_deref(), Some("0901234567"));
+
+        let a = parse_attachment(
+            "chat.recommended",
+            &json!({ "action": "recommened.user", "title": "An", "href": "https://zalo.me/84901234567", "params": "5" }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.phone.as_deref(), Some("84901234567"));
     }
 
     #[test]

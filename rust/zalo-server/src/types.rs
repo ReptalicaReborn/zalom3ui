@@ -321,6 +321,8 @@ pub enum AttachmentKind {
     Location,
     Call,
     Poll,
+    /// Generic rich embed (news / mini-app / OA article / todo …): title, description, thumb, href.
+    Embed,
     Other,
 }
 
@@ -414,6 +416,12 @@ pub struct Attachment {
     /// Detected one-time verification / OTP code (4–8 digits) for quick copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otp: Option<String>,
+    /// Embeds and link previews: source domain shown under the title (e.g. `"vnexpress.net"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Contact cards: the shared person's phone number, when the card carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +707,9 @@ pub struct ThreadSummary {
     /// Epoch ms the mute ends, -1 for "until turned off", absent when not muted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted_until: Option<i64>,
+    /// True for Official Account / ZNS senders (news, shops, banks).
+    #[serde(default)]
+    pub is_official_account: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

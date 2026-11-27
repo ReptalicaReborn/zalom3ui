@@ -44,6 +44,7 @@ object ZaloCore : CoreNatives {
             StartupLog.write(app, "core: starting")
             val code = start(dataDir.absolutePath, StartupLog.serverLog(app).absolutePath)
             started = code == 0
+            if (started) StartupTiming.markCoreReady(android.os.SystemClock.uptimeMillis())
             StartupLog.write(app, if (started) "core: started" else "core: failed to start (code $code)")
             // In the "While open" modes, a start from anywhere but the screen is paused again after a grace period.
             if (started) StayConnectedCoordinator.onCoreStarted()

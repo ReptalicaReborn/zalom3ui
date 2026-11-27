@@ -35,6 +35,7 @@ import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
+import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.call.CallActivity
 import java.io.File
@@ -89,6 +90,10 @@ class MessageNotifier(
     @Volatile
     private var lastThreadsFetchMs = 0L
 
+    /** Thread keys of Official Accounts, refreshed with the thread list; read when "Hide official accounts" is on. */
+    private val officialAccountKeys = ConcurrentHashMap.newKeySet<String>()
+    private val settings by lazy { SettingsStore(context) }
+
     private var scope: CoroutineScope? = null
 
     /** Listens until [scope] ends; reconnects while the server starts or restarts. */
@@ -113,12 +118,27 @@ class MessageNotifier(
 
     private fun onEvent(event: ServerEvent) {
         when (event) {
-            is ServerEvent.Message -> if (event.notify) show(event.message, event.threadName)
+            is ServerEvent.Message -> if (event.notify) showUnlessOfficial(event.message, event.threadName)
             is ServerEvent.Read -> cancel(event.thread)
             is ServerEvent.CallIncoming -> showCall(event.call)
             is ServerEvent.CallEnded -> endCall(event.callId)
             is ServerEvent.ThreadsChanged -> scope?.launch(Dispatchers.IO) { refreshAvatarUrls(force = false) }
             else -> Unit
+        }
+    }
+
+    /** With "Hide official accounts" on, an Official Account's message posts no notification. */
+    private fun showUnlessOfficial(msg: ChatMessage, threadName: String) {
+        if (msg.threadKind != "user" || !settings.hideOfficialAccounts) {
+            show(msg, threadName)
+            return
+        }
+        val key = ThreadRef(msg.threadKind, msg.threadId).key
+        val targetScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        targetScope.launch(Dispatchers.IO) {
+            // The core flags the chat before it announces the message, so a fresh list already knows a new OA.
+            if (key !in officialAccountKeys) refreshAvatarUrls(force = true)
+            if (key !in officialAccountKeys) show(msg, threadName)
         }
     }
 
@@ -129,6 +149,7 @@ class MessageNotifier(
         val threads = runCatching { ApiClient.onDevice(context).threads() }.getOrNull() ?: return
         for (t in threads) {
             if (t.avatar.isNotBlank()) avatarUrls[t.key] = t.avatar
+            if (t.isOfficialAccount) officialAccountKeys.add(t.key) else officialAccountKeys.remove(t.key)
         }
     }
 

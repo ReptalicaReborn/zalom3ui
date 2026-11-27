@@ -191,6 +191,11 @@ pub struct VideoStats {
     pub ssrcs: usize,
     pub payload_types: BTreeMap<u8, u64>,
     pub nal_types: BTreeMap<u8, u64>,
+    /// First payload byte of incoming video packets as hex (`1c` Zalo chunk, `7c`/`5c`/`3c` FU-A, `78` STAP-A,
+    /// `00` Annex B...), at most 16 distinct values. Tells which packetization the sender uses.
+    pub first_bytes: BTreeMap<String, u64>,
+    /// Incoming video packets with no payload (RTP padding probes).
+    pub empty_packets: u64,
     pub bytes: u64,
     pub frames: u64,
     pub keys: u64,
@@ -1214,6 +1219,16 @@ impl MediaEngine {
             .payload_types
             .entry(h.payload_type)
             .or_insert(0) += 1;
+        match self.rx_scratch.get(h.header_length) {
+            Some(b) => {
+                let key = format!("{b:02x}");
+                let map = &mut self.stats.video.first_bytes;
+                if map.len() < 16 || map.contains_key(&key) {
+                    *map.entry(key).or_insert(0) += 1;
+                }
+            }
+            None => self.stats.video.empty_packets += 1,
+        }
         if self.video_ssrcs.len() < MAX_SSRCS {
             self.video_ssrcs.insert(h.ssrc);
         }

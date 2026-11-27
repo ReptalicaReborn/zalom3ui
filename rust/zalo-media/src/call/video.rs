@@ -2,8 +2,12 @@
 //! One H.264 Annex-B access unit per frame, payload type 98 (key) / 97 (delta),
 //! frames > 1068 bytes split into 1068-byte chunks prefixed `[0x1c, flag]`
 //! (`0x80` first, `0x00` middle, `0x40` last), RTP marker bit on the final packet.
+//!
+//! The receiver is more forgiving than the sender: besides Zalo's chunks it also accepts standard RFC 6184
+//! payloads (FU-A with a real NAL type in the FU header, STAP-A, single raw NAL units), detected per packet
+//! from the first bytes, and it drops SVC-only NAL units (types 14/15/20) that hardware decoders choke on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const VIDEO_KEY_PT: u8 = 98;
 pub const VIDEO_DELTA_PT: u8 = 97;
@@ -141,8 +145,84 @@ pub fn nal_units(annex_b: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-fn is_fragment(p: &[u8]) -> bool {
-    p.len() >= 2 && p[0] == 0x1c && (p[1] & 0x3f) == 0
+/// How one RTP payload is packetized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartKind {
+    /// Starts with an Annex-B start code: a whole access unit.
+    AnnexB,
+    /// Zalo chunk `[0x1c, flag]` (an FU-A indicator whose FU header carries NAL type 0).
+    ZaloChunk,
+    /// RFC 6184 FU-A (indicator type 28, FU header with the real NAL type).
+    FuA,
+    /// RFC 6184 STAP-A (type 24).
+    StapA,
+    /// RFC 6184 single NAL unit without start code (types 1..=23).
+    Single,
+    Other,
+}
+
+fn classify(p: &[u8]) -> PartKind {
+    if p.len() >= 4 && p[0] == 0 && p[1] == 0 && (p[2] == 1 || (p[2] == 0 && p[3] == 1)) {
+        return PartKind::AnnexB;
+    }
+    match p.first().map(|b| b & 0x1f) {
+        Some(28) if p.len() >= 2 => {
+            if p[1] & 0x1f == 0 {
+                PartKind::ZaloChunk
+            } else {
+                PartKind::FuA
+            }
+        }
+        Some(24) => PartKind::StapA,
+        Some(1..=23) => PartKind::Single,
+        _ => PartKind::Other,
+    }
+}
+
+/// True when `p` cannot start an access unit (a continuation of a fragmented one).
+fn is_continuation(p: &[u8]) -> bool {
+    match classify(p) {
+        PartKind::ZaloChunk => p[1] != 0x80,
+        PartKind::FuA => p[1] & 0x80 == 0,
+        _ => false,
+    }
+}
+
+/// Appends the Annex-B form of one RTP payload to `out`.
+fn append_part(out: &mut Vec<u8>, p: &[u8]) {
+    match classify(p) {
+        PartKind::ZaloChunk => out.extend_from_slice(&p[2..]),
+        PartKind::FuA => {
+            if p[1] & 0x80 != 0 {
+                out.extend_from_slice(START_CODE);
+                out.push((p[0] & 0xe0) | (p[1] & 0x1f));
+            }
+            out.extend_from_slice(&p[2..]);
+        }
+        PartKind::StapA => {
+            let mut at = 1usize;
+            while at + 2 <= p.len() {
+                let n = u16::from_be_bytes([p[at], p[at + 1]]) as usize;
+                at += 2;
+                if n == 0 || at + n > p.len() {
+                    break;
+                }
+                out.extend_from_slice(START_CODE);
+                out.extend_from_slice(&p[at..at + n]);
+                at += n;
+            }
+        }
+        PartKind::Single => {
+            out.extend_from_slice(START_CODE);
+            out.extend_from_slice(p);
+        }
+        PartKind::AnnexB | PartKind::Other => out.extend_from_slice(p),
+    }
+}
+
+/// SVC extension NAL units (prefix, subset SPS, slice extension): not decodable as plain AVC.
+fn is_svc_nal(t: u8) -> bool {
+    matches!(t, 14 | 15 | 20)
 }
 
 struct Pending {
@@ -175,6 +255,9 @@ pub struct VideoAssembler {
     need_key: bool,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    /// Sequence numbers of packets that carry no video (RTP padding probes, other payload types): they use up a
+    /// sequence number between two frames, which must not be mistaken for a lost packet.
+    fillers: BTreeSet<i64>,
 }
 
 impl Default for VideoAssembler {
@@ -195,6 +278,7 @@ impl VideoAssembler {
             need_key: false,
             sps: None,
             pps: None,
+            fillers: BTreeSet::new(),
         }
     }
 
@@ -245,9 +329,6 @@ impl VideoAssembler {
         F: FnMut(AssembledFrame),
         K: FnMut(KeyNeededReason),
     {
-        if (pkt.payload_type != VIDEO_KEY_PT && pkt.payload_type != VIDEO_DELTA_PT) || pkt.payload.is_empty() {
-            return;
-        }
         let idx = self.extend(pkt.seq);
         self.max_idx = Some(match self.max_idx {
             None => idx,
@@ -257,6 +338,13 @@ impl VideoAssembler {
             if idx <= last {
                 return;
             }
+        }
+        if (pkt.payload_type != VIDEO_KEY_PT && pkt.payload_type != VIDEO_DELTA_PT) || pkt.payload.is_empty() {
+            if self.fillers.len() < 256 {
+                self.fillers.insert(idx);
+            }
+            self.flush(now_ms, &mut on_frame, &mut on_key_needed);
+            return;
         }
 
         let pos = match self.pending.iter().position(|(ts, _)| *ts == pkt.timestamp) {
@@ -352,7 +440,15 @@ impl VideoAssembler {
             return;
         }
         let (&first_idx, first_buf) = f.parts.first_key_value().unwrap();
-        if is_fragment(first_buf) && first_buf[1] != 0x80 {
+        if is_continuation(first_buf) {
+            return;
+        }
+        // Zalo chunks, FU-A starts and whole Annex-B units say that they begin a frame. A bare RFC 6184 NAL or STAP-A
+        // does not, so when it is the first packet we hold, make sure the packet before it belongs to another frame
+        // (otherwise a reordered SPS/PPS packet would be lost and the key frame emitted without them).
+        if matches!(classify(first_buf), PartKind::Single | PartKind::StapA | PartKind::Other)
+            && !self.previous_frame_ends_at(first_idx - 1)
+        {
             return;
         }
         let (&last_idx, _) = f.parts.last_key_value().unwrap();
@@ -364,42 +460,45 @@ impl VideoAssembler {
         }
 
         let (_, f) = self.pending.remove(pos);
-        let mut data = if f.parts.len() == 1 {
-            let mut part = f.parts.into_values().next().unwrap();
-            if is_fragment(&part) {
-                part.drain(..2);
-            }
-            part
-        } else {
-            let mut data = Vec::with_capacity(f.bytes);
-            for part in f.parts.values() {
-                if is_fragment(part) {
-                    data.extend_from_slice(&part[2..]);
-                } else {
-                    data.extend_from_slice(part);
-                }
-            }
-            data
-        };
+        let mut data = Vec::with_capacity(f.bytes + 16);
+        for part in f.parts.values() {
+            append_part(&mut data, part);
+        }
 
         let mut types_mask: u32 = 0;
+        let mut has_svc = false;
         let sps_slot = &mut self.sps;
         let pps_slot = &mut self.pps;
         for_each_nal_unit(&data, |u| {
-            if u.is_empty() {
-                return;
-            }
             let t = u[0] & 0x1f;
             types_mask |= 1u32 << t;
             if t == 7 {
                 *sps_slot = Some(u.to_vec());
             } else if t == 8 {
                 *pps_slot = Some(u.to_vec());
+            } else if is_svc_nal(t) {
+                has_svc = true;
             }
         });
+        // The reported mask keeps the SVC types so the call log shows what the sender really used.
+        let reported_mask = types_mask;
+        if has_svc {
+            let mut kept = Vec::with_capacity(data.len());
+            types_mask = 0;
+            for_each_nal_unit(&data, |u| {
+                let t = u[0] & 0x1f;
+                if !is_svc_nal(t) {
+                    kept.extend_from_slice(START_CODE);
+                    kept.extend_from_slice(u);
+                    types_mask |= 1u32 << t;
+                }
+            });
+            data = kept;
+        }
+        let svc_mask = reported_mask & ((1 << 14) | (1 << 15) | (1 << 20));
 
         let has_type = |mask: u32, t: u8| (mask & (1u32 << t)) != 0;
-        let key = f.key || has_type(types_mask, 5) || has_type(types_mask, 7);
+        let key = !data.is_empty() && (f.key || has_type(types_mask, 5) || has_type(types_mask, 7));
         if key {
             if let Some(ref sps) = self.sps {
                 let missing_sps = !has_type(types_mask, 7);
@@ -441,11 +540,23 @@ impl VideoAssembler {
                 key,
                 data,
                 timestamp,
-                nal_types_mask: types_mask,
+                nal_types_mask: types_mask | svc_mask,
                 last: end_idx,
                 since: now_ms,
             },
         );
+    }
+
+    /// True when the packet `idx` is known to be the last of an earlier frame (or nothing earlier is known yet).
+    fn previous_frame_ends_at(&self, idx: i64) -> bool {
+        match self.last_idx {
+            None => true,
+            Some(last) => {
+                last >= idx
+                    || self.ready.values().any(|r| r.last == idx)
+                    || self.pending.iter().any(|(_, p)| p.end == Some(idx))
+            }
+        }
     }
 
     fn has_earlier_pending(&self, before_idx: i64) -> bool {
@@ -460,6 +571,13 @@ impl VideoAssembler {
         K: FnMut(KeyNeededReason),
     {
         loop {
+            if let Some(mut last) = self.last_idx {
+                while self.fillers.remove(&(last + 1)) {
+                    last += 1;
+                }
+                self.last_idx = Some(last);
+                self.fillers = self.fillers.split_off(&(last + 1));
+            }
             if self.ready.is_empty() {
                 return;
             }
@@ -498,7 +616,9 @@ impl VideoAssembler {
         K: FnMut(KeyNeededReason),
     {
         self.last_idx = Some(fr.last);
-        if self.need_key && !fr.key {
+        if fr.data.is_empty() {
+            // Only SVC enhancement NAL units: nothing to decode, but the sequence numbers are consumed.
+        } else if self.need_key && !fr.key {
             self.stats.dropped += 1;
             on_key_needed(KeyNeededReason::NoKey);
         } else {
@@ -824,5 +944,223 @@ mod tests {
             out3.iter().map(|f| (f.key, f.timestamp)).collect::<Vec<_>>(),
             vec![(true, 1000), (false, 4000)]
         );
+    }
+
+    // ---- RFC 6184 and SVC input ----
+
+    fn raw(seq: u16, ts: u32, pt: u8, marker: bool, payload: Vec<u8>) -> OwnedPkt {
+        OwnedPkt { seq, timestamp: ts, payload_type: pt, marker, payload }
+    }
+
+    /// RFC 6184 FU-A fragments of one NAL (header byte + body), `size` body bytes per packet.
+    fn fu_a(nal: &[u8], size: usize) -> Vec<Vec<u8>> {
+        let (hdr, body) = (nal[0], &nal[1..]);
+        let n = body.len().div_ceil(size);
+        (0..n)
+            .map(|i| {
+                let mut fh = hdr & 0x1f;
+                if i == 0 {
+                    fh |= 0x80;
+                }
+                if i == n - 1 {
+                    fh |= 0x40;
+                }
+                let mut p = vec![(hdr & 0xe0) | 28, fh];
+                p.extend_from_slice(&body[i * size..((i + 1) * size).min(body.len())]);
+                p
+            })
+            .collect()
+    }
+
+    fn feed(a: &mut VideoAssembler, pkts: &[&OwnedPkt], now: i64, out: &mut Vec<AssembledFrame>) {
+        for p in pkts {
+            a.push_assembled(
+                VideoPacket {
+                    seq: p.seq,
+                    timestamp: p.timestamp,
+                    payload_type: p.payload_type,
+                    marker: p.marker,
+                    payload: &p.payload,
+                },
+                now,
+                |f| out.push(f),
+                |_| {},
+            );
+        }
+    }
+
+    fn big_idr_nal() -> Vec<u8> {
+        let mut n = vec![0x65, 0x88];
+        n.extend((0..3000).map(|i| (i % 251) as u8 | 1));
+        n
+    }
+
+    #[test]
+    fn rfc6184_fu_a_stap_a_and_single_nal_key_frame_in_shuffled_order_with_duplicates() {
+        let idr_nal = big_idr_nal();
+        let frags = fu_a(&idr_nal, 1000);
+        assert_eq!(frags.len(), 4);
+        // seq 10: STAP-A(SPS, PPS), 11..14: FU-A IDR, all one timestamp, marker last.
+        let mut stap = vec![0x78];
+        for nal in [SPS, PPS] {
+            stap.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            stap.extend_from_slice(nal);
+        }
+        let mut pk = vec![raw(1, 777, 98, false, stap)];
+        for (i, f) in frags.iter().enumerate() {
+            pk.push(raw(2 + i as u16, 777, 98, i == 3, f.clone()));
+        }
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&key_frame(), true, 0, 500), 1000, &mut out);
+        out.clear();
+        // Shuffled plus duplicates (NACK retransmits).
+        feed(&mut a, &[&pk[3], &pk[1], &pk[1], &pk[0], &pk[4], &pk[2], &pk[3], &pk[0]], 1000, &mut out);
+        assert_eq!(out.len(), 1);
+        let f = &out[0].frame;
+        assert!(f.key);
+        assert_eq!(f.timestamp, 777);
+        let units = nal_units(&f.data);
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0], SPS);
+        assert_eq!(units[1], PPS);
+        assert_eq!(units[2], &idr_nal[..]);
+        assert_eq!(a.stats.frames, 2);
+        assert_eq!(a.stats.dropped, 0);
+        // A late duplicate of the finished frame is ignored.
+        feed(&mut a, &[&pk[2]], 1001, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // Separate single-NAL packets (SPS, PPS) before a one-packet IDR.
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&key_frame(), true, 0, 1), 0, &mut out);
+        out.clear();
+        let p = [
+            raw(1, 5, 98, false, SPS.to_vec()),
+            raw(2, 5, 98, false, PPS.to_vec()),
+            raw(3, 5, 98, true, vec![0x65, 1, 2, 3]),
+        ];
+        feed(&mut a, &[&p[2], &p[0], &p[1]], 0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(nal_units(&out[0].frame.data), vec![SPS, PPS, &[0x65, 1, 2, 3][..]]);
+    }
+
+    #[test]
+    fn rfc6184_fu_a_delta_frame_after_zalo_key_frame() {
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&key_frame(), true, 0, 1000), 1000, &mut out);
+        let nal: Vec<u8> = std::iter::once(0x41).chain((0..2500).map(|i| (i % 7) as u8 + 1)).collect();
+        let frags = fu_a(&nal, 1100);
+        let pk: Vec<OwnedPkt> = frags
+            .iter()
+            .enumerate()
+            .map(|(i, f)| raw(1 + i as u16, 4000, 97, i == frags.len() - 1, f.clone()))
+            .collect();
+        feed(&mut a, &pk.iter().rev().collect::<Vec<_>>(), 1000, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(!out[1].frame.key);
+        assert_eq!(nal_units(&out[1].frame.data), vec![&nal[..]]);
+        assert_eq!(a.stats.gaps, 0);
+    }
+
+    fn push_all_assembled(a: &mut VideoAssembler, pkts: &[OwnedPkt], now: i64, out: &mut Vec<AssembledFrame>) {
+        feed(a, &pkts.iter().collect::<Vec<_>>(), now, out);
+    }
+
+    #[test]
+    fn zalo_multi_packet_frame_tolerates_reorder_and_duplicates() {
+        let mut au = SC.to_vec();
+        au.extend_from_slice(&[0x41, 0x9a]);
+        au.extend((0..4000).map(|i| (i % 200) as u8 + 1));
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&key_frame(), true, 0, 1000), 1000, &mut out);
+        let pk = packets(&au, false, 1, 4000);
+        assert_eq!(pk.len(), 4);
+        feed(&mut a, &[&pk[2], &pk[2], &pk[0], &pk[3], &pk[1], &pk[0]], 1000, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].frame.data, au);
+        assert_eq!(a.stats.dropped, 0);
+    }
+
+    #[test]
+    fn svc_nal_units_are_stripped_but_reported() {
+        let mut au = Vec::new();
+        for nal in [&[0x67u8, 0x42, 0, 0x1f][..], &[0x68, 0xce][..], &[0x0e, 1, 2][..], &[0x65, 9, 9][..], &[0x14, 5, 5][..], &[0x6f, 4, 4][..]] {
+            au.extend_from_slice(SC);
+            au.extend_from_slice(nal);
+        }
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        feed(&mut a, &[&raw(1, 1, 98, true, au)], 0, &mut out);
+        assert_eq!(out.len(), 1);
+        let types: Vec<u8> = nal_units(&out[0].frame.data).iter().map(|u| u[0] & 0x1f).collect();
+        assert_eq!(types, vec![7, 8, 5]);
+        assert!(out[0].frame.key);
+        for t in [14, 15, 20, 5] {
+            assert!(out[0].nal_types_mask & (1 << t) != 0, "type {t}");
+        }
+
+        // An access unit holding only enhancement layers is swallowed without a gap.
+        let mut only = SC.to_vec();
+        only.extend_from_slice(&[0x14, 1, 1]);
+        feed(&mut a, &[&raw(2, 2, 97, true, only)], 0, &mut out);
+        feed(&mut a, &[&raw(3, 3, 97, true, slice(4)[4..].to_vec().into_iter().fold(SC.to_vec(), |mut v, b| { v.push(b); v }))], 0, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(a.stats.gaps, 0);
+    }
+
+    #[test]
+    fn resolution_change_new_sps_flows_through_and_caches() {
+        let sps_a: &[u8] = &[0x67, 0x42, 0x00, 0x0d, 0xab];
+        let sps_b: &[u8] = &[0x67, 0x42, 0x00, 0x1e, 0xcd, 0xee];
+        let kf = |sps: &[u8]| {
+            let mut v = SC.to_vec();
+            v.extend_from_slice(sps);
+            v.extend_from_slice(SC);
+            v.extend_from_slice(PPS);
+            v.extend_from_slice(&idr(300));
+            v
+        };
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&kf(sps_a), true, 0, 100), 0, &mut out);
+        let n1 = packets(&kf(sps_a), true, 0, 100).len() as u16;
+        push_all_assembled(&mut a, &packets(&slice(500), false, n1, 200), 0, &mut out);
+        let n2 = n1 + packets(&slice(500), false, 0, 0).len() as u16;
+        let k2 = packets(&kf(sps_b), true, n2, 300);
+        let n3 = n2 + k2.len() as u16;
+        push_all_assembled(&mut a, &k2, 0, &mut out);
+        // Later IDR without parameter sets gets the NEW SPS/PPS prepended.
+        let mut bare = idr(50);
+        bare.drain(..0);
+        push_all_assembled(&mut a, &packets(&bare, true, n3, 400), 0, &mut out);
+        assert_eq!(out.len(), 4);
+        assert_eq!(nal_units(&out[2].frame.data)[0], sps_b);
+        assert_eq!(nal_units(&out[3].frame.data)[0], sps_b);
+        assert_eq!(a.stats.gaps, 0);
+    }
+
+    #[test]
+    fn padding_probe_packets_between_frames_are_not_gaps() {
+        let mut a = VideoAssembler::new();
+        let mut out = Vec::new();
+        push_all_assembled(&mut a, &packets(&key_frame(), true, 0, 100), 0, &mut out);
+        // seq 1: empty (padding-only) packet, seq 2: other payload type; seq 3: next frame arrives first.
+        let f = raw(3, 400, 97, true, slice(4));
+        feed(&mut a, &[&f], 0, &mut out);
+        assert_eq!(out.len(), 1, "frame waits for the missing seq 1..2");
+        feed(&mut a, &[&raw(2, 300, 99, false, vec![1, 2, 3])], 0, &mut out);
+        assert_eq!(out.len(), 1);
+        feed(&mut a, &[&raw(1, 200, 97, false, vec![])], 0, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(a.stats.gaps, 0);
+        assert!(!a.waiting_for_key());
+        // In-order filler followed by a frame.
+        feed(&mut a, &[&raw(4, 500, 97, false, vec![]), &raw(5, 600, 97, true, slice(4))], 0, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(a.stats.gaps, 0);
     }
 }

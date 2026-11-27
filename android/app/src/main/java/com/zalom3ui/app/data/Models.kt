@@ -121,7 +121,7 @@ data class StickerRef(
 @Immutable
 @Serializable
 data class Attachment(
-    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll" or "other". */
+    /** "photo", "sticker", "gif", "video", "voice", "file", "link", "embed", "contact", "location", "call", "poll" or "other". */
     val kind: String? = null,
     val title: String? = null,
     val description: String? = null,
@@ -144,6 +144,10 @@ data class Attachment(
     val actionLabel: String? = null,
     /** Detected one-time verification / OTP code (4–8 digits). */
     val otp: String? = null,
+    /** Embeds and link previews: the source domain shown under the title. */
+    val domain: String? = null,
+    /** Contact cards: the shared person's phone number, when the card carries one. */
+    val phone: String? = null,
 ) {
     /** The picture to show for a photo, GIF or sticker (ignoring local phone URIs from history backups). */
     val image: String? get() = when (kind) {
@@ -241,6 +245,8 @@ data class ThreadSummary(
     val pinned: Boolean = false,
     /** Epoch ms the mute ends, -1 for "until turned off", null when not muted. */
     val mutedUntil: Long? = null,
+    /** Official Account / ZNS sender (news, shops, banks); detected by the core. */
+    val isOfficialAccount: Boolean = false,
 ) {
     val key: String get() = "$kind:$id"
     val isMuted: Boolean get() = mutedUntil != null

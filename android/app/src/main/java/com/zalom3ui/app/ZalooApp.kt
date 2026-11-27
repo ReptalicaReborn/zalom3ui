@@ -7,6 +7,7 @@ import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import coil.disk.DiskCache
+import coil.imageLoader
 import coil.memory.MemoryCache
 import com.zalom3ui.app.call.CallMediaFactory
 import com.zalom3ui.app.call.EngineCallMedia
@@ -26,6 +27,13 @@ class ZalooApp : Application(), ImageLoaderFactory {
         StayConnectedCoordinator.init(this)
         // Calls get the real microphone/speaker/Opus engine (CallService asks the factory when a call connects).
         CallMediaFactory.create = { context -> EngineCallMedia(context) }
+        // Build Coil and OkHttp off the main thread, so the first avatar doesn't pay for them during the first frames.
+        Thread({
+            runCatching {
+                ApiClient.sharedHttpClient()
+                applicationContext.imageLoader
+            }
+        }, "image-warmup").apply { isDaemon = true }.start()
     }
 
     override fun newImageLoader(): ImageLoader =

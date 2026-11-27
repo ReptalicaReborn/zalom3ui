@@ -142,6 +142,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -200,6 +201,8 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.Hyphens
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -265,6 +268,10 @@ class ChatActions(
     val onSetDisappearingTtl: (Long?) -> Unit = {},
     val onLoadFriends: () -> Unit = {},
     val onSendCard: (Person) -> Unit = {},
+    /** Contact cards: open (or start) the 1:1 chat with the shared person. */
+    val onOpenUserChat: (Person) -> Unit = {},
+    /** Contact cards: send the shared person a friend request. */
+    val onAddFriend: (Person) -> Unit = {},
     val onCancelOutbox: (String) -> Unit = {},
     val onRetryOutbox: () -> Unit = {},
 )
@@ -300,6 +307,14 @@ fun ChatScreen(
     outboxEntries: List<OutboxEntry> = emptyList(),
     friends: List<Person> = emptyList(),
 ) {
+    val contactCardActions = remember(friends, actions) {
+        ContactCardActions(
+            isFriend = { id -> friends.any { it.id == id } },
+            onMessage = actions.onOpenUserChat,
+            onAddFriend = actions.onAddFriend,
+        )
+    }
+    CompositionLocalProvider(LocalContactCardActions provides contactCardActions) {
     if (chatAccentOverride != null && appearance != null) {
         AppTheme(
             appearance = appearance.copy(accent = chatAccentOverride, dynamicColor = false),
@@ -339,6 +354,7 @@ fun ChatScreen(
             outboxEntries = outboxEntries,
             friends = friends,
         )
+    }
     }
 }
 
@@ -3369,8 +3385,17 @@ private fun VoiceRecordingBar(
     }
 }
 
-/** Signal-style attachment sheet with expressive 60.dp rounded-squircle tinted tiles. */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+/** One action in the attachment grid. */
+private class AttachAction(
+    val label: String,
+    val icon: ImageVector,
+    val container: Color,
+    val content: Color,
+    val onClick: () -> Unit,
+)
+
+/** Attachment sheet: a left-aligned 4-column grid of tonal, rounded action tiles. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AttachmentSheet(
     onDismiss: () -> Unit,
@@ -3382,74 +3407,54 @@ private fun AttachmentSheet(
     onDisappearingTimer: () -> Unit,
     onCreatePoll: (() -> Unit)? = null,
 ) {
+    val cs = MaterialTheme.colorScheme
+    val actions = buildList {
+        add(AttachAction("Camera", Icons.Outlined.PhotoCamera, cs.primaryContainer, cs.onPrimaryContainer, onTakePhoto))
+        add(AttachAction("Gallery", Icons.Outlined.PhotoLibrary, cs.tertiaryContainer, cs.onTertiaryContainer, onPickMedia))
+        add(AttachAction("File", Icons.Outlined.AttachFile, cs.secondaryContainer, cs.onSecondaryContainer, onPickFiles))
+        add(AttachAction("Sticker", Icons.Outlined.Mood, cs.surfaceContainerHighest, cs.primary, onPickSticker))
+        add(AttachAction("Contact", Icons.Outlined.ContactPage, cs.secondaryContainer, cs.onSecondaryContainer, onShareContact))
+        add(AttachAction("Auto-delete", Icons.Outlined.Timer, cs.tertiaryContainer, cs.onTertiaryContainer, onDisappearingTimer))
+        if (onCreatePoll != null) {
+            add(AttachAction("Poll", Icons.Outlined.Poll, cs.primaryContainer, cs.onPrimaryContainer, onCreatePoll))
+        }
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
     ) {
-        Text(
-            "Share",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
-        )
-        FlowRow(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            AttachmentTile(
-                label = "Camera",
-                icon = Icons.Outlined.PhotoCamera,
-                container = MaterialTheme.colorScheme.secondaryContainer,
-                content = MaterialTheme.colorScheme.onSecondaryContainer,
-                onClick = onTakePhoto,
+            Text(
+                "Share",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(start = 8.dp, bottom = 8.dp),
             )
-            AttachmentTile(
-                label = "Photos & videos",
-                icon = Icons.Outlined.PhotoLibrary,
-                container = MaterialTheme.colorScheme.primaryContainer,
-                content = MaterialTheme.colorScheme.onPrimaryContainer,
-                onClick = onPickMedia,
-            )
-            AttachmentTile(
-                label = "File",
-                icon = Icons.Outlined.AttachFile,
-                container = MaterialTheme.colorScheme.secondaryContainer,
-                content = MaterialTheme.colorScheme.onSecondaryContainer,
-                onClick = onPickFiles,
-            )
-            AttachmentTile(
-                label = "Sticker",
-                icon = Icons.Outlined.Mood,
-                container = MaterialTheme.colorScheme.tertiaryContainer,
-                content = MaterialTheme.colorScheme.onTertiaryContainer,
-                onClick = onPickSticker,
-            )
-            AttachmentTile(
-                label = "Share contact",
-                icon = Icons.Outlined.ContactPage,
-                container = MaterialTheme.colorScheme.secondaryContainer,
-                content = MaterialTheme.colorScheme.onSecondaryContainer,
-                onClick = onShareContact,
-            )
-            AttachmentTile(
-                label = "Disappearing messages",
-                icon = Icons.Outlined.Timer,
-                container = MaterialTheme.colorScheme.tertiaryContainer,
-                content = MaterialTheme.colorScheme.onTertiaryContainer,
-                onClick = onDisappearingTimer,
-            )
-            if (onCreatePoll != null) {
-                AttachmentTile(
-                    label = "Poll",
-                    icon = Icons.Outlined.Poll,
-                    container = MaterialTheme.colorScheme.primaryContainer,
-                    content = MaterialTheme.colorScheme.onPrimaryContainer,
-                    onClick = onCreatePoll,
-                )
+            actions.chunked(4).forEach { rowActions ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    rowActions.forEach { action ->
+                        AttachmentTile(
+                            label = action.label,
+                            icon = action.icon,
+                            container = action.container,
+                            content = action.content,
+                            onClick = action.onClick,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    repeat(4 - rowActions.size) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
             }
         }
     }
@@ -3581,14 +3586,14 @@ private fun AttachmentTile(
     container: Color,
     content: Color,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .width(84.dp)
-            .clip(RoundedCornerShape(16.dp))
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
-            .padding(8.dp),
+            .padding(horizontal = 4.dp, vertical = 8.dp),
     ) {
         Surface(
             shape = RoundedCornerShape(20.dp),
@@ -3603,10 +3608,14 @@ private fun AttachmentTile(
         Spacer(Modifier.height(8.dp))
         Text(
             label,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelMedium.copy(
+                hyphens = Hyphens.None,
+                lineBreak = LineBreak.Heading,
+            ),
             color = MaterialTheme.colorScheme.onSurface,
             textAlign = TextAlign.Center,
             maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
