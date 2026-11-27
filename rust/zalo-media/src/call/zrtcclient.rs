@@ -15,7 +15,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::call::rtcp::{
-    parse_rtcp, pli, receiver_report, sdes_cname, sender_report, ReceiveStats, RtcpPacket,
+    nack, parse_rtcp, pli, read_tw_seq, receiver_report, sdes_cname, sender_report, NackTracker,
+    ReceiveStats, RtcpPacket, TwccRecorder,
 };
 use crate::call::srtp::{rtp_header, RtpHeader, SrtpContext, AUTH_TAG_LEN};
 use crate::call::video::{
@@ -41,7 +42,11 @@ const KEYREQ_MIN_GAP_MS: i64 = 250;
 const PLI_RETRY_MS: i64 = 1000;
 const VIDEO_TICK_MS: u64 = 50;
 const DEFAULT_PING_MS: u64 = 2000;
-const DEFAULT_RTCP_MS: u64 = 2000;
+const DEFAULT_RTCP_MS: u64 = 1000;
+/// Feedback cadence of TWCC reports and of the per-second status forward / join hello delays.
+const TWCC_TICK_MS: u64 = 50;
+const STATUS_TICK_MS: u64 = 1000;
+const HELLO_DELAY_MS: u64 = 200;
 const MAX_SSRCS: usize = 64;
 const MAX_RECEIVED_KEYS: usize = 64;
 
@@ -196,6 +201,8 @@ pub struct VideoStats {
     pub sent_bytes: u64,
     pub plis_sent: u64,
     pub key_requests: u64,
+    /// Generic NACK feedback packets sent for holes in incoming video.
+    pub nacks_sent: u64,
 }
 
 /// Last loss/jitter block reported by the peer about our audio stream.
@@ -215,6 +222,10 @@ pub struct RtcpStats {
     pub types: BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub their_view: Option<TheirView>,
+    /// Transport-wide congestion control feedback packets sent.
+    pub twcc_sent: u64,
+    /// Per-second status forwards sent to the media server.
+    pub status_sent: u64,
 }
 
 /// Complete call media telemetry snapshot recorded in `call-trace.jsonl`.
@@ -291,7 +302,11 @@ struct SrtpCandidate {
 
 impl SrtpCandidate {
     fn label(&self) -> String {
-        format!("{}/{}", if self.srtp_key { "srtpKey" } else { "session" }, if self.tag_len == 4 { 32 } else { 80 })
+        format!(
+            "{}/{}",
+            if self.srtp_key { "srtpKey" } else { "session" },
+            if self.tag_len == 4 { 32 } else { 80 }
+        )
     }
 }
 
@@ -304,11 +319,18 @@ enum SrtpActive {
 /// Transmit-side contexts for the active profile.
 #[allow(clippy::large_enum_variant)]
 enum SrtpTx {
-    Srtp { audio: SrtpContext, video: SrtpContext },
+    Srtp {
+        audio: SrtpContext,
+        video: SrtpContext,
+    },
     Plain,
 }
 
-fn build_ctx(opts: &MediaCallOptions, srtp_key: bool, tag_len: usize) -> Result<SrtpContext, String> {
+fn build_ctx(
+    opts: &MediaCallOptions,
+    srtp_key: bool,
+    tag_len: usize,
+) -> Result<SrtpContext, String> {
     let src = match (srtp_key, opts.srtp_key.as_deref()) {
         (true, Some(k)) => k,
         _ => opts.session.as_str(),
@@ -358,6 +380,11 @@ pub(crate) struct MediaEngine {
     last_key_req_at: i64,
     logged_unknown: usize,
     received_key_count: usize,
+    twcc: TwccRecorder,
+    twcc_media_ssrc: Option<u32>,
+    nack: NackTracker,
+    fwd_seq: u32,
+    audio_rx_second: u32,
     closed: bool,
     event_tx: mpsc::UnboundedSender<MediaEvent>,
 }
@@ -367,15 +394,21 @@ impl MediaEngine {
         opts: MediaCallOptions,
         event_tx: mpsc::UnboundedSender<MediaEvent>,
     ) -> Result<Self, String> {
-        let server_addr = opts
-            .server
-            .socket_addr()
-            .ok_or_else(|| format!("Invalid media server address: {}:{}", opts.server.host, opts.server.port))?;
+        let server_addr = opts.server.socket_addr().ok_or_else(|| {
+            format!(
+                "Invalid media server address: {}:{}",
+                opts.server.host, opts.server.port
+            )
+        })?;
         let has_key = opts
             .srtp_key
             .as_deref()
             .is_some_and(|k| k.encode_utf16().count() >= 30);
-        let first_tag = if opts.srtp_mode == Some(2) { 4 } else { AUTH_TAG_LEN };
+        let first_tag = if opts.srtp_mode == Some(2) {
+            4
+        } else {
+            AUTH_TAG_LEN
+        };
         let mut cands = Vec::new();
         let sources: &[bool] = if has_key { &[true, false] } else { &[false] };
         for &srtp_key in sources {
@@ -452,6 +485,11 @@ impl MediaEngine {
             last_key_req_at: 0,
             logged_unknown: 0,
             received_key_count: 0,
+            twcc: TwccRecorder::new(),
+            twcc_media_ssrc: None,
+            nack: NackTracker::new(),
+            fwd_seq: 1,
+            audio_rx_second: 0,
             closed: false,
             event_tx,
         })
@@ -582,7 +620,70 @@ impl MediaEngine {
     /// True when the 50 ms video reorder/PLI timer needs to run (false on audio-only calls).
     pub fn needs_video_tick(&self) -> bool {
         self.incoming_video.is_some()
-            && (self.assembler.has_buffered_frames() || self.assembler.waiting_for_key())
+            && (self.assembler.has_buffered_frames()
+                || self.assembler.waiting_for_key()
+                || self.nack.has_missing())
+    }
+
+    /// True while received packets wait for a TWCC report (the 50 ms feedback timer must run).
+    pub fn needs_twcc_tick(&self) -> bool {
+        self.token.is_some() && self.twcc.pending()
+    }
+
+    /// Notes one decrypted incoming RTP packet (still in `rx_scratch`) for TWCC.
+    fn record_twcc(&mut self, ssrc: u32, now: i64) {
+        if self.twcc_media_ssrc.is_none() {
+            self.twcc_media_ssrc = Some(ssrc);
+        }
+        if let Some(seq) = read_tw_seq(&self.rx_scratch) {
+            self.twcc.add(seq, now);
+        }
+    }
+
+    /// Sends the TWCC feedback for packets that arrived since the last one (audio RTCP kind).
+    pub fn twcc_tick(&mut self, out: &mut Vec<Vec<u8>>) {
+        let (Some(token), Some(media)) = (self.token, self.twcc_media_ssrc) else {
+            return;
+        };
+        for fb in self.twcc.build(self.video_ssrc, media) {
+            if let Ok(pkt) = zrtc::rtcp(token, &fb, false) {
+                self.stats.rtcp.twcc_sent += 1;
+                self.queue_send(pkt, "twcc", out);
+            }
+        }
+    }
+
+    /// Per-second status forward (sub 10) carrying the audio packets received in the last second.
+    pub fn send_status(&mut self, out: &mut Vec<Vec<u8>>) {
+        let Some(token) = self.token else {
+            return;
+        };
+        let rx = std::mem::take(&mut self.audio_rx_second);
+        let pkt = zrtc::forward_status(self.opts.user_id, token, self.fwd_seq, rx);
+        self.fwd_seq = self.fwd_seq.wrapping_add(1);
+        self.stats.rtcp.status_sent += 1;
+        self.queue_send(pkt, "status", out);
+    }
+
+    /// One-off forward (sub 8) Zalo's client sends shortly after joining.
+    pub fn send_join_hello(&mut self, out: &mut Vec<Vec<u8>>) {
+        if let Some(token) = self.token {
+            let pkt = zrtc::forward_hello(self.opts.user_id, token);
+            self.queue_send(pkt, "hello", out);
+        }
+    }
+
+    fn send_nacks(&mut self, reqs: Vec<crate::call::rtcp::NackRequest>, out: &mut Vec<Vec<u8>>) {
+        let Some(token) = self.token else {
+            return;
+        };
+        for r in reqs {
+            let fb = nack(self.video_ssrc, r.ssrc, &r.seqs);
+            if let Ok(pkt) = zrtc::rtcp(token, &fb, true) {
+                self.stats.video.nacks_sent += 1;
+                self.queue_send(pkt, "nack", out);
+            }
+        }
     }
 
     fn emit_log(&self, entry: Value) {
@@ -647,7 +748,11 @@ impl MediaEngine {
     }
 
     pub fn send_ping(&mut self, out: &mut Vec<Vec<u8>>) {
-        if let Ok(pkt) = zrtc::ping(self.opts.user_id, self.token.unwrap_or(0), &self.opts.session) {
+        if let Ok(pkt) = zrtc::ping(
+            self.opts.user_id,
+            self.token.unwrap_or(0),
+            &self.opts.session,
+        ) {
             self.queue_send(pkt, "ping", out);
         }
     }
@@ -693,9 +798,7 @@ impl MediaEngine {
 
         self.first_audio = false;
         self.seq = self.seq.wrapping_add(1);
-        self.ts = self
-            .ts
-            .wrapping_add((OPUS_CLOCK * FRAME_MS as u32) / 1000);
+        self.ts = self.ts.wrapping_add((OPUS_CLOCK * FRAME_MS as u32) / 1000);
         self.sent_packets = self.sent_packets.wrapping_add(1);
         self.sent_octets = self.sent_octets.wrapping_add(opus.len() as u32);
 
@@ -810,7 +913,13 @@ impl MediaEngine {
         }
     }
 
-    pub fn request_key_frame(&mut self, why: &str, min_gap_ms: i64, now: i64, out: &mut Vec<Vec<u8>>) {
+    pub fn request_key_frame(
+        &mut self,
+        why: &str,
+        min_gap_ms: i64,
+        now: i64,
+        out: &mut Vec<Vec<u8>>,
+    ) {
         let Some(token) = self.token else {
             return;
         };
@@ -849,6 +958,8 @@ impl MediaEngine {
         if self.assembler.waiting_for_key() && now - self.video_started_at >= 300 {
             self.request_key_frame("waiting", PLI_RETRY_MS, now, out);
         }
+        let retries = self.nack.tick(now);
+        self.send_nacks(retries, out);
     }
 
     fn sync_assembler_stats(&mut self) {
@@ -969,19 +1080,23 @@ impl MediaEngine {
                 match k {
                     kind::AUDIO_IN => self.on_audio(&payload, now),
                     kind::AUDIO_RTCP => {
+                        // Server-relayed RTCP often carries another token: count and log it once,
+                        // but still use it (SR timing for LSR/DLSR, PLI/FIR). The datagram source
+                        // address was already checked.
                         if let Some(expected) = self.token {
                             if token != Some(expected) {
                                 self.note_rtcp_token_mismatch(token, expected);
-                                return None;
                             }
                         }
                         self.on_rtcp(&payload, false, now);
                     }
                     kind::VIDEO_RTCP => {
+                        // Server-relayed RTCP often carries another token: count and log it once,
+                        // but still use it (SR timing for LSR/DLSR, PLI/FIR). The datagram source
+                        // address was already checked.
                         if let Some(expected) = self.token {
                             if token != Some(expected) {
                                 self.note_rtcp_token_mismatch(token, expected);
-                                return None;
                             }
                         }
                         self.on_rtcp(&payload, true, now);
@@ -1124,6 +1239,9 @@ impl MediaEngine {
         if let Some(inc) = self.incoming_video.as_mut() {
             inc.on_packet(h.seq, h.timestamp, now);
         }
+        self.record_twcc(h.ssrc, now);
+        let reqs = self.nack.note(h.ssrc, h.seq, now);
+        self.send_nacks(reqs, out);
 
         let mut frames = Vec::new();
         let mut asks = Vec::new();
@@ -1179,6 +1297,8 @@ impl MediaEngine {
         if let Some(inc) = self.incoming.as_mut() {
             inc.on_packet(h.seq, h.timestamp, now);
         }
+        self.audio_rx_second = self.audio_rx_second.saturating_add(1);
+        self.record_twcc(h.ssrc, now);
         self.stats.audio.ssrcs = self.ssrcs.len();
         if self.stats.audio.first_seq.is_none() {
             self.stats.audio.first_seq = Some(h.seq);
@@ -1249,10 +1369,12 @@ impl MediaCall {
     pub async fn new(
         opts: MediaCallOptions,
     ) -> Result<(Self, mpsc::UnboundedReceiver<MediaEvent>), String> {
-        let server_addr = opts
-            .server
-            .socket_addr()
-            .ok_or_else(|| format!("Invalid media server: {}:{}", opts.server.host, opts.server.port))?;
+        let server_addr = opts.server.socket_addr().ok_or_else(|| {
+            format!(
+                "Invalid media server: {}:{}",
+                opts.server.host, opts.server.port
+            )
+        })?;
         let bind_addr = if server_addr.is_ipv6() {
             "[::]:0"
         } else {
@@ -1361,7 +1483,12 @@ impl MediaCall {
     }
 }
 
-async fn flush_outbound(socket: &UdpSocket, dest: SocketAddr, out: &mut Vec<Vec<u8>>, engine: &MediaEngine) {
+async fn flush_outbound(
+    socket: &UdpSocket,
+    dest: SocketAddr,
+    out: &mut Vec<Vec<u8>>,
+    engine: &MediaEngine,
+) {
     for pkt in out.drain(..) {
         if let Err(err) = socket.send_to(&pkt, dest).await {
             engine.emit_log(json!({ "kind": "media_socket_error", "error": err.to_string() }));
@@ -1413,6 +1540,8 @@ async fn run_media_loop(
     let mut silence_active = false;
     let mut stats_dirty = false;
     let mut video_tick_armed = false;
+    let mut twcc_tick_armed = false;
+    let mut hello_active = false;
     let mut last_audio_at: Option<tokio::time::Instant> = None;
     let mut join_reply: Option<oneshot::Sender<Option<u32>>> = None;
     let mut init_pkt: Option<Vec<u8>> = None;
@@ -1429,6 +1558,12 @@ async fn run_media_loop(
     rtcp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut video_tick = tokio::time::interval(Duration::from_millis(VIDEO_TICK_MS));
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut twcc_tick = tokio::time::interval(Duration::from_millis(TWCC_TICK_MS));
+    twcc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut status_tick = tokio::time::interval(Duration::from_millis(STATUS_TICK_MS));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let hello_sleep = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(hello_sleep);
     let mut stats_sync_tick = tokio::time::interval(Duration::from_secs(1));
     stats_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1441,6 +1576,11 @@ async fn run_media_loop(
             video_tick.reset();
         }
         video_tick_armed = need_video;
+        let need_twcc = joined && engine.needs_twcc_tick();
+        if need_twcc && !twcc_tick_armed {
+            twcc_tick.reset();
+        }
+        twcc_tick_armed = need_twcc;
 
         tokio::select! {
             res = socket.recv_from(&mut recv_buf) => {
@@ -1462,6 +1602,9 @@ async fn run_media_loop(
                                     joined = true;
                                     ping_tick.reset();
                                     rtcp_tick.reset();
+                                    status_tick.reset();
+                                    hello_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(HELLO_DELAY_MS));
+                                    hello_active = true;
                                     if silence_active {
                                         silence_sleep.as_mut().reset(next_silence_deadline(last_audio_at));
                                     }
@@ -1589,6 +1732,24 @@ async fn run_media_loop(
                 flush_outbound(&socket, dest, &mut outbound, &engine).await;
                 stats_dirty = true;
             }
+            _ = twcc_tick.tick(), if twcc_tick_armed => {
+                engine.twcc_tick(&mut outbound);
+                if !outbound.is_empty() {
+                    flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                }
+                stats_dirty = true;
+            }
+            _ = status_tick.tick(), if joined => {
+                engine.send_status(&mut outbound);
+                flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                stats_dirty = true;
+            }
+            _ = &mut hello_sleep, if hello_active => {
+                hello_active = false;
+                engine.send_join_hello(&mut outbound);
+                flush_outbound(&socket, dest, &mut outbound, &engine).await;
+                stats_dirty = true;
+            }
             _ = video_tick.tick(), if video_tick_armed => {
                 engine.video_tick(now_ms(), &mut outbound);
                 if !outbound.is_empty() {
@@ -1703,11 +1864,21 @@ mod tests {
         let mut out = Vec::new();
         // Wrong source IP / port rejected
         assert_eq!(
-            engine.handle_datagram(&make_init_reply(1001, 111), "10.0.0.1:4200".parse().unwrap(), 1000, &mut out),
+            engine.handle_datagram(
+                &make_init_reply(1001, 111),
+                "10.0.0.1:4200".parse().unwrap(),
+                1000,
+                &mut out
+            ),
             None
         );
         assert_eq!(
-            engine.handle_datagram(&make_init_reply(1001, 111), "192.0.2.10:9999".parse().unwrap(), 1000, &mut out),
+            engine.handle_datagram(
+                &make_init_reply(1001, 111),
+                "192.0.2.10:9999".parse().unwrap(),
+                1000,
+                &mut out
+            ),
             None
         );
         assert_eq!(engine.token, None);
@@ -1715,7 +1886,12 @@ mod tests {
 
         // Right source, wrong userId rejected
         assert_eq!(
-            engine.handle_datagram(&make_init_reply(9999, 222), "192.0.2.10:4200".parse().unwrap(), 1000, &mut out),
+            engine.handle_datagram(
+                &make_init_reply(9999, 222),
+                "192.0.2.10:4200".parse().unwrap(),
+                1000,
+                &mut out
+            ),
             None
         );
         assert_eq!(engine.token, None);
@@ -1733,16 +1909,21 @@ mod tests {
         );
         assert_eq!(engine.token, Some(777));
 
-        // VideoRtcp wrong token rejected; right token accepted
+        // VideoRtcp with a foreign token is counted but still processed (server-relayed RTCP)
         let v_ssrc = engine.video_ssrc;
         let bad_pli = zrtc::rtcp(888, &pli(0x5555, v_ssrc), true).unwrap();
         engine.handle_datagram(&bad_pli, "192.0.2.10:4200".parse().unwrap(), 1000, &mut out);
         assert_eq!(engine.stats.received.get("rtcp_wrong_token"), Some(&1));
-        assert_eq!(engine.stats.video.key_requests, 0);
+        assert_eq!(engine.stats.video.key_requests, 1);
 
         let good_pli = zrtc::rtcp(777, &pli(0x5555, v_ssrc), true).unwrap();
-        engine.handle_datagram(&good_pli, "192.0.2.10:4200".parse().unwrap(), 1000, &mut out);
-        assert_eq!(engine.stats.video.key_requests, 1);
+        engine.handle_datagram(
+            &good_pli,
+            "192.0.2.10:4200".parse().unwrap(),
+            1000,
+            &mut out,
+        );
+        assert_eq!(engine.stats.video.key_requests, 2);
 
         // Drain events and check KeyFrameRequest arrived
         let mut saw_kfr = false;
@@ -1774,7 +1955,12 @@ mod tests {
 
         // Cap received keys at 64 + other_cmd overflow
         for k in 100u8..220 {
-            engine.handle_datagram(&[k, 0, 1], "192.0.2.10:4200".parse().unwrap(), 1000, &mut out);
+            engine.handle_datagram(
+                &[k, 0, 1],
+                "192.0.2.10:4200".parse().unwrap(),
+                1000,
+                &mut out,
+            );
         }
         assert!(engine.stats.received.len() <= 65);
         assert!(engine.stats.received.get("other_cmd").copied().unwrap_or(0) > 0);
@@ -2015,7 +2201,10 @@ mod tests {
         });
 
         let opts = MediaCallOptions::new(
-            MediaServer { host: "127.0.0.1".into(), port },
+            MediaServer {
+                host: "127.0.0.1".into(),
+                port,
+            },
             438_000_002,
             465_000_001,
             321_000_003,
@@ -2033,7 +2222,10 @@ mod tests {
             tick.tick().await;
             call.send_audio_frame(vec![0x78, i as u8, 1, 2, 3, 4, 5, 6]);
             if i % 3 == 0 {
-                call.send_video_frame(i % 30 == 0, vec![0, 0, 0, 1, if i % 30 == 0 { 0x65 } else { 0x41 }, 1, 2, 3]);
+                call.send_video_frame(
+                    i % 30 == 0,
+                    vec![0, 0, 0, 1, if i % 30 == 0 { 0x65 } else { 0x41 }, 1, 2, 3],
+                );
             }
             while let Ok(ev) = ev_rx.try_recv() {
                 match ev {
@@ -2087,10 +2279,16 @@ mod tests {
     const SRV: &str = "192.0.2.10:4200";
     const ALT_KEY: &str = "ALT-srtp-key-0123456789abcdefghijklmnopqrstuv";
 
-    fn srtp_engine(key: Option<&str>, mode: Option<u8>) -> (MediaEngine, mpsc::UnboundedReceiver<MediaEvent>) {
+    fn srtp_engine(
+        key: Option<&str>,
+        mode: Option<u8>,
+    ) -> (MediaEngine, mpsc::UnboundedReceiver<MediaEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let opts = MediaCallOptions::new(
-            MediaServer { host: "192.0.2.10".into(), port: 4200 },
+            MediaServer {
+                host: "192.0.2.10".into(),
+                port: 4200,
+            },
             1001,
             2002,
             3003,
@@ -2132,7 +2330,9 @@ mod tests {
     }
 
     fn profile_logs(logs: &[Value]) -> Vec<&Value> {
-        logs.iter().filter(|v| v["kind"] == "srtp_profile").collect()
+        logs.iter()
+            .filter(|v| v["kind"] == "srtp_profile")
+            .collect()
     }
 
     fn tx_audio_packet(e: &mut MediaEngine) -> Vec<u8> {
@@ -2233,7 +2433,9 @@ mod tests {
         let (mut e, mut rx) = srtp_engine(None, None);
         let mut peer = SrtpContext::from_session(ALT_KEY).unwrap();
         for i in 0..60u16 {
-            let payload: Vec<u8> = (0..20u8).map(|b| b.wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(7))).collect();
+            let payload: Vec<u8> = (0..20u8)
+                .map(|b| b.wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(7)))
+                .collect();
             feed_audio(&mut e, &peer.protect(&audio_rtp(i, &payload)).unwrap());
         }
         assert_eq!(e.stats.srtp, None);
@@ -2242,7 +2444,10 @@ mod tests {
         let (audio, logs) = drain(&mut rx);
         assert!(audio.is_empty());
         assert!(profile_logs(&logs).is_empty());
-        let nm: Vec<_> = logs.iter().filter(|v| v["kind"] == "srtp_no_match").collect();
+        let nm: Vec<_> = logs
+            .iter()
+            .filter(|v| v["kind"] == "srtp_no_match")
+            .collect();
         assert_eq!(nm.len(), 1);
         assert_eq!(nm[0]["packets"], 40);
     }
@@ -2257,9 +2462,269 @@ mod tests {
         }
         assert_eq!(e.stats.received.get("rtcp_wrong_token"), Some(&3));
         let (_, logs) = drain(&mut rx);
-        let m: Vec<_> = logs.iter().filter(|v| v["kind"] == "rtcp_token_mismatch").collect();
+        let m: Vec<_> = logs
+            .iter()
+            .filter(|v| v["kind"] == "rtcp_token_mismatch")
+            .collect();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["got"], 888);
         assert_eq!(m[0]["ours"], 4242);
+    }
+
+    /// RTP packet from the peer carrying the transport-wide seq extension (id 5).
+    fn rtp_tw(pt: u8, seq: u16, ssrc: u32, tw: u16, payload: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x90, pt];
+        r.extend_from_slice(&seq.to_be_bytes());
+        r.extend_from_slice(&(1000 + 960 * seq as u32).to_be_bytes());
+        r.extend_from_slice(&ssrc.to_be_bytes());
+        r.extend_from_slice(&[0xbe, 0xde, 0, 1, 0x51, (tw >> 8) as u8, tw as u8, 0]);
+        r.extend_from_slice(payload);
+        r
+    }
+
+    fn feed_kind(e: &mut MediaEngine, k: u8, protected: &[u8], now: i64, out: &mut Vec<Vec<u8>>) {
+        let mut m = vec![k];
+        m.extend_from_slice(protected);
+        e.handle_datagram(&m, SRV.parse().unwrap(), now, out);
+    }
+
+    /// RTCP feedback packets (type 205) in `out` for the given zrtc kind, with their FMT.
+    fn feedback(out: &[Vec<u8>], k: u8) -> Vec<(u8, Vec<u8>)> {
+        out.iter()
+            .filter(|p| p[0] == k && p.len() > 6 && p[6] == 205)
+            .map(|p| (p[5] & 0x1f, p[5..].to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn rtcp_processed_despite_token_mismatch() {
+        let (mut e, mut rx) = srtp_engine(None, None);
+        let mut out = Vec::new();
+        // Peer SR (foreign token) sets LSR for our next RR block; a PLI asks for a key frame.
+        let mut peer = SrtpContext::from_session(SESSION).unwrap();
+        feed_audio(&mut e, &peer.protect(&audio_rtp(1, &[0x78, 1])).unwrap());
+        let sr = sender_report(777, 1_700_000_000_000, 1, 1, 1, &[]);
+        let dg = zrtc::rtcp(999, &sr, false).unwrap();
+        e.handle_datagram(&dg, SRV.parse().unwrap(), 5000, &mut out);
+        let dg = zrtc::rtcp(999, &pli(0x5555, e.video_ssrc), true).unwrap();
+        e.handle_datagram(&dg, SRV.parse().unwrap(), 5000, &mut out);
+        assert_eq!(e.stats.received.get("rtcp_wrong_token"), Some(&2));
+        assert_eq!(e.stats.rtcp.types.get("SR"), Some(&1));
+        assert_eq!(e.stats.video.key_requests, 1);
+        let inc = e.incoming.as_mut().unwrap().block(5500).unwrap();
+        assert_ne!(inc.lsr, 0);
+        assert_eq!(inc.dlsr, 32768);
+        let _ = drain(&mut rx);
+    }
+
+    #[test]
+    fn engine_twcc_on_audio_rtcp_kind() {
+        let (mut e, _rx) = srtp_engine(None, None);
+        let mut peer_a = SrtpContext::from_session(SESSION).unwrap();
+        let mut peer_v = SrtpContext::from_session(SESSION).unwrap();
+        let mut out = Vec::new();
+        assert!(!e.needs_twcc_tick());
+        // Video first (its SSRC becomes the feedback's media SSRC), then audio; shared tw seq.
+        let vp = peer_v
+            .protect(&rtp_tw(98, 5, 0x0bad_f00d, 100, &[0, 0, 0, 1, 0x65, 1]))
+            .unwrap();
+        feed_kind(&mut e, kind::VIDEO_IN, &vp, 10_000, &mut out);
+        for (i, tw) in [101u16, 102, 104].into_iter().enumerate() {
+            let ap = peer_a
+                .protect(&rtp_tw(OPUS_PT, 1 + i as u16, 777, tw, &[0x78, 1]))
+                .unwrap();
+            feed_kind(
+                &mut e,
+                kind::AUDIO_IN,
+                &ap,
+                10_020 + 20 * i as i64,
+                &mut out,
+            );
+        }
+        // An arrival without the extension is not reported.
+        feed_audio(&mut e, &peer_a.protect(&audio_rtp(9, &[0x78])).unwrap());
+        assert!(e.needs_twcc_tick());
+        out.clear();
+        e.twcc_tick(&mut out);
+        assert_eq!(out.len(), 1);
+        let pkt = &out[0];
+        assert_eq!(pkt[0], kind::AUDIO_RTCP);
+        assert_eq!(&pkt[1..5], &4242u32.to_le_bytes());
+        let fb = &pkt[5..];
+        assert_eq!(&fb[..2], &[0x8f, 205]);
+        assert_eq!(
+            u32::from_be_bytes([fb[4], fb[5], fb[6], fb[7]]),
+            e.video_ssrc
+        );
+        assert_eq!(
+            u32::from_be_bytes([fb[8], fb[9], fb[10], fb[11]]),
+            0x0bad_f00d
+        );
+        assert_eq!(u16::from_be_bytes([fb[12], fb[13]]), 100);
+        assert_eq!(u16::from_be_bytes([fb[14], fb[15]]), 5);
+        assert_eq!(e.stats.rtcp.twcc_sent, 1);
+        // Nothing new: no timer, no feedback.
+        assert!(!e.needs_twcc_tick());
+        out.clear();
+        e.twcc_tick(&mut out);
+        assert!(out.is_empty());
+        // Next arrival yields the next feedback with an incremented count.
+        let ap = peer_a
+            .protect(&rtp_tw(OPUS_PT, 20, 777, 105, &[0x78, 1]))
+            .unwrap();
+        feed_kind(&mut e, kind::AUDIO_IN, &ap, 11_000, &mut out);
+        out.clear();
+        e.twcc_tick(&mut out);
+        assert_eq!(out[0][5 + 19], 1);
+    }
+
+    #[test]
+    fn engine_nack_on_video_holes_with_retries() {
+        let (mut e, _rx) = srtp_engine(None, None);
+        let mut peer = SrtpContext::from_session(SESSION).unwrap();
+        let mut out = Vec::new();
+        let ssrc = 0x1234_5678u32;
+        let mut send = |e: &mut MediaEngine, seq: u16, now: i64, out: &mut Vec<Vec<u8>>| {
+            let mut r = vec![0x80, 97];
+            r.extend_from_slice(&seq.to_be_bytes());
+            r.extend_from_slice(&(seq as u32 * 3000).to_be_bytes());
+            r.extend_from_slice(&ssrc.to_be_bytes());
+            r.extend_from_slice(&[0x41, 1, 2]);
+            feed_kind(e, kind::VIDEO_IN, &peer.protect(&r).unwrap(), now, out);
+        };
+        send(&mut e, 10, 1000, &mut out);
+        assert!(feedback(&out, kind::VIDEO_RTCP).is_empty()); // first packet: nothing
+        send(&mut e, 13, 1010, &mut out);
+        let nacks = feedback(&out, kind::VIDEO_RTCP);
+        assert_eq!(nacks.len(), 1);
+        let (fmt, p) = &nacks[0];
+        assert_eq!(*fmt, 1);
+        assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), e.video_ssrc);
+        assert_eq!(u32::from_be_bytes([p[8], p[9], p[10], p[11]]), ssrc);
+        assert_eq!(&p[12..16], &[0, 11, 0, 1]); // PID 11, BLP bit0 = 12
+        assert_eq!(e.stats.video.nacks_sent, 1);
+        assert!(e.needs_video_tick());
+        // The timer retries, then gives up after the drop window.
+        out.clear();
+        e.video_tick(1060, &mut out);
+        assert_eq!(feedback(&out, kind::VIDEO_RTCP).len(), 1);
+        // A recovered packet stops being requested.
+        out.clear();
+        send(&mut e, 11, 1070, &mut out);
+        send(&mut e, 12, 1071, &mut out);
+        e.video_tick(1110, &mut out);
+        assert!(feedback(&out, kind::VIDEO_RTCP).is_empty());
+        assert!(!e.nack.has_missing());
+    }
+
+    #[test]
+    fn engine_status_and_hello_forwards() {
+        let (mut e, _rx) = srtp_engine(None, None);
+        let mut peer = SrtpContext::from_session(SESSION).unwrap();
+        let mut out = Vec::new();
+        for i in 0..3u16 {
+            feed_audio(&mut e, &peer.protect(&audio_rtp(i, &[0x78])).unwrap());
+        }
+        e.send_status(&mut out);
+        e.send_status(&mut out);
+        e.send_join_hello(&mut out);
+        assert_eq!(out.len(), 3);
+        let parse_fwd = |p: &Vec<u8>| match zrtc::parse(p).unwrap() {
+            Packet::Control { header, .. } => header,
+            other => panic!("{other:?}"),
+        };
+        let (h1, h2, h3) = (parse_fwd(&out[0]), parse_fwd(&out[1]), parse_fwd(&out[2]));
+        assert_eq!(
+            (h1.cmd, h1.sub, h1.w6, h1.user_id, h1.w14),
+            (cmd::FORWARD, 10, 1, 1001, 4242)
+        );
+        assert_eq!((h2.sub, h2.w6), (10, 2));
+        assert_eq!((h3.sub, h3.w6), (8, 0));
+        // 20, 0, 1, 1, rx = 3, 0 : the counter covers one second and resets.
+        assert_eq!(&out[0][21 + 16..21 + 20], &3u32.to_le_bytes());
+        assert_eq!(&out[1][21 + 16..21 + 20], &0u32.to_le_bytes());
+        assert_eq!(e.stats.rtcp.status_sent, 2);
+    }
+
+    #[tokio::test]
+    async fn media_call_sends_twcc_status_and_hello() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = server.local_addr().unwrap().port();
+        let seen = Arc::new(RwLock::new((0usize, 0usize, 0usize)));
+        let seen_bg = Arc::clone(&seen);
+        let srv = Arc::clone(&server);
+        let (done_tx, mut done_rx) = oneshot::channel::<()>();
+        let srv_task = tokio::spawn(async move {
+            let mut tx_a = SrtpContext::from_session(SESSION).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut peer: Option<SocketAddr> = None;
+            let (mut seq, mut n) = (1u16, 0u16);
+            let mut t = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    _ = t.tick(), if peer.is_some() => {
+                        let rtp = rtp_tw(OPUS_PT, seq, 777, 3000 + n, &[0x78, 1, 2]);
+                        seq = seq.wrapping_add(1);
+                        n += 1;
+                        let mut ap = vec![kind::AUDIO_IN];
+                        ap.extend_from_slice(&tx_a.protect(&rtp).unwrap());
+                        let _ = srv.send_to(&ap, peer.unwrap()).await;
+                    }
+                    res = srv.recv_from(&mut buf) => {
+                        let Ok((len, from)) = res else { break };
+                        let msg = &buf[..len];
+                        match msg[0] {
+                            kind::REQUEST => {
+                                if let Ok(Packet::Control { header, .. }) = zrtc::parse(msg) {
+                                    if header.cmd == cmd::INIT_CALL_CALLEE {
+                                        let mut reply = msg[..21].to_vec();
+                                        reply[0] = kind::RESPONSE;
+                                        reply.extend_from_slice(&0u32.to_le_bytes());
+                                        reply.extend_from_slice(&1u32.to_le_bytes());
+                                        reply.extend_from_slice(&12345u32.to_le_bytes());
+                                        reply.extend_from_slice(&9u16.to_le_bytes());
+                                        reply.extend_from_slice(b"127.0.0.1");
+                                        let _ = srv.send_to(&reply, from).await;
+                                        peer = Some(from);
+                                    } else if header.cmd == cmd::FORWARD && header.sub == 10 {
+                                        seen_bg.write().unwrap().1 += 1;
+                                    } else if header.cmd == cmd::FORWARD && header.sub == 8 {
+                                        seen_bg.write().unwrap().2 += 1;
+                                    }
+                                }
+                            }
+                            kind::AUDIO_RTCP if len > 10 && msg[5] == 0x8f && msg[6] == 205 => {
+                                seen_bg.write().unwrap().0 += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+        let opts = MediaCallOptions::new(
+            MediaServer {
+                host: "127.0.0.1".into(),
+                port,
+            },
+            438_000_002,
+            465_000_001,
+            321_000_003,
+            SESSION.into(),
+            false,
+        );
+        let (call, _ev_rx) = MediaCall::new(opts).await.unwrap();
+        assert_eq!(call.join(2000, 100).await, Some(12345));
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        let stats = call.stats_async().await;
+        call.close(false);
+        let _ = done_tx.send(());
+        let _ = srv_task.await;
+        let (twcc, status, hello) = *seen.read().unwrap();
+        assert!(twcc >= 10, "twcc {twcc}");
+        assert_eq!(hello, 1);
+        assert!(status >= 1, "status {status}");
+        assert!(stats.rtcp.twcc_sent >= 10);
     }
 }

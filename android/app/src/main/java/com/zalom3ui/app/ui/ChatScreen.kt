@@ -127,6 +127,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
@@ -176,6 +177,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -831,7 +833,11 @@ private fun MediaPreviewSheet(
 ) {
     val colors = LocalChatColors.current
     var caption by rememberSaveable { mutableStateOf("") }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    val previewMaxHeight = (LocalConfiguration.current.screenHeightDp * 0.38f).dp
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -858,7 +864,7 @@ private fun MediaPreviewSheet(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 180.dp, max = 300.dp)
+                        .heightIn(min = 120.dp, max = previewMaxHeight)
                         .clip(RoundedCornerShape(18.dp))
                         .background(MaterialTheme.colorScheme.surfaceContainerHighest),
                     contentAlignment = Alignment.Center,
@@ -867,7 +873,7 @@ private fun MediaPreviewSheet(
                         model = uris.first(),
                         contentDescription = "Selected photo",
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp),
+                        modifier = Modifier.fillMaxWidth().heightIn(max = previewMaxHeight),
                     )
                 }
             } else {
@@ -2316,8 +2322,11 @@ private fun ReactionsDetailsSheet(
     onDismiss: () -> Unit,
 ) {
     val sorted = remember(msg.reactions) { msg.reactions.sortedByDescending { it.count } }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 24.dp)) {
             Text(
                 "Reactions",
                 style = MaterialTheme.typography.titleMedium,
@@ -2791,7 +2800,11 @@ private fun Composer(
                 )
             } else {
                 FilledIconButton(
-                    onClick = { attachSheet = true },
+                    onClick = {
+                        showEmoji = false
+                        keyboard?.hide()
+                        attachSheet = true
+                    },
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = colors.outgoing,
                         contentColor = colors.onOutgoing,
@@ -3153,11 +3166,21 @@ private fun AttachmentSheet(
     onPickSticker: () -> Unit,
     onCreatePoll: (() -> Unit)? = null,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
+        Text(
+            "Share",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+        )
         FlowRow(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
+                .navigationBarsPadding()
+                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -3213,7 +3236,7 @@ private fun AttachmentTile(
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .widthIn(min = 76.dp)
+            .width(84.dp)
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
             .padding(8.dp),

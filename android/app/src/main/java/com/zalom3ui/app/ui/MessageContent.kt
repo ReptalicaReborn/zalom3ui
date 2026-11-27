@@ -122,6 +122,7 @@ import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
 import com.zalom3ui.app.data.isLocalMediaUri
 import com.zalom3ui.app.server.OtpClipboard
+import com.zalom3ui.app.server.StartupLog
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.abs
@@ -399,20 +400,39 @@ private fun MediaFrame(
             is AsyncImagePainter.State.Error -> MediaUnavailablePlaceholder()
             else -> MediaPlaceholder()
         }
+        // Software bitmaps: a tall HD photo decoded to fill the frame can exceed the GPU texture limit as a hardware bitmap.
+        val context = LocalContext.current
+        val request = remember(activeUrl) {
+            ImageRequest.Builder(context).data(activeUrl).allowHardware(false).build()
+        }
         AsyncImage(
-            model = activeUrl,
+            model = request,
             contentDescription = "Photo",
             contentScale = ContentScale.Crop,
             onState = { state ->
                 loadState = state
-                if (state is AsyncImagePainter.State.Error && fallbackUrl != null && activeUrl != fallbackUrl) {
-                    activeUrl = fallbackUrl
+                if (state is AsyncImagePainter.State.Error) {
+                    if (fallbackUrl != null && activeUrl != fallbackUrl) {
+                        activeUrl = fallbackUrl
+                    } else {
+                        // Shareable from Settings: why a photo shows "Media unavailable" (file type and error only, no URL).
+                        val e = state.result.throwable
+                        StartupLog.write(
+                            context,
+                            "image: load failed (.${imageUrlExtension(activeUrl)}): ${e.javaClass.simpleName}: ${e.message?.take(120)}",
+                        )
+                    }
                 }
             },
             modifier = Modifier.matchParentSize(),
         )
     }
 }
+
+/** A photo URL's file extension (e.g. "jpg", "jxl"), for the log: never the URL itself. */
+internal fun imageUrlExtension(url: String?): String =
+    url.orEmpty().substringBefore('?').substringBefore('#').substringAfterLast('/').substringAfterLast('.', "")
+        .take(8).lowercase().ifEmpty { "none" }
 
 @Composable
 private fun MediaPlaceholder() {
