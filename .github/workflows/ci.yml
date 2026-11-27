@@ -77,6 +77,16 @@ jobs:
               fi
             done
           done
+      # Without the compiled baseline profile, a sideloaded APK cold-starts interpreted (no Play Store cloud profile).
+      - name: Check the release APK carries the baseline profile
+        run: |
+          for apk in app/build/outputs/apk/release/*.apk; do
+            unzip -l "$apk" | grep -E "assets/dexopt/baseline\.prof" || { echo "::error::assets/dexopt/baseline.prof missing from $apk"; exit 1; }
+          done
+          # How many app rules made it through R8 (rewritten to minified names), for the log.
+          for f in app/build/intermediates/merged_art_profile/release/*/baseline-prof.txt app/build/intermediates/merged_art_profile/release/baseline-prof.txt; do
+            [ -f "$f" ] && echo "$f: $(wc -l < "$f") rules, $(grep -c 'zalom3ui' "$f" || true) for com.zalom3ui"
+          done || true
       # Debug and R8-optimized release APKs, for arm64-v8a phones.
       - uses: actions/upload-artifact@v4
         with:
