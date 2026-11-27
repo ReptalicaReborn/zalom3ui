@@ -293,6 +293,23 @@ impl ZaloHttp {
         content_type: &str,
         data: Vec<u8>,
     ) -> Result<Value> {
+        self.post_multipart_chunk_counted(ctx, url, field_name, filename, content_type, data, None)
+            .await
+    }
+
+    /// Like [`Self::post_multipart_chunk`]; with `on_bytes`, the body is streamed in small pieces
+    /// and `on_bytes(n)` is called with the size of each piece as it is handed to the network.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn post_multipart_chunk_counted(
+        &self,
+        ctx: &ZaloContext,
+        url: &str,
+        field_name: &str,
+        filename: &str,
+        content_type: &str,
+        data: Vec<u8>,
+        on_bytes: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    ) -> Result<Value> {
         let current_url = Url::parse(url)?;
         let cookie_header = ctx
             .cookies
@@ -304,7 +321,16 @@ impl ZaloHttp {
         // Remove form-urlencoded content-type so reqwest sets multipart boundary header.
         headers.remove(reqwest::header::CONTENT_TYPE);
 
-        let part = reqwest::multipart::Part::bytes(data)
+        let part = match on_bytes {
+            Some(cb) => {
+                let len = data.len() as u64;
+                reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::wrap_stream(CountingChunks::new(data, cb)),
+                    len,
+                )
+            }
+            None => reqwest::multipart::Part::bytes(data),
+        }
             .file_name(filename.to_string())
             .mime_str(content_type)
             .map_err(|e| ProtoError::InvalidArg(format!("invalid mime type: {e}")))?;
@@ -553,4 +579,74 @@ pub fn form_urlencoded_body(pairs: &[(&str, &str)]) -> String {
         serializer.append_pair(k, v);
     }
     serializer.finish()
+}
+
+
+/// Size of the pieces a counted upload body is split into.
+pub const COUNTING_PIECE: usize = 16 * 1024;
+
+/// A body stream over `data` in [`COUNTING_PIECE`]-sized pieces; `on_bytes(n)` fires as each piece
+/// is polled out (i.e. handed to the HTTP layer).
+pub struct CountingChunks {
+    data: bytes::Bytes,
+    pos: usize,
+    on_bytes: Arc<dyn Fn(u64) + Send + Sync>,
+}
+
+impl CountingChunks {
+    pub fn new(data: Vec<u8>, on_bytes: Arc<dyn Fn(u64) + Send + Sync>) -> Self {
+        Self {
+            data: bytes::Bytes::from(data),
+            pos: 0,
+            on_bytes,
+        }
+    }
+}
+
+impl futures_util::Stream for CountingChunks {
+    type Item = std::result::Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.pos >= self.data.len() {
+            return std::task::Poll::Ready(None);
+        }
+        let end = (self.pos + COUNTING_PIECE).min(self.data.len());
+        let piece = self.data.slice(self.pos..end);
+        self.pos = end;
+        (self.on_bytes)(piece.len() as u64);
+        std::task::Poll::Ready(Some(Ok(piece)))
+    }
+}
+
+#[cfg(test)]
+mod counting_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test]
+    async fn counting_chunks_report_every_piece_and_preserve_bytes() {
+        let data: Vec<u8> = (0..(COUNTING_PIECE * 2 + 5)).map(|i| (i % 251) as u8).collect();
+        let seen = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let (s2, c2) = (seen.clone(), calls.clone());
+        let mut st = CountingChunks::new(
+            data.clone(),
+            Arc::new(move |n| {
+                s2.fetch_add(n, Ordering::SeqCst);
+                c2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let mut out = Vec::new();
+        while let Some(piece) = st.next().await {
+            out.extend_from_slice(&piece.unwrap());
+            assert_eq!(seen.load(Ordering::SeqCst) as usize, out.len());
+        }
+        assert_eq!(out, data);
+        assert_eq!(seen.load(Ordering::SeqCst) as usize, data.len());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 }

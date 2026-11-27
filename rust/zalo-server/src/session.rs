@@ -450,6 +450,21 @@ impl ZaloSession {
         let _ = self.events_tx.send(serialized);
     }
 
+    /// A progress sink for one upload batch to `thread_id`: broadcasts throttled `upload_progress`
+    /// events (see [`crate::upload_progress`]).
+    fn upload_progress_sink(&self, kind: ThreadKind, thread_id: &str) -> zalo_proto::UploadProgressSink {
+        let tx = self.events_tx.clone();
+        crate::upload_progress::progress_sink(
+            kind,
+            thread_id,
+            Arc::new(move |event: Value| {
+                if tx.receiver_count() > 0 {
+                    let _ = tx.send(event.to_string().into());
+                }
+            }),
+        )
+    }
+
     /// Subscribes to live server broadcast events for `/ws`.
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerBroadcastEvent> {
         self.events_tx.subscribe()
@@ -2515,6 +2530,7 @@ impl ZaloSession {
             quote,
             ttl: None,
             urgency: None,
+            progress: None,
         };
         let res = client
             .send_message(opts, thread_id, to_thread_type(kind))
@@ -2562,6 +2578,7 @@ impl ZaloSession {
                 width: if is_photo { file.width } else { None },
                 height: if is_photo { file.height } else { None },
             }],
+            progress: Some(self.upload_progress_sink(kind, thread_id)),
             ..Default::default()
         };
         let res = client
@@ -2612,7 +2629,7 @@ impl ZaloSession {
         };
 
         let uploaded = client
-            .upload_attachment(
+            .upload_attachment_progress(
                 &[UploadSource {
                     filename,
                     data,
@@ -2621,6 +2638,7 @@ impl ZaloSession {
                 }],
                 thread_id,
                 to_thread_type(kind),
+                Some(self.upload_progress_sink(kind, thread_id)),
             )
             .await
             .map_err(proto_to_http_error)?;

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 tokio.workspace = true
 futures-util.workspace = true
+bytes.workspace = true
 reqwest.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true

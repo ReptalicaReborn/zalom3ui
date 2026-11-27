@@ -20,7 +20,7 @@ axum = { version = "0.8", default-features = false, features = ["json", "matched
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "gzip", "deflate", "multipart", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "gzip", "deflate", "multipart", "json", "stream"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 

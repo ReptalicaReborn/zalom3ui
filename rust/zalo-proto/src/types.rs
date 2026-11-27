@@ -313,6 +313,39 @@ pub struct UploadSource {
     pub height: Option<u32>,
 }
 
+/// Byte progress of one uploaded file (`index` is its position in the `sources` slice).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadProgress {
+    pub index: usize,
+    pub filename: String,
+    /// Bytes of the file handed to the network so far (monotonic).
+    pub sent: u64,
+    /// The file's size in bytes.
+    pub total: u64,
+    /// Last report for this file; sent on success (`sent == total`) and on failure alike.
+    pub done: bool,
+}
+
+/// Receives [`UploadProgress`] reports. Cheap to clone; called from the uploading task.
+#[derive(Clone)]
+pub struct UploadProgressSink(Arc<dyn Fn(UploadProgress) + Send + Sync>);
+
+impl UploadProgressSink {
+    pub fn new(f: impl Fn(UploadProgress) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn report(&self, p: UploadProgress) {
+        (self.0)(p)
+    }
+}
+
+impl std::fmt::Debug for UploadProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UploadProgressSink")
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SendMessageOptions {
     pub msg: String,
@@ -321,6 +354,9 @@ pub struct SendMessageOptions {
     pub quote: Option<QuoteInput>,
     pub ttl: Option<i64>,
     pub urgency: Option<u8>,
+    /// Optional upload progress receiver for `attachments` (not part of the wire payload).
+    #[serde(skip)]
+    pub progress: Option<UploadProgressSink>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

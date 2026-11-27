@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -13,11 +14,84 @@ use crate::http::ZaloHttp;
 use crate::types::{
     DeleteMessageTarget, DestType, ForwardMessagePayload, MentionInput, QuoteInput,
     ReactionTarget, SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam,
-    ThreadType, UndoTarget, UploadResult, UploadSource,
+    ThreadType, UndoTarget, UploadProgress, UploadProgressSink, UploadResult, UploadSource,
 };
 
 const UPLOAD_FILE_DONE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MESSAGES_PER_SEEN: usize = 50;
+
+/// Reports one file's upload progress to an optional sink: a `sent = 0` report on creation,
+/// monotonic `advance` reports, and exactly one final `done` report (on [`Self::finish`], or on
+/// drop when the upload failed or was cancelled part-way).
+pub(crate) struct UploadTracker {
+    sink: Option<UploadProgressSink>,
+    index: usize,
+    filename: String,
+    total: u64,
+    sent: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl UploadTracker {
+    pub(crate) fn start(
+        sink: Option<UploadProgressSink>,
+        index: usize,
+        filename: &str,
+        total: u64,
+    ) -> Arc<Self> {
+        let t = Arc::new(Self {
+            sink,
+            index,
+            filename: filename.to_string(),
+            total,
+            sent: Default::default(),
+            finished: Default::default(),
+        });
+        t.report(false);
+        t
+    }
+
+    fn report(&self, done: bool) {
+        if let Some(sink) = &self.sink {
+            sink.report(UploadProgress {
+                index: self.index,
+                filename: self.filename.clone(),
+                sent: self.sent.load(std::sync::atomic::Ordering::SeqCst),
+                total: self.total,
+                done,
+            });
+        }
+    }
+
+    /// Adds `n` sent bytes (clamped to `total`) and reports.
+    pub(crate) fn advance(&self, n: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let prev = self.sent.load(SeqCst);
+        let next = prev.saturating_add(n).min(self.total);
+        self.sent.store(next, SeqCst);
+        if next != prev {
+            self.report(false);
+        }
+    }
+
+    /// Final report; on success `sent` is set to `total` first.
+    pub(crate) fn finish(&self, success: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.finished.swap(true, SeqCst) {
+            return;
+        }
+        if success {
+            self.sent.store(self.total, SeqCst);
+        }
+        self.report(true);
+    }
+}
+
+impl Drop for UploadTracker {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
 
 /// Maps a Zalo reaction icon string (all `zca-js` `Reactions` codes + `""` to clear) to its numeric `rType`.
 pub fn reaction_type_id(icon: &str) -> i32 {
@@ -222,6 +296,20 @@ impl ZaloClient {
         thread_id: &str,
         thread_type: ThreadType,
     ) -> Result<Vec<UploadResult>> {
+        self.upload_attachment_with_progress(sources, thread_id, thread_type, None)
+            .await
+    }
+
+    /// [`Self::upload_attachment`] reporting per-file byte progress to `progress`: a `sent = 0`
+    /// report when a file starts, reports as its body is streamed out, and a final `done` report
+    /// (also on failure). Files not reached because an earlier one failed report nothing.
+    pub async fn upload_attachment_with_progress(
+        &self,
+        sources: &[UploadSource],
+        thread_id: &str,
+        thread_type: ThreadType,
+        progress: Option<UploadProgressSink>,
+    ) -> Result<Vec<UploadResult>> {
         if sources.is_empty() {
             return Err(ProtoError::InvalidArg("Missing sources".into()));
         }
@@ -242,10 +330,10 @@ impl ZaloClient {
             if is_group { "group" } else { "message" }
         );
         let type_param = if is_group { "11" } else { "2" };
-        let mut client_id = Utc::now().timestamp_millis();
+        let client_id = Utc::now().timestamp_millis();
         let mut results = Vec::with_capacity(sources.len());
 
-        for src in sources {
+        for (src_index, src) in sources.iter().enumerate() {
             if src.filename.is_empty() {
                 return Err(ProtoError::InvalidArg("Missing filename".into()));
             }
@@ -274,10 +362,15 @@ impl ZaloClient {
                 "asyncfile/upload"
             };
             let total_chunk = total_size.div_ceil(chunk_size).max(1);
-            let cur_client_id = client_id;
-            client_id += 1;
+            let cur_client_id = client_id + src_index as i64;
 
             let mut final_res_data: Option<Value> = None;
+            let tracker = UploadTracker::start(
+                progress.clone(),
+                src_index,
+                &src.filename,
+                total_size as u64,
+            );
 
             for chunk_idx in 0..total_chunk {
                 let start = chunk_idx * chunk_size;
@@ -306,15 +399,20 @@ impl ZaloClient {
                     &[("type", type_param), ("params", &encrypted)],
                     true,
                 )?;
+                let on_bytes: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress.as_ref().map(|_| {
+                    let t = Arc::clone(&tracker);
+                    Arc::new(move |n| t.advance(n)) as Arc<dyn Fn(u64) + Send + Sync>
+                });
                 let res_data = self
                     .http
-                    .post_multipart_chunk(
+                    .post_multipart_chunk_counted(
                         &self.ctx,
                         &upload_url,
                         "chunkContent",
                         &src.filename,
                         "application/octet-stream",
                         slice,
+                        on_bytes,
                     )
                     .await?;
 
@@ -337,6 +435,8 @@ impl ZaloClient {
                     message: "Upload did not complete with valid fileId/photoId".into(),
                 }
             })?;
+
+            tracker.finish(true);
 
             if file_kind == "image" {
                 results.push(UploadResult::Image {
@@ -586,8 +686,13 @@ impl ZaloClient {
         let uploaded = if non_gifs.is_empty() {
             Vec::new()
         } else {
-            self.upload_attachment(&non_gifs, thread_id, thread_type)
-                .await?
+            self.upload_attachment_with_progress(
+                &non_gifs,
+                thread_id,
+                thread_type,
+                options.progress.clone(),
+            )
+            .await?
         };
 
         let is_single = options.attachments.len() == 1;
@@ -1313,6 +1418,52 @@ fn val_to_str(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    fn collect() -> (UploadProgressSink, Arc<Mutex<Vec<UploadProgress>>>) {
+        let out: Arc<Mutex<Vec<UploadProgress>>> = Default::default();
+        let o = out.clone();
+        (UploadProgressSink::new(move |p| o.lock().unwrap().push(p)), out)
+    }
+
+    #[test]
+    fn tracker_reports_start_monotonic_progress_and_done_on_success() {
+        let (sink, out) = collect();
+        let t = UploadTracker::start(Some(sink), 2, "a.png", 10);
+        t.advance(4);
+        t.advance(4);
+        t.advance(100); // clamped
+        t.advance(1); // no change, no report
+        t.finish(true);
+        t.finish(true); // idempotent
+        drop(t);
+        let ev = out.lock().unwrap().clone();
+        let sent: Vec<u64> = ev.iter().map(|e| e.sent).collect();
+        assert_eq!(sent, vec![0, 4, 8, 10, 10]);
+        assert!(ev.iter().all(|e| e.total == 10 && e.index == 2 && e.filename == "a.png"));
+        assert_eq!(ev.iter().filter(|e| e.done).count(), 1);
+        assert!(ev.last().unwrap().done);
+    }
+
+    #[test]
+    fn tracker_emits_done_with_partial_sent_when_dropped_after_failure() {
+        let (sink, out) = collect();
+        let t = UploadTracker::start(Some(sink), 0, "f.bin", 100);
+        t.advance(30);
+        drop(t);
+        let ev = out.lock().unwrap().clone();
+        let last = ev.last().unwrap();
+        assert!(last.done);
+        assert_eq!((last.sent, last.total), (30, 100));
+        assert_eq!(ev.iter().filter(|e| e.done).count(), 1);
+    }
+
+    #[test]
+    fn tracker_without_sink_is_silent() {
+        let t = UploadTracker::start(None, 0, "x", 1);
+        t.advance(1);
+        t.finish(true);
+    }
 
     #[test]
     fn reaction_type_ids_match_zca_js() {
