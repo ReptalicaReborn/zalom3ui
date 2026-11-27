@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
+#[cfg(feature = "tcp")]
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Path as AxumPath, State};
 use axum::http::{header, StatusCode};
@@ -20,6 +21,7 @@ use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+#[cfg(feature = "tcp")]
 use tracing::debug;
 use url::Url;
 
@@ -45,11 +47,13 @@ const INCOMING_RING_TIMEOUT_MS: u64 = 45_000;
 const OUTGOING_SETUP_TIMEOUT_MS: u64 = 20_000;
 const OUTGOING_RING_TIMEOUT_MS: u64 = 60_000;
 const ANSWER_TEST_SECONDS: u64 = 30;
+#[cfg(feature = "tcp")]
 const WS_HEARTBEAT_SECS: u64 = 30;
 const MAX_AUDIO_FROM_APP_BYTES: usize = 1276;
 const MAX_VIDEO_FRAME_BYTES: usize = 512 * 1024;
+#[cfg(feature = "tcp")]
 const AUDIO_WS_MAX_PAYLOAD: usize = MAX_VIDEO_FRAME_BYTES + 1024;
-const AUDIO_WS_QUEUE_CAP: usize = 256;
+const AUDIO_WS_QUEUE_CAP: usize = 64;
 
 /// Server -> app: peer requested a video key frame (`0x05`).
 pub const KEY_FRAME_REQUEST: &[u8] = &[0x05];
@@ -239,19 +243,30 @@ pub struct AudioLink {
 }
 
 impl AudioLink {
+    /// Non-blocking poll for an already queued message.
+    pub fn try_recv(&self) -> Result<AudioWsOut, mpsc::error::TryRecvError> {
+        match self.rx.try_lock() {
+            Ok(mut rx) => rx.try_recv(),
+            Err(_) => Err(mpsc::error::TryRecvError::Empty),
+        }
+    }
+
     /// The next message for the client; `None` when the link was unregistered without a close.
     pub async fn recv(&self) -> Option<AudioWsOut> {
         self.rx.lock().await.recv().await
     }
 
     /// Handles one binary frame from the app: `0x02` audio, `0x04` video, `0x06` key-frame request.
-    /// Anything else is ignored.
-    pub fn handle_incoming(&self, data: &[u8]) {
-        if let Some(opus) = decode_audio_from_app(data) {
-            self.manager.send_call_audio(opus.to_vec());
-        } else if let Some((key, annex_b)) = decode_video_from_app(data) {
-            self.manager.send_call_video(key, annex_b.to_vec());
-        } else if is_key_frame_wanted(data) {
+    /// Anything else is ignored. Consumes the owned buffer in-place to avoid copying video frames.
+    pub fn handle_incoming(&self, mut data: Vec<u8>) {
+        if data.len() >= 2 && data.len() <= MAX_AUDIO_FROM_APP_BYTES && data[0] == 0x02 {
+            data.remove(0);
+            self.manager.send_call_audio(data);
+        } else if data.len() >= 3 && data.len() <= MAX_VIDEO_FRAME_BYTES + 2 && data[0] == 0x04 {
+            let key = (data[1] & 1) != 0;
+            data.drain(..2);
+            self.manager.send_call_video(key, data);
+        } else if is_key_frame_wanted(&data) {
             self.manager.request_call_key_frame();
         }
     }
@@ -378,7 +393,7 @@ impl CallManager {
         let weak = Arc::downgrade(self);
         let session = Arc::clone(&self.session);
         let mut voip_rx = session.subscribe_voip_controls();
-        let mut events_rx = session.subscribe_events();
+        let mut state_rx = session.subscribe_state();
         let mut closed_rx = session.subscribe_listener_closed();
 
         // Start ControlPoller immediately if already logged in.
@@ -409,24 +424,16 @@ impl CallManager {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    ev = events_rx.recv() => {
+                    changed = state_rx.changed() => {
                         let Some(mgr) = weak.upgrade() else { break };
-                        match ev {
-                            Ok(payload) => {
-                                if payload.get("type").and_then(|v| v.as_str()) == Some("status") {
-                                    let state_str = payload
-                                        .get("status")
-                                        .and_then(|s| s.get("state"))
-                                        .and_then(|v| v.as_str());
-                                    if state_str == Some("logged_out") {
-                                        mgr.on_logout();
-                                    } else {
-                                        mgr.sync_control_poller();
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        if changed.is_err() {
+                            break;
+                        }
+                        let state = *state_rx.borrow_and_update();
+                        if state == SessionState::LoggedOut {
+                            mgr.on_logout();
+                        } else {
+                            mgr.sync_control_poller();
                         }
                     }
                 }
@@ -2142,14 +2149,15 @@ pub fn router(state: AppState) -> (Router<AppState>, Arc<CallManager>) {
         .route("/api/calls/start", post(post_start_call))
         .route("/api/calls/hangup", post(post_hangup_call))
         .route("/api/calls/mute", post(post_mute_call))
-        .route("/api/calls/camera", post(post_camera_call))
-        .route("/ws/call-audio", get(ws_call_audio))
-        .layer(Extension(Arc::clone(&manager)));
+        .route("/api/calls/camera", post(post_camera_call));
+    #[cfg(feature = "tcp")]
+    let router = router.route("/ws/call-audio", get(ws_call_audio));
+    let router = router.layer(Extension(Arc::clone(&manager)));
     (router, manager)
 }
 
 async fn get_call_log(State(state): State<AppState>) -> impl IntoResponse {
-    let body = state.session.call_trace().read();
+    let body = state.session.call_trace().read_async().await;
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -2158,7 +2166,7 @@ async fn get_call_log(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn clear_call_log(State(state): State<AppState>) -> StatusCode {
-    state.session.call_trace().clear();
+    state.session.call_trace().clear_async().await;
     StatusCode::NO_CONTENT
 }
 
@@ -2240,6 +2248,7 @@ async fn post_camera_call(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn ws_call_audio(
     Extension(manager): Extension<Arc<CallManager>>,
     ws: WebSocketUpgrade,
@@ -2248,6 +2257,7 @@ async fn ws_call_audio(
         .on_upgrade(move |socket| handle_ws_call_audio(socket, manager))
 }
 
+#[cfg(feature = "tcp")]
 async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) {
     let Some(link) = manager.open_audio_link() else {
         let _ = socket
@@ -2298,7 +2308,7 @@ async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) 
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
                         alive = true;
-                        link.handle_incoming(data.as_ref());
+                        link.handle_incoming(Vec::from(data));
                     }
                     Some(Ok(Message::Pong(_))) => {
                         alive = true;
@@ -2416,14 +2426,20 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[cfg(feature = "tcp")]
     use futures_util::{SinkExt, StreamExt};
-    use tokio::net::{TcpListener, UdpSocket};
+    #[cfg(feature = "tcp")]
+    use tokio::net::TcpListener;
+    use tokio::net::UdpSocket;
+    #[cfg(feature = "tcp")]
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    #[cfg(feature = "tcp")]
     use tokio_tungstenite::tungstenite::Message as TMsg;
     use zalo_media::call::rtcp::{parse_rtcp, pli, RtcpPacket};
     use zalo_media::call::srtp::{rtp_header, SrtpContext};
     use zalo_media::call::zrtc::{self, cmd, kind, Packet};
 
+    #[cfg(feature = "tcp")]
     use crate::config::Config;
     use crate::store::ChatStore;
 
@@ -2753,7 +2769,7 @@ mod tests {
         mgr.on_voip_control(&ring_control(media.port, "321000003", true), "socket", now_ms(), false);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let ev = ev_rx.try_recv().unwrap();
+        let ev: Value = serde_json::from_str(&ev_rx.try_recv().unwrap()).unwrap();
         assert_eq!(ev["type"], "call");
         assert_eq!(ev["call"]["type"], "incoming");
         assert_eq!(ev["call"]["call"]["callerName"], "Bảo");
@@ -2889,7 +2905,8 @@ mod tests {
 
         // Drain events and check outgoing -> ringing -> connected -> ended
         let mut seen_types = Vec::new();
-        while let Ok(e) = ev_rx.try_recv() {
+        while let Ok(raw) = ev_rx.try_recv() {
+            let e: Value = serde_json::from_str(&raw).unwrap();
             if let Some(t) = e["call"]["type"].as_str() {
                 seen_types.push(t.to_string());
             }
@@ -2907,7 +2924,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(90)).await;
         assert!(mgr.current_call().is_none());
         let mut saw_unreachable = false;
-        while let Ok(e) = ev_rx.try_recv() {
+        while let Ok(raw) = ev_rx.try_recv() {
+            let e: Value = serde_json::from_str(&raw).unwrap();
             if e["call"]["type"] == "ended"
                 && e["call"]["callId"] == c3.call_id
                 && e["call"]["act"] == "unreachable"
@@ -2920,6 +2938,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn ws_call_audio_replacement_binary_streaming_and_call_end_close() {
         let media = FakeMediaServer::start(true).await;
@@ -3173,7 +3192,8 @@ mod tests {
         assert!(mgr.decline_call("400001").await.is_err());
 
         let mut saw_declined = false;
-        while let Ok(e) = ev_rx.try_recv() {
+        while let Ok(raw) = ev_rx.try_recv() {
+            let e: Value = serde_json::from_str(&raw).unwrap();
             if e["call"]["type"] == "ended"
                 && e["call"]["callId"] == "400001"
                 && e["call"]["act"] == "declined"

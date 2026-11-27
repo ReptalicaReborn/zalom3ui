@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
@@ -6,7 +7,7 @@ use serde_json::Value;
 use url::Url;
 
 /// Serializable cookie compatible with `tough-cookie` JSON (`credentials.json` from `zca-js`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedCookie {
     #[serde(alias = "name")]
     pub key: String,
@@ -29,63 +30,111 @@ pub struct SavedCookie {
     pub http_only: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+    #[serde(skip)]
+    expires_epoch_secs: Option<i64>,
+    #[serde(skip)]
+    expires_cached: bool,
+}
+
+impl PartialEq for SavedCookie {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.value == other.value
+            && self.domain == other.domain
+            && self.path == other.path
+            && self.expires == other.expires
+            && self.secure == other.secure
+            && self.http_only == other.http_only
+            && self.extra == other.extra
+    }
+}
+
+fn parse_expires_epoch_secs(expires: Option<&Value>) -> Option<i64> {
+    let exp = expires?;
+    match exp {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("infinity") {
+                return None;
+            }
+            if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+                return Some(dt.timestamp());
+            }
+            if let Ok(dt) = DateTime::parse_from_rfc2822(trimmed) {
+                return Some(dt.timestamp());
+            }
+            // Try common HTTP-date format: "Wed, 18 Mar 2026 12:34:56 GMT"
+            if let Ok(naive) =
+                chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT")
+            {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp());
+            }
+            if let Ok(naive) =
+                chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d-%b-%Y %H:%M:%S GMT")
+            {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp());
+            }
+            None
+        }
+        Value::Number(n) => {
+            let ms = n.as_i64()?;
+            let secs = if ms > 10_000_000_000 { ms / 1000 } else { ms };
+            DateTime::from_timestamp(secs, 0).map(|dt| dt.timestamp())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_domain_in_place(domain: &mut Option<String>) {
+    match domain.as_mut() {
+        Some(d) => {
+            let trimmed = d.trim().trim_start_matches('.');
+            if trimmed.is_empty() {
+                *d = "chat.zalo.me".to_string();
+            } else if trimmed.len() == d.len() {
+                d.make_ascii_lowercase();
+            } else {
+                *d = trimmed.to_ascii_lowercase();
+            }
+        }
+        None => {
+            *domain = Some("chat.zalo.me".to_string());
+        }
+    }
 }
 
 impl SavedCookie {
     pub fn new(key: impl Into<String>, value: impl Into<String>, domain: impl Into<String>) -> Self {
+        let mut dom = Some(domain.into());
+        normalize_domain_in_place(&mut dom);
         Self {
             key: key.into(),
             value: value.into(),
-            domain: Some(domain.into()),
+            domain: dom,
             path: Some("/".to_string()),
             expires: None,
             secure: None,
             http_only: None,
             extra: HashMap::new(),
+            expires_epoch_secs: None,
+            expires_cached: true,
         }
+    }
+
+    /// Populates the cached `expires_epoch_secs` from `self.expires`.
+    fn refresh_expires_cache(&mut self) {
+        self.expires_epoch_secs = parse_expires_epoch_secs(self.expires.as_ref());
+        self.expires_cached = true;
     }
 
     /// Returns whether this cookie is expired relative to `now`.
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
-        let Some(ref exp) = self.expires else {
-            return false;
+        let secs = if self.expires_cached {
+            self.expires_epoch_secs
+        } else {
+            parse_expires_epoch_secs(self.expires.as_ref())
         };
-        match exp {
-            Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("infinity") {
-                    return false;
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-                    return dt.with_timezone(&Utc) <= now;
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc2822(trimmed) {
-                    return dt.with_timezone(&Utc) <= now;
-                }
-                // Try common HTTP-date format: "Wed, 18 Mar 2026 12:34:56 GMT"
-                if let Ok(naive) =
-                    chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT")
-                {
-                    return DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc) <= now;
-                }
-                if let Ok(naive) =
-                    chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d-%b-%Y %H:%M:%S GMT")
-                {
-                    return DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc) <= now;
-                }
-                false
-            }
-            Value::Number(n) => {
-                if let Some(ms) = n.as_i64() {
-                    let secs = if ms > 10_000_000_000 { ms / 1000 } else { ms };
-                    if let Some(dt) = DateTime::from_timestamp(secs, 0) {
-                        return dt <= now;
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
+        secs.is_some_and(|exp_secs| exp_secs <= now.timestamp())
     }
 
     /// Normalized domain without a leading dot, lowercase.
@@ -96,6 +145,15 @@ impl SavedCookie {
             .trim()
             .trim_start_matches('.')
             .to_ascii_lowercase()
+    }
+
+    /// Zero-allocation domain slice for cookies already normalized on insert/import.
+    #[inline]
+    fn domain_str(&self) -> &str {
+        match self.domain.as_deref() {
+            Some(d) if !d.is_empty() => d,
+            _ => "chat.zalo.me",
+        }
     }
 
     pub fn normalized_path(&self) -> &str {
@@ -125,18 +183,27 @@ where
         Jar { cookies: Vec<SavedCookie> },
     }
 
-    match CookieOrJar::deserialize(deserializer)? {
-        CookieOrJar::List(list) => Ok(list),
-        CookieOrJar::Jar { cookies } => Ok(cookies),
+    let mut list = match CookieOrJar::deserialize(deserializer)? {
+        CookieOrJar::List(list) => list,
+        CookieOrJar::Jar { cookies } => cookies,
+    };
+    for c in &mut list {
+        c.refresh_expires_cache();
     }
+    Ok(list)
 }
 
 /// Returns true if `host` belongs to Zalo's cookie domain family (matching `src/historysync.ts`).
 pub fn is_zalo_cookie_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
-    if h.is_empty() {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
         return false;
     }
+    let h: Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(trimmed)
+    };
     const SUFFIXES: &[&str] = &[
         "zalo.me",
         "zaloapp.com",
@@ -146,7 +213,7 @@ pub fn is_zalo_cookie_host(host: &str) -> bool {
         "dlmd.me",
     ];
     SUFFIXES.iter().any(|suffix| {
-        h == *suffix
+        h.as_ref() == *suffix
             || (h.len() > suffix.len()
                 && h.ends_with(suffix)
                 && h.as_bytes()[h.len() - suffix.len() - 1] == b'.')
@@ -174,21 +241,8 @@ impl ZaloCookieJar {
     }
 
     pub fn import_cookies(&mut self, saved: Vec<SavedCookie>) {
-        for mut c in saved {
-            if let Some(ref d) = c.domain {
-                let trimmed = d.trim();
-                if let Some(stripped) = trimmed.strip_prefix('.') {
-                    c.domain = Some(stripped.to_ascii_lowercase());
-                } else if !trimmed.is_empty() {
-                    c.domain = Some(trimmed.to_ascii_lowercase());
-                }
-            }
-            if c.domain.as_deref().unwrap_or("").is_empty() {
-                c.domain = Some("chat.zalo.me".to_string());
-            }
-            if c.path.as_deref().unwrap_or("").is_empty() {
-                c.path = Some("/".to_string());
-            }
+        self.cookies.reserve(saved.len());
+        for c in saved {
             self.upsert(c);
         }
     }
@@ -212,21 +266,28 @@ impl ZaloCookieJar {
         };
         let now = Utc::now();
         if cookie.is_expired(now) {
-            self.remove(&cookie.key, &cookie.normalized_domain(), cookie.normalized_path());
+            self.remove(&cookie.key, cookie.domain_str(), cookie.normalized_path());
         } else {
             self.upsert(cookie);
         }
     }
 
     /// Upserts a cookie by `(key, domain, path)`.
-    pub fn upsert(&mut self, cookie: SavedCookie) {
-        let dom = cookie.normalized_domain();
-        let path = cookie.normalized_path().to_string();
-        if let Some(existing) = self.cookies.iter_mut().find(|c| {
-            c.key == cookie.key
-                && c.normalized_domain() == dom
-                && c.normalized_path() == path
-        }) {
+    pub fn upsert(&mut self, mut cookie: SavedCookie) {
+        normalize_domain_in_place(&mut cookie.domain);
+        if cookie.path.as_deref().unwrap_or("").is_empty() {
+            cookie.path = Some("/".to_string());
+        }
+        if !cookie.expires_cached {
+            cookie.refresh_expires_cache();
+        }
+        let dom = cookie.domain_str();
+        let path = cookie.normalized_path();
+        if let Some(existing) = self
+            .cookies
+            .iter_mut()
+            .find(|c| c.key == cookie.key && c.domain_str() == dom && c.normalized_path() == path)
+        {
             *existing = cookie;
         } else {
             self.cookies.push(cookie);
@@ -234,9 +295,14 @@ impl ZaloCookieJar {
     }
 
     pub fn remove(&mut self, key: &str, domain: &str, path: &str) {
-        let dom = domain.trim_start_matches('.').to_ascii_lowercase();
+        let trimmed = domain.trim().trim_start_matches('.');
+        let dom: Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(trimmed.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(trimmed)
+        };
         self.cookies.retain(|c| {
-            !(c.key == key && c.normalized_domain() == dom && c.normalized_path() == path)
+            !(c.key == key && c.domain_str() == dom.as_ref() && c.normalized_path() == path)
         });
     }
 
@@ -245,7 +311,11 @@ impl ZaloCookieJar {
         let Some(host) = url.host_str() else {
             return Vec::new();
         };
-        let host_lower = host.to_ascii_lowercase();
+        let host_lower: Cow<'_, str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(host)
+        };
         let req_path = if url.path().is_empty() { "/" } else { url.path() };
         let is_secure = url.scheme().eq_ignore_ascii_case("https")
             || url.scheme().eq_ignore_ascii_case("wss");
@@ -261,8 +331,7 @@ impl ZaloCookieJar {
                 if c.secure.unwrap_or(false) && !is_secure {
                     return false;
                 }
-                let dom = c.normalized_domain();
-                if !domain_matches(&host_lower, &dom, c.is_host_only()) {
+                if !domain_matches(&host_lower, c.domain_str(), c.is_host_only()) {
                     return false;
                 }
                 path_matches(req_path, c.normalized_path())
@@ -274,7 +343,7 @@ impl ZaloCookieJar {
             b.normalized_path()
                 .len()
                 .cmp(&a.normalized_path().len())
-                .then_with(|| b.normalized_domain().len().cmp(&a.normalized_domain().len()))
+                .then_with(|| b.domain_str().len().cmp(&a.domain_str().len()))
         });
         matched
     }
@@ -282,14 +351,26 @@ impl ZaloCookieJar {
     /// Formats the `Cookie:` request header value for `url`.
     pub fn cookie_header_for(&self, url: &Url) -> String {
         let matched = self.matching_cookies(url);
-        let mut seen = HashSet::new();
-        let mut parts = Vec::with_capacity(matched.len());
+        if matched.is_empty() {
+            return String::new();
+        }
+        let cap: usize = matched
+            .iter()
+            .map(|c| c.key.len() + 1 + c.value.len() + 2)
+            .sum();
+        let mut out = String::with_capacity(cap);
+        let mut seen = HashSet::with_capacity(matched.len());
         for c in matched {
             if seen.insert(c.key.as_str()) {
-                parts.push(format!("{}={}", c.key, c.value));
+                if !out.is_empty() {
+                    out.push_str("; ");
+                }
+                out.push_str(&c.key);
+                out.push('=');
+                out.push_str(&c.value);
             }
         }
-        parts.join("; ")
+        out
     }
 
     /// Formats the `Cookie:` header for a string URL.
@@ -304,29 +385,39 @@ impl ZaloCookieJar {
     /// plus `zpw_uin` fallback, matching `src/historysync.ts:backupCookieHeader`).
     pub fn backup_cookie_header(&self, target: &Url, uid: &str) -> String {
         let chat_url = Url::parse("https://chat.zalo.me/").expect("valid static url");
-        let mut order: Vec<(String, String)> = Vec::new();
-        let mut seen = HashSet::new();
+        let chat_cookies = self.matching_cookies(&chat_url);
+        let target_cookies = self.matching_cookies(target);
+        let cap: usize = chat_cookies
+            .iter()
+            .chain(target_cookies.iter())
+            .map(|c| c.key.len() + 1 + c.value.len() + 2)
+            .sum::<usize>()
+            + uid.len()
+            + 16;
+        let mut out = String::with_capacity(cap);
+        let mut seen: HashSet<&str> = HashSet::with_capacity(chat_cookies.len() + target_cookies.len());
 
-        for c in self
-            .matching_cookies(&chat_url)
-            .into_iter()
-            .chain(self.matching_cookies(target))
-        {
+        for c in chat_cookies.into_iter().chain(target_cookies) {
             if c.value.is_empty() && (c.key == "zpw_uin" || c.key == "zpw_sek") {
                 continue;
             }
-            if seen.insert(c.key.clone()) {
-                order.push((c.key.clone(), c.value.clone()));
+            if seen.insert(c.key.as_str()) {
+                if !out.is_empty() {
+                    out.push_str("; ");
+                }
+                out.push_str(&c.key);
+                out.push('=');
+                out.push_str(&c.value);
             }
         }
         if !seen.contains("zpw_uin") && !uid.is_empty() {
-            order.push(("zpw_uin".to_string(), uid.to_string()));
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str("zpw_uin=");
+            out.push_str(uid);
         }
-        order
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ")
+        out
     }
 }
 
@@ -379,6 +470,7 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<SavedCookie> 
     let mut domain: Option<String> = None;
     let mut path: Option<String> = None;
     let mut expires: Option<Value> = None;
+    let mut expires_epoch_secs: Option<i64> = None;
     let mut secure: Option<bool> = None;
     let mut http_only: Option<bool> = None;
     let mut host_only = true;
@@ -407,28 +499,32 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<SavedCookie> 
                 }
                 "expires" => {
                     if let Ok(dt) = DateTime::parse_from_rfc2822(v_trim) {
-                        expires = Some(Value::String(dt.with_timezone(&Utc).to_rfc3339()));
+                        let utc = dt.with_timezone(&Utc);
+                        expires_epoch_secs = Some(utc.timestamp());
+                        expires = Some(Value::String(utc.to_rfc3339()));
                     } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
                         v_trim,
                         "%a, %d %b %Y %H:%M:%S GMT",
                     ) {
-                        expires = Some(Value::String(
-                            DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).to_rfc3339(),
-                        ));
+                        let utc = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+                        expires_epoch_secs = Some(utc.timestamp());
+                        expires = Some(Value::String(utc.to_rfc3339()));
                     } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
                         v_trim,
                         "%a, %d-%b-%Y %H:%M:%S GMT",
                     ) {
-                        expires = Some(Value::String(
-                            DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).to_rfc3339(),
-                        ));
+                        let utc = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+                        expires_epoch_secs = Some(utc.timestamp());
+                        expires = Some(Value::String(utc.to_rfc3339()));
                     } else {
+                        expires_epoch_secs = None;
                         expires = Some(Value::String(v_trim.to_string()));
                     }
                 }
                 "max-age" => {
                     if let Ok(secs) = v_trim.parse::<i64>() {
                         let exp_dt = Utc::now() + chrono::Duration::seconds(secs);
+                        expires_epoch_secs = Some(exp_dt.timestamp());
                         expires = Some(Value::String(exp_dt.to_rfc3339()));
                     }
                 }
@@ -467,6 +563,8 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<SavedCookie> 
         secure,
         http_only,
         extra,
+        expires_epoch_secs,
+        expires_cached: true,
     })
 }
 

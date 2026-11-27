@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 
 use zalo_proto::{RawWsMessage, ThreadType, WsEvent};
 
-use crate::session::ZaloSession;
+use crate::session::{ServerBroadcastEvent, ZaloSession};
 use crate::store::ChatStore;
 use crate::testing::{FakeLogin, FakeZaloApi};
 
@@ -19,7 +19,7 @@ pub struct Rig {
     pub session: Arc<ZaloSession>,
     pub store: ChatStore,
     pub api: Arc<FakeZaloApi>,
-    pub events: broadcast::Receiver<Value>,
+    pub events: broadcast::Receiver<ServerBroadcastEvent>,
     pub dir: PathBuf,
 }
 
@@ -66,7 +66,9 @@ impl Rig {
     pub fn drain_events(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
         while let Ok(ev) = self.events.try_recv() {
-            out.push(ev);
+            if let Ok(val) = serde_json::from_str::<Value>(&ev) {
+                out.push(val);
+            }
         }
         out
     }

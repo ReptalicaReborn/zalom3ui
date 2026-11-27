@@ -308,8 +308,13 @@ async fn got_login_info_writes_credentials_atomically_with_mode_0600() {
         false,
     );
     session.start_qr_login();
-    settle().await;
     let cred_path = dir.join("credentials.json");
+    for _ in 0..100 {
+        if cred_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(cred_path.exists());
     assert!(!dir.join("credentials.json.tmp").exists());
     #[cfg(unix)]

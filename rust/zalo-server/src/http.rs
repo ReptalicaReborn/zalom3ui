@@ -3,27 +3,43 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "tcp")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
+#[cfg(feature = "tcp")]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
-use axum::http::header::{self, HeaderName, HeaderValue};
-use axum::http::{HeaderMap, Method, StatusCode};
+#[cfg(feature = "tcp")]
+use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+#[cfg(feature = "tcp")]
+use axum::http::header::{HeaderName, HeaderValue};
+#[cfg(feature = "tcp")]
+use axum::http::Method;
+use axum::http::{header, HeaderMap, StatusCode};
+#[cfg(feature = "tcp")]
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+#[cfg(feature = "tcp")]
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+#[cfg(feature = "tcp")]
 use subtle::ConstantTimeEq;
+#[cfg(feature = "tcp")]
 use tower_http::services::ServeDir;
+#[cfg(feature = "tcp")]
 use url::Url;
 use zalo_proto::CreatePollInput;
 
-use crate::config::{is_loopback_host, Config};
+#[cfg(feature = "tcp")]
+use crate::config::is_loopback_host;
+use crate::config::Config;
 use crate::errors::{ApiResult, HttpError};
 use crate::routes::{self, AppState};
-use crate::session::{MuteOption, UploadFile, ZaloSession};
+use crate::session::{MuteOption, ServerBroadcastEvent, UploadFile, ZaloSession};
 use crate::types::{MentionInfo, ReactionChoice, ThreadKind, REACTIONS};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
@@ -33,9 +49,12 @@ const MAX_FRIEND_MESSAGE: usize = 150;
 const MAX_FORWARD_TARGETS: usize = 20;
 const MAX_POLL_TEXT: usize = 200;
 const MAX_POLL_OPTIONS: usize = 30;
+#[cfg(feature = "tcp")]
 const WS_MAX_PAYLOAD: usize = 64 * 1024;
+#[cfg(feature = "tcp")]
 const WS_HEARTBEAT_SECS: u64 = 30;
 
+#[cfg(feature = "tcp")]
 const STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
 /// Builds the complete Axum [`Router`] with all REST routes, `/ws`, Track 1/2 sub-routers,
@@ -51,11 +70,14 @@ pub struct App {
     pub calls: Arc<routes::calls::CallManager>,
 }
 
-/// Builds the application. With `network_facing`, the [`security_middleware`] (Host, Origin and
-/// bearer-token checks, security headers) wraps every route, as for the TCP server. Without it
-/// (the in-process embedded core, reachable only by the app itself) those checks are skipped;
-/// body-size limits stay either way.
+/// Builds the application. With `network_facing` (and the `tcp` feature enabled), the
+/// security middleware (Host, Origin and bearer-token checks, security headers) wraps every route,
+/// as for the TCP server. Without it (the in-process embedded core, reachable only by the app
+/// itself) those checks are skipped; body-size limits stay either way.
 pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing: bool) -> App {
+    #[cfg(not(feature = "tcp"))]
+    let _ = network_facing;
+
     let store = session.store().clone();
     let state = AppState {
         config: Arc::clone(&config),
@@ -173,23 +195,29 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
         .merge(routes::history_sync::router(state.clone()))
         .layer(DefaultBodyLimit::max(MAX_JSON_BYTES));
 
+    #[allow(unused_mut)]
     let mut router = Router::new()
-        .route("/ws", get(ws_events))
         .merge(upload_routes)
         .merge(json_routes);
 
-    if let Some(ref public_dir) = config.public_dir {
-        if public_dir.exists() {
-            router = router.fallback_service(ServeDir::new(public_dir));
+    #[cfg(feature = "tcp")]
+    {
+        router = router.route("/ws", get(ws_events));
+
+        if let Some(ref public_dir) = config.public_dir {
+            if public_dir.exists() {
+                router = router.fallback_service(ServeDir::new(public_dir));
+            }
+        }
+
+        if network_facing {
+            router = router.layer(middleware::from_fn_with_state(
+                state.clone(),
+                security_middleware,
+            ));
         }
     }
 
-    if network_facing {
-        router = router.layer(middleware::from_fn_with_state(
-            state.clone(),
-            security_middleware,
-        ));
-    }
     App {
         router: router.with_state(state),
         calls,
@@ -198,6 +226,7 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
 
 // ---- Security Middleware ----
 
+#[cfg(feature = "tcp")]
 async fn security_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -240,6 +269,7 @@ async fn security_middleware(
     response
 }
 
+#[cfg(feature = "tcp")]
 fn apply_security_headers(headers: &mut HeaderMap, include_csp: bool) {
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -258,6 +288,7 @@ fn apply_security_headers(headers: &mut HeaderMap, include_csp: bool) {
     }
 }
 
+#[cfg(feature = "tcp")]
 fn has_bad_host_chars(host: &str) -> bool {
     host.is_empty()
         || host
@@ -265,6 +296,7 @@ fn has_bad_host_chars(host: &str) -> bool {
             .any(|c| c.is_whitespace() || matches!(c, '/' | '@' | '\\'))
 }
 
+#[cfg(feature = "tcp")]
 fn is_valid_host(config: &Config, host_header: Option<&str>) -> bool {
     if !is_loopback_host(&config.host) {
         return true;
@@ -281,6 +313,7 @@ fn is_valid_host(config: &Config, host_header: Option<&str>) -> bool {
     url.host_str().is_some_and(is_loopback_host)
 }
 
+#[cfg(feature = "tcp")]
 fn origin_matches_host(origin: &str, host_header: Option<&str>) -> bool {
     let Some(host) = host_header else {
         return false;
@@ -304,6 +337,7 @@ fn origin_matches_host(origin: &str, host_header: Option<&str>) -> bool {
         && origin_url.port_or_known_default() == host_url.port_or_known_default()
 }
 
+#[cfg(feature = "tcp")]
 fn is_allowed_origin(
     headers: &HeaderMap,
     host_header: Option<&str>,
@@ -339,6 +373,7 @@ fn is_allowed_origin(
     true
 }
 
+#[cfg(feature = "tcp")]
 fn is_authorized(
     config: &Config,
     auth_header: Option<&str>,
@@ -364,6 +399,7 @@ fn is_authorized(
 
 // ---- WebSocket `/ws` ----
 
+#[cfg(feature = "tcp")]
 async fn ws_events(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.max_message_size(WS_MAX_PAYLOAD)
         .on_upgrade(move |socket| handle_ws_events(socket, state))
@@ -373,46 +409,53 @@ async fn ws_events(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl 
 /// current status, then every broadcast event, each as the JSON text sent over `/ws`. Shared by
 /// the WebSocket handler and the in-process embedded subscription.
 pub struct EventStream {
-    rx: tokio::sync::broadcast::Receiver<Value>,
-    initial: Option<String>,
+    rx: tokio::sync::broadcast::Receiver<ServerBroadcastEvent>,
+    initial: Option<Arc<str>>,
 }
 
 impl EventStream {
     /// Subscribes first, then snapshots the status, so no event is missed in between.
     pub fn new(session: &ZaloSession) -> Self {
         let rx = session.subscribe_events();
-        let initial = json!({
+        let initial: Arc<str> = json!({
             "type": "status",
             "status": session.get_status(),
         })
-        .to_string();
+        .to_string()
+        .into();
         Self {
             rx,
             initial: Some(initial),
         }
     }
 
-    /// The next event as JSON text, or `None` once the server is gone. Cancel-safe.
-    pub async fn next(&mut self) -> Option<String> {
+    /// The next event as shared JSON text, or `None` once the server is gone. Cancel-safe.
+    pub async fn next_shared(&mut self) -> Option<Arc<str>> {
         if let Some(initial) = self.initial.take() {
             return Some(initial);
         }
         loop {
             match self.rx.recv().await {
-                Ok(payload) => return Some(payload.to_string()),
+                Ok(payload) => return Some(payload),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
     }
+
+    /// The next event as JSON text, or `None` once the server is gone. Cancel-safe.
+    pub async fn next(&mut self) -> Option<String> {
+        self.next_shared().await.map(|s| s.to_string())
+    }
 }
 
+#[cfg(feature = "tcp")]
 async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
     let mut events = EventStream::new(&state.session);
 
-    if let Some(initial) = events.next().await {
+    if let Some(initial) = events.next_shared().await {
         if socket
-            .send(Message::Text(initial.into()))
+            .send(Message::Text(initial.as_ref().into()))
             .await
             .is_err()
         {
@@ -456,10 +499,10 @@ async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
                     }
                 }
             }
-            ev = events.next() => {
+            ev = events.next_shared() => {
                 match ev {
                     Some(text) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        if socket.send(Message::Text(text.as_ref().into())).await.is_err() {
                             break;
                         }
                     }
@@ -499,7 +542,7 @@ async fn post_reconnect(State(state): State<AppState>) -> ApiResult<impl IntoRes
 /// Pauses the chat listener (no auto-reconnect while paused); login and credentials stay.
 /// Does nothing when not logged in.
 async fn post_listener_pause(State(state): State<AppState>) -> impl IntoResponse {
-    state.session.pause();
+    state.session.pause_async().await;
     Json(state.session.get_status())
 }
 
@@ -585,6 +628,7 @@ async fn put_replay_mode(
         .and_then(crate::replay::ReplayMode::parse)
         .ok_or_else(|| HttpError::bad_request("mode must be \"null\", \"newest\" or \"page\""))?;
     state.session.replay().set_mode(mode);
+    state.session.replay().flush().await;
     Ok(Json(json!({ "mode": mode.as_str() })))
 }
 
@@ -740,7 +784,7 @@ async fn upload_attachment(
         .and_then(|s| positive_usize(s))
         .and_then(|n| u32::try_from(n).ok());
     let file = UploadFile {
-        data: body.to_vec(),
+        data: Vec::from(body),
         filename: name,
         width,
         height,
@@ -785,7 +829,7 @@ async fn upload_voice(
             .and_then(|s| Path::new(s).file_name().and_then(|f| f.to_str()))
             .unwrap_or("voice.m4a")
             .to_string();
-        (body.to_vec(), name)
+        (Vec::from(body), name)
     };
     state
         .session

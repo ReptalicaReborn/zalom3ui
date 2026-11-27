@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use aes::Aes128;
-use ctr::cipher::{KeyIvInit, StreamCipher};
+use ctr::cipher::{InnerIvInit, KeyInit, KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
@@ -109,11 +109,12 @@ struct RxStream {
 
 /// RFC 3711 SRTP context for one media stream direction/transport (separate TX/RX maps per SSRC).
 pub struct SrtpContext {
-    enc_key: [u8; KEY_LEN],
-    auth_key: [u8; AUTH_KEY_LEN],
+    aes_enc: Aes128,
+    hmac_init: HmacSha1,
     salt: [u8; SALT_LEN],
     tx_streams: HashMap<u32, TxStream>,
     rx_streams: HashMap<u32, RxStream>,
+    last_rx: Option<(u32, RxStream)>,
 }
 
 impl SrtpContext {
@@ -124,12 +125,16 @@ impl SrtpContext {
         let enc: [u8; KEY_LEN] = derive_key(mk, ms, 0, KEY_LEN).try_into().unwrap();
         let auth: [u8; AUTH_KEY_LEN] = derive_key(mk, ms, 1, AUTH_KEY_LEN).try_into().unwrap();
         let salt: [u8; SALT_LEN] = derive_key(mk, ms, 2, SALT_LEN).try_into().unwrap();
+        let aes_enc = Aes128::new((&enc).into());
+        let hmac_init =
+            <HmacSha1 as Mac>::new_from_slice(&auth).expect("HMAC-SHA1 accepts 20-byte key");
         Ok(Self {
-            enc_key: enc,
-            auth_key: auth,
+            aes_enc,
+            hmac_init,
             salt,
             tx_streams: HashMap::new(),
             rx_streams: HashMap::new(),
+            last_rx: None,
         })
     }
 
@@ -142,6 +147,7 @@ impl SrtpContext {
         Self::new(&raw[..KEY_LEN], &raw[KEY_LEN..KEY_LEN + SALT_LEN])
     }
 
+    #[inline]
     fn iv(&self, ssrc: u32, index: u64) -> [u8; 16] {
         let mut iv = [0u8; 16];
         iv[..SALT_LEN].copy_from_slice(&self.salt);
@@ -154,8 +160,19 @@ impl SrtpContext {
         iv
     }
 
+    #[inline]
+    fn apply_aes_cm_in_place(&self, iv: &[u8; 16], data: &mut [u8]) {
+        let core = ctr::CtrCore::<Aes128, ctr::flavors::Ctr128BE>::inner_iv_init(
+            self.aes_enc.clone(),
+            iv.into(),
+        );
+        let mut cipher = Aes128Ctr::from_core(core);
+        cipher.apply_keystream(data);
+    }
+
+    #[inline]
     fn tag(&self, authenticated: &[u8], roc: u32) -> [u8; AUTH_TAG_LEN] {
-        let mut mac = HmacSha1::new_from_slice(&self.auth_key).expect("HMAC-SHA1 accepts 20-byte key");
+        let mut mac = self.hmac_init.clone();
         mac.update(authenticated);
         mac.update(&roc.to_be_bytes());
         let full = mac.finalize().into_bytes();
@@ -191,9 +208,10 @@ impl SrtpContext {
         }
     }
 
-    /// Encrypts and authenticates one RTP packet into an SRTP packet.
-    pub fn protect(&mut self, rtp: &[u8]) -> Result<Vec<u8>, SrtpError> {
-        let h = rtp_header(rtp).ok_or(SrtpError::NotRtpPacket)?;
+    /// Encrypts and authenticates an RTP packet already written at `&mut buf[rtp_offset..]` in place,
+    /// appending the 10-byte HMAC-SHA1 authentication tag.
+    pub fn protect_in_place(&mut self, buf: &mut Vec<u8>, rtp_offset: usize) -> Result<(), SrtpError> {
+        let h = rtp_header(&buf[rtp_offset..]).ok_or(SrtpError::NotRtpPacket)?;
         let s = self.tx_streams.entry(h.ssrc).or_insert(TxStream {
             roc: 0,
             last_seq: 0,
@@ -216,18 +234,61 @@ impl SrtpContext {
         let roc = s.roc;
 
         let iv = self.iv(h.ssrc, index);
-        let enc_payload = aes_cm(&self.enc_key, &iv, &rtp[h.header_length..]);
+        self.apply_aes_cm_in_place(&iv, &mut buf[rtp_offset + h.header_length..]);
+        let tag = self.tag(&buf[rtp_offset..], roc);
+        buf.extend_from_slice(&tag);
+        Ok(())
+    }
 
+    /// Encrypts and authenticates `rtp`, appending the SRTP packet into `out`.
+    pub fn protect_into(&mut self, rtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
+        let start = out.len();
+        out.reserve(rtp.len() + AUTH_TAG_LEN);
+        out.extend_from_slice(rtp);
+        if let Err(e) = self.protect_in_place(out, start) {
+            out.truncate(start);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Encrypts and authenticates one RTP packet into an SRTP packet.
+    pub fn protect(&mut self, rtp: &[u8]) -> Result<Vec<u8>, SrtpError> {
         let mut out = Vec::with_capacity(rtp.len() + AUTH_TAG_LEN);
-        out.extend_from_slice(&rtp[..h.header_length]);
-        out.extend_from_slice(&enc_payload);
-        let tag = self.tag(&out, roc);
-        out.extend_from_slice(&tag);
+        self.protect_into(rtp, &mut out)?;
         Ok(out)
     }
 
-    /// Verifies and decrypts one SRTP packet; returns `None` when tag fails, replayed, damaged, or invalid.
-    pub fn unprotect(&mut self, srtp: &[u8]) -> Option<Vec<u8>> {
+    fn update_rx_stream(ex: Option<RxStream>, roc: u32, seq: u16, index: u64) -> RxStream {
+        match ex {
+            None => RxStream {
+                roc,
+                last_seq: seq,
+                started: true,
+                replay_mask: 1,
+            },
+            Some(mut st) => {
+                let max_idx = ((st.roc as u64) << 16) | (st.last_seq as u64);
+                if index > max_idx {
+                    let shift = index - max_idx;
+                    st.replay_mask = if shift >= REPLAY_WINDOW {
+                        1
+                    } else {
+                        (st.replay_mask << shift) | 1
+                    };
+                    st.roc = roc;
+                    st.last_seq = seq;
+                } else {
+                    st.replay_mask |= 1u64 << (max_idx - index);
+                }
+                st
+            }
+        }
+    }
+
+    /// Verifies and decrypts `srtp` into `out` (reusing its capacity), returning the parsed
+    /// [`RtpHeader`] on success. Returns `None` when tag fails, replayed, damaged, or invalid.
+    pub fn unprotect_into(&mut self, srtp: &[u8], out: &mut Vec<u8>) -> Option<RtpHeader> {
         if srtp.len() < 12 + AUTH_TAG_LEN {
             return None;
         }
@@ -235,8 +296,14 @@ impl SrtpContext {
         let tag_in = &srtp[srtp.len() - AUTH_TAG_LEN..];
         let h = rtp_header(body)?;
 
-        let existing = self.rx_streams.get(&h.ssrc).copied();
-        if existing.is_none() && self.rx_streams.len() >= MAX_RX_STREAMS {
+        let cached_hit = matches!(self.last_rx, Some((s, _)) if s == h.ssrc);
+        let existing = if cached_hit {
+            Some(self.last_rx.unwrap().1)
+        } else {
+            self.rx_streams.get(&h.ssrc).copied()
+        };
+        let total_streams = self.rx_streams.len() + usize::from(self.last_rx.is_some());
+        if existing.is_none() && total_streams >= MAX_RX_STREAMS {
             return None;
         }
         let roc = Self::estimate_roc(existing.as_ref(), h.seq)?;
@@ -259,55 +326,114 @@ impl SrtpContext {
             return None;
         }
 
+        out.clear();
+        out.extend_from_slice(body);
         let iv = self.iv(h.ssrc, index);
-        let mut payload = aes_cm(&self.enc_key, &iv, &body[h.header_length..]);
-        let has_padding = (body[0] & 0x20) != 0;
+        self.apply_aes_cm_in_place(&iv, &mut out[h.header_length..]);
+        let has_padding = (out[0] & 0x20) != 0;
         if has_padding {
-            if payload.is_empty() {
+            let payload_len = out.len() - h.header_length;
+            if payload_len == 0 {
                 return None;
             }
-            let pad_len = payload[payload.len() - 1] as usize;
-            if pad_len < 1 || pad_len > payload.len() {
+            let pad_len = out[out.len() - 1] as usize;
+            if pad_len < 1 || pad_len > payload_len {
                 return None;
             }
-            payload.truncate(payload.len() - pad_len);
+            out.truncate(out.len() - pad_len);
+            out[0] &= !0x20;
         }
 
-        match self.rx_streams.get_mut(&h.ssrc) {
-            None => {
-                self.rx_streams.insert(
-                    h.ssrc,
-                    RxStream {
-                        roc,
-                        last_seq: h.seq,
-                        started: true,
-                        replay_mask: 1,
-                    },
-                );
+        let updated = Self::update_rx_stream(existing, roc, h.seq, index);
+        if cached_hit {
+            self.last_rx = Some((h.ssrc, updated));
+        } else {
+            if existing.is_some() {
+                self.rx_streams.remove(&h.ssrc);
             }
-            Some(ex) => {
-                let max_idx = ((ex.roc as u64) << 16) | (ex.last_seq as u64);
-                if index > max_idx {
-                    let shift = index - max_idx;
-                    ex.replay_mask = if shift >= REPLAY_WINDOW {
-                        1
-                    } else {
-                        (ex.replay_mask << shift) | 1
-                    };
-                    ex.roc = roc;
-                    ex.last_seq = h.seq;
-                } else {
-                    ex.replay_mask |= 1u64 << (max_idx - index);
+            if let Some((prev_ssrc, prev_st)) = self.last_rx.replace((h.ssrc, updated)) {
+                self.rx_streams.insert(prev_ssrc, prev_st);
+            }
+        }
+
+        Some(h)
+    }
+
+    /// Verifies and decrypts an SRTP packet stored in `buf` in place, truncating the auth tag and
+    /// any RTP padding, returning the parsed [`RtpHeader`] on success.
+    pub fn unprotect_in_place(&mut self, buf: &mut Vec<u8>) -> Option<RtpHeader> {
+        if buf.len() < 12 + AUTH_TAG_LEN {
+            return None;
+        }
+        let body_len = buf.len() - AUTH_TAG_LEN;
+        let h = rtp_header(&buf[..body_len])?;
+
+        let cached_hit = matches!(self.last_rx, Some((s, _)) if s == h.ssrc);
+        let existing = if cached_hit {
+            Some(self.last_rx.unwrap().1)
+        } else {
+            self.rx_streams.get(&h.ssrc).copied()
+        };
+        let total_streams = self.rx_streams.len() + usize::from(self.last_rx.is_some());
+        if existing.is_none() && total_streams >= MAX_RX_STREAMS {
+            return None;
+        }
+        let roc = Self::estimate_roc(existing.as_ref(), h.seq)?;
+        let index = ((roc as u64) << 16) | (h.seq as u64);
+        if index > MAX_PACKET_INDEX {
+            return None;
+        }
+        if let Some(ex) = existing {
+            let max_idx = ((ex.roc as u64) << 16) | (ex.last_seq as u64);
+            if index <= max_idx {
+                let diff = max_idx - index;
+                if diff >= REPLAY_WINDOW || ((ex.replay_mask >> diff) & 1) != 0 {
+                    return None;
                 }
             }
         }
 
-        let mut out = Vec::with_capacity(h.header_length + payload.len());
-        out.extend_from_slice(&body[..h.header_length]);
-        out.extend_from_slice(&payload);
-        if has_padding {
-            out[0] &= !0x20;
+        let expected_tag = self.tag(&buf[..body_len], roc);
+        if !bool::from(expected_tag.ct_eq(&buf[body_len..])) {
+            return None;
         }
+
+        buf.truncate(body_len);
+        let iv = self.iv(h.ssrc, index);
+        self.apply_aes_cm_in_place(&iv, &mut buf[h.header_length..]);
+        let has_padding = (buf[0] & 0x20) != 0;
+        if has_padding {
+            let payload_len = buf.len() - h.header_length;
+            if payload_len == 0 {
+                return None;
+            }
+            let pad_len = buf[buf.len() - 1] as usize;
+            if pad_len < 1 || pad_len > payload_len {
+                return None;
+            }
+            buf.truncate(buf.len() - pad_len);
+            buf[0] &= !0x20;
+        }
+
+        let updated = Self::update_rx_stream(existing, roc, h.seq, index);
+        if cached_hit {
+            self.last_rx = Some((h.ssrc, updated));
+        } else {
+            if existing.is_some() {
+                self.rx_streams.remove(&h.ssrc);
+            }
+            if let Some((prev_ssrc, prev_st)) = self.last_rx.replace((h.ssrc, updated)) {
+                self.rx_streams.insert(prev_ssrc, prev_st);
+            }
+        }
+
+        Some(h)
+    }
+
+    /// Verifies and decrypts one SRTP packet; returns `None` when tag fails, replayed, damaged, or invalid.
+    pub fn unprotect(&mut self, srtp: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(srtp.len().saturating_sub(AUTH_TAG_LEN));
+        self.unprotect_into(srtp, &mut out)?;
         Some(out)
     }
 }
@@ -393,11 +519,16 @@ mod tests {
         for (name, pkts) in vectors {
             let mut tx = SrtpContext::from_session(SESSION).unwrap();
             let mut rx = SrtpContext::from_session(SESSION).unwrap();
+            let mut rx_in_place = SrtpContext::from_session(SESSION).unwrap();
             for (rtp_hex, srtp_hex) in *pkts {
                 let got = tx.protect(&decode_hex(rtp_hex)).unwrap();
                 assert_eq!(hex::encode(&got), *srtp_hex, "protect {name}");
                 let plain = rx.unprotect(&decode_hex(srtp_hex)).expect(name);
                 assert_eq!(hex::encode(&plain), *rtp_hex, "unprotect {name}");
+                let mut ip = decode_hex(srtp_hex);
+                let h = rx_in_place.unprotect_in_place(&mut ip).expect(name);
+                assert_eq!(hex::encode(&ip), *rtp_hex, "unprotect_in_place {name}");
+                assert_eq!(h, rtp_header(&plain).unwrap());
             }
         }
 

@@ -117,7 +117,7 @@ impl ZaloHttp {
                 .map(|j| j.cookie_header_for(&current_url))
                 .unwrap_or_default();
 
-            let mut headers = default_zalo_headers(user_agent, &cookie_header)?;
+            let mut headers = default_zalo_headers(user_agent, "")?;
             if let Some(extra) = extra_headers {
                 for (k, v) in extra {
                     if let (Ok(name), Ok(val)) = (
@@ -133,11 +133,13 @@ impl ZaloHttp {
                     headers.insert(reqwest::header::REFERER, val);
                 }
             }
-            // Refresh Cookie header for this hop in case extra_headers or redirects changed host.
+            // Attach Cookie header once for this hop (after extra_headers so jar cookies win).
             if !cookie_header.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(&cookie_header) {
-                    headers.insert(reqwest::header::COOKIE, val);
-                }
+                headers.insert(
+                    reqwest::header::COOKIE,
+                    HeaderValue::from_str(&cookie_header)
+                        .map_err(|e| ProtoError::InvalidArg(format!("invalid cookie header: {e}")))?,
+                );
             } else {
                 headers.remove(reqwest::header::COOKIE);
             }
@@ -412,15 +414,19 @@ impl ZaloHttp {
                 message: text.chars().take(200).collect(),
             });
         }
-        if let Some(cl) = resp.content_length() {
-            if cl as usize > max_bytes {
-                return Err(ProtoError::HttpStatus {
-                    status: 413,
-                    message: "Backup exceeds size cap".into(),
-                });
+        let initial_cap = match resp.content_length() {
+            Some(cl) => {
+                if cl > max_bytes as u64 {
+                    return Err(ProtoError::HttpStatus {
+                        status: 413,
+                        message: "Backup exceeds size cap".into(),
+                    });
+                }
+                cl as usize
             }
-        }
-        let mut out = Vec::new();
+            None => 0,
+        };
+        let mut out = Vec::with_capacity(initial_cap);
         while let Some(chunk) = resp.chunk().await? {
             if out.len().saturating_add(chunk.len()) > max_bytes {
                 return Err(ProtoError::HttpStatus {

@@ -127,7 +127,7 @@ internal class NativeTransport(
         const val CORE_NOT_STARTED = "The Zalo core is not running"
         private const val JSON = "application/json"
         private const val OCTET_STREAM = "application/octet-stream"
-        private const val EVENT_POLL_MS = 20_000L
+        private const val EVENT_POLL_MS = 60_000L
 
         /** A voice file goes up bare (no multipart); its name rides in the query. */
         internal fun voicePath(path: String, file: File): String {

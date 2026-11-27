@@ -11,31 +11,50 @@
 //! - `audioOpen` / `audioSend` / `audioNext` / `audioCloseReason` / `audioClose`: `/ws/call-audio`.
 //!
 //! Nothing here panics across the FFI boundary: every entry point catches panics and turns errors
-//! into return values. (A release build uses `panic = "abort"`, so there a panic still ends the
-//! process; the catch is for dev and test builds.)
+//! into return values. (Release builds use `panic = "unwind"`, so panics caught at the JNI
+//! boundary degrade cleanly into error values instead of aborting the Android process.)
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::fmt::{self, Write as FmtWrite};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Once};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 
 use jni::objects::{JByteArray, JObject, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jsize, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use tokio::runtime::Runtime;
-use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::EnvFilter;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Id, Level, Metadata, Subscriber};
 use zalo_server::embedded::{
-    AudioPoll, EmbeddedAudio, EmbeddedConfig, EmbeddedCore, EmbeddedEvents, EventPoll,
+    AudioPoll, EmbeddedAudio, EmbeddedConfig, EmbeddedCore, EmbeddedEvents, EmbeddedResponse,
+    EventPoll,
 };
 use zalo_server::log::RotatingFileLogger;
 
 static LOGGER_INIT: Once = Once::new();
 static ACTIVE_LOG_FILE: Mutex<Option<Arc<RotatingFileLogger>>> = Mutex::new(None);
+static FILE_LOG_TX: OnceLock<SyncSender<(Arc<RotatingFileLogger>, &'static str, String)>> =
+    OnceLock::new();
+
+fn file_log_tx() -> &'static SyncSender<(Arc<RotatingFileLogger>, &'static str, String)> {
+    FILE_LOG_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<(Arc<RotatingFileLogger>, &'static str, String)>(256);
+        let _ = std::thread::Builder::new()
+            .name("zalocore-log".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                while let Ok((logger, level, msg)) = rx.recv() {
+                    logger.log(level, &msg);
+                }
+            });
+        tx
+    })
+}
 
 fn init_logging() {
     LOGGER_INIT.call_once(|| {
@@ -44,58 +63,79 @@ fn init_logging() {
                 .with_tag("ZalooCore")
                 .with_max_level(log::LevelFilter::Info),
         );
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(AndroidLogMakeWriter)
-            .try_init();
+        let _ = tracing::subscriber::set_global_default(AndroidTracingSubscriber);
     });
 }
 
-struct AndroidLogMakeWriter;
-
-struct AndroidLogWriter {
-    buf: Vec<u8>,
+struct FieldVisitor {
+    message: String,
+    fields: String,
 }
 
-impl Write for AndroidLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
+impl Visit for FieldVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message.push_str(value);
+        } else {
+            let _ = write!(self.fields, " {}={}", field.name(), value);
+        }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            let _ = write!(self.message, "{value:?}");
+        } else {
+            let _ = write!(self.fields, " {}={value:?}", field.name());
+        }
     }
 }
 
-impl Drop for AndroidLogWriter {
-    fn drop(&mut self) {
-        if self.buf.is_empty() {
+struct AndroidTracingSubscriber;
+
+impl Subscriber for AndroidTracingSubscriber {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() <= Level::INFO
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+    fn enter(&self, _span: &Id) {}
+    fn exit(&self, _span: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let meta = event.metadata();
+        let (log_level, level_str) = match *meta.level() {
+            Level::ERROR => (log::Level::Error, "error"),
+            Level::WARN => (log::Level::Warn, "warn"),
+            Level::INFO => (log::Level::Info, "info"),
+            Level::DEBUG => (log::Level::Debug, "debug"),
+            Level::TRACE => (log::Level::Trace, "trace"),
+        };
+        let mut visitor = FieldVisitor {
+            message: String::new(),
+            fields: String::new(),
+        };
+        event.record(&mut visitor);
+        let mut text = visitor.message;
+        if !visitor.fields.is_empty() {
+            text.push_str(&visitor.fields);
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             return;
         }
+        log::log!(target: meta.target(), log_level, "{trimmed}");
         if let Ok(guard) = ACTIVE_LOG_FILE.lock() {
             if let Some(ref logger) = *guard {
-                logger.write_raw(&self.buf);
+                let _ = file_log_tx().try_send((Arc::clone(logger), level_str, trimmed.to_string()));
             }
         }
-        let text = String::from_utf8_lossy(&self.buf);
-        let trimmed = text.trim_end();
-        if !trimmed.is_empty() {
-            log::info!("{trimmed}");
-        }
     }
 }
-
-impl<'a> MakeWriter<'a> for AndroidLogMakeWriter {
-    type Writer = AndroidLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        AndroidLogWriter { buf: Vec::new() }
-    }
-}
-
 
 // ---- Process-wide state ----
 
@@ -180,11 +220,66 @@ pub fn encode_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> 
     out
 }
 
+#[cfg(test)]
 fn encode_failure(message: &str) -> Vec<u8> {
     encode_response(0, "text/plain", message.as_bytes())
 }
 
 // ---- JNI helpers ----
+
+fn as_jbytes(bytes: &[u8]) -> &[jbyte] {
+    // SAFETY: `u8` and `jbyte` (`i8`) have identical size (1) and alignment (1), and all bit
+    // patterns are valid for both types.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<jbyte>(), bytes.len()) }
+}
+
+/// Single-copy JNI encoding: allocates the Java `byte[]` once and copies the 4-byte header,
+/// content type, and body directly into it without an intermediate `Vec<u8>`.
+fn encode_response_to_jbytes(
+    env: &mut JNIEnv,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> jbyteArray {
+    let ct = &content_type.as_bytes()[..content_type.len().min(u16::MAX as usize)];
+    let Ok(total) = jsize::try_from(4 + ct.len() + body.len()) else {
+        return ptr::null_mut();
+    };
+    let Ok(arr) = env.new_byte_array(total) else {
+        return ptr::null_mut();
+    };
+    let status_be = status.to_be_bytes();
+    let ct_len_be = (ct.len() as u16).to_be_bytes();
+    let header = [status_be[0], status_be[1], ct_len_be[0], ct_len_be[1]];
+    if env
+        .set_byte_array_region(&arr, 0, as_jbytes(&header))
+        .is_err()
+    {
+        return ptr::null_mut();
+    }
+    if !ct.is_empty()
+        && env
+            .set_byte_array_region(&arr, 4, as_jbytes(ct))
+            .is_err()
+    {
+        return ptr::null_mut();
+    }
+    if !body.is_empty()
+        && env
+            .set_byte_array_region(&arr, (4 + ct.len()) as jsize, as_jbytes(body))
+            .is_err()
+    {
+        return ptr::null_mut();
+    }
+    arr.into_raw()
+}
+
+fn encode_result_to_jbytes(env: &mut JNIEnv, res: Result<EmbeddedResponse, String>) -> jbyteArray {
+    match res {
+        Ok(r) => encode_response_to_jbytes(env, r.status, &r.content_type, &r.body),
+        Err(msg) => encode_response_to_jbytes(env, 0, "text/plain", msg.as_bytes()),
+    }
+}
 
 fn read_jstring(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
     if s.is_null() {
@@ -251,6 +346,9 @@ fn start_core(data_dir: &str, log_file: &str) -> jint {
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .thread_name("zalocore")
         .build()
@@ -352,18 +450,18 @@ pub extern "system" fn Java_com_zalom3ui_app_server_ZaloCore_stop(
 
 // ---- request / requestFile ----
 
-fn do_request(
+fn run_request(
     method: &str,
     path: &str,
     content_type: &str,
     body: Result<Vec<u8>, String>,
     file: Option<&Path>,
-) -> Vec<u8> {
+) -> Result<EmbeddedResponse, String> {
     let Some(r) = running() else {
-        return encode_failure("The Zalo core is not running");
+        return Err("The Zalo core is not running".to_string());
     };
     let ct = (!content_type.is_empty()).then_some(content_type);
-    let result = r.rt.block_on(async {
+    r.rt.block_on(async {
         match file {
             Some(file) => r.core.request_file(method, path, ct, file).await,
             None => {
@@ -373,8 +471,18 @@ fn do_request(
                     .await
             }
         }
-    });
-    match result {
+    })
+}
+
+#[cfg(test)]
+fn do_request(
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: Result<Vec<u8>, String>,
+    file: Option<&Path>,
+) -> Vec<u8> {
+    match run_request(method, path, content_type, body, file) {
         Ok(res) => encode_response(res.status, &res.content_type, &res.body),
         Err(e) => encode_failure(&e),
     }
@@ -394,17 +502,17 @@ pub extern "system" fn Java_com_zalom3ui_app_server_ZaloCore_request(
     content_type: JString,
     body: JByteArray,
 ) -> jbyteArray {
-    let out = guard(encode_failure("Native error"), || {
+    let res = guard(Err("Native error".to_string()), || {
         let method = read_jstring(&mut env, &method);
         let path = read_jstring(&mut env, &path_and_query);
         let ct = read_jstring(&mut env, &content_type);
         let body = read_bytes(&mut env, &body);
         match (method, path, ct) {
-            (Ok(m), Ok(p), Ok(c)) => do_request(&m, &p, &c, body, None),
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => encode_failure(&e),
+            (Ok(m), Ok(p), Ok(c)) => run_request(&m, &p, &c, body, None),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
         }
     });
-    to_jbytes(&mut env, &out)
+    encode_result_to_jbytes(&mut env, res)
 }
 
 /// Like `request`, with the body read from `file_path` in chunks (never held whole in memory).
@@ -417,21 +525,19 @@ pub extern "system" fn Java_com_zalom3ui_app_server_ZaloCore_requestFile(
     content_type: JString,
     file_path: JString,
 ) -> jbyteArray {
-    let out = guard(encode_failure("Native error"), || {
+    let res = guard(Err("Native error".to_string()), || {
         let method = read_jstring(&mut env, &method);
         let path = read_jstring(&mut env, &path_and_query);
         let ct = read_jstring(&mut env, &content_type);
         let file = read_jstring(&mut env, &file_path);
         match (method, path, ct, file) {
             (Ok(m), Ok(p), Ok(c), Ok(f)) => {
-                do_request(&m, &p, &c, Ok(Vec::new()), Some(Path::new(&f)))
+                run_request(&m, &p, &c, Ok(Vec::new()), Some(Path::new(&f)))
             }
-            (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
-                encode_failure(&e)
-            }
+            (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (_, _, _, Err(e)) => Err(e),
         }
     });
-    to_jbytes(&mut env, &out)
+    encode_result_to_jbytes(&mut env, res)
 }
 
 // ---- Events ----
@@ -518,13 +624,13 @@ pub extern "system" fn Java_com_zalom3ui_app_server_ZaloCore_audioSend(
         let Some(sub) = get_sub(&AUDIO, handle) else {
             return false;
         };
-        if sub.inner.close_info().is_some() {
+        if sub.inner.is_closed() {
             return false;
         }
         match read_bytes(&mut env, &data) {
             Ok(bytes) => {
                 let _enter = sub.rt.enter();
-                sub.inner.send(&bytes);
+                sub.inner.send_owned(bytes);
                 true
             }
             Err(_) => false,

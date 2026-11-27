@@ -25,9 +25,9 @@ pub use api::voicecall::{
 pub use api::{parse_noised_ids_reply, NoisedIdsReply, ZaloClient};
 pub use cookies::{is_zalo_cookie_host, SavedCookie, ZaloCookieJar};
 pub use crypto::{
-    decode_aes, decode_aes_utf8_key, decode_event_payload, encode_aes, encode_aes_utf8_key,
-    generate_zalo_uuid, get_sign_key, inflate_any, md5_hex, parse_json_keeping_bigints,
-    AesOutputEncoding, ParamsEncryptor,
+    decode_aes, decode_aes_utf8_key, decode_event_payload, decode_event_payload_with_cipher,
+    encode_aes, encode_aes_utf8_key, generate_zalo_uuid, get_sign_key, inflate_any, md5_hex,
+    parse_json_keeping_bigints, AesOutputEncoding, EventCipher, ParamsEncryptor,
 };
 pub use error::{ProtoError, Result};
 pub use http::{handle_zalo_response, ZaloHttp};

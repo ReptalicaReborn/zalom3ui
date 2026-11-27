@@ -528,6 +528,37 @@ pub struct ChatMessage {
     pub otp: Option<String>,
 }
 
+/// Lazy, non-persisted folded search text cache attached to [`StoredMessage`].
+/// Ignored by serialization and equality comparisons.
+#[derive(Debug, Default)]
+pub struct SearchCache(std::sync::OnceLock<String>);
+
+impl Clone for SearchCache {
+    fn clone(&self) -> Self {
+        let cell = std::sync::OnceLock::new();
+        if let Some(val) = self.0.get() {
+            let _ = cell.set(val.clone());
+        }
+        Self(cell)
+    }
+}
+
+impl PartialEq for SearchCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl SearchCache {
+    pub fn get_or_init(&self, f: impl FnOnce() -> String) -> &str {
+        self.0.get_or_init(f).as_str()
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = std::sync::OnceLock::new();
+    }
+}
+
 /// Persisted on-disk message inside `threads/<hex>.json` and legacy `messages.json`.
 /// Never serialized directly to clients; convert via `ChatStore::to_public`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -567,6 +598,9 @@ pub struct StoredMessage {
     /// Server-side raw fields; omitted from API responses and absent for imported history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<RawRef>,
+    /// Lazily populated diacritic-folded lowercase search string (cleared on recall).
+    #[serde(skip)]
+    pub search_folded: SearchCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

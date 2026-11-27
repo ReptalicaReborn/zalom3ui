@@ -34,6 +34,19 @@ impl BoundedWriter {
             exceeded: false,
         }
     }
+
+    fn with_hint(hint: usize, max: usize) -> Self {
+        let cap = if hint > 0 {
+            hint.min(max)
+        } else {
+            (64 * 1024).min(max)
+        };
+        Self {
+            buf: Vec::with_capacity(cap),
+            max,
+            exceeded: false,
+        }
+    }
 }
 
 impl Write for BoundedWriter {
@@ -56,6 +69,16 @@ impl Write for BoundedWriter {
 
 /// Decodes a `.xz` container stream with a hard cap of `max_output` decoded bytes.
 pub fn decode_xz(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
+    decode_xz_with_hint(src, 0, max_output)
+}
+
+/// Decodes a `.xz` container stream, pre-allocating `size_hint` bytes (capped at `max_output`)
+/// when non-zero to avoid geometric `Vec` reallocation spikes.
+pub fn decode_xz_with_hint(
+    src: &[u8],
+    size_hint: usize,
+    max_output: usize,
+) -> Result<Vec<u8>, LzmaError> {
     if src.len() < 12 || &src[..6] != XZ_MAGIC {
         return Err(LzmaError::InvalidData("Not an .xz stream".into()));
     }
@@ -71,7 +94,7 @@ pub fn decode_xz(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
     let trimmed = &src[..stream_end];
 
     let mut reader = Cursor::new(trimmed);
-    let mut writer = BoundedWriter::new(64 * 1024, max_output);
+    let mut writer = BoundedWriter::with_hint(size_hint, max_output);
     match lzma_rs::xz_decompress(&mut reader, &mut writer) {
         Ok(()) => Ok(writer.buf),
         Err(err) => {
@@ -232,6 +255,15 @@ fn validate_and_find_xz_stream_end(src: &[u8]) -> Result<Option<usize>, LzmaErro
 
 /// Decodes a raw `.lzma` ("lzma_alone") stream with a hard cap of `max_output` decoded bytes.
 pub fn decode_lzma_alone(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
+    decode_lzma_alone_with_hint(src, 0, max_output)
+}
+
+/// Decodes a raw `.lzma` ("lzma_alone") stream, using `size_hint` when non-zero to pre-allocate once.
+pub fn decode_lzma_alone_with_hint(
+    src: &[u8],
+    size_hint: usize,
+    max_output: usize,
+) -> Result<Vec<u8>, LzmaError> {
     if src.len() < 13 + 5 {
         return Err(LzmaError::InvalidData("Truncated LZMA data".into()));
     }
@@ -254,7 +286,11 @@ pub fn decode_lzma_alone(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaE
     };
 
     let mut reader = Cursor::new(src);
-    let mut writer = BoundedWriter::new(known_size.unwrap_or(64 * 1024), max_output);
+    let mut writer = if size_hint > 0 {
+        BoundedWriter::with_hint(size_hint, max_output)
+    } else {
+        BoundedWriter::new(known_size.unwrap_or(64 * 1024), max_output)
+    };
     match lzma_rs::lzma_decompress(&mut reader, &mut writer) {
         Ok(()) => {
             if let Some(expected) = known_size {
@@ -276,10 +312,19 @@ pub fn decode_lzma_alone(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaE
 
 /// Auto-detects `.xz` (by magic header) or `.lzma` ("lzma_alone") and decompresses with `max_output` cap.
 pub fn decode_lzma_auto(src: &[u8], max_output: usize) -> Result<Vec<u8>, LzmaError> {
+    decode_lzma_auto_with_hint(src, 0, max_output)
+}
+
+/// Like [`decode_lzma_auto`], pre-allocating `size_hint` bytes (capped at `max_output`) when known.
+pub fn decode_lzma_auto_with_hint(
+    src: &[u8],
+    size_hint: usize,
+    max_output: usize,
+) -> Result<Vec<u8>, LzmaError> {
     if src.len() >= 6 && &src[..6] == XZ_MAGIC {
-        decode_xz(src, max_output)
+        decode_xz_with_hint(src, size_hint, max_output)
     } else {
-        decode_lzma_alone(src, max_output)
+        decode_lzma_alone_with_hint(src, size_hint, max_output)
     }
 }
 

@@ -234,6 +234,7 @@ pub struct EmbeddedAudio {
     link: AudioLink,
     core_closed: watch::Receiver<bool>,
     local_closed: watch::Sender<bool>,
+    closed: std::sync::atomic::AtomicBool,
     close: Mutex<Option<(u16, String)>>,
 }
 
@@ -243,28 +244,66 @@ impl EmbeddedAudio {
             link,
             core_closed,
             local_closed: watch::channel(false).0,
+            closed: std::sync::atomic::AtomicBool::new(false),
             close: Mutex::new(None),
         }
+    }
+
+    /// Lock-free check whether the link has already closed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn set_close(&self, code: u16, reason: &str) {
         if let Ok(mut c) = self.close.lock() {
             c.get_or_insert((code, reason.to_string()));
         }
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Sends one frame from the app: `0x02` audio, `0x04` video, `0x06` key-frame request.
     pub fn send(&self, data: &[u8]) {
-        if self.close_info().is_none() {
+        if !self.is_closed() {
+            self.link.handle_incoming(data.to_vec());
+        }
+    }
+
+    /// Like [`send`](Self::send), taking an owned buffer to avoid copying large video frames.
+    pub fn send_owned(&self, data: Vec<u8>) {
+        if !self.is_closed() {
             self.link.handle_incoming(data);
         }
     }
 
     /// Waits up to `timeout` for the next message from the call.
     pub async fn next(&self, timeout: Duration) -> AudioPoll {
-        if self.close_info().is_some() {
+        if self.is_closed() {
             return AudioPoll::Closed;
         }
+        if *self.core_closed.borrow() {
+            self.set_close(1001, "shutting down");
+            return AudioPoll::Closed;
+        }
+        if *self.local_closed.borrow() {
+            self.set_close(1000, "closed");
+            return AudioPoll::Closed;
+        }
+        // Fast path: return a queued frame immediately without cloning watch channels or
+        // registering a Tokio sleep timer (saves 50–80 timer allocs/sec during active calls).
+        match self.link.try_recv() {
+            Ok(AudioWsOut::Binary(data)) => return AudioPoll::Frame(data),
+            Ok(AudioWsOut::Close(code, reason)) => {
+                self.set_close(code, reason);
+                return AudioPoll::Closed;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.set_close(1000, "closed");
+                return AudioPoll::Closed;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+
         let mut core = self.core_closed.clone();
         let mut local = self.local_closed.subscribe();
         if *core.borrow() {
@@ -301,6 +340,9 @@ impl EmbeddedAudio {
 
     /// The close code and reason once the link is over, else `None`.
     pub fn close_info(&self) -> Option<(u16, String)> {
+        if !self.is_closed() {
+            return None;
+        }
         self.close.lock().ok().and_then(|c| c.clone())
     }
 

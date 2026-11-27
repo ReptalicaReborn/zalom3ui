@@ -17,19 +17,25 @@ pub mod types;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+#[cfg(feature = "tcp")]
 use std::future::Future;
 use std::sync::Arc;
 
+#[cfg(feature = "tcp")]
 use tokio::net::TcpListener;
+#[cfg(feature = "tcp")]
 use tracing::info;
 
-use crate::config::{is_loopback_host, Config};
+#[cfg(feature = "tcp")]
+use crate::config::is_loopback_host;
+use crate::config::Config;
 use crate::session::ZaloSession;
 use crate::store::ChatStore;
 
 /// Installs the rustls ring crypto provider (no-op if already installed), opens `ChatStore`,
 /// starts `ZaloSession`, binds a TCP listener on `(config.host, config.port)`, and serves HTTP/WS
 /// until `shutdown` resolves. Flushes `ChatStore` cleanly on exit.
+#[cfg(feature = "tcp")]
 pub async fn run_server(
     config: Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -47,6 +53,7 @@ pub async fn run_server(
 
 /// Serves the Zalỏ HTTP/WebSocket application on a pre-bound [`TcpListener`] (useful for tests
 /// binding an ephemeral `port = 0` and inspecting `listener.local_addr()`).
+#[cfg(feature = "tcp")]
 pub async fn serve_on_listener(
     config: Config,
     listener: TcpListener,
