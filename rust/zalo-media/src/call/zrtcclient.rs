@@ -1703,6 +1703,133 @@ mod tests {
         assert!(rtcps >= 1, "sent RTCP");
     }
 
+    /// Continuous 20 ms audio + ~17 fps video in both directions for ~2 s.
+    #[tokio::test]
+    async fn media_call_continuous_bidirectional_stream() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = server.local_addr().unwrap().port();
+        let counts = Arc::new(RwLock::new((0usize, 0usize)));
+        let counts_bg = Arc::clone(&counts);
+        let srv = Arc::clone(&server);
+        let (done_tx, mut done_rx) = oneshot::channel::<()>();
+        let srv_task = tokio::spawn(async move {
+            let mut tx_a = SrtpContext::from_session(SESSION).unwrap();
+            let mut tx_v = SrtpContext::from_session(SESSION).unwrap();
+            let mut rx_a = SrtpContext::from_session(SESSION).unwrap();
+            let mut rx_v = SrtpContext::from_session(SESSION).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut peer: Option<SocketAddr> = None;
+            let (mut aseq, mut vseq) = (65_530u16, 500u16);
+            let mut t = tokio::time::interval(Duration::from_millis(20));
+            let mut n = 0u32;
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    _ = t.tick(), if peer.is_some() => {
+                        let to = peer.unwrap();
+                        let mut artp = vec![0x80, OPUS_PT];
+                        artp.extend_from_slice(&aseq.to_be_bytes());
+                        artp.extend_from_slice(&(n * 960).to_be_bytes());
+                        artp.extend_from_slice(&777u32.to_be_bytes());
+                        artp.extend_from_slice(&[0x78, 1, 2, 3, 4, 5]);
+                        aseq = aseq.wrapping_add(1);
+                        let mut ap = vec![kind::AUDIO_IN];
+                        ap.extend_from_slice(&tx_a.protect(&artp).unwrap());
+                        let _ = srv.send_to(&ap, to).await;
+                        if n % 3 == 0 {
+                            let key = n % 30 == 0;
+                            let mut vrtp = vec![0x80, 0x80 | if key { 98 } else { 97 }];
+                            vrtp.extend_from_slice(&vseq.to_be_bytes());
+                            vrtp.extend_from_slice(&(n * 3000).to_be_bytes());
+                            vrtp.extend_from_slice(&777u32.to_be_bytes());
+                            vrtp.extend_from_slice(&[0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0x88, 0x80]);
+                            vseq = vseq.wrapping_add(1);
+                            let mut vp = vec![kind::VIDEO_IN];
+                            vp.extend_from_slice(&tx_v.protect(&vrtp).unwrap());
+                            let _ = srv.send_to(&vp, to).await;
+                        }
+                        n += 1;
+                    }
+                    res = srv.recv_from(&mut buf) => {
+                        let Ok((len, from)) = res else { break };
+                        let msg = &buf[..len];
+                        if msg.is_empty() { continue; }
+                        match msg[0] {
+                            kind::REQUEST => {
+                                if let Ok(Packet::Control { header, .. }) = zrtc::parse(msg) {
+                                    if header.cmd == cmd::INIT_CALL_CALLEE {
+                                        let mut reply = msg[..21].to_vec();
+                                        reply[0] = kind::RESPONSE;
+                                        reply.extend_from_slice(&0u32.to_le_bytes());
+                                        reply.extend_from_slice(&1u32.to_le_bytes());
+                                        reply.extend_from_slice(&12345u32.to_le_bytes());
+                                        reply.extend_from_slice(&9u16.to_le_bytes());
+                                        reply.extend_from_slice(b"127.0.0.1");
+                                        let _ = srv.send_to(&reply, from).await;
+                                        peer = Some(from);
+                                    }
+                                }
+                            }
+                            kind::AUDIO if len > 5 && rx_a.unprotect(&msg[5..]).is_some() => {
+                                counts_bg.write().unwrap().0 += 1;
+                            }
+                            kind::VIDEO if len > 5 && rx_v.unprotect(&msg[5..]).is_some() => {
+                                counts_bg.write().unwrap().1 += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        let opts = MediaCallOptions::new(
+            MediaServer { host: "127.0.0.1".into(), port },
+            438_000_002,
+            465_000_001,
+            321_000_003,
+            SESSION.into(),
+            false,
+        );
+        let (call, mut ev_rx) = MediaCall::new(opts).await.unwrap();
+        assert_eq!(call.join(2000, 100).await, Some(12345));
+        assert_eq!(call.token(), Some(12345));
+        call.start_silence();
+
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let (mut audio_ev, mut video_ev) = (0usize, 0usize);
+        for i in 0..100u32 {
+            tick.tick().await;
+            call.send_audio_frame(vec![0x78, i as u8, 1, 2, 3, 4, 5, 6]);
+            if i % 3 == 0 {
+                call.send_video_frame(i % 30 == 0, vec![0, 0, 0, 1, if i % 30 == 0 { 0x65 } else { 0x41 }, 1, 2, 3]);
+            }
+            while let Ok(ev) = ev_rx.try_recv() {
+                match ev {
+                    MediaEvent::Audio { .. } => audio_ev += 1,
+                    MediaEvent::Video(_) => video_ev += 1,
+                    _ => {}
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(ev) = ev_rx.try_recv() {
+            match ev {
+                MediaEvent::Audio { .. } => audio_ev += 1,
+                MediaEvent::Video(_) => video_ev += 1,
+                _ => {}
+            }
+        }
+        call.close(false);
+        let _ = done_tx.send(());
+        let _ = srv_task.await;
+        let (a_out, v_out) = *counts.read().unwrap();
+        assert!(a_out >= 90, "audio out {a_out}");
+        assert!(v_out >= 30, "video out {v_out}");
+        assert!(audio_ev >= 90, "audio events {audio_ev}");
+        assert!(video_ev >= 25, "video events {video_ev}");
+    }
+
     #[tokio::test]
     async fn close_during_join_returns_none_cleanly() {
         let opts = MediaCallOptions::new(
