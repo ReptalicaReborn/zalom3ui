@@ -598,6 +598,13 @@ fn dispatch_body(
         }
     }
 
+    // Ping reply (v=1, cmd=2): the server echoes our keepalive `{ eventId }` unencrypted. Nothing to
+    // decode; describe it so the socket log shows a ping, not a decode failure.
+    if version == 1 && cmd == 2 {
+        report.describe_payload(&parsed, &parsed);
+        return Vec::new();
+    }
+
     // Duplicate connection (v=1, cmd=3000, sub=0)
     if version == 1 && cmd == 3000 && sub_cmd == 0 {
         return vec![WsEvent::Closed {
@@ -629,6 +636,8 @@ fn dispatch_body(
         report.describe_payload(d, inner);
     } else {
         report.error = Some("payload decode failed");
+        let why = decoded.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        report.describe_envelope(&parsed, &why);
     }
     // `pageMsgs` (Official Account / ZNS / OTP) are read on 501 and 510 whatever the subCmd.
     let has_page_msgs = inner_ref
@@ -1693,6 +1702,74 @@ mod tests {
         assert_eq!(page.items[0].uid_from, "other");
         assert_eq!(page.items[2].uid_from, "zero");
         assert!(!r.arrays.iter().find(|a| a.name == "other").unwrap().read);
+    }
+
+    #[test]
+    fn traced_report_shows_scalar_values_but_never_string_contents() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let secret = "SECRET-OTP-482910 Nguyen Van A";
+        // A 501 like the one seen when an OTP arrived on the phone: every list empty.
+        let frame = plain_frame(
+            501,
+            0,
+            json!({
+                "data": {
+                    "msgs": [], "pageMsgs": [],
+                    "more": 1, "lastActionId": 123456789,
+                    "queueStatus": { "pending": 2 },
+                    "note": secret,
+                },
+                "error_code": 0,
+                "error_message": secret,
+            }),
+        );
+        let (_events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        let r = report.expect("report");
+        let n = secret.chars().count();
+        for want in [
+            "error_code=0".to_string(),
+            format!("error_message=str({n})"),
+            "more=1".to_string(),
+            "lastActionId=123456789".to_string(),
+            "queueStatus={pending}".to_string(),
+            format!("note=str({n})"),
+        ] {
+            assert!(r.scalars.contains(&want), "missing {want}: {:?}", r.scalars);
+        }
+        let rendered = serde_json::to_string(&r).unwrap();
+        for needle in ["SECRET", "482910", "Nguyen"] {
+            assert!(!rendered.contains(needle), "leaked {needle}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn traced_report_describes_the_wrapper_of_an_undecodable_frame() {
+        let ctx = test_ctx();
+        let mut ck = Some("MDEyMzQ1Njc4OWFiY2RlZg==".to_string());
+        let body = json!({ "encrypt": 2, "data": "SECRET!!not-base64" }).to_string();
+        let frame = encode_frame(1, 501, 0, body.as_bytes());
+        let (_events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        let r = report.expect("report");
+        assert_eq!(r.error, Some("payload decode failed"));
+        assert!(r.envelope.contains(&"encrypt=2".to_string()), "{:?}", r.envelope);
+        assert!(r.envelope.contains(&"data=str(18)".to_string()), "{:?}", r.envelope);
+        assert!(r.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        let rendered = serde_json::to_string(&r).unwrap();
+        assert!(!rendered.contains("SECRET"), "leaked: {rendered}");
+    }
+
+    #[test]
+    fn traced_report_labels_the_ping_reply() {
+        let ctx = test_ctx();
+        let mut ck = None;
+        let frame = encode_frame(1, 2, 1, json!({ "eventId": 1_700_000_000_000_i64 }).to_string().as_bytes());
+        let (events, report) = dispatch_frame_traced(&frame, &mut ck, &ctx, true);
+        assert!(events.is_empty());
+        let r = report.expect("report");
+        assert_eq!(r.error, None);
+        assert!(r.consumed);
+        assert_eq!(r.scalars, vec!["eventId=1700000000000"]);
     }
 
     #[test]
