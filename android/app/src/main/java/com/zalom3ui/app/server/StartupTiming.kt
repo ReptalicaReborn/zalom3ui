@@ -32,9 +32,33 @@ object StartupTiming {
     fun sinceStart(processStartUptimeMs: Long, eventUptimeMs: Long): Long? =
         (eventUptimeMs - processStartUptimeMs).takeIf { eventUptimeMs > 0L && it >= 0L }
 
-    fun format(firstFrameMs: Long?, coreReadyMs: Long?, listDataMs: Long, threads: Int): String {
+    /** Named moments on the way to the chat list (see [mark]), by uptime. Only the first time each is seen is kept. */
+    private val marks = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Records that [name] happened at [uptimeMs] ([android.os.SystemClock.uptimeMillis]); later calls are ignored. */
+    fun mark(name: String, uptimeMs: Long) {
+        marks.putIfAbsent(name, uptimeMs)
+    }
+
+    fun snapshotMarks(): Map<String, Long> = HashMap(marks)
+
+    /** "vm-created 190, refresh-start 205, ..." in time order, each as ms since process start. */
+    fun formatMarks(processStartUptimeMs: Long, marks: Map<String, Long>): String =
+        marks.entries
+            .mapNotNull { (name, at) -> sinceStart(processStartUptimeMs, at)?.let { name to it } }
+            .sortedBy { it.second }
+            .joinToString(", ") { (name, ms) -> "$name $ms" }
+
+    fun format(
+        firstFrameMs: Long?,
+        coreReadyMs: Long?,
+        listDataMs: Long,
+        threads: Int,
+        steps: String = "",
+    ): String {
         fun part(v: Long?) = if (v == null) "n/a" else "$v ms"
-        return "startup: process→first-frame ${part(firstFrameMs)}, process→core-ready ${part(coreReadyMs)}, " +
+        val base = "startup: process→first-frame ${part(firstFrameMs)}, process→core-ready ${part(coreReadyMs)}, " +
             "process→list-data ${part(listDataMs)} (threads=$threads)"
+        return if (steps.isEmpty()) base else "$base; at ms: $steps"
     }
 }

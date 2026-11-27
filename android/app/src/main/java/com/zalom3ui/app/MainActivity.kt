@@ -164,6 +164,7 @@ class MainActivity : ComponentActivity() {
                 coreReadyMs = StartupTiming.sinceStart(processStartUptimeMs, StartupTiming.coreReadyUptimeMs),
                 listDataMs = now - processStartUptimeMs,
                 threads = threads,
+                steps = StartupTiming.formatMarks(processStartUptimeMs, StartupTiming.snapshotMarks()),
             )
             StartupLog.write(this, line)
         }

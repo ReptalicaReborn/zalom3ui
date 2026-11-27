@@ -1,6 +1,7 @@
 package com.zalom3ui.app.ui
 
 import android.app.Application
+import android.os.SystemClock
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -38,6 +39,7 @@ import com.zalom3ui.app.data.readPickedFile
 import com.zalom3ui.app.server.ConversationShortcuts
 import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.server.StayConnectedCoordinator
+import com.zalom3ui.app.server.StartupTiming
 import com.zalom3ui.app.server.ZaloCore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -249,6 +251,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val pendingSeq = AtomicLong(0L)
 
     init {
+        StartupTiming.mark("vm-created", SystemClock.uptimeMillis())
         rebuildClient()
     }
 
@@ -1344,9 +1347,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshAll(api: ApiClient) {
         // Status and threads are asked together: the threads call only matters when signed in, and its failure is
         // only raised then (as before, when it was called after the status).
+        StartupTiming.mark("refresh-start", SystemClock.uptimeMillis())
         val (status, threads) = coroutineScope {
-            val statusCall = async { api.status() }
-            val threadsCall = async { runCatching { api.threads() } }
+            val statusCall = async { api.status().also { StartupTiming.mark("status-ready", SystemClock.uptimeMillis()) } }
+            val threadsCall = async {
+                runCatching { api.threads() }.also { StartupTiming.mark("threads-ready", SystemClock.uptimeMillis()) }
+            }
             val status = statusCall.await()
             status to (if (status.isLoggedIn) threadsCall.await().getOrThrow() else emptyList())
         }
@@ -1358,6 +1364,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 startupError = null,
             )
         }
+        StartupTiming.mark("state-applied", SystemClock.uptimeMillis())
         // The sync progress isn't needed for the first paint: fetched after it, in its own update.
         if (status.isLoggedIn) {
             viewModelScope.launch {

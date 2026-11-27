@@ -34,4 +34,27 @@ class StartupTimingTest {
             StartupTiming.format(null, null, 900, 3),
         )
     }
+
+    @Test
+    fun marks_are_listed_in_time_order_since_process_start() {
+        val marks = mapOf("state-applied" to 1_410L, "vm-created" to 1_190L, "status-ready" to 1_230L, "never" to 0L)
+        assertEquals("vm-created 190, status-ready 230, state-applied 410", StartupTiming.formatMarks(1_000, marks))
+        assertEquals("", StartupTiming.formatMarks(1_000, emptyMap()))
+    }
+
+    @Test
+    fun format_appends_the_steps_when_there_are_some() {
+        assertEquals(
+            "startup: process→first-frame 105 ms, process→core-ready 78 ms, process→list-data 510 ms (threads=102); " +
+                "at ms: vm-created 190",
+            StartupTiming.format(105, 78, 510, 102, steps = "vm-created 190"),
+        )
+    }
+
+    @Test
+    fun a_mark_keeps_its_first_time() {
+        StartupTiming.mark("test-only-mark", 100)
+        StartupTiming.mark("test-only-mark", 900)
+        assertEquals(100L, StartupTiming.snapshotMarks()["test-only-mark"])
+    }
 }
