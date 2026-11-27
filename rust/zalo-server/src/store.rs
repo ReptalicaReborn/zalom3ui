@@ -916,7 +916,9 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
         .or_else(|| remote_str(content_map.get("href")))
         .or_else(|| remote_str(params.get("oriUrl")))
         .or_else(|| remote_str(params.get("origUrl")))
+        .or_else(|| remote_str(params.get("hdUrl")))
         .or_else(|| remote_str(params.get("normalUrl")))
+        .or_else(|| remote_str(params.get("rawUrl")))
         .or_else(|| remote_str(params.get("url")))
     } else {
         non_empty_str(content_map.get("href"))
@@ -3149,6 +3151,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hd.href.as_deref(), Some("https://x/hd.jpg"));
+
+        // HD upload echo: no content.href/thumb, only hdUrl/rawUrl/thumbUrl in params
+        let echo = parse_attachment(
+            "chat.photo",
+            &json!({
+                "params": json!({
+                    "hdUrl": "https://x/hd2.jpg",
+                    "rawUrl": "https://x/raw.jpg",
+                    "thumbUrl": "https://x/t2.jpg",
+                    "width": 1080,
+                    "height": 5400,
+                }).to_string(),
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(echo.href.as_deref(), Some("https://x/hd2.jpg"));
+        assert_eq!(echo.thumb.as_deref(), Some("https://x/t2.jpg"));
+        let raw_only = parse_attachment(
+            "chat.photo",
+            &json!({ "params": json!({ "rawUrl": "https://x/raw.jpg" }).to_string() }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(raw_only.href.as_deref(), Some("https://x/raw.jpg"));
     }
 
     #[test]

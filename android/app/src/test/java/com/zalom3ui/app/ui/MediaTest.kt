@@ -163,4 +163,13 @@ class MediaTest {
         assertEquals(listOf("Đức Anh"), filterPeople(people, "duc").map { it.name })
         assertEquals(3, filterPeople(people, " ").size)
     }
+
+    @Test
+    fun imageUrlExtensionNamesTheFileTypeOnly() {
+        assertEquals("jxl", imageUrlExtension("https://photo.zdn.vn/a/b/c.JXL?token=abc#frag"))
+        assertEquals("jpg", imageUrlExtension("https://photo.zdn.vn/a/b/c.jpg"))
+        assertEquals("none", imageUrlExtension("https://photo.zdn.vn/a/b/c"))
+        assertEquals("none", imageUrlExtension("https://photo.zdn.vn.example/"))
+        assertEquals("none", imageUrlExtension(null))
+    }
 }

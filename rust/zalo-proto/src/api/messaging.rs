@@ -634,7 +634,9 @@ impl ZaloClient {
                     m.insert("hdSize".to_string(), json!(total_size.to_string()));
                     m.insert("zsource".to_string(), json!(-1));
                     m.insert("ttl".to_string(), json!(options.ttl.unwrap_or(0)));
-                    m.insert("jcp".to_string(), json!("{\"convertible\":\"jxl\"}"));
+                    // No `jcp: {"convertible":"jxl"}` (Zalo Web sends it; it can show JPEG XL). It lets
+                    // Zalo serve the photo as JPEG XL, which Android cannot decode: a high-quality JPG we
+                    // sent came back as "Media unavailable" while ordinary photos showed.
                     if is_multi {
                         m.insert("groupLayoutId".to_string(), json!(group_layout_id));
                         m.insert("isGroupLayout".to_string(), json!(1));
