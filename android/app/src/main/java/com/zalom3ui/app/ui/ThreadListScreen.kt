@@ -37,6 +37,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Chat
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Drafts
@@ -47,6 +48,7 @@ import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.WifiOff
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.Card
@@ -146,6 +148,8 @@ class ThreadListActions(
     val onMute: (ThreadSummary, MuteOption?) -> Unit,
     val onMarkRead: (ThreadSummary) -> Unit,
     val onMarkUnread: (ThreadSummary) -> Unit,
+    /** Turns on "Hide official accounts" (from an OA chat's long-press menu). */
+    val onHideOfficialAccounts: () -> Unit = {},
     val onDelete: (ThreadSummary) -> Unit,
     val onSearchMessages: (String) -> Unit = {},
     val onOpenSearchHit: (MessageSearchHit) -> Unit = {},
@@ -153,14 +157,34 @@ class ThreadListActions(
 )
 
 /** Filter modes shown in the chat list's connected pill bar. */
-enum class ChatFilter { ALL, UNREAD, GROUPS }
+enum class ChatFilter {
+    ALL,
+    UNREAD,
+    GROUPS,
+    /** Only Official Accounts; reached from the "Official accounts (N)" row, not from the pill bar. */
+    OFFICIAL,
+}
 
 /** Pure helper that filters conversation summaries according to [filter], preserving order. */
 internal fun filterChats(chats: List<ThreadSummary>, filter: ChatFilter): List<ThreadSummary> = when (filter) {
     ChatFilter.ALL -> chats
     ChatFilter.UNREAD -> chats.filter { it.unread > 0 }
     ChatFilter.GROUPS -> chats.filter { it.kind == "group" }
+    ChatFilter.OFFICIAL -> chats.filter { it.isOfficialAccount }
 }
+
+/**
+ * The chats the list shows for [filter]. With [hideOfficialAccounts] on, Official Accounts are left out of every
+ * filter except [ChatFilter.OFFICIAL], which exists to reach them.
+ */
+internal fun chatsForFilter(chats: List<ThreadSummary>, filter: ChatFilter, hideOfficialAccounts: Boolean): List<ThreadSummary> {
+    val base = if (hideOfficialAccounts && filter != ChatFilter.OFFICIAL) chats.filterNot { it.isOfficialAccount } else chats
+    return filterChats(base, filter)
+}
+
+/** How many Official Account chats the "Official accounts (N)" row stands for; 0 when they are not hidden. */
+internal fun hiddenOfficialAccountCount(chats: List<ThreadSummary>, hideOfficialAccounts: Boolean): Int =
+    if (hideOfficialAccounts) chats.count { it.isOfficialAccount } else 0
 
 private val WHITESPACE_REGEX = Regex("\\s+")
 
@@ -216,7 +240,7 @@ internal fun findHighlightRanges(text: String, query: String): List<IntRange> {
     return ranges
 }
 
-private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE }
+private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE, HIDE_OFFICIAL }
 
 /**
  * The chat list. It takes only the parts of [UiState] it shows, so it skips recomposing when anything else changes;
@@ -238,6 +262,8 @@ fun ThreadListScreen(
     messageSearchBusy: Boolean,
     actions: ThreadListActions,
     selectedKey: String? = null,
+    /** "Hide official accounts" setting: OA chats move behind an "Official accounts (N)" row. */
+    hideOfficialAccounts: Boolean = false,
 ) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -251,6 +277,7 @@ fun ThreadListScreen(
         query = ""
     }
     BackHandler(enabled = searching) { closeSearch() }
+    BackHandler(enabled = !searching && filter == ChatFilter.OFFICIAL) { filter = ChatFilter.ALL }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val latestOnSearchMessages by rememberUpdatedState(actions.onSearchMessages)
@@ -264,9 +291,14 @@ fun ThreadListScreen(
     val chats = remember(threads, drafts) {
         threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 || !drafts[it.ref.key].isNullOrBlank() }
     }
-    val unreadChatCount = remember(chats) { chats.count { it.unread > 0 } }
-    val visibleChats = remember(chats, filter, searching) {
-        if (searching) chats else filterChats(chats, filter)
+    val unreadChatCount = remember(chats, hideOfficialAccounts) {
+        chats.count { it.unread > 0 && !(hideOfficialAccounts && it.isOfficialAccount) }
+    }
+    val officialCount = remember(chats, hideOfficialAccounts) { hiddenOfficialAccountCount(chats, hideOfficialAccounts) }
+    // If the setting is turned off while the official-accounts list is open, fall back to all chats.
+    val activeFilter = if (filter == ChatFilter.OFFICIAL && !hideOfficialAccounts) ChatFilter.ALL else filter
+    val visibleChats = remember(chats, activeFilter, searching, hideOfficialAccounts) {
+        if (searching) chats else chatsForFilter(chats, activeFilter, hideOfficialAccounts)
     }
     val folded = foldForSearch(query.trim())
     val matches = remember(threads, folded) {
@@ -283,6 +315,7 @@ fun ThreadListScreen(
             RowAction.READ -> actions.onMarkRead(thread)
             RowAction.UNREAD -> actions.onMarkUnread(thread)
             RowAction.DELETE -> deleteFor = thread
+            RowAction.HIDE_OFFICIAL -> actions.onHideOfficialAccounts()
         }
     }
 
@@ -451,11 +484,21 @@ fun ThreadListScreen(
                         )
                     }
                 }
+                if (!searching && officialCount > 0 && activeFilter == ChatFilter.OFFICIAL) {
+                    item(key = "official-back", contentType = "official-row") {
+                        OfficialAccountsRow(
+                            text = "Official accounts ($officialCount)",
+                            hint = "Back to all chats",
+                            onClick = { filter = ChatFilter.ALL },
+                        )
+                    }
+                }
                 if (chats.isEmpty()) {
                     item(key = "empty", contentType = "empty") { EmptyChats() }
                 } else if (visibleChats.isEmpty()) {
                     item(key = "empty-filtered", contentType = "empty") {
-                        val (title, subtitle) = when (filter) {
+                        val (title, subtitle) = when (activeFilter) {
+                            ChatFilter.OFFICIAL -> "No official accounts" to "News, shops and notification senders appear here."
                             ChatFilter.UNREAD -> "All caught up" to "No unread conversations right now."
                             ChatFilter.GROUPS -> "No group chats" to "Group conversations you join or create appear here."
                             ChatFilter.ALL -> "No chats yet" to "New messages appear here. Tap the pencil to write to a friend or group."
@@ -463,9 +506,18 @@ fun ThreadListScreen(
                         EmptyChats(
                             title = title,
                             subtitle = subtitle,
-                            actionLabel = if (filter != ChatFilter.ALL) "View all chats" else null,
-                            onAction = if (filter != ChatFilter.ALL) ({ filter = ChatFilter.ALL }) else null,
+                            actionLabel = if (activeFilter != ChatFilter.ALL) "View all chats" else null,
+                            onAction = if (activeFilter != ChatFilter.ALL) ({ filter = ChatFilter.ALL }) else null,
                         )
+                    }
+                    if (officialCount > 0 && activeFilter == ChatFilter.ALL) {
+                        item(key = "official-row", contentType = "official-row") {
+                            OfficialAccountsRow(
+                                text = "Official accounts ($officialCount)",
+                                hint = "Hidden from your chat list",
+                                onClick = { filter = ChatFilter.OFFICIAL },
+                            )
+                        }
                     }
                 } else {
                     val pinned = visibleChats.filter { it.pinned }
@@ -497,6 +549,15 @@ fun ThreadListScreen(
                             onLongClick = { sheetFor = thread },
                             onAction = { onRowAction(thread, it) },
                         )
+                    }
+                    if (officialCount > 0 && activeFilter == ChatFilter.ALL) {
+                        item(key = "official-row", contentType = "official-row") {
+                            OfficialAccountsRow(
+                                text = "Official accounts ($officialCount)",
+                                hint = "Hidden from your chat list",
+                                onClick = { filter = ChatFilter.OFFICIAL },
+                            )
+                        }
                     }
                 }
             }
@@ -549,6 +610,32 @@ fun ThreadListScreen(
 }
 
 private const val MAX_RESULTS = 100
+
+/** Compact row that stands in for hidden Official Accounts and opens (or leaves) their own list. */
+@Composable
+private fun OfficialAccountsRow(text: String, hint: String, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Outlined.Campaign, contentDescription = null, tint = colors.onSurfaceVariant)
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(text, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                hint,
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -1187,6 +1274,13 @@ private fun ThreadActionsSheet(
                     label = "Mark as unread",
                     icon = Icons.Outlined.MarkChatUnread,
                     onClick = { onAction(RowAction.UNREAD) },
+                )
+            }
+            if (thread.isOfficialAccount) {
+                SheetActionRow(
+                    label = "Hide official accounts",
+                    icon = Icons.Outlined.VisibilityOff,
+                    onClick = { onAction(RowAction.HIDE_OFFICIAL) },
                 )
             }
             HorizontalDivider(

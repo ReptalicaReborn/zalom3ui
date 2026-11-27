@@ -142,6 +142,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -265,6 +266,10 @@ class ChatActions(
     val onSetDisappearingTtl: (Long?) -> Unit = {},
     val onLoadFriends: () -> Unit = {},
     val onSendCard: (Person) -> Unit = {},
+    /** Contact cards: open (or start) the 1:1 chat with the shared person. */
+    val onOpenUserChat: (Person) -> Unit = {},
+    /** Contact cards: send the shared person a friend request. */
+    val onAddFriend: (Person) -> Unit = {},
     val onCancelOutbox: (String) -> Unit = {},
     val onRetryOutbox: () -> Unit = {},
 )
@@ -300,6 +305,14 @@ fun ChatScreen(
     outboxEntries: List<OutboxEntry> = emptyList(),
     friends: List<Person> = emptyList(),
 ) {
+    val contactCardActions = remember(friends, actions) {
+        ContactCardActions(
+            isFriend = { id -> friends.any { it.id == id } },
+            onMessage = actions.onOpenUserChat,
+            onAddFriend = actions.onAddFriend,
+        )
+    }
+    CompositionLocalProvider(LocalContactCardActions provides contactCardActions) {
     if (chatAccentOverride != null && appearance != null) {
         AppTheme(
             appearance = appearance.copy(accent = chatAccentOverride, dynamicColor = false),
@@ -339,6 +352,7 @@ fun ChatScreen(
             outboxEntries = outboxEntries,
             friends = friends,
         )
+    }
     }
 }
 

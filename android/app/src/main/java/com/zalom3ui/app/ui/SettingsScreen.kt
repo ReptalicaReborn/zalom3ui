@@ -29,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
@@ -115,6 +116,8 @@ fun SettingsScreen(
     onLogout: () -> Unit,
     reducedMotion: Boolean = false,
     onReducedMotion: (Boolean) -> Unit = {},
+    hideOfficialAccounts: Boolean = false,
+    onHideOfficialAccounts: (Boolean) -> Unit = {},
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
     onSyncHistory: () -> Unit = {},
@@ -422,6 +425,29 @@ fun SettingsScreen(
             }
 
             if (current.onDevice) IncomingCallSettings()
+
+            SectionHeader("Chats")
+            ExpressiveSettingsGroup(
+                items = listOf<@Composable () -> Unit>(
+                    {
+                        ListItem(
+                            modifier = Modifier.clickable { onHideOfficialAccounts(!hideOfficialAccounts) },
+                            colors = transparentListItemColors,
+                            leadingContent = { Icon(Icons.Outlined.Campaign, null) },
+                            headlineContent = { Text("Hide official accounts") },
+                            supportingContent = {
+                                Text("News, shops and ZNS notifications won't show in your chat list or notify you")
+                            },
+                            trailingContent = {
+                                Switch(
+                                    checked = hideOfficialAccounts,
+                                    onCheckedChange = onHideOfficialAccounts,
+                                )
+                            },
+                        )
+                    },
+                ),
+            )
 
             // How long Zalo stays connected (only the on-phone core has this choice), and codes from Zalo's notifications.
             StayConnectedSettings(showModes = current.onDevice)

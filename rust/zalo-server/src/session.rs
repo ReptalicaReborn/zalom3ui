@@ -1395,6 +1395,12 @@ impl ZaloSession {
         let kind = from_thread_type(raw.thread_type);
         let own_id = self.own_id();
         let msg = normalize_message(&raw.data, kind, &raw.thread_id, raw.is_self, own_id.as_deref());
+        if kind == ThreadKind::User
+            && is_official_account_message(&raw.data, &msg.msg_type, msg.is_self)
+            && self.store.mark_official_account(&raw.thread_id)
+        {
+            self.broadcast_event(json!({ "type": "threads" }));
+        }
 
         if let Some(ref poll) = msg.attachment.as_ref().and_then(|a| a.poll.as_ref()) {
             if msg.thread_kind == ThreadKind::Group {
@@ -1512,10 +1518,14 @@ impl ZaloSession {
                         let name = non_empty_str(prof.get("displayName"))
                             .or_else(|| non_empty_str(prof.get("zaloName")));
                         let avatar = non_empty_str(prof.get("avatar")).unwrap_or_default();
+                        let clean_id = raw_id.split('_').next().unwrap_or(raw_id).to_string();
+                        if profile_is_official_account(prof) {
+                            session.store.mark_official_account(&clean_id);
+                            changed = true;
+                        }
                         if name.is_none() && avatar.is_empty() {
                             continue;
                         }
-                        let clean_id = raw_id.split('_').next().unwrap_or(raw_id).to_string();
                         session.store.upsert_thread(ThreadInfo {
                             id: clean_id.clone(),
                             kind: ThreadKind::User,
@@ -1936,6 +1946,11 @@ impl ZaloSession {
                 for key in ["changed_profiles", "unchanged_profiles"] {
                     if let Some(map) = res.get(key).and_then(|v| v.as_object()) {
                         for (raw_id, p) in map {
+                            if profile_is_official_account(p) {
+                                let oa_id = raw_id.split('_').next().unwrap_or(raw_id);
+                                self.store.mark_official_account(oa_id);
+                                changed = true;
+                            }
                             let Some(name) = non_empty_str(p.get("displayName"))
                                 .or_else(|| non_empty_str(p.get("zaloName")))
                             else {
@@ -4281,6 +4296,27 @@ fn is_plain_numeric_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 11 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Whether a raw incoming message proves its 1:1 sender is an Official Account: it arrived via
+/// `pageMsgs` (marked `isPage` by the listener), or it is an OA-only card type from the peer.
+fn is_official_account_message(data: &Value, msg_type: &str, is_self: bool) -> bool {
+    if data.get("isPage").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    !is_self && matches!(msg_type, "chat.webcontent" | "chat.webcontent.v2")
+}
+
+/// Whether a Zalo `getUserInfo` profile describes an Official Account: a non-empty `oaInfo`
+/// object, or an explicit `isOA` flag.
+fn profile_is_official_account(prof: &Value) -> bool {
+    let truthy = |v: Option<&Value>| match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().is_some_and(|n| n != 0),
+        Some(Value::Object(o)) => !o.is_empty(),
+        _ => false,
+    };
+    truthy(prof.get("oaInfo")) || truthy(prof.get("isOA")) || truthy(prof.get("is_oa"))
+}
+
 fn non_empty_str(v: Option<&Value>) -> Option<String> {
     match v {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -4448,6 +4484,19 @@ fn parse_board_item(item: &Value) -> Option<BoardItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_account_detection_signals() {
+        use serde_json::json;
+        assert!(is_official_account_message(&json!({"isPage": true}), "webchat", false));
+        assert!(is_official_account_message(&json!({}), "chat.webcontent", false));
+        assert!(!is_official_account_message(&json!({}), "chat.webcontent", true));
+        assert!(!is_official_account_message(&json!({}), "webchat", false));
+        assert!(profile_is_official_account(&json!({"oaInfo": {"oaId": "1"}})));
+        assert!(profile_is_official_account(&json!({"isOA": 1})));
+        assert!(!profile_is_official_account(&json!({"oaInfo": null, "isOA": 0})));
+        assert!(!profile_is_official_account(&json!({"displayName": "A"})));
+    }
 
     #[test]
     fn mute_until_values_are_sensible() {

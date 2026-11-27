@@ -1390,6 +1390,8 @@ fn try_normalize_page(
     data_map.insert("dName".to_string(), Value::String(d_name));
     data_map.insert("ts".to_string(), ts);
     data_map.insert("content".to_string(), content);
+    // Marker for the server: this message came through `pageMsgs` (Official Account / ZNS).
+    data_map.insert("isPage".to_string(), Value::Bool(true));
 
     for opt_key in ["propertyExt", "ttl", "st", "at", "cmd", "mentions"] {
         if let Some(v) = obj.get(opt_key) {

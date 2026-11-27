@@ -202,7 +202,15 @@ class SettingsStore(context: Context) {
             prefs.edit().putBoolean(KEY_REDUCED_MOTION, value).apply()
         }
 
+    /** Hide Official Accounts (news, shops, ZNS senders) from the chat list and don't notify for them. */
+    var hideOfficialAccounts: Boolean
+        get() = prefs.getBoolean(KEY_HIDE_OFFICIAL_ACCOUNTS, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HIDE_OFFICIAL_ACCOUNTS, value).apply()
+        }
+
     internal companion object {
+        const val KEY_HIDE_OFFICIAL_ACCOUNTS = "hide_official_accounts"
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
         const val KEY_OTP_FROM_ZALO_NOTIFICATIONS = "otp_from_zalo_notifications"

@@ -153,6 +153,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val latestDrafts = HashMap<String, String>(_state.value.drafts)
     private val draftSaves = HashMap<String, Job>()
 
+    private val _hideOfficialAccounts = MutableStateFlow(settingsStore.hideOfficialAccounts)
+    /** "Hide official accounts": the chat list hides OA chats behind an "Official accounts (N)" row. */
+    val hideOfficialAccounts: StateFlow<Boolean> = _hideOfficialAccounts.asStateFlow()
+
     private val _reducedMotion = MutableStateFlow(settingsStore.reducedMotion)
     /** User preference for reduced motion (combined with system setting at the theme root). */
     val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
@@ -245,6 +249,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setAppearance(appearance: Appearance) {
         settingsStore.saveAppearance(appearance)
         _state.update { it.copy(appearance = appearance) }
+    }
+
+    fun setHideOfficialAccounts(hide: Boolean) {
+        settingsStore.hideOfficialAccounts = hide
+        _hideOfficialAccounts.value = hide
     }
 
     fun setReducedMotion(enabled: Boolean) {
