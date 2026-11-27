@@ -91,8 +91,9 @@ The details (how a request travels, events, calls, storage, the connection lifec
 ### Logging in
 
 - **Zalo is on another phone:** tap **Get QR code** and scan it with that phone (Zalo → QR icon next to search).
-- **Zalo is on this same phone:** tap **Get QR code**, then **Save image**. In Zalo, open the QR scanner, tap the
-  picture button and pick the saved code. **Share** sends the image elsewhere (e.g. to a computer to scan from).
+- **Zalo is on this same phone:** Zalo only accepts a live scan, not a saved picture of the code, and you can't scan
+  your own screen. Tap **Get QR code**, then **Send to another phone**, open the code on that phone's screen (or a
+  computer's) and scan it with Zalo on this one.
 - Confirm on the phone.
 
 *Settings → Restart Zalo service* restarts the core if it gets stuck; *Log out of Zalo* removes the session and the

@@ -1,11 +1,5 @@
 package com.zalom3ui.app.ui
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
-import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -25,7 +19,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.HelpOutline
-import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.QrCode2
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Share
@@ -61,7 +54,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import com.zalom3ui.app.data.SessionStatus
 import kotlinx.coroutines.launch
 
@@ -77,26 +69,6 @@ fun LoginScreen(
     val scope = rememberCoroutineScope()
     val qr = remember(status.qrImage) { status.qrImage?.let(::decodeDataUrl) }
     var showHelp by rememberSaveable { mutableStateOf(false) }
-
-    fun save() {
-        val bitmap = qr ?: return
-        scope.launch {
-            val ok = QrActions.saveToGallery(context, bitmap)
-            Toast.makeText(
-                context,
-                if (ok) "Saved to Pictures. In Zalo, open the QR scanner and pick it from your gallery." else "Couldn't save the image",
-                Toast.LENGTH_LONG,
-            ).show()
-        }
-    }
-    val storagePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) save()
-    }
-    fun saveWithPermission() {
-        val legacy = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
-        if (legacy) storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE) else save()
-    }
 
     Scaffold(
         topBar = {
@@ -133,7 +105,8 @@ fun LoginScreen(
                         Text(
                             when {
                                 status.scannedBy != null -> "Scanned by ${status.scannedBy}. Tap “Log in” on the phone to finish."
-                                else -> "Scan this code with the Zalo app on another phone, or save it and pick it in Zalo's QR scanner on this one."
+                                else -> "Scan this code live with the QR scanner in the Zalo app (the QR icon next to search). " +
+                                    "Zalo doesn't accept a saved picture of it."
                             },
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -219,23 +192,22 @@ fun LoginScreen(
             ) {
                 when {
                     qr != null -> {
+                        Text(
+                            "Zalo is on this phone? You can't scan your own screen: send the code to another phone, " +
+                                "open it there and scan that screen with Zalo here.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                         Button(
-                            onClick = { saveWithPermission() },
-                            shape = CircleShape,
-                            modifier = Modifier.fillMaxWidth().height(54.dp),
-                        ) {
-                            Icon(Icons.Outlined.Download, null, Modifier.size(18.dp))
-                            Spacer(Modifier.size(8.dp))
-                            Text("Save image", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-                        }
-                        OutlinedButton(
                             onClick = { scope.launch { QrActions.share(context, qr) } },
                             shape = CircleShape,
                             modifier = Modifier.fillMaxWidth().height(54.dp),
                         ) {
                             Icon(Icons.Outlined.Share, null, Modifier.size(18.dp))
                             Spacer(Modifier.size(8.dp))
-                            Text("Share", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                            Text("Send to another phone", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                         }
                     }
                     status.retrying -> {
@@ -288,9 +260,10 @@ private fun LoginHelp(onClose: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             val steps = listOf(
                 "Tap “Get QR code”.",
-                "Zalo is on this phone: tap “Save image”, then in Zalo tap the QR icon next to search, " +
-                    "choose the picture button and pick the saved code.",
-                "Zalo is on another phone: scan the code on this screen with that phone's Zalo QR scanner.",
+                "Zalo is on another phone: scan the code on this screen with that phone's Zalo QR scanner " +
+                    "(the QR icon next to search).",
+                "Zalo is on this same phone: Zalo can't scan a saved picture, only a live code. Tap " +
+                    "“Send to another phone”, open the code on that phone's screen, and scan it with Zalo on this one.",
                 "Confirm the login in Zalo. Only one web session can be active, so this logs out Zalo Web elsewhere.",
             )
             steps.forEachIndexed { i, step ->

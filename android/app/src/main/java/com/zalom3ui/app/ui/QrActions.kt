@@ -13,70 +13,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * The login QR code has to be scanned by the Zalo app, which usually lives on this same phone.
- * Zalo's QR scanner can read a code from a picture in the gallery, so offer to save or share it.
+ * The login QR code has to be scanned live by the Zalo app's camera: Zalo does not accept a saved picture of it.
+ * When Zalo is on this same phone, the code is sent to another phone (or computer) and scanned from that screen.
  */
 object QrActions {
     private const val SHARED_FILE_MAX_AGE_MS = 60 * 60_000L
 
-    /** Saves [qr] to Pictures/Zalỏ. Returns false when it couldn't. */
-    suspend fun saveToGallery(context: Context, qr: Bitmap): Boolean = withContext(Dispatchers.IO) {
-        val prepared = try {
-            withQuietZone(qr)
-        } catch (_: Exception) {
-            return@withContext false
-        }
-        try {
-            save(context, prepared, "zalo-login-${System.currentTimeMillis()}.png")
-        } catch (_: Exception) {
-            false
-        } finally {
-            prepared.recycle()
-        }
-    }
-
-    private fun save(context: Context, image: Bitmap, name: String): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val resolver = context.contentResolver
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/Zalỏ")
-            }
-            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return false
-            try {
-                val out = resolver.openOutputStream(uri)
-                if (out == null) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    return false
-                }
-                val ok = out.use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                if (!ok) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    return false
-                }
-            } catch (e: Exception) {
-                runCatching { resolver.delete(uri, null, null) }
-                throw e
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Zalỏ")
-            dir.mkdirs()
-            val file = File(dir, name)
-            val ok = file.outputStream().use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            if (!ok) {
-                file.delete()
-                return false
-            }
-            @Suppress("DEPRECATION")
-            context.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, android.net.Uri.fromFile(file)))
-        }
-        return true
-    }
-
-    /** Opens the share sheet with the QR image, e.g. to send it to a computer or another phone. */
+    /** Opens the share sheet with the QR image, to send it to the other phone (or computer) it will be scanned from. */
     suspend fun share(context: Context, qr: Bitmap) {
         val uri = withContext(Dispatchers.IO) {
             runCatching {
