@@ -24,7 +24,7 @@ enum class ThemeMode(val label: String) {
 
 enum class ChatAccent(val key: String, val label: String) {
     ULTRAMARINE("ultramarine", "Ultramarine"),
-    REPTDOC_GOLD("gold", "ReptDoc gold"),
+    REPTDOC_GOLD("gold", "Gold"),
     CRIMSON("crimson", "Crimson"),
     FOREST("forest", "Forest"),
     PLUM("plum", "Plum"),
