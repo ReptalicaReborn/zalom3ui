@@ -391,18 +391,39 @@ private fun MediaFrame(
             .heightIn(max = 360.dp)
             .clip(RoundedCornerShape(12.dp))
     }
-    // Placeholder under the photo (no subcomposition per bubble): the loading one, or "unavailable" if it fails.
-    // Hidden once the photo is in.
-    var loadState by remember(activeUrl) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
-    Box(frameMod.clickable(onClick = onClick)) {
-        when (loadState) {
-            is AsyncImagePainter.State.Success -> {}
-            is AsyncImagePainter.State.Error -> MediaUnavailablePlaceholder()
+    // A photo we just sent can fail to load until Zalo has processed the upload, so a failure is retried a few
+    // times (and on tap) before it counts. Each attempt is a new request; Coil caches no failures.
+    var attempt by remember(url, fallbackUrl) { mutableStateOf(0) }
+    var failed by remember(url, fallbackUrl, attempt) { mutableStateOf(false) }
+    val retriesLeft = attempt < MEDIA_RETRY_DELAYS_MS.size
+    if (failed && retriesLeft) {
+        LaunchedEffect(url, fallbackUrl, attempt) {
+            delay(MEDIA_RETRY_DELAYS_MS[attempt])
+            activeUrl = url
+            attempt += 1
+        }
+    }
+    // Placeholder under the photo (no subcomposition per bubble): the loading one, or "unavailable" once retries
+    // are spent. Hidden once the photo is in.
+    var loadState by remember(activeUrl, attempt) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+    val clickMod = Modifier.clickable {
+        if (failed) {
+            // Tap to try again now.
+            activeUrl = url
+            attempt += 1
+        } else {
+            onClick()
+        }
+    }
+    Box(frameMod.then(clickMod)) {
+        when {
+            loadState is AsyncImagePainter.State.Success -> {}
+            failed && !retriesLeft -> MediaUnavailablePlaceholder()
             else -> MediaPlaceholder()
         }
         // Software bitmaps: a tall HD photo decoded to fill the frame can exceed the GPU texture limit as a hardware bitmap.
         val context = LocalContext.current
-        val request = remember(activeUrl) {
+        val request = remember(activeUrl, attempt) {
             ImageRequest.Builder(context).data(activeUrl).allowHardware(false).build()
         }
         AsyncImage(
@@ -415,12 +436,17 @@ private fun MediaFrame(
                     if (fallbackUrl != null && activeUrl != fallbackUrl) {
                         activeUrl = fallbackUrl
                     } else {
-                        // Shareable from Settings: why a photo shows "Media unavailable" (file type and error only, no URL).
-                        val e = state.result.throwable
-                        StartupLog.write(
-                            context,
-                            "image: load failed (.${imageUrlExtension(activeUrl)}): ${e.javaClass.simpleName}: ${e.message?.take(120)}",
-                        )
+                        failed = true
+                        if (attempt == 0 || attempt == MEDIA_RETRY_DELAYS_MS.size) {
+                            // Shareable from Settings: why a photo shows "Media unavailable" (file type and error
+                            // only, no URL), on the first failure and when the retries are spent.
+                            val e = state.result.throwable
+                            StartupLog.write(
+                                context,
+                                "image: load failed, attempt ${attempt + 1} (.${imageUrlExtension(activeUrl)}): " +
+                                    "${e.javaClass.simpleName}: ${e.message?.take(120)}",
+                            )
+                        }
                     }
                 }
             },
@@ -428,6 +454,9 @@ private fun MediaFrame(
         )
     }
 }
+
+/** Waits before each retry of a photo that failed to load: about a minute in all. */
+internal val MEDIA_RETRY_DELAYS_MS = longArrayOf(2_000, 4_000, 8_000, 15_000, 30_000)
 
 /** A photo URL's file extension (e.g. "jpg", "jxl"), for the log: never the URL itself. */
 internal fun imageUrlExtension(url: String?): String =
