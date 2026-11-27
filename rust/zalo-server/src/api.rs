@@ -20,7 +20,7 @@ use zalo_proto::{
     DeleteMessageTarget, DestType, ForwardMessagePayload, LastMessageInfo, ListenerHandle,
     LoginQrEvent, MuteAction, MuteDuration, NoisedIdsReply, ReactionTarget, Result as ProtoResult,
     SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType,
-    UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient, ZaloHttp,
+    UndoTarget, UploadProgressSink, UploadResult, UploadSource, WsEvent, ZaloClient, ZaloHttp,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -138,6 +138,18 @@ macro_rules! define_api_trait {
             /// Starts the chat-socket listener (self-listen on, retry-on-close on).
             fn start_listener(&self) -> ProtoResult<ListenerStart>;
 
+            /// `upload_attachment` reporting byte progress to `progress`. The default ignores it.
+            fn upload_attachment_progress<'a>(
+                &'a self,
+                sources: &'a [UploadSource],
+                thread_id: &'a str,
+                thread_type: ThreadType,
+                progress: Option<UploadProgressSink>,
+            ) -> BoxFuture<'a, ProtoResult<Vec<UploadResult>>> {
+                let _ = progress;
+                self.upload_attachment(sources, thread_id, thread_type)
+            }
+
             $( fn $name<'a>(&'a self $(, $arg: $ty)*) -> BoxFuture<'a, ProtoResult<$ret>>; )*
         }
 
@@ -156,6 +168,18 @@ macro_rules! define_api_trait {
                     events,
                     control: Arc::new(ProtoListenerControl(handle)),
                 })
+            }
+
+            fn upload_attachment_progress<'a>(
+                &'a self,
+                sources: &'a [UploadSource],
+                thread_id: &'a str,
+                thread_type: ThreadType,
+                progress: Option<UploadProgressSink>,
+            ) -> BoxFuture<'a, ProtoResult<Vec<UploadResult>>> {
+                Box::pin(self.client.upload_attachment_with_progress(
+                    sources, thread_id, thread_type, progress,
+                ))
             }
 
             $( fn $name<'a>(&'a self $(, $arg: $ty)*) -> BoxFuture<'a, ProtoResult<$ret>> {

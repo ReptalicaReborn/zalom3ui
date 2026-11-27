@@ -246,5 +246,7 @@ The standalone server, and the core inside the app, answer the same API. All end
 
 `GET /ws` is a WebSocket that pushes `status`, `message` (with `notify` and `threadName` when a phone should show it),
 `message_updated` (reactions, recalls, receipts, sticker images), `message_deleted`, `read`, `typing`, `threads`,
-`poll`, `call` and `history_sync` events. `GET /ws/call-audio` carries a call's audio and video frames
+`poll`, `call`, `history_sync` and `upload_progress` events. `upload_progress` reports
+`{ threadKind, threadId, uploadId, sent, total, done }` for each file being sent, at most every 100 ms. `GET
+/ws/call-audio` carries a call's audio and video frames
 ([docs/call-audio.md](docs/call-audio.md)). Inside the app, the same events and frames come over JNI instead.

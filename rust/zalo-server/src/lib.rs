@@ -13,6 +13,7 @@ pub mod session;
 pub mod socket_log;
 pub mod store;
 pub mod types;
+pub mod upload_progress;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -23,7 +23,7 @@ use zalo_proto::{
     DeleteMessageTarget, DestType, ForwardMessagePayload, LastMessageInfo, LoginQrEvent,
     MuteAction, MuteDuration, NoisedIdsReply, ProtoError, ReactionTarget, Result as ProtoResult,
     SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType,
-    UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient,
+    UndoTarget, UploadProgressSink, UploadResult, UploadSource, WsEvent, ZaloClient,
 };
 
 use crate::api::{BoxFuture, ListenerControl, ListenerStart, ZaloApi, ZaloLogin};
@@ -43,8 +43,29 @@ struct ListenerSlot {
     tx: mpsc::UnboundedSender<WsEvent>,
 }
 
+/// Scripted upload progress: called with the call's progress sink when the method is invoked.
+type ProgressScript = Arc<dyn Fn(&UploadProgressSink) + Send + Sync>;
+
+/// Finds the progress sink among a fake method's arguments (autoref specialization: only
+/// `SendMessageOptions` carries one).
+trait SinkFromOptions {
+    fn __sink(&self) -> Option<UploadProgressSink>;
+}
+impl SinkFromOptions for SendMessageOptions {
+    fn __sink(&self) -> Option<UploadProgressSink> {
+        self.progress.clone()
+    }
+}
+trait SinkFromOther {
+    fn __sink(&self) -> Option<UploadProgressSink> {
+        None
+    }
+}
+impl<T: ?Sized> SinkFromOther for &T {}
+
 #[derive(Default)]
 struct FakeState {
+    progress_scripts: HashMap<&'static str, ProgressScript>,
     calls: Vec<Call>,
     handlers: HashMap<&'static str, Handler>,
     listeners: Vec<ListenerSlot>,
@@ -106,6 +127,16 @@ impl FakeZaloApi {
         f: impl Fn(&[Value]) -> BoxFuture<'static, ProtoResult<Value>> + Send + Sync + 'static,
     ) {
         self.lock().handlers.insert(method, Arc::new(f));
+    }
+
+    /// Makes `method` (`send_message` or `upload_attachment`) report upload progress through the
+    /// sink the session passed, the way the real client does, by running `f` on it.
+    pub fn script_progress(
+        &self,
+        method: &'static str,
+        f: impl Fn(&UploadProgressSink) + Send + Sync + 'static,
+    ) {
+        self.lock().progress_scripts.insert(method, Arc::new(f));
     }
 
     /// Makes the next (and every) `start_listener` fail like a missing WebSocket URL would.
@@ -170,15 +201,22 @@ impl FakeZaloApi {
         &self,
         method: &'static str,
         args: Vec<Value>,
+        sink: Option<UploadProgressSink>,
     ) -> BoxFuture<'static, ProtoResult<Value>> {
-        let handler = {
+        let (handler, script) = {
             let mut st = self.lock();
             st.calls.push(Call {
                 method,
                 args: args.clone(),
             });
-            st.handlers.get(method).cloned()
+            (
+                st.handlers.get(method).cloned(),
+                st.progress_scripts.get(method).cloned(),
+            )
         };
+        if let (Some(script), Some(sink)) = (script, sink.as_ref()) {
+            script(sink);
+        }
         match handler {
             Some(h) => h(&args),
             None => Box::pin(async { Ok(Value::Null) }),
@@ -273,9 +311,28 @@ macro_rules! define_fake_methods {
                 })
             }
 
+            fn upload_attachment_progress<'a>(
+                &'a self,
+                sources: &'a [UploadSource],
+                thread_id: &'a str,
+                thread_type: ThreadType,
+                progress: Option<UploadProgressSink>,
+            ) -> BoxFuture<'a, ProtoResult<Vec<UploadResult>>> {
+                let args = vec![
+                    serde_json::to_value(sources).unwrap_or(Value::Null),
+                    serde_json::to_value(thread_id).unwrap_or(Value::Null),
+                    serde_json::to_value(thread_type).unwrap_or(Value::Null),
+                ];
+                let answer = self.dispatch("upload_attachment", args, progress);
+                Box::pin(async move { from_script::<Vec<UploadResult>>("upload_attachment", answer.await?) })
+            }
+
             $( fn $name<'a>(&'a self $(, $arg: $ty)*) -> BoxFuture<'a, ProtoResult<$ret>> {
                 let args = vec![$( serde_json::to_value(&$arg).unwrap_or(Value::Null) ),*];
-                let answer = self.dispatch(stringify!($name), args);
+                #[allow(unused_mut)]
+                let mut sink: Option<UploadProgressSink> = None;
+                $( if sink.is_none() { sink = (&$arg).__sink(); } )*
+                let answer = self.dispatch(stringify!($name), args, sink);
                 Box::pin(async move { from_script::<$ret>(stringify!($name), answer.await?) })
             } )*
         }

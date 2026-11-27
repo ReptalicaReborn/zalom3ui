@@ -460,3 +460,88 @@ async fn zalo_session_send_voice_fails_with_502_if_upload_attachment_returns_no_
     );
     assert_eq!(app.api.methods(), vec!["upload_attachment"]);
 }
+
+// ---- upload_progress events ----
+
+fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<Arc<str>>) -> Vec<Value> {
+    let mut out = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        out.push(serde_json::from_str::<Value>(&e).unwrap());
+    }
+    out.into_iter()
+        .filter(|e| e["type"] == "upload_progress")
+        .collect()
+}
+
+#[tokio::test]
+async fn send_attachment_broadcasts_upload_progress_events() {
+    use zalo_server::session::UploadFile;
+    let app = TestApp::new();
+    app.api.respond("send_message", json!({ "message": null, "attachment": [] }));
+    app.api.script_progress("send_message", |sink| {
+        for (sent, done) in [(0, false), (5, false), (10, true)] {
+            sink.report(zalo_proto::UploadProgress {
+                index: 0,
+                filename: "pic.png".into(),
+                sent,
+                total: 10,
+                done,
+            });
+        }
+    });
+    let mut rx = app.session.subscribe_events();
+    app.session
+        .send_attachment(
+            ThreadKind::Group,
+            "g1",
+            UploadFile {
+                data: vec![1; 10],
+                filename: "pic.png".into(),
+                width: Some(4),
+                height: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+    let ev = drain_events(&mut rx);
+    // The mid-progress report is within 100 ms of the start, so it is throttled away.
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    for e in &ev {
+        assert_eq!(e["threadKind"], "group");
+        assert_eq!(e["threadId"], "g1");
+        assert_eq!(e["total"], 10);
+        assert!(e["uploadId"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+    assert_eq!(ev[0]["uploadId"], ev[1]["uploadId"]);
+    assert_eq!((ev[0]["sent"].as_u64(), ev[0]["done"].as_bool()), (Some(0), Some(false)));
+    assert_eq!((ev[1]["sent"].as_u64(), ev[1]["done"].as_bool()), (Some(10), Some(true)));
+}
+
+#[tokio::test]
+async fn send_voice_broadcasts_upload_progress_even_when_the_upload_fails() {
+    let app = TestApp::new();
+    app.api.script_progress("upload_attachment", |sink| {
+        for (sent, done) in [(0, false), (3, true)] {
+            sink.report(zalo_proto::UploadProgress {
+                index: 0,
+                filename: "v.m4a".into(),
+                sent,
+                total: 6,
+                done,
+            });
+        }
+    });
+    app.api.fail("upload_attachment", || zalo_proto::ProtoError::UploadTimeout);
+    let mut rx = app.session.subscribe_events();
+    let res = app
+        .session
+        .send_voice(ThreadKind::User, "100", vec![0; 6], "v.m4a")
+        .await;
+    assert!(res.is_err());
+    let ev = drain_events(&mut rx);
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev[0]["threadKind"], "user");
+    assert_eq!(ev[1]["done"], true);
+    assert_eq!(ev[1]["sent"], 3);
+    assert_eq!(ev[1]["total"], 6);
+}

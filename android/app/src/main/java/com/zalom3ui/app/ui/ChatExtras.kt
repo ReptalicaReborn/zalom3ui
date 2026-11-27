@@ -1,5 +1,8 @@
 package com.zalom3ui.app.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,16 +41,19 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import com.zalom3ui.app.data.StickerInfo
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 
 /** Words Zalo's sticker search knows well, offered before anything is typed. */
 val STICKER_SUGGESTIONS = listOf("hi", "ok", "haha", "love", "cảm ơn", "buồn", "chúc ngủ ngon", "yêu", "giận", "wow")
@@ -180,30 +186,70 @@ fun LeaveGroupDialog(name: String, onDismiss: () -> Unit, onLeave: (silent: Bool
     )
 }
 
+/** Overall upload progress by chat key (see [AppViewModel.uploadProgress]); provided at the app root. */
+val LocalUploadProgress = staticCompositionLocalOf<StateFlow<Map<String, Float>>?> { null }
+
+/**
+ * [UploadingNote] for one chat. The progress flow is collected here, not in the chat screen, so the ~10 progress ticks
+ * a second recompose only this note.
+ */
 @Composable
-fun UploadingNote(count: Int) {
+fun UploadingNoteHost(threadKey: String, count: Int) {
+    val flow = LocalUploadProgress.current
+    val progress = flow?.collectAsState()?.value?.get(threadKey)
+    UploadingNote(count, progress)
+}
+
+/**
+ * "Sending N files… 45%" with a determinate wavy bar. [progress] is 0..1, or null while no byte count is known (the bar
+ * then sits flat at 0). The wave never travels (waveSpeed 0), so nothing animates between progress changes: the bar only
+ * redraws while [animateFloatAsState] eases to a new value, then goes idle again.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun UploadingNote(count: Int, progress: Float? = null) {
+    val animated by animateFloatAsState(
+        targetValue = progress?.coerceIn(0f, 1f) ?: 0f,
+        animationSpec = tween(durationMillis = 150, easing = LinearEasing),
+        label = "UploadProgress",
+    )
+    val hasProgress = progress != null
+    val label = (if (count == 1) "Sending 1 file…" else "Sending $count files…") +
+        (if (progress != null) " ${(progress.coerceIn(0f, 1f) * 100).toInt()}%" else "")
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp),
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(20.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Icon(
-                imageVector = Icons.Outlined.CloudUpload,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.primary,
-            )
-            Text(
-                if (count == 1) "Sending 1 file…" else "Sending $count files…",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.CloudUpload,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            LinearWavyProgressIndicator(
+                progress = { animated },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                amplitude = { if (hasProgress) 1f else 0f },
+                waveSpeed = 0.dp,
             )
         }
     }

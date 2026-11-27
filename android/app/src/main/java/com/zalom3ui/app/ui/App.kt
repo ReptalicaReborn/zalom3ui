@@ -215,7 +215,7 @@ private fun AppNav(vm: AppViewModel) {
     }
     LaunchedEffect(polls) { vm.pollEvents.collect { polls.onChanged(it) } }
 
-    CompositionLocalProvider(LocalPolls provides polls) {
+    CompositionLocalProvider(LocalPolls provides polls, LocalUploadProgress provides vm.uploadProgress) {
     NavHost(
         navController = nav,
         startDestination = Routes.HOME,
