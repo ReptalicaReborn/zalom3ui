@@ -715,6 +715,25 @@ pub struct GroupMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupLinkInfo {
+    pub link: Option<String>,
+    pub enabled: bool,
+    pub expiration_date: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub creator_id: String,
+    pub create_time: i64,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StickerInfo {
     pub id: i64,
     #[serde(default)]

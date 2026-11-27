@@ -299,11 +299,61 @@ data class AddMembersResult(
     val failed: List<String> = emptyList(),
 )
 
-/** `GET /threads/:kind/:id/info`: last-online for users, members for groups. */
+/** Lightweight thread identity returned by `GET /api/threads/user/{id}/info` commonGroups. */
+@Serializable
+data class ThreadInfo(
+    val id: String,
+    val kind: String,
+    val name: String,
+    val avatar: String = "",
+) {
+    val ref: ThreadRef get() = ThreadRef(kind, id)
+}
+
+/** `GET /api/threads/user/{id}/info`. */
+@Serializable
+data class UserThreadInfo(
+    val lastOnline: Long? = null,
+    val commonGroups: List<ThreadInfo> = emptyList(),
+)
+
+/** `GET`/`POST /api/groups/{id}/link`. */
+@Serializable
+data class GroupLinkInfo(
+    val link: String? = null,
+    val enabled: Boolean = false,
+    val expirationDate: Long? = null,
+)
+
+/** `POST /api/groups/join-link`. */
+@Serializable
+data class JoinGroupLinkResponse(
+    val groupId: String? = null,
+)
+
+/** One item from `GET /api/groups/{id}/board` or `POST /api/groups/{id}/notes`. */
+@Serializable
+data class BoardItem(
+    val id: String,
+    val kind: String,
+    val title: String,
+    val creatorId: String = "",
+    val createTime: Long = 0L,
+    val pinned: Boolean = false,
+)
+
+/** `GET /api/groups/{id}/board`. */
+@Serializable
+data class BoardResponse(
+    val items: List<BoardItem> = emptyList(),
+)
+
+/** `GET /threads/:kind/:id/info`: last-online and common groups for users, members for groups. */
 @Serializable
 data class ThreadDetails(
     val lastOnline: Long? = null,
     val members: List<GroupMember>? = null,
+    val commonGroups: List<ThreadInfo> = emptyList(),
 )
 
 data class ThreadRef(val kind: String, val id: String) {
@@ -341,6 +391,8 @@ data class PendingMessage(
 data class PendingShare(
     val text: String? = null,
     val uris: List<android.net.Uri> = emptyList(),
+    /** Present when the user picked a Direct Share conversation shortcut from the Android share sheet. */
+    val target: ThreadRef? = null,
 )
 
 /** Zalo's six quick reactions, in the order the official app shows them. */

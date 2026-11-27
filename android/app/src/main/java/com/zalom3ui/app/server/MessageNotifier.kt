@@ -8,16 +8,26 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import androidx.core.content.FileProvider
+import androidx.core.graphics.drawable.IconCompat
+import androidx.core.graphics.drawable.toBitmap
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
+import coil.size.Scale
 import com.zalom3ui.app.MainActivity
 import com.zalom3ui.app.R
 import com.zalom3ui.app.call.CallPopup
@@ -27,13 +37,18 @@ import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.ui.call.CallActivity
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Shows a notification for each new message the on-phone server flags (`notify`: not mine, not muted, not the chat on
@@ -46,15 +61,33 @@ class MessageNotifier(
     /** Called after a message notification for the chat was posted, with the chat's title (the bridge hides Zalo's own). */
     private val onPosted: (ThreadRef, String) -> Unit = { _, _ -> },
 ) {
+    private val stateLock = Any()
+
     private val history = object : LinkedHashMap<String, ArrayDeque<Line>>(MAX_THREADS, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArrayDeque<Line>>?): Boolean =
             size > MAX_THREADS
     }
 
-    private data class Line(val sender: String, val text: String, val ts: Long)
+    private data class Line(
+        val id: String,
+        val sender: String,
+        val senderId: String,
+        val text: String,
+        val ts: Long,
+        val mediaUri: Uri? = null,
+        val mediaMime: String? = null,
+    )
 
     /** The latest one-time code in each chat's notification, kept (10 min) until the chat is read, so "Copy" survives newer lines. */
     private val otpByThread = HashMap<String, Pair<String, Long>>()
+
+    /** Monotonic counter per thread so cancelled or superseded async notification jobs never post stale alerts. */
+    private val generationByThread = HashMap<String, Long>()
+
+    /** Cached thread avatar URLs keyed by `ThreadRef.key`, refreshed lazily from the on-device core. */
+    private val avatarUrls = ConcurrentHashMap<String, String>()
+    @Volatile
+    private var lastThreadsFetchMs = 0L
 
     private var scope: CoroutineScope? = null
 
@@ -66,6 +99,7 @@ class MessageNotifier(
             while (isActive) {
                 try {
                     val api = ApiClient.onDevice(context)
+                    launch(Dispatchers.IO) { refreshAvatarUrls(force = true) }
                     api.events().collect { onEvent(it) }
                 } catch (e: CancellationException) {
                     throw e
@@ -83,90 +117,279 @@ class MessageNotifier(
             is ServerEvent.Read -> cancel(event.thread)
             is ServerEvent.CallIncoming -> showCall(event.call)
             is ServerEvent.CallEnded -> endCall(event.callId)
+            is ServerEvent.ThreadsChanged -> scope?.launch(Dispatchers.IO) { refreshAvatarUrls(force = false) }
             else -> Unit
+        }
+    }
+
+    private suspend fun refreshAvatarUrls(force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastThreadsFetchMs < THREADS_REFRESH_MIN_MS) return
+        lastThreadsFetchMs = now
+        val threads = runCatching { ApiClient.onDevice(context).threads() }.getOrNull() ?: return
+        for (t in threads) {
+            if (t.avatar.isNotBlank()) avatarUrls[t.key] = t.avatar
         }
     }
 
     private fun show(msg: ChatMessage, threadName: String) {
         val ref = ThreadRef(msg.threadKind, msg.threadId)
-        val lines = history.getOrPut(ref.key) { ArrayDeque() }
-        val otp = OtpText.messageCode(msg)
-        if (otp != null) {
-            otpByThread[ref.key] = otp to System.currentTimeMillis()
-            OtpNotifications.dedupe.noteNotified(otp, System.currentTimeMillis())
-        }
-        val text = notificationText(msg)
-        lines.addLast(Line(msg.fromName.ifBlank { threadName }, if (otp != null) OtpText.line(otp, text) else text, msg.ts))
-        while (lines.size > MAX_LINES) lines.removeFirst()
-
         val isGroup = ref.kind == "group"
-        val me = Person.Builder().setName("You").build()
-        val style = NotificationCompat.MessagingStyle(me)
-            .setConversationTitle(if (isGroup) threadName else null)
-            .setGroupConversation(isGroup)
-        for (line in lines) {
-            style.addMessage(line.text, line.ts, Person.Builder().setName(line.sender.ifBlank { threadName }).build())
+        val displayTitle = threadName.ifBlank { msg.fromName.ifBlank { "Chat" } }
+        val senderName = msg.fromName.ifBlank { displayTitle }
+        val otp = OtpText.messageCode(msg)
+        val text = notificationText(msg)
+        val lineText = if (otp != null) OtpText.line(otp, text) else text
+        val newLine = Line(
+            id = msg.id,
+            sender = senderName,
+            senderId = msg.fromId,
+            text = lineText,
+            ts = msg.ts,
+        )
+
+        val linesSnapshot: List<Line>
+        val code: String?
+        val gen: Long
+        synchronized(stateLock) {
+            val lines = history.getOrPut(ref.key) { ArrayDeque() }
+            if (otp != null) {
+                otpByThread[ref.key] = otp to System.currentTimeMillis()
+                OtpNotifications.dedupe.noteNotified(otp, System.currentTimeMillis())
+            }
+            lines.addLast(newLine)
+            while (lines.size > MAX_LINES) lines.removeFirst()
+            linesSnapshot = lines.toList()
+            code = otpByThread[ref.key]
+                ?.takeIf { System.currentTimeMillis() - it.second <= OtpDedupe.RESCUE_MEMORY_MS }
+                ?.first
+            gen = (generationByThread[ref.key] ?: 0L) + 1L
+            generationByThread[ref.key] = gen
         }
 
-        val requestCode = ref.key.hashCode()
-        val open = PendingIntent.getActivity(
-            context,
-            requestCode,
-            MainActivity.openChatIntent(context, ref),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val reply = NotificationCompat.Action.Builder(
-            R.drawable.ic_launcher_foreground,
-            "Reply",
-            PendingIntent.getBroadcast(
+        val targetScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        targetScope.launch(Dispatchers.IO) {
+            val photoUrl = if (msg.attachment?.kind == "photo") {
+                msg.attachment.remoteThumb ?: msg.attachment.remoteHref
+            } else {
+                null
+            }
+
+            var threadIcon: IconCompat? = null
+            var senderIcon: IconCompat? = null
+            var shortcutPushed = false
+            var photoUri: Uri? = null
+
+            withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                coroutineScope {
+                    val avatarJob = launch {
+                        if (!avatarUrls.containsKey(ref.key)) {
+                            refreshAvatarUrls(force = false)
+                        }
+                        val threadAvatarUrl = avatarUrls[ref.key]
+                        val senderAvatarUrl = if (isGroup && msg.fromId.isNotBlank()) {
+                            avatarUrls["user:${msg.fromId}"]
+                        } else {
+                            threadAvatarUrl
+                        }
+                        threadIcon = ConversationShortcuts.loadCircularAvatarIcon(context, threadAvatarUrl)
+                        senderIcon = if (senderAvatarUrl != null && senderAvatarUrl != threadAvatarUrl) {
+                            ConversationShortcuts.loadCircularAvatarIcon(context, senderAvatarUrl)
+                        } else {
+                            threadIcon
+                        }
+                        ConversationShortcuts.pushShortcut(
+                            context = context,
+                            ref = ref,
+                            title = displayTitle,
+                            avatarUrl = threadAvatarUrl,
+                            isGroup = isGroup,
+                        )
+                        shortcutPushed = true
+                    }
+                    val mediaJob = launch {
+                        if (photoUrl != null) {
+                            photoUri = fetchNotificationPhotoPreview(photoUrl, msg.id)
+                        }
+                    }
+                    joinAll(avatarJob, mediaJob)
+                }
+            }
+
+            // Guarantee the conversation shortcut exists even if remote avatar fetch timed out.
+            if (!shortcutPushed) {
+                ConversationShortcuts.pushShortcut(
+                    context = context,
+                    ref = ref,
+                    title = displayTitle,
+                    avatarUrl = null,
+                    isGroup = isGroup,
+                )
+            }
+
+            val finalLines = if (photoUri != null) {
+                synchronized(stateLock) {
+                    val current = history[ref.key]
+                    if (current != null && current.isNotEmpty()) {
+                        val lastIdx = current.indexOfLast { it.id == msg.id && it.ts == msg.ts }
+                        if (lastIdx >= 0) {
+                            val list = current.toMutableList()
+                            list[lastIdx] = list[lastIdx].copy(mediaUri = photoUri, mediaMime = "image/jpeg")
+                            current.clear()
+                            current.addAll(list)
+                        }
+                    }
+                }
+                linesSnapshot.mapIndexed { idx, line ->
+                    if (idx == linesSnapshot.lastIndex) line.copy(mediaUri = photoUri, mediaMime = "image/jpeg") else line
+                }
+            } else {
+                linesSnapshot
+            }
+
+            val stillCurrent = synchronized(stateLock) { generationByThread[ref.key] == gen }
+            if (!stillCurrent) return@launch
+
+            val resolvedThreadIcon = threadIcon
+                ?: ConversationShortcuts.createInitialsIcon(displayTitle, ref.key, isGroup)
+            val me = Person.Builder().setName("You").build()
+            val style = NotificationCompat.MessagingStyle(me)
+                .setConversationTitle(if (isGroup) displayTitle else null)
+                .setGroupConversation(isGroup)
+
+            for (line in finalLines) {
+                val lineName = line.sender.ifBlank { displayTitle }
+                val personKey = if (line.senderId.isNotBlank()) "user:${line.senderId}" else "${ref.key}:$lineName"
+                val lineIcon = when {
+                    !isGroup -> resolvedThreadIcon
+                    line.senderId == msg.fromId && senderIcon != null -> senderIcon
+                    else -> ConversationShortcuts.createInitialsIcon(lineName, personKey, isGroup = false)
+                }
+                val person = Person.Builder()
+                    .setKey(personKey)
+                    .setName(lineName)
+                    .apply { if (lineIcon != null) setIcon(lineIcon) }
+                    .build()
+                val styleMsg = NotificationCompat.MessagingStyle.Message(line.text, line.ts, person)
+                if (line.mediaUri != null && line.mediaMime != null) {
+                    styleMsg.setData(line.mediaMime, line.mediaUri)
+                }
+                style.addMessage(styleMsg)
+            }
+
+            val requestCode = ref.key.hashCode()
+            val open = PendingIntent.getActivity(
                 context,
                 requestCode,
-                NotificationActionReceiver.intent(context, NotificationActionReceiver.ACTION_REPLY, ref),
-                // RemoteInput fills the intent in, so it has to stay mutable.
-                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            ),
-        )
-            .addRemoteInput(RemoteInput.Builder(NotificationActionReceiver.KEY_TEXT).setLabel("Message").build())
-            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
-            .setShowsUserInterface(false)
-            .build()
-        val markRead = NotificationCompat.Action.Builder(
-            R.drawable.ic_launcher_foreground,
-            "Mark as read",
-            PendingIntent.getBroadcast(
-                context,
-                requestCode + 1,
-                NotificationActionReceiver.intent(context, NotificationActionReceiver.ACTION_MARK_READ, ref),
+                MainActivity.openChatIntent(context, ref),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            ),
-        )
-            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
-            .setShowsUserInterface(false)
-            .build()
+            )
+            val reply = NotificationCompat.Action.Builder(
+                R.drawable.ic_launcher_foreground,
+                "Reply",
+                PendingIntent.getBroadcast(
+                    context,
+                    requestCode,
+                    NotificationActionReceiver.intent(context, NotificationActionReceiver.ACTION_REPLY, ref),
+                    // RemoteInput fills the intent in, so it has to stay mutable.
+                    PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
+                .addRemoteInput(RemoteInput.Builder(NotificationActionReceiver.KEY_TEXT).setLabel("Message").build())
+                .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+                .setShowsUserInterface(false)
+                .build()
+            val markRead = NotificationCompat.Action.Builder(
+                R.drawable.ic_launcher_foreground,
+                "Mark as read",
+                PendingIntent.getBroadcast(
+                    context,
+                    requestCode + 1,
+                    NotificationActionReceiver.intent(context, NotificationActionReceiver.ACTION_MARK_READ, ref),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
+                .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
+                .setShowsUserInterface(false)
+                .build()
 
-        // A chat with a code in it: "Copy 482910", and the code stays off the lock screen.
-        val code = otpByThread[ref.key]?.takeIf { System.currentTimeMillis() - it.second <= OtpDedupe.RESCUE_MEMORY_MS }?.first
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setStyle(style)
-            .setContentTitle(threadName)
-            .setContentText(lines.last().text)
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setWhen(msg.ts)
-            .addAction(reply)
-            .addAction(markRead)
-        if (code != null) {
-            builder.addAction(OtpNotifications.copyAction(context, code))
-            OtpNotifications.applyLockScreenPrivacy(context, builder, CHANNEL_ID)
+            val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setStyle(style)
+                .setContentTitle(displayTitle)
+                .setContentText(finalLines.last().text)
+                .setContentIntent(open)
+                .setShortcutId(ConversationShortcuts.shortcutId(ref))
+                .setAutoCancel(true)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setWhen(msg.ts)
+                .addAction(reply)
+                .addAction(markRead)
+            resolvedThreadIcon?.let { icon ->
+                runCatching { builder.setLargeIcon(icon.toIcon(context)) }
+            }
+            if (code != null) {
+                builder.addAction(OtpNotifications.copyAction(context, code))
+                OtpNotifications.applyLockScreenPrivacy(context, builder, CHANNEL_ID)
+            }
+            val notification = builder.build()
+            if (canNotify(context)) {
+                val posted = runCatching {
+                    NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification)
+                }
+                if (posted.isSuccess) runCatching { onPosted(ref, displayTitle) }
+            }
         }
-        val notification = builder.build()
-        if (canNotify(context)) {
-            val posted = runCatching { NotificationManagerCompat.from(context).notify(ref.key, NOTIFICATION_ID, notification) }
-            if (posted.isSuccess) runCatching { onPosted(ref, threadName) }
+    }
+
+    /**
+     * Downloads a scaled JPEG thumbnail for an incoming photo message into `<cacheDir>/shared/notif_media/`
+     * (covered by `file_paths.xml`'s `shared/` cache-path), grants read access to SystemUI, and prunes
+     * older previews to keep at most [MAX_MEDIA_FILES].
+     */
+    private suspend fun fetchNotificationPhotoPreview(url: String, msgId: String): Uri? {
+        return try {
+            val request = ImageRequest.Builder(context)
+                .data(url)
+                .size(MAX_PREVIEW_PX, MAX_PREVIEW_PX)
+                .scale(Scale.FIT)
+                .allowHardware(false)
+                .build()
+            val result = context.imageLoader.execute(request) as? SuccessResult ?: return null
+            val drawable = result.drawable
+            val w = drawable.intrinsicWidth.takeIf { it > 0 }?.coerceAtMost(MAX_PREVIEW_PX) ?: MAX_PREVIEW_PX
+            val h = drawable.intrinsicHeight.takeIf { it > 0 }?.coerceAtMost(MAX_PREVIEW_PX) ?: MAX_PREVIEW_PX
+            val bitmap = drawable.toBitmap(width = w, height = h, config = Bitmap.Config.ARGB_8888)
+            val dir = File(context.cacheDir, NOTIF_MEDIA_SUBDIR).apply { mkdirs() }
+            val safeId = msgId.replace(Regex("[^A-Za-z0-9_-]"), "").take(24).ifEmpty { "photo" }
+            val file = File(dir, "${System.currentTimeMillis()}_$safeId.jpg")
+            val ok = file.outputStream().use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 82, out)
+            }
+            if (!ok) {
+                file.delete()
+                return null
+            }
+            pruneNotifMedia(dir)
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+            runCatching {
+                context.grantUriPermission(SYSTEM_UI_PACKAGE, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            uri
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
         }
+    }
+
+    private fun pruneNotifMedia(dir: File) {
+        val files = dir.listFiles()?.filter { it.isFile } ?: return
+        if (files.size <= MAX_MEDIA_FILES) return
+        files.sortedByDescending { it.lastModified() }
+            .drop(MAX_MEDIA_FILES)
+            .forEach { it.delete() }
     }
 
     private val ringing = LinkedHashSet<String>()
@@ -268,8 +491,11 @@ class MessageNotifier(
     }
 
     private fun cancel(ref: ThreadRef) {
-        history.remove(ref.key)
-        otpByThread.remove(ref.key)
+        synchronized(stateLock) {
+            history.remove(ref.key)
+            otpByThread.remove(ref.key)
+            generationByThread[ref.key] = (generationByThread[ref.key] ?: 0L) + 1L
+        }
         NotificationManagerCompat.from(context).cancel(ref.key, NOTIFICATION_ID)
     }
 
@@ -312,6 +538,12 @@ class MessageNotifier(
         private const val MAX_LINES = 7
         private const val MAX_THREADS = 50
         private const val RECONNECT_MS = 3_000L
+        private const val FETCH_TIMEOUT_MS = 1_500L
+        private const val THREADS_REFRESH_MIN_MS = 30_000L
+        private const val MAX_PREVIEW_PX = 720
+        private const val MAX_MEDIA_FILES = 20
+        private const val NOTIF_MEDIA_SUBDIR = "shared/notif_media"
+        private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
 
         fun ensureChannel(context: Context) {
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(

@@ -1,6 +1,7 @@
 package com.zalom3ui.app.ui
 
 import android.os.Build
+import android.widget.Toast
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.BorderStroke
@@ -32,12 +33,14 @@ import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.FormatColorFill
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.RestartAlt
+import androidx.compose.material.icons.outlined.Schedule
+import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Sync
-import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.rounded.Check
@@ -75,6 +78,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
@@ -83,11 +87,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.zalom3ui.app.data.ApiClient
+import com.zalom3ui.app.data.AppLockTimeout
 import com.zalom3ui.app.data.Appearance
 import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.ServerSettings
+import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThemeMode
+import com.zalom3ui.app.security.AppLock
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -276,6 +284,8 @@ fun SettingsScreen(
                 }
             }
             ExpressiveSettingsGroup(items = appearanceItems)
+
+            PrivacySecuritySettings()
 
             SectionHeader("Zalo runs on")
             Surface(
@@ -515,6 +525,151 @@ fun SettingsScreen(
                 }) { Text("Log out", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun PrivacySecuritySettings() {
+    val context = LocalContext.current
+    val activity = remember(context) { AppLock.findActivity(context) }
+    val store = remember(context) { SettingsStore(context) }
+    var canAuth by remember { mutableStateOf(AppLock.canAuthenticate(context)) }
+    var appLockEnabled by remember { mutableStateOf(store.appLockEnabled) }
+    var appLockTimeout by remember { mutableStateOf(store.appLockTimeout) }
+    var screenSecurity by remember { mutableStateOf(store.screenSecurity) }
+    var pickTimeout by rememberSaveable { mutableStateOf(false) }
+
+    LifecycleResumeEffect(Unit) {
+        canAuth = AppLock.canAuthenticate(context)
+        onPauseOrDispose { }
+    }
+
+    val transparentListItemColors = ListItemDefaults.colors(containerColor = Color.Transparent)
+
+    fun setAppLock(enable: Boolean) {
+        if (!enable) {
+            store.appLockEnabled = false
+            appLockEnabled = false
+            return
+        }
+        if (!canAuth) {
+            Toast.makeText(context, "Set up a screen lock in device settings first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (activity != null) {
+            AppLock.authenticate(
+                activity = activity,
+                onSuccess = {
+                    store.appLockEnabled = true
+                    appLockEnabled = true
+                },
+                onError = { message ->
+                    if (message.isNotBlank()) {
+                        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                    }
+                },
+            )
+        } else {
+            store.appLockEnabled = true
+            appLockEnabled = true
+        }
+    }
+
+    fun setScreenSecurity(secure: Boolean) {
+        store.screenSecurity = secure
+        screenSecurity = secure
+        activity?.let { AppLock.applyScreenSecurity(it, secure) }
+    }
+
+    SectionHeader("Privacy & security")
+    val privacyItems = buildList<@Composable () -> Unit> {
+        add {
+            ListItem(
+                modifier = Modifier.clickable(enabled = canAuth || appLockEnabled) {
+                    setAppLock(!appLockEnabled)
+                },
+                colors = transparentListItemColors,
+                leadingContent = { Icon(Icons.Outlined.Lock, null) },
+                headlineContent = { Text("App lock") },
+                supportingContent = {
+                    Text(
+                        if (canAuth || appLockEnabled) {
+                            "Require biometrics or device PIN to unlock Zalỏ"
+                        } else {
+                            "Set up a screen lock in device settings to enable"
+                        },
+                    )
+                },
+                trailingContent = {
+                    Switch(
+                        checked = appLockEnabled,
+                        enabled = canAuth || appLockEnabled,
+                        onCheckedChange = ::setAppLock,
+                    )
+                },
+            )
+        }
+        if (appLockEnabled) {
+            add {
+                ListItem(
+                    modifier = Modifier.clickable { pickTimeout = true },
+                    colors = transparentListItemColors,
+                    leadingContent = { Icon(Icons.Outlined.Schedule, null) },
+                    headlineContent = { Text("Auto-lock") },
+                    supportingContent = { Text(appLockTimeout.label) },
+                )
+            }
+        }
+        add {
+            ListItem(
+                modifier = Modifier.clickable { setScreenSecurity(!screenSecurity) },
+                colors = transparentListItemColors,
+                leadingContent = { Icon(Icons.Outlined.Security, null) },
+                headlineContent = { Text("Screen security") },
+                supportingContent = { Text("Block screenshots & hide app preview in Recents") },
+                trailingContent = {
+                    Switch(
+                        checked = screenSecurity,
+                        onCheckedChange = ::setScreenSecurity,
+                    )
+                },
+            )
+        }
+    }
+    ExpressiveSettingsGroup(items = privacyItems)
+
+    if (pickTimeout) {
+        AlertDialog(
+            onDismissRequest = { pickTimeout = false },
+            title = { Text("Auto-lock") },
+            text = {
+                Column {
+                    AppLockTimeout.entries.forEach { option ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .selectable(
+                                    selected = appLockTimeout == option,
+                                    role = Role.RadioButton,
+                                    onClick = {
+                                        store.appLockTimeout = option
+                                        appLockTimeout = option
+                                        pickTimeout = false
+                                    },
+                                )
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = appLockTimeout == option, onClick = null)
+                            Spacer(Modifier.width(12.dp))
+                            Text(option.label, style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { pickTimeout = false }) { Text("Cancel") } },
         )
     }
 }

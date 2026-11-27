@@ -30,9 +30,10 @@ use crate::replay::{BatchStats, ReplayHub};
 use crate::socket_log::SocketLog;
 use crate::store::{normalize_message, recalled_message_id, to_public_message, ChatStore};
 use crate::types::{
-    reaction_code, thread_key, ChatMessage, FoundUser, FriendRequest, GroupMember, MentionInfo,
-    MessageSearchHit, Person, PollOptionView, PollView, PollVoter, SessionState, SessionStatus,
-    StickerInfo, StoredMessage, ThreadInfo, ThreadKind, ThreadSummary, STICKER_IMAGE_URL,
+    reaction_code, sanitize_remote_url, thread_key, AttachmentKind, BoardItem, ChatMessage,
+    FoundUser, FriendRequest, GroupLinkInfo, GroupMember, MentionInfo, MessageSearchHit, Person,
+    PollOptionView, PollView, PollVoter, SessionState, SessionStatus, StickerInfo, StoredMessage,
+    ThreadInfo, ThreadKind, ThreadSummary, STICKER_IMAGE_URL,
 };
 
 /// Pre-serialized JSON event payload broadcast to all connected `/ws` clients.
@@ -53,7 +54,10 @@ const SESSION_EXPIRED: &str = "Your Zalo session has ended. Log in again with th
 const STICKER_SEARCH_LIMIT: usize = 30;
 const MAX_STICKERS_CACHE: usize = 500;
 const MAX_GROUP_NAME: usize = 100;
+const MAX_ALIAS_LENGTH: usize = 100;
+const MAX_NOTE_TITLE: usize = 1000;
 const MAX_TEXT_LENGTH: usize = 4000;
+const MAX_TTL_MS: u64 = 2_592_000_000;
 const MAX_FORWARD_TARGETS: usize = 20;
 const VIEWING_TTL_MS: i64 = 90_000;
 const NOTIFY_MAX_AGE_MS: i64 = 10 * 60_000;
@@ -225,6 +229,7 @@ struct SessionInner {
     generation: u64,
     resuming: bool,
     members: HashMap<String, (i64, Vec<GroupMember>)>,
+    group_member_ids: HashMap<String, HashSet<String>>,
     poll_groups: HashMap<i64, String>,
     poll_group_order: VecDeque<i64>,
     friend_list: HashMap<String, Person>,
@@ -286,6 +291,7 @@ impl Default for SessionInner {
             generation: 0,
             resuming: false,
             members: HashMap::new(),
+            group_member_ids: HashMap::new(),
             poll_groups: HashMap::new(),
             poll_group_order: VecDeque::new(),
             friend_list: HashMap::new(),
@@ -803,6 +809,7 @@ impl ZaloSession {
                 s.notify_window = None;
                 s.client = None;
                 s.members.clear();
+                s.group_member_ids.clear();
                 s.poll_groups.clear();
                 s.poll_group_order.clear();
                 s.friend_list.clear();
@@ -1852,6 +1859,7 @@ impl ZaloSession {
                 return;
             }
             if let Some(grid_map) = info.get("gridInfoMap").and_then(|v| v.as_object()) {
+                let mut member_sets: Vec<(String, HashSet<String>)> = Vec::new();
                 for (id, g) in grid_map {
                     let name = non_empty_str(g.get("name")).unwrap_or_default();
                     let avatar = non_empty_str(g.get("avt")).unwrap_or_default();
@@ -1861,6 +1869,19 @@ impl ZaloSession {
                         name,
                         avatar,
                     });
+                    let ids = extract_group_member_ids(g);
+                    if !ids.is_empty() {
+                        member_sets.push((id.clone(), ids));
+                    }
+                }
+                if !member_sets.is_empty() {
+                    if let Ok(mut s) = self.inner.write() {
+                        if s.generation == generation {
+                            for (gid, ids) in member_sets {
+                                s.group_member_ids.insert(gid, ids);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2007,13 +2028,49 @@ impl ZaloSession {
                     Err(e) if e.status == 409 => return Err(e),
                     Err(_) => None,
                 };
-                Ok(json!({ "lastOnline": last_online }))
+                let common_groups = self.common_groups(id);
+                Ok(json!({
+                    "lastOnline": last_online,
+                    "commonGroups": common_groups,
+                }))
             }
             ThreadKind::Group => {
                 let members = self.group_members(id).await?;
                 Ok(json!({ "members": members }))
             }
         }
+    }
+
+    /// Computes cached groups that contain `user_id` (from loaded group info and member lists).
+    pub fn common_groups(&self, user_id: &str) -> Vec<ThreadInfo> {
+        if user_id.is_empty() {
+            return Vec::new();
+        }
+        let mut group_ids: HashSet<String> = HashSet::new();
+        if let Ok(s) = self.inner.read() {
+            for (gid, ids) in &s.group_member_ids {
+                if ids.contains(user_id) {
+                    group_ids.insert(gid.clone());
+                }
+            }
+            for (gid, (_, list)) in &s.members {
+                if list.iter().any(|m| m.id == user_id) {
+                    group_ids.insert(gid.clone());
+                }
+            }
+        }
+        let mut out: Vec<ThreadInfo> = group_ids
+            .into_iter()
+            .filter_map(|gid| self.store.get_thread(ThreadKind::Group, &gid))
+            .collect();
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out
     }
 
     pub async fn last_online(&self, user_id: &str) -> Result<Option<i64>, HttpError> {
@@ -2051,6 +2108,7 @@ impl ZaloSession {
             .get("gridInfoMap")
             .and_then(|m| m.get(group_id))
             .ok_or_else(|| HttpError::not_found("Group not found"))?;
+        let mut member_id_set = extract_group_member_ids(info);
 
         let mut list: Vec<GroupMember> = info
             .get("currentMems")
@@ -2103,6 +2161,9 @@ impl ZaloSession {
             }
         }
 
+        for m in &list {
+            member_id_set.insert(m.id.clone());
+        }
         let own_id = self.own_id();
         list.retain(|m| own_id.as_deref() != Some(m.id.as_str()));
         list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name)));
@@ -2123,6 +2184,9 @@ impl ZaloSession {
                 }
             }
             s.members.insert(group_id.to_string(), (now, list.clone()));
+            if !member_id_set.is_empty() {
+                s.group_member_ids.insert(group_id.to_string(), member_id_set);
+            }
         }
         Ok(list)
     }
@@ -2480,6 +2544,19 @@ impl ZaloSession {
         quote_id: Option<&str>,
         mentions: Option<Vec<MentionInfo>>,
     ) -> Result<Option<String>, HttpError> {
+        self.send_text_with_ttl(kind, thread_id, text, quote_id, mentions, None)
+            .await
+    }
+
+    pub async fn send_text_with_ttl(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        text: &str,
+        quote_id: Option<&str>,
+        mentions: Option<Vec<MentionInfo>>,
+        ttl: Option<u64>,
+    ) -> Result<Option<String>, HttpError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(HttpError::bad_request("text is required"));
@@ -2488,6 +2565,13 @@ impl ZaloSession {
             return Err(HttpError::bad_request(format!(
                 "text is longer than {MAX_TEXT_LENGTH} characters"
             )));
+        }
+        if let Some(ms) = ttl {
+            if ms > MAX_TTL_MS {
+                return Err(HttpError::bad_request(format!(
+                    "ttl must be at most {MAX_TTL_MS} milliseconds"
+                )));
+            }
         }
         let client = self.api()?;
         let quote = if let Some(qid) = quote_id.filter(|s| !s.is_empty()) {
@@ -2528,7 +2612,7 @@ impl ZaloSession {
             attachments: Vec::new(),
             mentions: proto_mentions,
             quote,
-            ttl: None,
+            ttl,
             urgency: None,
             progress: None,
         };
@@ -2543,6 +2627,68 @@ impl ZaloSession {
             .map(val_to_string)
             .filter(|s| !s.is_empty());
         Ok(msg_id)
+    }
+
+    pub async fn send_card(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        user_id: &str,
+        phone: Option<&str>,
+        ttl: Option<u64>,
+    ) -> Result<(), HttpError> {
+        let uid = user_id.trim();
+        if uid.is_empty() {
+            return Err(HttpError::bad_request("userId is required"));
+        }
+        if let Some(ms) = ttl {
+            if ms > MAX_TTL_MS {
+                return Err(HttpError::bad_request(format!(
+                    "ttl must be at most {MAX_TTL_MS} milliseconds"
+                )));
+            }
+        }
+        let client = self.api()?;
+        let clean_phone = phone.map(str::trim).filter(|s| !s.is_empty());
+        client
+            .send_card(uid, clean_phone, thread_id, to_thread_type(kind), ttl)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(())
+    }
+
+    pub async fn send_link(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        link: &str,
+        message: Option<&str>,
+        ttl: Option<u64>,
+    ) -> Result<(), HttpError> {
+        let Some(clean_link) = sanitize_remote_url(link) else {
+            return Err(HttpError::bad_request("link must be a valid http(s) URL"));
+        };
+        let clean_msg = message.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(m) = clean_msg {
+            if m.chars().count() > MAX_TEXT_LENGTH {
+                return Err(HttpError::bad_request(format!(
+                    "message is longer than {MAX_TEXT_LENGTH} characters"
+                )));
+            }
+        }
+        if let Some(ms) = ttl {
+            if ms > MAX_TTL_MS {
+                return Err(HttpError::bad_request(format!(
+                    "ttl must be at most {MAX_TTL_MS} milliseconds"
+                )));
+            }
+        }
+        let client = self.api()?;
+        client
+            .send_link(&clean_link, clean_msg, thread_id, to_thread_type(kind), ttl)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(())
     }
 
     pub async fn send_attachment(
@@ -2863,18 +3009,148 @@ impl ZaloSession {
         }
         let client = self.api()?;
         let (msg, raw) = self.require_message(kind, thread_id, msg_id)?;
-        let Some(text) = raw.content.as_str() else {
-            return Err(HttpError::bad_request("Only text messages can be forwarded"));
-        };
         if msg.recalled {
-            return Err(HttpError::bad_request("Only text messages can be forwarded"));
+            return Err(HttpError::bad_request("Can't forward a recalled message"));
         }
+
+        // 1. Plain text message: batch by thread kind via Zalo's mforward endpoint.
+        if let Some(text) = raw.content.as_str().filter(|s| !s.is_empty()) {
+            return self
+                .forward_text_batch(&client, text, Some(&msg), &unique)
+                .await;
+        }
+
+        // 2. Non-text / media / attachment messages.
+        let att = msg.attachment.as_ref();
+        let att_kind = att.and_then(|a| a.kind);
+        let remote_href = att
+            .and_then(|a| a.href.as_deref())
+            .and_then(sanitize_remote_url)
+            .or_else(|| {
+                raw.content
+                    .get("href")
+                    .and_then(|v| v.as_str())
+                    .and_then(sanitize_remote_url)
+            })
+            .or_else(|| {
+                att.and_then(|a| a.thumb.as_deref())
+                    .and_then(sanitize_remote_url)
+            });
+
+        // Voice clip with remote URL -> send_voice to each target.
+        if att_kind == Some(AttachmentKind::Voice) {
+            if let Some(voice_url) = remote_href.as_deref() {
+                for (tkind, tid) in &unique {
+                    client
+                        .send_voice(voice_url, None, tid, to_thread_type(*tkind))
+                        .await
+                        .map_err(proto_to_http_error)?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Contact card -> send_card to each target.
+        if att_kind == Some(AttachmentKind::Contact) {
+            if let Some(uid) = att
+                .and_then(|a| a.user_id.as_deref())
+                .filter(|s| !s.is_empty())
+            {
+                for (tkind, tid) in &unique {
+                    client
+                        .send_card(uid, None, tid, to_thread_type(*tkind), None)
+                        .await
+                        .map_err(proto_to_http_error)?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Sticker -> send_sticker to each target.
+        if att_kind == Some(AttachmentKind::Sticker) {
+            if let Some(st) = att.and_then(|a| a.sticker.as_ref()) {
+                let param = StickerParam {
+                    id: st.id,
+                    cate_id: st.cat_id,
+                    sticker_type: st.sticker_type as i64,
+                };
+                for (tkind, tid) in &unique {
+                    client
+                        .send_sticker(&param, tid, to_thread_type(*tkind))
+                        .await
+                        .map_err(proto_to_http_error)?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Caption/title metadata for link or photo/video/file fallback.
+        let caption = att
+            .and_then(|a| a.title.as_deref().or(a.description.as_deref()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let t = msg.text.trim();
+                if t.is_empty() || (t.starts_with('[') && t.ends_with(']')) {
+                    None
+                } else {
+                    Some(t)
+                }
+            });
+
+        // Link or Photo/Video/File/Gif/Other with remote URL: send_link with clean text/URL fallback.
+        if let Some(url) = remote_href.as_deref() {
+            let fallback_text = match caption {
+                Some(cap) if !cap.contains(url) => format!("{cap}\n{url}"),
+                Some(cap) => cap.to_string(),
+                None => url.to_string(),
+            };
+            for (tkind, tid) in &unique {
+                let send_res = client
+                    .send_link(url, caption, tid, to_thread_type(*tkind), None)
+                    .await;
+                if send_res.is_err() {
+                    self.forward_text_batch(
+                        &client,
+                        &fallback_text,
+                        None,
+                        &[(*tkind, tid.clone())],
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Final text fallback for any remaining attachment with readable text/title/description.
+        let fallback = caption
+            .map(str::to_string)
+            .or_else(|| {
+                let t = msg.text.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+            .ok_or_else(|| HttpError::bad_request("This message has no forwardable content"))?;
+        self.forward_text_batch(&client, &fallback, Some(&msg), &unique)
+            .await
+    }
+
+    async fn forward_text_batch(
+        &self,
+        client: &Arc<dyn ZaloApi>,
+        text: &str,
+        reference_msg: Option<&StoredMessage>,
+        unique: &[(ThreadKind, String)],
+    ) -> Result<(), HttpError> {
         let payload = ForwardMessagePayload {
             message: text.to_string(),
             ttl: None,
-            reference: Some(ForwardReference {
-                id: msg.id,
-                ts: msg.ts,
+            reference: reference_msg.map(|m| ForwardReference {
+                id: m.id.clone(),
+                ts: m.ts,
                 fw_lvl: 1,
             }),
         };
@@ -3074,6 +3350,120 @@ impl ZaloSession {
         })
     }
 
+    pub async fn set_friend_alias(&self, user_id: &str, alias: &str) -> Result<(), HttpError> {
+        let trimmed: String = alias.trim().chars().take(MAX_ALIAS_LENGTH).collect();
+        if trimmed.is_empty() {
+            return Err(HttpError::bad_request("alias is required"));
+        }
+        let client = self.api()?;
+        client
+            .change_friend_alias(&trimmed, user_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        let mut avatar = self
+            .store
+            .get_thread(ThreadKind::User, user_id)
+            .map(|t| t.avatar)
+            .unwrap_or_default();
+        if let Ok(mut s) = self.inner.write() {
+            if let Some(person) = s.friend_list.get_mut(user_id) {
+                person.name = trimmed.clone();
+                if avatar.is_empty() {
+                    avatar = person.avatar.clone();
+                }
+            }
+        }
+        self.store.upsert_thread(ThreadInfo {
+            id: user_id.to_string(),
+            kind: ThreadKind::User,
+            name: trimmed,
+            avatar,
+        });
+        self.broadcast_event(json!({ "type": "threads" }));
+        Ok(())
+    }
+
+    pub async fn remove_friend_alias(&self, user_id: &str) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .remove_friend_alias(user_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        if let Ok(res) = client
+            .get_user_info(&[user_id.to_string()], None)
+            .await
+        {
+            for key in ["changed_profiles", "unchanged_profiles"] {
+                if let Some(map) = res.get(key).and_then(|v| v.as_object()) {
+                    for (raw_id, p) in map {
+                        let clean_id = raw_id.split('_').next().unwrap_or(raw_id);
+                        if clean_id != user_id {
+                            continue;
+                        }
+                        let Some(name) = non_empty_str(p.get("displayName"))
+                            .or_else(|| non_empty_str(p.get("zaloName")))
+                        else {
+                            continue;
+                        };
+                        let avatar = non_empty_str(p.get("avatar")).unwrap_or_else(|| {
+                            self.store
+                                .get_thread(ThreadKind::User, user_id)
+                                .map(|t| t.avatar)
+                                .unwrap_or_default()
+                        });
+                        if let Ok(mut s) = self.inner.write() {
+                            if let Some(person) = s.friend_list.get_mut(user_id) {
+                                person.name = name.clone();
+                                if !avatar.is_empty() {
+                                    person.avatar = avatar.clone();
+                                }
+                            }
+                        }
+                        self.store.upsert_thread(ThreadInfo {
+                            id: user_id.to_string(),
+                            kind: ThreadKind::User,
+                            name,
+                            avatar,
+                        });
+                    }
+                }
+            }
+        }
+        self.broadcast_event(json!({ "type": "threads" }));
+        Ok(())
+    }
+
+    pub async fn remove_friend(&self, user_id: &str) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .remove_friend(user_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        if let Ok(mut s) = self.inner.write() {
+            s.friend_list.remove(user_id);
+        }
+        self.broadcast_event(json!({ "type": "threads" }));
+        Ok(())
+    }
+
+    pub async fn block_user(&self, user_id: &str) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .block_user(user_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(())
+    }
+
+    pub async fn unblock_user(&self, user_id: &str) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .unblock_user(user_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(())
+    }
+
     // ---- Groups ----
 
     pub async fn create_group(
@@ -3158,14 +3548,24 @@ impl ZaloSession {
             .add_user_to_group(&ids, group_id)
             .await
             .map_err(proto_to_http_error)?;
-        if let Ok(mut s) = self.inner.write() {
-            s.members.remove(group_id);
-        }
-        let failed = res
+        let failed: Vec<String> = res
             .get("errorMembers")
             .and_then(|v| v.as_array())
             .map(|a| a.iter().map(val_to_string).collect())
             .unwrap_or_default();
+        if let Ok(mut s) = self.inner.write() {
+            s.members.remove(group_id);
+            let failed_set: HashSet<&str> = failed.iter().map(String::as_str).collect();
+            let entry = s
+                .group_member_ids
+                .entry(group_id.to_string())
+                .or_default();
+            for id in &ids {
+                if !failed_set.contains(id.as_str()) {
+                    entry.insert(id.clone());
+                }
+            }
+        }
         Ok(failed)
     }
 
@@ -3190,6 +3590,11 @@ impl ZaloSession {
             return Err(HttpError::forbidden(
                 "Only the group's owner and deputies can remove members",
             ));
+        }
+        if let Ok(mut s) = self.inner.write() {
+            if let Some(set) = s.group_member_ids.get_mut(group_id) {
+                set.remove(member_id);
+            }
         }
         Ok(())
     }
@@ -3227,10 +3632,184 @@ impl ZaloSession {
             .map_err(proto_to_http_error)?;
         if let Ok(mut s) = self.inner.write() {
             s.members.remove(group_id);
+            s.group_member_ids.remove(group_id);
         }
         self.store.delete_thread(ThreadKind::Group, group_id);
         self.broadcast_event(json!({ "type": "threads" }));
         Ok(())
+    }
+
+    pub async fn get_group_link(&self, group_id: &str) -> Result<GroupLinkInfo, HttpError> {
+        let client = self.api()?;
+        let res = client
+            .get_group_link_detail(group_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(parse_group_link_info(&res, false))
+    }
+
+    pub async fn enable_group_link(&self, group_id: &str) -> Result<GroupLinkInfo, HttpError> {
+        let client = self.api()?;
+        let res = client
+            .enable_group_link(group_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(parse_group_link_info(&res, true))
+    }
+
+    pub async fn disable_group_link(&self, group_id: &str) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .disable_group_link(group_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        Ok(())
+    }
+
+    pub async fn join_group_link(&self, link: &str) -> Result<Option<String>, HttpError> {
+        let trimmed = link.trim();
+        if trimmed.is_empty() {
+            return Err(HttpError::bad_request("link is required"));
+        }
+        let client = self.api()?;
+        let generation = self.inner.read().map(|s| s.generation).unwrap_or(0);
+        let existing_groups: HashSet<String> = self
+            .store
+            .list_threads()
+            .into_iter()
+            .filter(|t| t.kind == ThreadKind::Group)
+            .map(|t| t.id)
+            .collect();
+
+        let res = client
+            .join_group_link(trimmed)
+            .await
+            .map_err(proto_to_http_error)?;
+        let mut group_id = res
+            .get("groupId")
+            .or_else(|| res.get("grid"))
+            .map(val_to_string)
+            .filter(|s| !s.is_empty());
+
+        if let Ok(all) = client.get_all_groups().await {
+            if let Some(map) = all.get("gridVerMap").and_then(|v| v.as_object()) {
+                let all_ids: Vec<String> = map.keys().cloned().collect();
+                let new_ids: Vec<String> = all_ids
+                    .iter()
+                    .filter(|id| !existing_groups.contains(*id))
+                    .cloned()
+                    .collect();
+                if group_id.is_none() {
+                    group_id = new_ids.first().cloned();
+                }
+                let to_load = if !new_ids.is_empty() {
+                    new_ids
+                } else if let Some(ref gid) = group_id {
+                    vec![gid.clone()]
+                } else {
+                    Vec::new()
+                };
+                if !to_load.is_empty() {
+                    self.load_groups(&client, &to_load, generation).await;
+                }
+            }
+        } else if let Some(ref gid) = group_id {
+            self.load_groups(&client, std::slice::from_ref(gid), generation)
+                .await;
+        }
+
+        self.broadcast_event(json!({ "type": "threads" }));
+        Ok(group_id)
+    }
+
+    pub async fn add_group_deputy(
+        &self,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .add_group_deputy(user_id, group_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        if let Ok(mut s) = self.inner.write() {
+            s.members.remove(group_id);
+        }
+        Ok(())
+    }
+
+    pub async fn remove_group_deputy(
+        &self,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<(), HttpError> {
+        let client = self.api()?;
+        client
+            .remove_group_deputy(user_id, group_id)
+            .await
+            .map_err(proto_to_http_error)?;
+        if let Ok(mut s) = self.inner.write() {
+            s.members.remove(group_id);
+        }
+        Ok(())
+    }
+
+    pub async fn get_group_board(
+        &self,
+        group_id: &str,
+        page: Option<u32>,
+        count: Option<u32>,
+    ) -> Result<Vec<BoardItem>, HttpError> {
+        let client = self.api()?;
+        let res = client
+            .get_list_board(group_id, page, count)
+            .await
+            .map_err(proto_to_http_error)?;
+        let items = res
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(parse_board_item).collect())
+            .unwrap_or_default();
+        Ok(items)
+    }
+
+    pub async fn create_group_note(
+        &self,
+        group_id: &str,
+        title: &str,
+        pin: bool,
+    ) -> Result<BoardItem, HttpError> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err(HttpError::bad_request("title is required"));
+        }
+        if trimmed.chars().count() > MAX_NOTE_TITLE {
+            return Err(HttpError::bad_request(format!(
+                "title is longer than {MAX_NOTE_TITLE} characters"
+            )));
+        }
+        let client = self.api()?;
+        let res = client
+            .create_note(group_id, trimmed, pin)
+            .await
+            .map_err(proto_to_http_error)?;
+        let id = res.get("id").map(val_to_string).unwrap_or_default();
+        let resolved_title = extract_board_title(&res).unwrap_or_else(|| trimmed.to_string());
+        let creator_id = non_empty_str(res.get("creatorId"))
+            .or_else(|| self.own_id())
+            .unwrap_or_default();
+        let create_time = {
+            let ct = val_to_i64(res.get("createTime"));
+            if ct > 0 { ct } else { now_ms() }
+        };
+        Ok(BoardItem {
+            id,
+            kind: "note".to_string(),
+            title: resolved_title,
+            creator_id,
+            create_time,
+            pinned: pin,
+        })
     }
 
     // ---- Polls ----
@@ -3780,6 +4359,115 @@ fn extract_uids_excluding(v: Option<&Value>, exclude: Option<&str>) -> Vec<Strin
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn extract_group_member_ids(info: &Value) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if let Some(arr) = info.get("currentMems").and_then(|v| v.as_array()) {
+        for m in arr {
+            let id = m.get("id").map(val_to_string).unwrap_or_default();
+            if !id.is_empty() {
+                ids.insert(id);
+            }
+        }
+    }
+    for key in ["memVerList", "memberIds"] {
+        if let Some(arr) = info.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                let raw = val_to_string(item);
+                let clean = raw.split('_').next().unwrap_or(&raw);
+                if !clean.is_empty() {
+                    ids.insert(clean.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn parse_group_link_info(res: &Value, default_enabled_if_link: bool) -> GroupLinkInfo {
+    let link = non_empty_str(res.get("link"));
+    let enabled = match res.get("enabled") {
+        Some(v) => js_truthy(v),
+        None => default_enabled_if_link && link.is_some(),
+    };
+    let expiration_date = res
+        .get("expiration_date")
+        .or_else(|| res.get("expirationDate"))
+        .and_then(|v| {
+            let n = val_to_i64(Some(v));
+            if n > 0 { Some(n) } else { None }
+        });
+    GroupLinkInfo {
+        link,
+        enabled,
+        expiration_date,
+    }
+}
+
+fn extract_board_title(detail: &Value) -> Option<String> {
+    let parsed_params = match detail.get("params") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+        Some(other @ Value::Object(_)) => Some(other.clone()),
+        _ => None,
+    };
+    if let Some(ref p) = parsed_params {
+        if let Some(t) = non_empty_str(p.get("title"))
+            .or_else(|| non_empty_str(p.get("content")))
+            .or_else(|| non_empty_str(p.get("msg")))
+        {
+            return Some(t);
+        }
+    }
+    non_empty_str(detail.get("title"))
+        .or_else(|| non_empty_str(detail.get("question")))
+        .or_else(|| non_empty_str(detail.get("content")))
+}
+
+fn parse_board_item(item: &Value) -> Option<BoardItem> {
+    let board_type = val_to_i64(item.get("boardType"));
+    let data = item.get("data").unwrap_or(item);
+    let kind = match board_type {
+        1 => "note",
+        2 => "pinned_message",
+        3 => "poll",
+        _ => "other",
+    };
+    let id = data
+        .get("id")
+        .or_else(|| data.get("poll_id"))
+        .map(val_to_string)
+        .unwrap_or_default();
+    let title = extract_board_title(data).unwrap_or_default();
+    let creator_id = data
+        .get("creatorId")
+        .or_else(|| data.get("creator"))
+        .map(val_to_string)
+        .unwrap_or_default();
+    let create_time = val_to_i64(
+        data.get("createTime")
+            .or_else(|| data.get("created_time")),
+    );
+    let pinned = if board_type == 2 {
+        true
+    } else {
+        data.get("pinAct")
+            .or_else(|| data.get("isPinned"))
+            .or_else(|| data.get("pinned"))
+            .map(js_truthy)
+            .unwrap_or(false)
+    };
+    if id.is_empty() && title.is_empty() {
+        return None;
+    }
+    Some(BoardItem {
+        id,
+        kind: kind.to_string(),
+        title,
+        creator_id,
+        create_time,
+        pinned,
+    })
 }
 
 #[cfg(test)]

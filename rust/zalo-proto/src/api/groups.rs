@@ -192,4 +192,190 @@ impl ZaloClient {
             .post_encrypted(&self.ctx, &format!("{base}/api/group/leave"), &params, &[])
             .await
     }
+
+    /// Gets group invite link details (`GET /api/group/link/detail` on `group` service).
+    pub async fn get_group_link_detail(&self, group_id: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "grid": group_id,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/link/detail"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Enables and creates a new group invite link (`GET /api/group/link/new` on `group` service).
+    pub async fn enable_group_link(&self, group_id: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "grid": group_id,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/link/new"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Disables the group invite link (`GET /api/group/link/disable` on `group` service).
+    pub async fn disable_group_link(&self, group_id: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "grid": group_id,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/link/disable"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Joins a group via invite link (`GET /api/group/link/join` on `group` service).
+    pub async fn join_group_link(&self, link: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "link": link,
+            "clientLang": self.ctx.language,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/link/join"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Promotes a group member to deputy/admin (`GET /api/group/admins/add` on `group` service).
+    pub async fn add_group_deputy(&self, member_id: &str, group_id: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "grid": group_id,
+            "members": [member_id],
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/admins/add"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Removes a group deputy/admin (`GET /api/group/admins/remove` on `group` service).
+    pub async fn remove_group_deputy(&self, member_id: &str, group_id: &str) -> Result<Value> {
+        let base = self.require_service("group")?;
+        let params = json!({
+            "grid": group_id,
+            "members": [member_id],
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/group/admins/remove"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Lists board items (notes, pinned messages, polls) in a group (`GET /api/board/list` on `group_board` service).
+    pub async fn get_list_board(
+        &self,
+        group_id: &str,
+        page: Option<u32>,
+        count: Option<u32>,
+    ) -> Result<Value> {
+        let base = self.require_service("group_board")?;
+        let params = json!({
+            "group_id": group_id,
+            "board_type": 0,
+            "page": page.unwrap_or(1),
+            "count": count.unwrap_or(20),
+            "last_id": 0,
+            "last_type": 0,
+            "imei": self.ctx.imei,
+        });
+        let mut data = self
+            .http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/board/list"),
+                &params,
+                &[],
+            )
+            .await?;
+        if let Some(items) = data.get_mut("items").and_then(|v| v.as_array_mut()) {
+            for item in items.iter_mut() {
+                let board_type = item.get("boardType").and_then(|v| v.as_i64()).unwrap_or(0);
+                if board_type != 3 {
+                    if let Some(detail) = item.get_mut("data").and_then(|v| v.as_object_mut()) {
+                        if let Some(params_str) = detail.get("params").and_then(|v| v.as_str()) {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(params_str) {
+                                detail.insert("params".to_string(), parsed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(data)
+    }
+
+    /// Creates a note on the group board (`POST /api/board/topic/createv2` on `group_board` service).
+    pub async fn create_note(
+        &self,
+        group_id: &str,
+        title: &str,
+        pin_act: bool,
+    ) -> Result<Value> {
+        let base = self.require_service("group_board")?;
+        let params = json!({
+            "grid": group_id,
+            "type": 0,
+            "color": -16777216,
+            "emoji": "",
+            "startTime": -1,
+            "duration": -1,
+            "params": json!({ "title": title }).to_string(),
+            "repeat": 0,
+            "src": 1,
+            "imei": self.ctx.imei,
+            "pinAct": if pin_act { 1 } else { 0 },
+        });
+        let mut data = self
+            .http
+            .post_encrypted(
+                &self.ctx,
+                &format!("{base}/api/board/topic/createv2"),
+                &params,
+                &[],
+            )
+            .await?;
+        if let Some(obj) = data.as_object_mut() {
+            if let Some(params_str) = obj.get("params").and_then(|v| v.as_str()) {
+                if let Ok(parsed) = serde_json::from_str::<Value>(params_str) {
+                    obj.insert("params".to_string(), parsed);
+                }
+            }
+        }
+        Ok(data)
+    }
 }

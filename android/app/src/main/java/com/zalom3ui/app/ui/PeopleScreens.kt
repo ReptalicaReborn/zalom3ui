@@ -2,6 +2,7 @@ package com.zalom3ui.app.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,13 +19,17 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Chat
+import androidx.compose.material.icons.outlined.AdminPanelSettings
 import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PersonRemove
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
@@ -359,7 +364,7 @@ fun AddFriendScreen(
     }
 }
 
-/** A group's members; owners and deputies can remove people (Zalo refuses others, with a message). */
+/** A group's members; owners and deputies can manage deputies and remove people (Zalo refuses others, with a message). */
 @Composable
 fun GroupMembersScreen(
     groupName: String,
@@ -369,6 +374,9 @@ fun GroupMembersScreen(
     onAdd: () -> Unit,
     onOpen: (GroupMember) -> Unit,
     onRemove: (GroupMember) -> Unit,
+    deputyIds: Set<String> = emptySet(),
+    onAddDeputy: (GroupMember) -> Unit = {},
+    onRemoveDeputy: (GroupMember) -> Unit = {},
 ) {
     LaunchedEffect(Unit) { onLoad() }
     var removing by remember { mutableStateOf<GroupMember?>(null) }
@@ -384,14 +392,56 @@ fun GroupMembersScreen(
         LazyColumn(modifier.fillMaxSize()) {
             item(key = "count", contentType = "header") { SectionHeader("${members.size + 1} members (you included)") }
             items(members, key = { it.id }, contentType = { "member" }) { m ->
+                var menuOpen by remember(m.id) { mutableStateOf(false) }
                 Row(
-                    Modifier.fillMaxWidth().clickable { onOpen(m) }.padding(horizontal = 16.dp, vertical = 8.dp),
+                    Modifier.fillMaxWidth().clickable { onOpen(m) }.padding(start = 16.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Avatar(m.name, "", key = m.id, isGroup = false, size = 40.dp)
                     Spacer(Modifier.width(12.dp))
-                    Text(m.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { removing = m }) { Icon(Icons.Outlined.PersonRemove, contentDescription = "Remove ${m.name}") }
+                    Column(Modifier.weight(1f)) {
+                        Text(m.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (m.id in deputyIds) {
+                            Text("Deputy", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                    Box {
+                        IconButton(onClick = { menuOpen = true }) {
+                            Icon(Icons.Outlined.MoreVert, contentDescription = "Options for ${m.name}")
+                        }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Make deputy") },
+                                leadingIcon = { Icon(Icons.Outlined.AdminPanelSettings, contentDescription = null) },
+                                onClick = {
+                                    menuOpen = false
+                                    onAddDeputy(m)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Remove deputy") },
+                                leadingIcon = { Icon(Icons.Outlined.PersonRemove, contentDescription = null) },
+                                onClick = {
+                                    menuOpen = false
+                                    onRemoveDeputy(m)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Remove from group", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Outlined.PersonRemove,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                                onClick = {
+                                    menuOpen = false
+                                    removing = m
+                                },
+                            )
+                        }
+                    }
                 }
             }
         }

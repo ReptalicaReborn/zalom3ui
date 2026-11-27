@@ -29,6 +29,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -87,6 +88,8 @@ import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material.icons.outlined.ContactPage
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -111,6 +114,7 @@ import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material3.AlertDialog
@@ -213,6 +217,7 @@ import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.PendingMessage
+import com.zalom3ui.app.data.Person
 import com.zalom3ui.app.data.QUICK_REACTIONS
 import com.zalom3ui.app.data.Quote
 import com.zalom3ui.app.data.StickerInfo
@@ -254,12 +259,19 @@ class ChatActions(
     val onDismissPending: (String) -> Unit = {},
     val onDeleteMany: (List<ChatMessage>) -> Unit = {},
     val onForwardMany: (List<ChatMessage>) -> Unit = {},
+    val onLoadGroupBoard: () -> Unit = {},
+    val onCreateGroupNote: (String) -> Unit = {},
+    val onSetDisappearingTtl: (Long?) -> Unit = {},
+    val onLoadFriends: () -> Unit = {},
+    val onSendCard: (Person) -> Unit = {},
+    val onCancelOutbox: (String) -> Unit = {},
+    val onRetryOutbox: () -> Unit = {},
 )
 
 /** Photos and videos picked at once from the system photo picker. */
 private const val MAX_PICKED_MEDIA = 20
 
-private enum class MessageAction { REPLY, COPY, FORWARD, SELECT, RECALL, DELETE }
+private enum class MessageAction { REPLY, COPY, FORWARD, PIN_NOTE, SELECT, RECALL, DELETE }
 
 /** Messages from the same person this close together are drawn as one group of bubbles. */
 private const val GROUP_GAP_MS = 5 * 60_000L
@@ -282,6 +294,10 @@ fun ChatScreen(
     appearance: Appearance? = null,
     scrollToMsgId: String? = null,
     onScrolledToMsg: () -> Unit = {},
+    boardItems: List<BoardNoteItem> = emptyList(),
+    disappearingTtlMs: Long? = null,
+    outboxEntries: List<OutboxEntry> = emptyList(),
+    friends: List<Person> = emptyList(),
 ) {
     if (chatAccentOverride != null && appearance != null) {
         AppTheme(appearance.copy(accent = chatAccentOverride, dynamicColor = false)) {
@@ -296,6 +312,10 @@ fun ChatScreen(
                 initialDraft = initialDraft,
                 scrollToMsgId = scrollToMsgId,
                 onScrolledToMsg = onScrolledToMsg,
+                boardItems = boardItems,
+                disappearingTtlMs = disappearingTtlMs,
+                outboxEntries = outboxEntries,
+                friends = friends,
             )
         }
     } else {
@@ -310,6 +330,10 @@ fun ChatScreen(
             initialDraft = initialDraft,
             scrollToMsgId = scrollToMsgId,
             onScrolledToMsg = onScrolledToMsg,
+            boardItems = boardItems,
+            disappearingTtlMs = disappearingTtlMs,
+            outboxEntries = outboxEntries,
+            friends = friends,
         )
     }
 }
@@ -327,10 +351,15 @@ private fun ChatScreenContent(
     initialDraft: String,
     scrollToMsgId: String?,
     onScrolledToMsg: () -> Unit,
+    boardItems: List<BoardNoteItem>,
+    disappearingTtlMs: Long?,
+    outboxEntries: List<OutboxEntry>,
+    friends: List<Person>,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val colors = LocalChatColors.current
+    val isGroup = chat.kind == "group"
     var menuFor by remember(chat.ref) { mutableStateOf<String?>(null) }
     var reactionsFor by remember(chat.ref) { mutableStateOf<String?>(null) }
     var replyTo by remember(chat.ref) { mutableStateOf<ChatMessage?>(null) }
@@ -339,6 +368,9 @@ private fun ChatScreenContent(
     var viewingUrl by rememberSaveable { mutableStateOf<String?>(null) }
     var viewingMsgId by rememberSaveable { mutableStateOf<String?>(null) }
     var showStickers by rememberSaveable { mutableStateOf(false) }
+    var showPinNoteDialog by rememberSaveable { mutableStateOf(false) }
+    var showDisappearingDialog by rememberSaveable { mutableStateOf(false) }
+    var showShareContactSheet by rememberSaveable { mutableStateOf(false) }
     var pendingCameraUriStr by rememberSaveable { mutableStateOf<String?>(null) }
     var previewMediaUris by remember(chat.ref) { mutableStateOf<List<Uri>>(emptyList()) }
     val selectedIds = remember(chat.ref) { mutableStateListOf<String>() }
@@ -349,6 +381,10 @@ private fun ChatScreenContent(
     var jumpNonce by remember { mutableIntStateOf(0) }
     var jumpTarget by remember { mutableStateOf<Pair<String, Int>?>(null) }
 
+    LaunchedEffect(chat.ref, isGroup) {
+        if (isGroup) actions.onLoadGroupBoard()
+    }
+
     LaunchedEffect(initialSearch) {
         if (initialSearch) {
             searching = true
@@ -357,10 +393,17 @@ private fun ChatScreenContent(
     }
 
     val searchMatches = remember(chat.messages, searchQuery) {
-        findMessageMatches(chat.messages, searchQuery)
+        findInChatMatches(chat.messages, searchQuery)
+    }
+    LaunchedEffect(searchQuery, searchMatches.size) {
+        searchIndex = if (searchMatches.isEmpty()) 0 else searchMatches.lastIndex
     }
     val activeSearchIndex = if (searchMatches.isEmpty()) 0 else searchIndex.coerceIn(0, searchMatches.lastIndex)
     val activeSearchMatchId = searchMatches.getOrNull(activeSearchIndex)
+
+    val threadOutbox = remember(outboxEntries, chat.ref) {
+        outboxEntries.filter { it.thread == chat.ref }
+    }
 
     fun jumpToMessage(id: String) {
         jumpNonce++
@@ -399,7 +442,6 @@ private fun ChatScreenContent(
     BackHandler(enabled = selectedIds.isNotEmpty() && selectedMsg == null) { selectedIds.clear() }
     BackHandler(enabled = searching && selectedMsg == null && selectedIds.isEmpty()) { closeSearch() }
 
-    val isGroup = chat.kind == "group"
     DisposableEffect(chat.ref) { onDispose { VoicePlayback.stop() } }
 
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKED_MEDIA)) { uris ->
@@ -479,6 +521,12 @@ private fun ChatScreenContent(
                 }
             }
             MessageAction.FORWARD -> actions.onForward(msg)
+            MessageAction.PIN_NOTE -> {
+                val noteTitle = msg.text.trim()
+                if (isGroup && noteTitle.isNotEmpty()) {
+                    actions.onCreateGroupNote(noteTitle)
+                }
+            }
             MessageAction.SELECT -> {
                 if (msg.id !in selectedIds) selectedIds.add(msg.id)
             }
@@ -507,7 +555,7 @@ private fun ChatScreenContent(
                 if (selectedIds.isNotEmpty()) {
                     val idSet = selectedIds.toSet()
                     val selectedMessages = chat.messages.filter { it.id in idSet }
-                    val forwardable = selectedMessages.filter { it.isText }
+                    val forwardable = selectedMessages.filter { !it.recalled }
                     SelectionTopBar(
                         count = selectedIds.size,
                         canForward = forwardable.isNotEmpty(),
@@ -520,27 +568,6 @@ private fun ChatScreenContent(
                             selectedIds.clear()
                             if (selectedMessages.isNotEmpty()) actions.onDeleteMany(selectedMessages)
                         },
-                    )
-                } else if (searching) {
-                    InChatSearchTopBar(
-                        query = searchQuery,
-                        onQueryChange = {
-                            searchQuery = it
-                            searchIndex = 0
-                        },
-                        matchCount = searchMatches.size,
-                        activeIndex = activeSearchIndex,
-                        onOlder = {
-                            if (searchMatches.isNotEmpty()) {
-                                searchIndex = (activeSearchIndex + 1) % searchMatches.size
-                            }
-                        },
-                        onNewer = {
-                            if (searchMatches.isNotEmpty()) {
-                                searchIndex = (activeSearchIndex - 1 + searchMatches.size) % searchMatches.size
-                            }
-                        },
-                        onClose = closeSearch,
                     )
                 } else {
                     TopAppBar(
@@ -588,6 +615,11 @@ private fun ChatScreenContent(
                                     Icon(Icons.Outlined.Videocam, contentDescription = "Video call")
                                 }
                             }
+                            IconButton(onClick = {
+                                if (searching) closeSearch() else searching = true
+                            }) {
+                                Icon(Icons.Outlined.Search, contentDescription = "Search in chat")
+                            }
                             ChatMenu(
                                 thread = thread,
                                 isGroup = isGroup,
@@ -616,6 +648,9 @@ private fun ChatScreenContent(
                     sending = chat.sending,
                     uploading = chat.uploading,
                     stickers = stickers,
+                    disappearingTtlMs = disappearingTtlMs,
+                    onOpenDisappearingTimer = { showDisappearingDialog = true },
+                    onOpenShareContact = { showShareContactSheet = true },
                     onTakePhoto = onTakePhoto,
                     onPickMedia = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
                     onPickFiles = { pickFiles.launch(arrayOf("*/*")) },
@@ -637,30 +672,61 @@ private fun ChatScreenContent(
                 )
             },
         ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding)) {
-                MessageList(
-                    chat = chat,
-                    typing = typing,
-                    jumpTarget = jumpTarget,
-                    selectedIds = selectedIds.toSet(),
-                    onToggleSelect = ::toggleSelect,
-                    onOpenMenu = { menuFor = it.id },
-                    onOpenReactions = { reactionsFor = it.id },
-                    onQuoteClick = { quote ->
-                        findQuotedMessageId(chat.messages, quote)?.let(::jumpToMessage)
-                    },
-                    onSwipeReply = { replyTo = it },
-                    onLoadEarlier = actions.onLoadEarlier,
-                    onOpenImage = { msgId, url ->
-                        viewingMsgId = msgId
-                        viewingUrl = url
-                    },
-                    onOpenUrl = onOpenUrl,
-                    onRetryPending = actions.onRetryPending,
-                    onDismissPending = actions.onDismissPending,
-                )
-                if (chat.loading && chat.messages.isEmpty()) {
-                    LinearWavyProgressIndicator(Modifier.fillMaxWidth())
+            Column(Modifier.fillMaxSize().padding(padding)) {
+                AnimatedVisibility(visible = searching) {
+                    InChatSearchBar(
+                        query = searchQuery,
+                        onQueryChange = { searchQuery = it },
+                        matchIndex = activeSearchIndex,
+                        matchCount = searchMatches.size,
+                        onPrev = {
+                            if (searchMatches.isNotEmpty()) {
+                                searchIndex = (activeSearchIndex - 1 + searchMatches.size) % searchMatches.size
+                            }
+                        },
+                        onNext = {
+                            if (searchMatches.isNotEmpty()) {
+                                searchIndex = (activeSearchIndex + 1) % searchMatches.size
+                            }
+                        },
+                        onClose = closeSearch,
+                    )
+                }
+                if (isGroup && boardItems.isNotEmpty()) {
+                    PinnedMessageBanner(
+                        items = boardItems,
+                        onCreateNote = { showPinNoteDialog = true },
+                    )
+                }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    MessageList(
+                        chat = chat,
+                        typing = typing,
+                        outboxEntries = threadOutbox,
+                        jumpTarget = jumpTarget,
+                        searchFocusedId = if (searching) activeSearchMatchId else null,
+                        selectedIds = selectedIds.toSet(),
+                        onToggleSelect = ::toggleSelect,
+                        onOpenMenu = { menuFor = it.id },
+                        onOpenReactions = { reactionsFor = it.id },
+                        onQuoteClick = { quote ->
+                            findQuotedMessageId(chat.messages, quote)?.let(::jumpToMessage)
+                        },
+                        onSwipeReply = { replyTo = it },
+                        onLoadEarlier = actions.onLoadEarlier,
+                        onOpenImage = { msgId, url ->
+                            viewingMsgId = msgId
+                            viewingUrl = url
+                        },
+                        onOpenUrl = onOpenUrl,
+                        onRetryPending = actions.onRetryPending,
+                        onDismissPending = actions.onDismissPending,
+                        onCancelOutbox = actions.onCancelOutbox,
+                        onRetryOutbox = actions.onRetryOutbox,
+                    )
+                    if (chat.loading && chat.messages.isEmpty()) {
+                        LinearWavyProgressIndicator(Modifier.fillMaxWidth())
+                    }
                 }
             }
         }
@@ -743,6 +809,39 @@ private fun ChatScreenContent(
             onLeave = {
                 dialog = null
                 actions.onLeaveGroup(it)
+            },
+        )
+    }
+
+    if (showPinNoteDialog) {
+        PinNoteDialog(
+            onDismiss = { showPinNoteDialog = false },
+            onCreate = { noteText ->
+                showPinNoteDialog = false
+                actions.onCreateGroupNote(noteText)
+            },
+        )
+    }
+
+    if (showDisappearingDialog) {
+        DisappearingTimerDialog(
+            currentTtlMs = disappearingTtlMs,
+            onDismiss = { showDisappearingDialog = false },
+            onSelect = { ttl ->
+                showDisappearingDialog = false
+                actions.onSetDisappearingTtl(ttl)
+            },
+        )
+    }
+
+    if (showShareContactSheet) {
+        ShareContactSheet(
+            friends = friends,
+            onLoad = actions.onLoadFriends,
+            onDismiss = { showShareContactSheet = false },
+            onPick = { friend ->
+                showShareContactSheet = false
+                actions.onSendCard(friend)
             },
         )
     }
@@ -942,71 +1041,6 @@ private fun MediaPreviewSheet(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun InChatSearchTopBar(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    matchCount: Int,
-    activeIndex: Int,
-    onOlder: () -> Unit,
-    onNewer: () -> Unit,
-    onClose: () -> Unit,
-) {
-    val colors = LocalChatColors.current
-    val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
-    TopAppBar(
-        colors = TopAppBarDefaults.topAppBarColors(containerColor = colors.background),
-        navigationIcon = {
-            IconButton(onClick = onClose) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close search")
-            }
-        },
-        title = {
-            BasicTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                singleLine = true,
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                modifier = Modifier.fillMaxWidth().focusRequester(focus),
-                decorationBox = { inner ->
-                    Box(contentAlignment = Alignment.CenterStart) {
-                        if (query.isEmpty()) {
-                            Text(
-                                "Search in chat",
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        inner()
-                    }
-                },
-            )
-        },
-        actions = {
-            if (query.isNotBlank()) {
-                Text(
-                    if (matchCount == 0) "0 / 0" else "${activeIndex + 1} / $matchCount",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(end = 2.dp),
-                )
-                IconButton(onClick = onOlder, enabled = matchCount > 0) {
-                    Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Older match")
-                }
-                IconButton(onClick = onNewer, enabled = matchCount > 0) {
-                    Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Newer match")
-                }
-                IconButton(onClick = { onQueryChange("") }) {
-                    Icon(Icons.Outlined.Close, contentDescription = "Clear search")
-                }
-            }
-        },
-    )
-}
-
 @Composable
 private fun ChatMenu(
     thread: ThreadSummary?,
@@ -1086,7 +1120,9 @@ private fun ChatMenu(
 private fun MessageList(
     chat: ChatState,
     typing: TypingInfo?,
+    outboxEntries: List<OutboxEntry>,
     jumpTarget: Pair<String, Int>?,
+    searchFocusedId: String?,
     selectedIds: Set<String>,
     onToggleSelect: (ChatMessage) -> Unit,
     onOpenMenu: (ChatMessage) -> Unit,
@@ -1098,6 +1134,8 @@ private fun MessageList(
     onOpenUrl: (String) -> Unit,
     onRetryPending: (String) -> Unit,
     onDismissPending: (String) -> Unit,
+    onCancelOutbox: (String) -> Unit,
+    onRetryOutbox: () -> Unit,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -1107,7 +1145,8 @@ private fun MessageList(
     // The list reads each row's content type on every measure pass, so a row is classified once per list.
     val rowTypes = remember(reversedItems) { arrayOfNulls<String>(reversedItems.size) }
     val reversedPending = remember(chat.pending) { chat.pending.asReversed() }
-    val bottomOffset = (if (typing != null) 1 else 0) + reversedPending.size
+    val reversedOutbox = remember(outboxEntries) { outboxEntries.asReversed() }
+    val bottomOffset = (if (typing != null) 1 else 0) + reversedOutbox.size + reversedPending.size
     val isGroup = chat.kind == "group"
     val selectionMode = selectedIds.isNotEmpty()
     val unreadCount = remember(chat.messages, chat.firstUnreadId) {
@@ -1146,8 +1185,8 @@ private fun MessageList(
     LaunchedEffect(listState, chat.hasMore, chat.messages.size) {
         snapshotFlow { nearTop }.collect { if (it && chat.hasMore) onLoadEarlier() }
     }
-    // Follow new messages, optimistic pending bubbles, and "typing…" when already at the bottom.
-    LaunchedEffect(chat.messages.lastOrNull()?.id, chat.pending.size, typing != null) {
+    // Follow new messages, queued outbox bubbles, optimistic pending bubbles, and "typing…" when already at the bottom.
+    LaunchedEffect(chat.messages.lastOrNull()?.id, chat.pending.size, outboxEntries.size, typing != null) {
         if (listState.firstVisibleItemIndex <= 1) listState.animateScrollToItem(0)
     }
 
@@ -1210,6 +1249,19 @@ private fun MessageList(
                 item(key = "typing", contentType = "typing") { TypingBubble(isGroup, typing) }
             }
             items(
+                reversedOutbox.size,
+                key = { "outbox:${reversedOutbox[it].localId}" },
+                contentType = { "outbox" },
+            ) { i ->
+                val entry = reversedOutbox[i]
+                OutboxMessageRow(
+                    entry = entry,
+                    maxBubble = maxBubble,
+                    onCancel = { onCancelOutbox(entry.localId) },
+                    onRetry = onRetryOutbox,
+                )
+            }
+            items(
                 reversedPending.size,
                 key = { "pending:${reversedPending[it].localId}" },
                 contentType = { "pending" },
@@ -1236,7 +1288,7 @@ private fun MessageList(
                     when (item) {
                         is ChatItem.CallGroup -> CallGroupRow(
                             calls = item.calls,
-                            highlightedId = highlightedMsgId,
+                            highlightedId = highlightedMsgId ?: searchFocusedId,
                             selectedIds = selectedIds,
                             selectionMode = selectionMode,
                             onToggleSelect = onToggleSelect,
@@ -1246,10 +1298,11 @@ private fun MessageList(
                             val msg = item.msg
                             val systemLabel = systemMessageLabel(msg)
                             val isSelected = msg.id in selectedIds
+                            val isSearchFocused = searchFocusedId == msg.id
                             when {
                                 !msg.recalled && msg.attachment?.kind == "call" -> CallSystemRow(
                                     msg = msg,
-                                    highlighted = highlightedMsgId == msg.id,
+                                    highlighted = highlightedMsgId == msg.id || isSearchFocused,
                                     selected = isSelected,
                                     selectionMode = selectionMode,
                                     onClick = { if (selectionMode) onToggleSelect(msg) },
@@ -1258,7 +1311,7 @@ private fun MessageList(
                                 systemLabel != null -> SystemInfoRow(
                                     label = systemLabel,
                                     ts = msg.ts,
-                                    highlighted = highlightedMsgId == msg.id,
+                                    highlighted = highlightedMsgId == msg.id || isSearchFocused,
                                     selected = isSelected,
                                     selectionMode = selectionMode,
                                     onClick = { if (selectionMode) onToggleSelect(msg) },
@@ -1278,6 +1331,7 @@ private fun MessageList(
                                         lastOfRun = lastOfRun,
                                         maxBubble = maxBubble,
                                         highlighted = highlightedMsgId == msg.id,
+                                        searchFocused = isSearchFocused,
                                         selectionMode = selectionMode,
                                         selected = isSelected,
                                         onToggleSelect = { onToggleSelect(msg) },
@@ -1475,6 +1529,97 @@ private fun PendingMessageRow(
                     fontWeight = FontWeight.Medium,
                 )
             }
+        }
+    }
+}
+
+/** Outgoing bubble queued in [OfflineOutbox] while offline, with tap-to-cancel and retry. */
+@Composable
+private fun OutboxMessageRow(
+    entry: OutboxEntry,
+    maxBubble: Dp,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val shape = RoundedCornerShape(20.dp)
+    val container = colors.outgoing.copy(alpha = 0.62f)
+    val content = colors.onOutgoing.copy(alpha = 0.90f)
+    val meta = content.copy(alpha = 0.78f)
+    val hasError = !entry.lastError.isNullOrBlank()
+
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        horizontalAlignment = Alignment.End,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                onClick = onCancel,
+                modifier = Modifier.size(32.dp).padding(end = 4.dp),
+            ) {
+                Icon(
+                    Icons.Outlined.Close,
+                    contentDescription = "Cancel queued message",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            Surface(
+                shape = shape,
+                color = container,
+                contentColor = content,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                modifier = Modifier
+                    .widthIn(max = maxBubble)
+                    .clip(shape)
+                    .clickable(onClick = onCancel),
+            ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    TextWithFooter(
+                        text = AnnotatedString(entry.text),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = content,
+                        footer = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(formatClock(entry.createdAt), style = MaterialTheme.typography.labelSmall, color = meta)
+                                Spacer(Modifier.width(4.dp))
+                                Icon(
+                                    imageVector = Icons.Outlined.CloudOff,
+                                    contentDescription = "Queued offline",
+                                    tint = meta,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier
+                .padding(top = 3.dp, end = 6.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = if (hasError) onRetry else onCancel)
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+        ) {
+            Icon(
+                imageVector = if (hasError) Icons.Outlined.ErrorOutline else Icons.Outlined.Schedule,
+                contentDescription = null,
+                tint = if (hasError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(13.dp),
+            )
+            Text(
+                text = if (hasError) "Queued · tap to retry" else "Queued · sends when online",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (hasError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.Medium,
+            )
         }
     }
 }
@@ -1819,6 +1964,7 @@ private fun MessageRow(
     lastOfRun: Boolean,
     maxBubble: Dp,
     highlighted: Boolean,
+    searchFocused: Boolean = false,
     selectionMode: Boolean = false,
     selected: Boolean = false,
     onToggleSelect: () -> Unit = {},
@@ -1842,10 +1988,11 @@ private fun MessageRow(
     val highlightColor by animateColorAsState(
         targetValue = when {
             selected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            searchFocused -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
             highlighted -> MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
             else -> Color.Transparent
         },
-        animationSpec = tween(durationMillis = if (highlighted || selected) 160 else 640),
+        animationSpec = tween(durationMillis = if (highlighted || selected || searchFocused) 160 else 640),
         label = "bubbleHighlight",
     )
 
@@ -1855,6 +2002,17 @@ private fun MessageRow(
             .padding(top = if (firstOfRun) 8.dp else 2.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(highlightColor)
+            .then(
+                if (searchFocused) {
+                    Modifier.border(
+                        width = 1.5.dp,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                        shape = RoundedCornerShape(20.dp),
+                    )
+                } else {
+                    Modifier
+                },
+            )
             .then(if (selectionMode) Modifier.clickable(onClick = onToggleSelect) else Modifier),
     ) {
         // Revealed while swiping a message to the right to reply to it.
@@ -2488,8 +2646,9 @@ private fun FocusedMessageOverlay(
                     if (msg.text.isNotBlank() && msg.attachment == null) {
                         ToolbarActionItem("Copy", Icons.Outlined.ContentCopy) { onAction(MessageAction.COPY) }
                     }
-                    if (msg.isText) {
-                        ToolbarActionItem("Forward", Icons.AutoMirrored.Outlined.Forward) { onAction(MessageAction.FORWARD) }
+                    ToolbarActionItem("Forward", Icons.AutoMirrored.Outlined.Forward) { onAction(MessageAction.FORWARD) }
+                    if (isGroup && msg.text.isNotBlank()) {
+                        ToolbarActionItem("Pin note", Icons.Outlined.PushPin) { onAction(MessageAction.PIN_NOTE) }
                     }
                 }
                 ToolbarActionItem("Select", Icons.Outlined.CheckCircle) { onAction(MessageAction.SELECT) }
@@ -2568,6 +2727,9 @@ private fun Composer(
     sending: Boolean,
     uploading: Int,
     stickers: StickerSearch,
+    disappearingTtlMs: Long?,
+    onOpenDisappearingTimer: () -> Unit,
+    onOpenShareContact: () -> Unit,
     onTakePhoto: () -> Unit,
     onPickMedia: () -> Unit,
     onPickFiles: () -> Unit,
@@ -2707,6 +2869,19 @@ private fun Composer(
 
     Column(Modifier.background(colors.background).navigationBarsPadding().imePadding()) {
         if (uploading > 0) UploadingNoteHost(threadKey, uploading)
+        if (!isRecording && disappearingTtlMs != null && disappearingTtlMs > 0L) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                DisappearingTimerChip(
+                    ttlMs = disappearingTtlMs,
+                    onClick = onOpenDisappearingTimer,
+                )
+            }
+        }
         if (isRecording && !recordingLocked) {
             val lockProgress = (-slideOffsetY / lockThresholdPx).coerceIn(0f, 1f)
             Box(
@@ -3053,6 +3228,16 @@ private fun Composer(
                 keyboard?.hide()
                 onPickSticker()
             },
+            onShareContact = {
+                attachSheet = false
+                keyboard?.hide()
+                onOpenShareContact()
+            },
+            onDisappearingTimer = {
+                attachSheet = false
+                keyboard?.hide()
+                onOpenDisappearingTimer()
+            },
             onCreatePoll = if (canCreatePoll) {
                 {
                     attachSheet = false
@@ -3164,6 +3349,8 @@ private fun AttachmentSheet(
     onPickMedia: () -> Unit,
     onPickFiles: () -> Unit,
     onPickSticker: () -> Unit,
+    onShareContact: () -> Unit,
+    onDisappearingTimer: () -> Unit,
     onCreatePoll: (() -> Unit)? = null,
 ) {
     ModalBottomSheet(
@@ -3212,6 +3399,20 @@ private fun AttachmentSheet(
                 content = MaterialTheme.colorScheme.onTertiaryContainer,
                 onClick = onPickSticker,
             )
+            AttachmentTile(
+                label = "Share contact",
+                icon = Icons.Outlined.ContactPage,
+                container = MaterialTheme.colorScheme.secondaryContainer,
+                content = MaterialTheme.colorScheme.onSecondaryContainer,
+                onClick = onShareContact,
+            )
+            AttachmentTile(
+                label = "Disappearing messages",
+                icon = Icons.Outlined.Timer,
+                container = MaterialTheme.colorScheme.tertiaryContainer,
+                content = MaterialTheme.colorScheme.onTertiaryContainer,
+                onClick = onDisappearingTimer,
+            )
             if (onCreatePoll != null) {
                 AttachmentTile(
                     label = "Poll",
@@ -3220,6 +3421,125 @@ private fun AttachmentSheet(
                     content = MaterialTheme.colorScheme.onPrimaryContainer,
                     onClick = onCreatePoll,
                 )
+            }
+        }
+    }
+}
+
+/** Material 3 dialog for pinning a new note on a group's board. */
+@Composable
+internal fun PinNoteDialog(
+    onDismiss: () -> Unit,
+    onCreate: (String) -> Unit,
+) {
+    var note by rememberSaveable { mutableStateOf("") }
+    val trimmed = note.trim()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Outlined.PushPin,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        },
+        title = { Text("Pin a note") },
+        text = {
+            OutlinedTextField(
+                value = note,
+                onValueChange = { note = it.take(1000) },
+                label = { Text("Note") },
+                placeholder = { Text("Announcement or reminder for the group…") },
+                minLines = 2,
+                maxLines = 5,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onCreate(trimmed) },
+                enabled = trimmed.isNotEmpty(),
+            ) {
+                Text("Pin")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+/** Bottom sheet letting the user pick a friend to share as a Zalo contact card. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ShareContactSheet(
+    friends: List<Person>,
+    onLoad: () -> Unit,
+    onDismiss: () -> Unit,
+    onPick: (Person) -> Unit,
+) {
+    LaunchedEffect(Unit) { onLoad() }
+    var query by rememberSaveable { mutableStateOf("") }
+    val filtered = remember(friends, query) { filterPeople(friends, query) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .heightIn(min = 240.dp, max = 520.dp)
+                .padding(bottom = 16.dp),
+        ) {
+            Text(
+                "Share contact",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            )
+            SearchPill(
+                query = query,
+                onQuery = { query = it },
+                placeholder = "Search friends",
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            if (friends.isEmpty()) {
+                Text(
+                    "Loading contacts…",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(24.dp),
+                )
+            } else if (filtered.isEmpty()) {
+                Text(
+                    "No matching contacts",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(24.dp),
+                )
+            } else {
+                LazyColumn(Modifier.weight(1f, fill = false)) {
+                    items(filtered, key = { it.id }) { person ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(person) }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Avatar(person.name, person.avatar, key = "user:${person.id}", isGroup = false, size = 40.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Text(
+                                person.name,
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

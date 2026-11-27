@@ -7,11 +7,13 @@ import androidx.lifecycle.viewModelScope
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.ApiException
 import com.zalom3ui.app.data.Appearance
+import com.zalom3ui.app.data.BoardItem
 import com.zalom3ui.app.data.ChatAccent
 import com.zalom3ui.app.data.ChatMessage
 import com.zalom3ui.app.data.CreatePollRequest
 import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.FriendRequest
+import com.zalom3ui.app.data.GroupLinkInfo
 import com.zalom3ui.app.data.GroupMember
 import com.zalom3ui.app.data.HistorySyncEvent
 import com.zalom3ui.app.data.HistorySyncStatus
@@ -31,7 +33,9 @@ import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
+import com.zalom3ui.app.data.UserThreadInfo
 import com.zalom3ui.app.data.readPickedFile
+import com.zalom3ui.app.server.ConversationShortcuts
 import com.zalom3ui.app.server.LocalServer
 import com.zalom3ui.app.server.StayConnectedCoordinator
 import com.zalom3ui.app.server.ZaloCore
@@ -152,6 +156,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
     val pollEvents: SharedFlow<Long> = _pollEvents
+
+    private val outbox = OfflineOutbox()
+    /** Queued text messages held locally while offline and drained FIFO on reconnect. */
+    val outboxEntries: StateFlow<List<OutboxEntry>> = outbox.entries
+
+    private val _disappearingTtl = MutableStateFlow<Map<String, Long?>>(emptyMap())
+    /** Per-thread disappearing message TTL in ms, keyed by [ThreadRef.key]. */
+    val disappearingTtl: StateFlow<Map<String, Long?>> = _disappearingTtl.asStateFlow()
+
+    private val _groupBoards = MutableStateFlow<Map<String, List<BoardNoteItem>>>(emptyMap())
+    /** Pinned notes / board items per group ID. */
+    val groupBoards: StateFlow<Map<String, List<BoardNoteItem>>> = _groupBoards.asStateFlow()
+
+    private val _blockedUsers = MutableStateFlow<Set<String>>(emptySet())
+    /** Users blocked during this session (for instant Block/Unblock UI toggle). */
+    val blockedUsers: StateFlow<Set<String>> = _blockedUsers.asStateFlow()
+
+    private val _groupDeputies = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+    /** Session-tracked deputy user IDs per group ID. */
+    val groupDeputies: StateFlow<Map<String, Set<String>>> = _groupDeputies.asStateFlow()
 
     /** Live upload bytes per chat, from the core's `upload_progress` events. Only touched on the main thread. */
     private var uploads: UploadsByChat = emptyMap()
@@ -396,6 +420,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun logout() {
         VoicePlayback.stop()
+        outbox.clear()
+        _disappearingTtl.value = emptyMap()
+        _groupBoards.value = emptyMap()
+        _blockedUsers.value = emptySet()
+        _groupDeputies.value = emptyMap()
+        ConversationShortcuts.clearAll(getApplication())
         launchApi { api ->
             val status = api.logout()
             _state.update { it.copy(status = status, threads = emptyList(), chat = null) }
@@ -516,6 +546,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // On a tablet this leaves the chat beside the list without closing it: its draft shows in the list at once.
         flushDrafts()
         _state.update { it.copy(chat = ChatState(thread.kind, thread.id, thread.name)) }
+        pushShortcutForRef(thread.ref, fallbackName = thread.name, fallbackAvatar = thread.avatar)
         if (visible) viewModelScope.launch { runCatching { client?.setPresence(thread.ref) } }
         launchApi(onDone = { updateChat(thread.ref) { it.copy(loading = false) } }) { api ->
             val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
@@ -523,6 +554,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val firstUnread = if (unread > 0) res.messages.filter { !it.isSelf }.takeLast(unread).firstOrNull()?.id else null
             updateChat(thread.ref) {
                 it.copy(
+                    name = it.name.ifBlank { res.thread?.name.orEmpty() },
                     messages = merge(it.messages, res.messages),
                     loading = false,
                     hasMore = res.messages.size >= PAGE_SIZE,
@@ -557,17 +589,69 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Sets (or clears, when null/<=0) the disappearing-message TTL in ms for [ref]. */
+    fun setDisappearingTtl(ref: ThreadRef, ttlMs: Long?) {
+        _disappearingTtl.update { current ->
+            if (ttlMs == null || ttlMs <= 0L) current - ref.key else current + (ref.key to ttlMs)
+        }
+    }
+
+    fun cancelOutboxEntry(localId: String) {
+        outbox.remove(localId)
+    }
+
+    fun retryOutbox() {
+        flushOutbox()
+    }
+
+    fun flushOutbox() {
+        val api = client ?: return
+        if (_state.value.status?.state != "ready") return
+        if (outbox.pendingCount() == 0) return
+        viewModelScope.launch {
+            val sent = outbox.flushAll { entry ->
+                runCatching {
+                    sendTextOrLink(api, entry.thread, entry.text, entry.quoteId, entry.mentions, entry.ttl)
+                    pushShortcutForRef(entry.thread)
+                }
+            }
+            if (sent > 0) {
+                _state.value.chat?.let { chat ->
+                    val res = runCatching { api.messages(chat.kind, chat.id, PAGE_SIZE) }.getOrNull()
+                    if (res != null) {
+                        updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages)) }
+                    }
+                }
+            }
+        }
+    }
+
     /**
-     * Optimistically appends [text] to [ChatState.pending], invokes [onSent] immediately, clears the
-     * thread draft, and sends via the server. On failure the pending bubble stays in the list with
-     * `failed = true` so the user can retry or dismiss it.
+     * Sends [text] in the open chat. When offline (session state != `"ready"`), queues directly into [OfflineOutbox]
+     * so it drains FIFO on reconnect. Otherwise shows an optimistic bubble and falls back to [OfflineOutbox] on
+     * transient/offline errors.
      */
     fun send(text: String, quote: ChatMessage? = null, mentioned: List<GroupMember> = emptyList(), onSent: () -> Unit = {}) {
         val chat = _state.value.chat ?: return
         val body = text.trim()
         if (body.isEmpty()) return
         val mentions = if (chat.kind == "group") findMentions(body, mentioned) else emptyList()
+        val ttl = _disappearingTtl.value[chat.ref.key]
         val now = System.currentTimeMillis()
+        if (_state.value.status?.state != "ready" || client == null) {
+            outbox.enqueue(
+                thread = chat.ref,
+                text = body,
+                quoteId = quote?.id,
+                mentions = mentions,
+                ttl = ttl,
+                localId = "outbox-$now-${pendingSeq.incrementAndGet()}",
+                createdAt = now,
+            )
+            clearDraft(chat.ref)
+            onSent()
+            return
+        }
         val item = PendingMessage(
             localId = "pending-$now-${pendingSeq.incrementAndGet()}",
             text = body,
@@ -579,17 +663,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         updateChat(chat.ref) { it.copy(pending = it.pending + item) }
         clearDraft(chat.ref)
         onSent()
-        sendPending(chat.ref, item)
+        sendPending(chat.ref, item, ttl)
     }
 
     fun retryPending(localId: String) {
         val chat = _state.value.chat ?: return
         val item = chat.pending.firstOrNull { it.localId == localId } ?: return
+        val ttl = _disappearingTtl.value[chat.ref.key]
         val retrying = item.copy(failed = false, error = null, ts = System.currentTimeMillis())
         updateChat(chat.ref) { c ->
             c.copy(pending = c.pending.map { if (it.localId == localId) retrying else it })
         }
-        sendPending(chat.ref, retrying)
+        sendPending(chat.ref, retrying, ttl)
     }
 
     fun dismissPending(localId: String) {
@@ -599,15 +684,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun sendPending(ref: ThreadRef, item: PendingMessage) {
+    private fun sendPending(ref: ThreadRef, item: PendingMessage, ttl: Long? = null) {
         val api = client
-        if (api == null) {
-            markPendingFailed(ref, item.localId, "Not connected to the server")
+        if (api == null || _state.value.status?.state != "ready") {
+            movePendingToOutbox(ref, item, ttl)
             return
         }
         viewModelScope.launch {
             try {
-                api.send(ref.kind, ref.id, item.text, quoteId = item.quoteId, mentions = item.mentions)
+                sendTextOrLink(api, ref, item.text, item.quoteId, item.mentions, ttl)
+                pushShortcutForRef(ref)
                 val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
                 updateChat(ref) { chat ->
                     val updatedMessages = if (res != null) merge(chat.messages, res.messages) else chat.messages
@@ -619,9 +705,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                markPendingFailed(ref, item.localId, e.message ?: "Failed to send")
+                if (isLikelyOfflineError(e)) {
+                    movePendingToOutbox(ref, item, ttl)
+                } else {
+                    markPendingFailed(ref, item.localId, e.message ?: "Failed to send")
+                }
             }
         }
+    }
+
+    private suspend fun sendTextOrLink(
+        api: ApiClient,
+        ref: ThreadRef,
+        text: String,
+        quoteId: String?,
+        mentions: List<Mention>,
+        ttl: Long?,
+    ) {
+        if (quoteId == null && mentions.isEmpty() && isStandaloneHttpUrl(text)) {
+            try {
+                api.sendLink(ref.kind, ref.id, text, ttl = ttl)
+                return
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (isLikelyOfflineError(e)) throw e
+                // Fall back to regular text message if rich link parsing fails on the server.
+            }
+        }
+        api.send(ref.kind, ref.id, text, quoteId = quoteId, mentions = mentions, ttl = ttl)
+    }
+
+    private fun movePendingToOutbox(ref: ThreadRef, item: PendingMessage, ttl: Long?) {
+        updateChat(ref) { chat ->
+            chat.copy(pending = chat.pending.filterNot { it.localId == item.localId })
+        }
+        outbox.enqueue(
+            thread = ref,
+            text = item.text,
+            quoteId = item.quoteId,
+            mentions = item.mentions,
+            ttl = ttl,
+            localId = item.localId,
+            createdAt = item.ts,
+        )
     }
 
     private fun markPendingFailed(ref: ThreadRef, localId: String, error: String) {
@@ -631,6 +758,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (p.localId == localId) p.copy(failed = true, error = error) else p
                 },
             )
+        }
+    }
+
+    /** Sends a contact card into [ref], honoring any active disappearing timer. */
+    fun sendCard(ref: ThreadRef, userId: String, phone: String? = null) {
+        val ttl = _disappearingTtl.value[ref.key]
+        launchApi { api ->
+            api.sendCard(ref.kind, ref.id, userId, phone = phone, ttl = ttl)
+            pushShortcutForRef(ref)
+            val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
+            if (res != null) {
+                updateChat(ref) { it.copy(messages = merge(it.messages, res.messages)) }
+            }
+            _state.update { it.copy(notice = "Contact shared") }
+        }
+    }
+
+    /** Sends a rich link preview into [ref], honoring any active disappearing timer. */
+    fun sendLink(ref: ThreadRef, link: String, message: String? = null) {
+        val ttl = _disappearingTtl.value[ref.key]
+        launchApi { api ->
+            api.sendLink(ref.kind, ref.id, link, message = message, ttl = ttl)
+            pushShortcutForRef(ref)
+            val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
+            if (res != null) {
+                updateChat(ref) { it.copy(messages = merge(it.messages, res.messages)) }
+            }
         }
     }
 
@@ -702,6 +856,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         val api = client ?: break
                         file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
                         api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
+                        pushShortcutForRef(chat.ref)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -734,6 +889,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val api = client ?: throw ApiException("Not connected to the server")
                 api.sendVoice(chat.ref, file)
+                pushShortcutForRef(chat.ref)
                 val res = runCatching { api.messages(chat.kind, chat.id, PAGE_SIZE) }.getOrNull()
                 if (res != null) {
                     updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages)) }
@@ -762,7 +918,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun sendSticker(sticker: StickerInfo) {
         val chat = _state.value.chat ?: return
-        launchApi { api -> api.sendSticker(chat.kind, chat.id, sticker.id) }
+        launchApi { api ->
+            api.sendSticker(chat.kind, chat.id, sticker.id)
+            pushShortcutForRef(chat.ref)
+        }
     }
 
     // ---- Friends ----
@@ -831,6 +990,64 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         openChat(existing ?: ThreadSummary(id = user.id, kind = "user", name = user.name, avatar = user.avatar))
     }
 
+    /** Loads 1:1 user presence (`lastOnline`) and `commonGroups`. */
+    suspend fun loadUserInfo(userId: String): UserThreadInfo {
+        val info = pollApi().userInfo(userId)
+        if (info.lastOnline != null) {
+            updateChat(ThreadRef("user", userId)) { it.copy(lastOnline = info.lastOnline) }
+        }
+        return info
+    }
+
+    fun changeFriendAlias(userId: String, alias: String) {
+        val trimmed = alias.trim()
+        if (trimmed.isEmpty()) return
+        launchApi { api ->
+            api.changeFriendAlias(userId, trimmed)
+            val ref = ThreadRef("user", userId)
+            updateChat(ref) { it.copy(name = trimmed) }
+            refreshThreads(api)
+            _state.update { it.copy(notice = "Nickname updated") }
+        }
+    }
+
+    fun removeFriendAlias(userId: String) = launchApi { api ->
+        api.removeFriendAlias(userId)
+        refreshThreads(api)
+        val ref = ThreadRef("user", userId)
+        val refreshedName = _state.value.threads.firstOrNull { it.ref == ref }?.name
+        if (!refreshedName.isNullOrBlank()) {
+            updateChat(ref) { it.copy(name = refreshedName) }
+        }
+        _state.update { it.copy(notice = "Nickname reset") }
+    }
+
+    fun removeFriend(userId: String, onDone: () -> Unit = {}) = launchApi { api ->
+        api.removeFriend(userId)
+        refreshThreads(api)
+        _state.update { s ->
+            s.copy(
+                friends = s.friends.filterNot { it.id == userId },
+                notice = "Removed from friends",
+            )
+        }
+        onDone()
+    }
+
+    fun blockUser(userId: String, onDone: () -> Unit = {}) = launchApi { api ->
+        api.blockUser(userId)
+        _blockedUsers.update { it + userId }
+        _state.update { it.copy(notice = "User blocked") }
+        onDone()
+    }
+
+    fun unblockUser(userId: String, onDone: () -> Unit = {}) = launchApi { api ->
+        api.unblockUser(userId)
+        _blockedUsers.update { it - userId }
+        _state.update { it.copy(notice = "User unblocked") }
+        onDone()
+    }
+
     // ---- Groups ----
 
     fun createGroup(name: String, members: List<String>, onDone: () -> Unit = {}, onCreated: (ThreadSummary) -> Unit) =
@@ -887,9 +1104,76 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (chat.kind != "group") return
         launchApi { api ->
             api.leaveGroup(chat.id, silent)
+            ConversationShortcuts.removeShortcut(getApplication(), chat.ref)
             _state.update { it.copy(notice = "You left ${chat.name}") }
             onLeft()
             refreshThreads(api)
+        }
+    }
+
+    suspend fun loadGroupLink(groupId: String): GroupLinkInfo = pollApi().groupLink(groupId)
+
+    suspend fun enableGroupLink(groupId: String): GroupLinkInfo = pollApi().enableGroupLink(groupId)
+
+    suspend fun disableGroupLink(groupId: String) {
+        pollApi().disableGroupLink(groupId)
+    }
+
+    fun joinGroupLink(link: String, onJoined: (ThreadSummary?) -> Unit = {}) = launchApi { api ->
+        val resp = api.joinGroupLink(link)
+        refreshThreads(api)
+        val groupId = resp.groupId?.takeIf { it.isNotBlank() }
+        val thread = if (groupId != null) {
+            _state.value.threads.firstOrNull { it.kind == "group" && it.id == groupId }
+                ?: ThreadSummary(id = groupId, kind = "group", name = "Group")
+        } else {
+            null
+        }
+        _state.update { it.copy(notice = "Joined group") }
+        onJoined(thread)
+    }
+
+    fun addGroupDeputy(groupId: String, userId: String, memberName: String = "") = launchApi { api ->
+        api.addGroupDeputy(groupId, userId)
+        _groupDeputies.update { current ->
+            current + (groupId to (current[groupId].orEmpty() + userId))
+        }
+        val label = memberName.ifBlank { "Member" }
+        _state.update { it.copy(notice = "$label is now a deputy") }
+    }
+
+    fun removeGroupDeputy(groupId: String, userId: String, memberName: String = "") = launchApi { api ->
+        api.removeGroupDeputy(groupId, userId)
+        _groupDeputies.update { current ->
+            current + (groupId to (current[groupId].orEmpty() - userId))
+        }
+        val label = memberName.ifBlank { "Member" }
+        _state.update { it.copy(notice = "Removed $label as deputy") }
+    }
+
+    fun loadGroupBoard(groupId: String) {
+        val api = client ?: return
+        viewModelScope.launch {
+            runCatching { api.groupBoard(groupId) }.onSuccess { resp ->
+                val items = resp.items.map { it.toBoardNoteItem() }
+                _groupBoards.update { it + (groupId to items) }
+            }
+        }
+    }
+
+    fun createGroupNote(groupId: String, title: String, pin: Boolean = true, onDone: () -> Unit = {}) {
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) return
+        launchApi(onDone = onDone) { api ->
+            val created = api.createGroupNote(groupId, trimmed, pin).toBoardNoteItem()
+            _groupBoards.update { current ->
+                val existing = current[groupId].orEmpty().filterNot { it.id == created.id }
+                current + (groupId to (listOf(created) + existing))
+            }
+            _state.update { it.copy(notice = if (pin) "Note pinned" else "Note created") }
+            runCatching { api.groupBoard(groupId) }.onSuccess { resp ->
+                _groupBoards.update { it + (groupId to resp.items.map { item -> item.toBoardNoteItem() }) }
+            }
         }
     }
 
@@ -959,7 +1243,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun forwardSelectedMany(targets: List<ThreadRef>, onDone: () -> Unit) {
-        val messages = _state.value.forwardingMany
+        val messages = _state.value.forwardingMany.filterNot { it.recalled }
         if (messages.isEmpty() || targets.isEmpty()) {
             _state.update { it.copy(forwardingMany = emptyList()) }
             return
@@ -974,6 +1258,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun forward(message: ChatMessage, target: ThreadSummary, onDone: () -> Unit) = launchApi { api ->
+        if (message.recalled) return@launchApi
         api.forward(message.threadKind, message.threadId, message.id, listOf(target.ref))
         onDone()
     }
@@ -997,6 +1282,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteConversation(ref: ThreadRef) = launchApi { api ->
         api.deleteConversation(ref.kind, ref.id)
+        ConversationShortcuts.removeShortcut(getApplication(), ref)
         updateChat(ref) { it.copy(messages = emptyList(), hasMore = false) }
     }
 
@@ -1020,6 +1306,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 historySync = sync ?: it.historySync,
             )
         }
+        if (threads.isNotEmpty()) syncShortcutsAsync(threads)
+        if (status.state == "ready") flushOutbox()
         _state.value.chat?.let { chat ->
             val res = api.messages(chat.kind, chat.id, PAGE_SIZE)
             updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages), loading = false) }
@@ -1030,8 +1318,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         when (event) {
             is ServerEvent.Status -> {
                 val wasLoggedIn = _state.value.status?.isLoggedIn == true
+                val wasReady = _state.value.status?.state == "ready"
                 _state.update { it.copy(status = event.status, connectionError = null) }
                 if (event.status.isLoggedIn && !wasLoggedIn) scheduleRefreshThreads(api)
+                if (event.status.state == "ready" && (!wasReady || outbox.pendingCount() > 0)) {
+                    flushOutbox()
+                }
             }
             is ServerEvent.ThreadsChanged -> scheduleRefreshThreads(api)
             is ServerEvent.Message -> onMessage(api, event.message)
@@ -1123,6 +1415,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshThreads(api: ApiClient) {
         val threads = api.threads()
         _state.update { it.copy(threads = keepUnchanged(it.threads, threads)) }
+        if (threads.isNotEmpty()) syncShortcutsAsync(threads)
+    }
+
+    private fun syncShortcutsAsync(threads: List<ThreadSummary>) {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { ConversationShortcuts.syncRecentShortcuts(app, threads) }
+        }
+    }
+
+    private fun pushShortcutForRef(ref: ThreadRef, fallbackName: String = "", fallbackAvatar: String? = null) {
+        val thread = _state.value.threads.firstOrNull { it.ref == ref }
+        val openChat = _state.value.chat?.takeIf { it.ref == ref }
+        val title = thread?.name?.ifBlank { null }
+            ?: openChat?.name?.ifBlank { null }
+            ?: fallbackName.ifBlank { null }
+            ?: return
+        val avatar = thread?.avatar?.takeIf { it.isNotBlank() } ?: fallbackAvatar?.takeIf { it.isNotBlank() }
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                ConversationShortcuts.pushShortcut(
+                    context = app,
+                    ref = ref,
+                    title = title,
+                    avatarUrl = avatar,
+                    isGroup = ref.kind == "group",
+                )
+            }
+        }
     }
 
     private suspend fun markRead(api: ApiClient, ref: ThreadRef) {
@@ -1173,6 +1495,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val DRAFT_SAVE_DEBOUNCE_MS = 500L
         private const val PAGE_SIZE = 30
         private const val MAX_CHAT_MESSAGES = 300
+        private val STANDALONE_HTTP_URL = Regex("^https?://\\S+$", RegexOption.IGNORE_CASE)
+
+        /** True when [text] is a single standalone `http://` or `https://` URL with no surrounding spaces. */
+        internal fun isStandaloneHttpUrl(text: String): Boolean = STANDALONE_HTTP_URL.matches(text.trim())
 
         /** Newer copies of a message (reactions, recalls, receipts) replace older ones. */
         private fun merge(current: List<ChatMessage>, incoming: List<ChatMessage>, cap: Boolean = true): List<ChatMessage> {
@@ -1222,3 +1548,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 }
 
 val ThreadSummary.ref: ThreadRef get() = ThreadRef(kind, id)
+
+private fun BoardItem.toBoardNoteItem(): BoardNoteItem = BoardNoteItem(
+    id = id,
+    kind = kind,
+    title = title,
+    creatorId = creatorId,
+    createTime = createTime,
+    pinned = pinned,
+)

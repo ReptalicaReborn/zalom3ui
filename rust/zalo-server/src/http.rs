@@ -45,6 +45,8 @@ use crate::types::{MentionInfo, ReactionChoice, ThreadKind, REACTIONS};
 const MAX_JSON_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_TEXT_LENGTH: usize = 4000;
+const MAX_TTL_MS: u64 = 2_592_000_000;
+const MAX_NOTE_TITLE: usize = 1000;
 const MAX_FRIEND_MESSAGE: usize = 150;
 const MAX_FORWARD_TARGETS: usize = 20;
 const MAX_POLL_TEXT: usize = 200;
@@ -131,11 +133,13 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
         .route("/api/threads/{kind}/{id}/typing", post(post_typing))
         .route("/api/threads/{kind}/{id}", delete(delete_thread))
         .route("/api/presence", put(put_presence))
-        // Messages & stickers
+        // Messages, cards, links & stickers
         .route(
             "/api/threads/{kind}/{id}/messages",
             get(get_messages).post(post_message),
         )
+        .route("/api/threads/{kind}/{id}/card", post(post_card))
+        .route("/api/threads/{kind}/{id}/link", post(post_link))
         .route("/api/search", get(get_search))
         .route("/api/stickers", get(get_stickers))
         .route("/api/threads/{kind}/{id}/stickers", post(post_sticker))
@@ -155,8 +159,17 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
             "/api/threads/{kind}/{id}/messages/{msgId}/forward",
             post(post_forward),
         )
-        // Friends
+        // Friends & users
         .route("/api/friends", get(get_friends))
+        .route(
+            "/api/friends/{userId}/alias",
+            put(put_friend_alias).delete(delete_friend_alias),
+        )
+        .route("/api/friends/{userId}", delete(delete_friend))
+        .route(
+            "/api/users/{userId}/block",
+            post(post_block_user).delete(delete_unblock_user),
+        )
         .route(
             "/api/friend-requests",
             get(get_friend_requests).post(post_friend_request),
@@ -175,13 +188,26 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
             delete(delete_friend_request),
         )
         .route("/api/users/find", get(get_find_user))
-        // Groups
+        // Groups, links, deputies, board & notes
         .route("/api/groups", post(post_create_group))
+        .route("/api/groups/join-link", post(post_join_group_link))
+        .route(
+            "/api/groups/{id}/link",
+            get(get_group_link)
+                .post(post_enable_group_link)
+                .delete(delete_disable_group_link),
+        )
         .route("/api/groups/{id}/members", post(post_add_group_members))
         .route(
             "/api/groups/{id}/members/{userId}",
             delete(delete_group_member),
         )
+        .route(
+            "/api/groups/{id}/deputies/{userId}",
+            post(post_add_group_deputy).delete(delete_remove_group_deputy),
+        )
+        .route("/api/groups/{id}/board", get(get_group_board))
+        .route("/api/groups/{id}/notes", post(post_create_group_note))
         .route("/api/groups/{id}/name", put(put_group_name))
         .route("/api/groups/{id}/leave", post(post_leave_group))
         // Polls
@@ -953,11 +979,64 @@ async fn post_message(
         Some(other) => Some(other.to_string()),
     };
     let mentions = parse_mentions(val.get("mentions"), text)?;
+    let ttl = parse_optional_ttl(val.get("ttl"))?;
     let msg_id = state
         .session
-        .send_text(kind, &id, text, quote_id.as_deref(), mentions)
+        .send_text_with_ttl(kind, &id, text, quote_id.as_deref(), mentions, ttl)
         .await?;
     Ok((StatusCode::CREATED, Json(json!({ "msgId": msg_id }))))
+}
+
+async fn post_card(
+    State(state): State<AppState>,
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let kind = parse_kind(&kind)?;
+    let val = parse_json_body(&body)?;
+    let user_id = val
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HttpError::bad_request("userId is required"))?;
+    let phone = match val.get("phone") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        _ => return Err(HttpError::bad_request("phone must be a string")),
+    };
+    let ttl = parse_optional_ttl(val.get("ttl"))?;
+    state
+        .session
+        .send_card(kind, &id, user_id, phone, ttl)
+        .await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn post_link(
+    State(state): State<AppState>,
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let kind = parse_kind(&kind)?;
+    let val = parse_json_body(&body)?;
+    let link = val
+        .get("link")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HttpError::bad_request("link is required"))?;
+    let message = match val.get("message") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        _ => return Err(HttpError::bad_request("message must be a string")),
+    };
+    let ttl = parse_optional_ttl(val.get("ttl"))?;
+    state
+        .session
+        .send_link(kind, &id, link, message, ttl)
+        .await?;
+    Ok(StatusCode::CREATED)
 }
 
 async fn put_reaction(
@@ -1117,6 +1196,54 @@ async fn get_find_user(
     Ok(Json(user))
 }
 
+async fn put_friend_alias(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let val = parse_json_body(&body)?;
+    let alias = val
+        .get("alias")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HttpError::bad_request("alias is required"))?;
+    state.session.set_friend_alias(&user_id, alias).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_friend_alias(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    state.session.remove_friend_alias(&user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_friend(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    state.session.remove_friend(&user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_block_user(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    state.session.block_user(&user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_unblock_user(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    state.session.unblock_user(&user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---- Groups handlers ----
 
 async fn post_create_group(
@@ -1175,6 +1302,108 @@ async fn post_leave_group(
     let silent = val.get("silent").and_then(|v| v.as_bool()) == Some(true);
     state.session.leave_group(&id, silent).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_group_link(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    let info = state.session.get_group_link(&id).await?;
+    Ok(Json(info))
+}
+
+async fn post_enable_group_link(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    let info = state.session.enable_group_link(&id).await?;
+    Ok(Json(info))
+}
+
+async fn delete_disable_group_link(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    state.session.disable_group_link(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_join_group_link(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let val = parse_json_body(&body)?;
+    let link = val
+        .get("link")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HttpError::bad_request("link is required"))?;
+    let group_id = state.session.join_group_link(link).await?;
+    Ok(Json(json!({ "groupId": group_id })))
+}
+
+async fn post_add_group_deputy(
+    State(state): State<AppState>,
+    AxumPath((id, user_id)): AxumPath<(String, String)>,
+) -> ApiResult<StatusCode> {
+    state.session.add_group_deputy(&id, &user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_remove_group_deputy(
+    State(state): State<AppState>,
+    AxumPath((id, user_id)): AxumPath<(String, String)>,
+) -> ApiResult<StatusCode> {
+    state.session.remove_group_deputy(&id, &user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_group_board(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult<impl IntoResponse> {
+    let page = match query.get("page") {
+        None => None,
+        Some(raw) => Some(
+            positive_usize(raw)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| HttpError::bad_request("page must be a positive integer"))?,
+        ),
+    };
+    let count = match query.get("count") {
+        None => None,
+        Some(raw) => Some(
+            positive_usize(raw)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| HttpError::bad_request("count must be a positive integer"))?,
+        ),
+    };
+    let items = state.session.get_group_board(&id, page, count).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn post_create_group_note(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let val = parse_json_body(&body)?;
+    let title = val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HttpError::bad_request("title is required"))?;
+    if title.chars().count() > MAX_NOTE_TITLE {
+        return Err(HttpError::bad_request(format!(
+            "title is longer than {MAX_NOTE_TITLE} characters"
+        )));
+    }
+    let pin = val.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
+    let item = state.session.create_group_note(&id, title, pin).await?;
+    Ok((StatusCode::CREATED, Json(item)))
 }
 
 // ---- Polls handlers ----
@@ -1341,6 +1570,24 @@ fn parse_poll_id(value: &str) -> ApiResult<i64> {
         .ok()
         .filter(|&id| id > 0)
         .ok_or_else(|| HttpError::bad_request("Invalid poll id"))
+}
+
+fn parse_optional_ttl(val: Option<&Value>) -> ApiResult<Option<u64>> {
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => {
+            let ms = n
+                .as_u64()
+                .ok_or_else(|| HttpError::bad_request("ttl must be a non-negative integer"))?;
+            if ms > MAX_TTL_MS {
+                return Err(HttpError::bad_request(format!(
+                    "ttl must be at most {MAX_TTL_MS} milliseconds"
+                )));
+            }
+            Ok(Some(ms))
+        }
+        _ => Err(HttpError::bad_request("ttl must be a non-negative integer")),
+    }
 }
 
 fn positive_usize(value: &str) -> Option<usize> {

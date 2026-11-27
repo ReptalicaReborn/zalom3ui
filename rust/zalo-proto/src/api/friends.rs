@@ -205,4 +205,95 @@ impl ZaloClient {
             .post_encrypted(&self.ctx, &format!("{base}/api/friend/undo"), &params, &[])
             .await
     }
+
+    /// Changes a friend's alias/nickname (`GET /api/alias/update` on `alias` service).
+    pub async fn change_friend_alias(&self, alias: &str, friend_id: &str) -> Result<Value> {
+        let base = self.require_service("alias")?;
+        let params = json!({
+            "friendId": friend_id,
+            "alias": alias,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/alias/update"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Removes a friend's alias/nickname (`GET /api/alias/remove` on `alias` service).
+    pub async fn remove_friend_alias(&self, friend_id: &str) -> Result<Value> {
+        let base = self.require_service("alias")?;
+        let params = json!({
+            "friendId": friend_id,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/alias/remove"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Removes a friend (`POST /api/friend/remove` on `friend` service).
+    pub async fn remove_friend(&self, friend_id: &str) -> Result<Value> {
+        let base = self.require_service("friend")?;
+        let params = json!({
+            "fid": friend_id,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .post_encrypted(&self.ctx, &format!("{base}/api/friend/remove"), &params, &[])
+            .await
+    }
+
+    /// Blocks a user (`POST /api/friend/block` on `friend` service).
+    pub async fn block_user(&self, user_id: &str) -> Result<Value> {
+        let base = self.require_service("friend")?;
+        let params = json!({
+            "fid": user_id,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .post_encrypted(&self.ctx, &format!("{base}/api/friend/block"), &params, &[])
+            .await
+    }
+
+    /// Unblocks a user (`POST /api/friend/unblock` on `friend` service).
+    pub async fn unblock_user(&self, user_id: &str) -> Result<Value> {
+        let base = self.require_service("friend")?;
+        let params = json!({
+            "fid": user_id,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .post_encrypted(
+                &self.ctx,
+                &format!("{base}/api/friend/unblock"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Fetches QR code URLs for one or more users (`POST /api/friend/mget-qr` on `friend` service).
+    pub async fn get_qr(&self, user_ids: &[String]) -> Result<Value> {
+        let base = self.require_service("friend")?;
+        let params = json!({
+            "fids": user_ids,
+        });
+        self.http
+            .post_encrypted(
+                &self.ctx,
+                &format!("{base}/api/friend/mget-qr"),
+                &params,
+                &[],
+            )
+            .await
+    }
 }

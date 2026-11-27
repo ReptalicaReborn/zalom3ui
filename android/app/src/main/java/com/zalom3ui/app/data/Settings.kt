@@ -48,6 +48,18 @@ data class Appearance(
     val ultraExpressive: Boolean = false,
 )
 
+enum class AppLockTimeout(val key: String, val label: String, val timeoutMs: Long) {
+    IMMEDIATE("0", "Immediately", 0L),
+    ONE_MIN("60", "After 1 minute", 60_000L),
+    FIVE_MIN("300", "After 5 minutes", 300_000L),
+    THIRTY_MIN("1800", "After 30 minutes", 1_800_000L),
+    ;
+
+    companion object {
+        fun fromKey(key: String?): AppLockTimeout = entries.firstOrNull { it.key == key } ?: ONE_MIN
+    }
+}
+
 /** Server settings, kept in app-private storage. */
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -165,6 +177,24 @@ class SettingsStore(context: Context) {
         }.apply()
     }
 
+    var appLockEnabled: Boolean
+        get() = prefs.getBoolean(KEY_APP_LOCK_ENABLED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_APP_LOCK_ENABLED, value).apply()
+        }
+
+    var appLockTimeout: AppLockTimeout
+        get() = AppLockTimeout.fromKey(prefs.getString(KEY_APP_LOCK_TIMEOUT, null))
+        set(value) {
+            prefs.edit().putString(KEY_APP_LOCK_TIMEOUT, value.key).apply()
+        }
+
+    var screenSecurity: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_SECURITY, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_SCREEN_SECURITY, value).apply()
+        }
+
     internal companion object {
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
@@ -180,6 +210,9 @@ class SettingsStore(context: Context) {
         const val KEY_ULTRA_EXPRESSIVE = "ultra_expressive"
         const val KEY_CHAT_ACCENTS = "chat_accents"
         const val KEY_CHAT_DRAFTS = "chat_drafts"
+        const val KEY_APP_LOCK_ENABLED = "app_lock_enabled"
+        const val KEY_APP_LOCK_TIMEOUT = "app_lock_timeout"
+        const val KEY_SCREEN_SECURITY = "screen_security"
 
         fun encodeChatAccents(accents: Map<String, ChatAccent>): String =
             Json.encodeToString(accents.mapValues { it.value.key })

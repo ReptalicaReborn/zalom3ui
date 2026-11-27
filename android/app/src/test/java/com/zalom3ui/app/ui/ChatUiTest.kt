@@ -54,4 +54,14 @@ class ChatUiTest {
         assertEquals(1, previousCharacterStart("ab", 2))
         assertEquals(0, previousCharacterStart("", 0))
     }
+
+    @Test
+    fun standaloneHttpUrl_matchesOnlyPureHttpUrls() {
+        org.junit.Assert.assertTrue(AppViewModel.isStandaloneHttpUrl("https://example.com/article?id=1"))
+        org.junit.Assert.assertTrue(AppViewModel.isStandaloneHttpUrl("  http://zalo.me/g/abc  "))
+        org.junit.Assert.assertFalse(AppViewModel.isStandaloneHttpUrl("check https://example.com"))
+        org.junit.Assert.assertFalse(AppViewModel.isStandaloneHttpUrl("https://a.com https://b.com"))
+        org.junit.Assert.assertFalse(AppViewModel.isStandaloneHttpUrl("file:///etc/passwd"))
+        org.junit.Assert.assertFalse(AppViewModel.isStandaloneHttpUrl("hello world"))
+    }
 }

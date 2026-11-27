@@ -1266,6 +1266,152 @@ impl ZaloClient {
         self.http.post_encrypted(&self.ctx, &url, &params, &[]).await
     }
 
+    /// Parses link preview metadata (`GET /api/message/parselink` on `file` service).
+    pub async fn parse_link(&self, link: &str) -> Result<Value> {
+        if link.is_empty() {
+            return Err(ProtoError::InvalidArg("Missing link".into()));
+        }
+        let base = self.require_service("file")?;
+        let params = json!({
+            "link": link,
+            "version": 1,
+            "imei": self.ctx.imei,
+        });
+        self.http
+            .get_encrypted(
+                &self.ctx,
+                &format!("{base}/api/message/parselink"),
+                &params,
+                &[],
+            )
+            .await
+    }
+
+    /// Sends a contact card (`POST /api/message/forward` or `/api/group/forward` on `file` service).
+    pub async fn send_card(
+        &self,
+        user_id: &str,
+        phone_number: Option<&str>,
+        thread_id: &str,
+        thread_type: ThreadType,
+        ttl: Option<u64>,
+    ) -> Result<Value> {
+        if user_id.is_empty() {
+            return Err(ProtoError::InvalidArg("Missing userId".into()));
+        }
+        if thread_id.is_empty() {
+            return Err(ProtoError::InvalidArg("Missing threadId".into()));
+        }
+        let qr_data = self.get_qr(&[user_id.to_string()]).await?;
+        let base = self.require_service("file")?;
+        let client_id = Utc::now().timestamp_millis().to_string();
+
+        let mut msg_info = Map::new();
+        msg_info.insert("contactUid".to_string(), json!(user_id));
+        if let Some(qr_url) = qr_data.get(user_id).filter(|v| !v.is_null()) {
+            msg_info.insert("qrCodeUrl".to_string(), qr_url.clone());
+        }
+        if let Some(phone) = phone_number.filter(|p| !p.is_empty()) {
+            msg_info.insert("phone".to_string(), json!(phone));
+        }
+
+        let mut params = Map::new();
+        params.insert("ttl".to_string(), json!(ttl.unwrap_or(0)));
+        params.insert("msgType".to_string(), json!(6));
+        params.insert("clientId".to_string(), json!(client_id));
+        params.insert("msgInfo".to_string(), json!(Value::Object(msg_info).to_string()));
+
+        let url = match thread_type {
+            ThreadType::Group => {
+                params.insert("visibility".to_string(), json!(0));
+                params.insert("grid".to_string(), json!(thread_id));
+                format!("{base}/api/group/forward")
+            }
+            ThreadType::User => {
+                params.insert("toId".to_string(), json!(thread_id));
+                params.insert("imei".to_string(), json!(self.ctx.imei));
+                format!("{base}/api/message/forward")
+            }
+        };
+        self.http
+            .post_encrypted(&self.ctx, &url, &Value::Object(params), &[])
+            .await
+    }
+
+    /// Sends a rich link preview message (`POST /api/message/link` or `/api/group/sendlink`).
+    pub async fn send_link(
+        &self,
+        link: &str,
+        msg: Option<&str>,
+        thread_id: &str,
+        thread_type: ThreadType,
+        ttl: Option<u64>,
+    ) -> Result<Value> {
+        if link.is_empty() {
+            return Err(ProtoError::InvalidArg("Missing link".into()));
+        }
+        if thread_id.is_empty() {
+            return Err(ProtoError::InvalidArg("Missing threadId".into()));
+        }
+        let parsed = self.parse_link(link).await?;
+        let meta = parsed.get("data").unwrap_or(&parsed);
+
+        let full_msg = match msg.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) if m.contains(link) => m.to_string(),
+            Some(m) => format!("{m} {link}"),
+            None => link.to_string(),
+        };
+
+        let media_str = meta
+            .get("media")
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "{}".to_string());
+
+        let mut params = Map::new();
+        params.insert("msg".to_string(), json!(full_msg));
+        params.insert(
+            "href".to_string(),
+            meta.get("href").cloned().unwrap_or_else(|| json!(link)),
+        );
+        params.insert(
+            "src".to_string(),
+            meta.get("src").cloned().unwrap_or_else(|| json!("")),
+        );
+        params.insert(
+            "title".to_string(),
+            meta.get("title").cloned().unwrap_or_else(|| json!("")),
+        );
+        params.insert(
+            "desc".to_string(),
+            meta.get("desc").cloned().unwrap_or_else(|| json!("")),
+        );
+        params.insert(
+            "thumb".to_string(),
+            meta.get("thumb").cloned().unwrap_or_else(|| json!("")),
+        );
+        params.insert("type".to_string(), json!(2));
+        params.insert("media".to_string(), json!(media_str));
+        params.insert("ttl".to_string(), json!(ttl.unwrap_or(0)));
+        params.insert("clientId".to_string(), json!(Utc::now().timestamp_millis()));
+
+        let url = match thread_type {
+            ThreadType::Group => {
+                params.insert("grid".to_string(), json!(thread_id));
+                params.insert("imei".to_string(), json!(self.ctx.imei));
+                format!("{}/api/group/sendlink", self.require_service("group")?)
+            }
+            ThreadType::User => {
+                params.insert("toId".to_string(), json!(thread_id));
+                params.insert("mentionInfo".to_string(), json!(""));
+                format!("{}/api/message/link", self.require_service("chat")?)
+            }
+        };
+
+        self.http
+            .post_encrypted(&self.ctx, &url, &Value::Object(params), &[("nretry", "0")])
+            .await
+    }
+
     /// Sends a typing indicator (`POST /api/message/typing` or `/api/group/typing`).
     pub async fn send_typing_event(
         &self,
