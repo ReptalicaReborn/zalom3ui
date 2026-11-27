@@ -166,6 +166,9 @@ pub enum WsEvent {
         thread_type: ThreadType,
         messages: Vec<RawWsMessage>,
     },
+    /// `pageMsgs` (OA / ZNS / OTP) that arrived on a 510 history frame with a subCmd other than 1.
+    /// Replayed history like [`WsEvent::OldMessages`], but outside the paged replay.
+    OldPageMessages(Vec<RawWsMessage>),
     Undo(RawWsMessage),
     Reactions {
         thread_type: ThreadType,
@@ -207,6 +210,9 @@ pub enum WsEvent {
         code: u16,
         reason: String,
     },
+    /// Structure-only description of one decoded frame, for the socket log. Sent before the
+    /// frame's other events. Carries no message text.
+    Frame(crate::framelog::FrameReport),
     Error(String),
 }
 

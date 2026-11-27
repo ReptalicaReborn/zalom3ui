@@ -2105,7 +2105,7 @@ private fun Bubble(
                         footer = footer,
                     )
                     if (!self) {
-                        val otp = remember(msg.text) { extractOtpCode(msg.text) }
+                        val otp = remember(msg.otp, msg.text) { msg.otp ?: extractOtpCode(msg.text) }
                         if (otp != null) {
                             Spacer(Modifier.height(8.dp))
                             OtpCopyChip(otp = otp)

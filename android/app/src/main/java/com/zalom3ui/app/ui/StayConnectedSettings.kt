@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.NotificationsActive
+import androidx.compose.material.icons.outlined.Password
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -40,12 +41,16 @@ import com.zalom3ui.app.server.StayConnectedCoordinator
 import com.zalom3ui.app.server.ZaloNotificationListener
 
 /**
- * Settings → "Stay connected" (only while Zalo runs on this phone): how long Zalỏ stays connected to Zalo. Choosing a
- * mode takes effect at once ([StayConnectedCoordinator.applyMode]). The notification bridge needs notification access;
- * without it that mode behaves like "While open", and this says so.
+ * Settings → "Stay connected" (only while Zalo runs on this phone, [showModes]): how long Zalỏ stays connected to Zalo.
+ * Choosing a mode takes effect at once ([StayConnectedCoordinator.applyMode]). The notification bridge needs notification
+ * access; without it that mode behaves like "While open", and this says so.
+ *
+ * Below it, always: "Codes from Zalo's notifications" (off by default), which reads one-time codes from the official
+ * Zalo app's notifications. It uses the same notification access, and is offered right in the bridge's group when that
+ * access is already granted.
  */
 @Composable
-fun StayConnectedSettings() {
+fun StayConnectedSettings(showModes: Boolean = true) {
     val context = LocalContext.current
     val store = remember { SettingsStore(context) }
     var stay by remember { mutableStateOf(store.loadStay()) }
@@ -56,8 +61,18 @@ fun StayConnectedSettings() {
     }
 
     val transparent = ListItemDefaults.colors(containerColor = Color.Transparent)
+    val setRescue = { on: Boolean ->
+        stay = stay.copy(otpFromZaloNotifications = on)
+        StayConnectedCoordinator.saveOtpFromZaloNotifications(context, on)
+    }
+    val openAccess = {
+        runCatching {
+            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+        Unit
+    }
     val items = buildList<@Composable () -> Unit> {
-        for (mode in StayConnected.entries) {
+        for (mode in if (showModes) StayConnected.entries else emptyList()) {
             add {
                 Row(
                     Modifier
@@ -86,7 +101,7 @@ fun StayConnectedSettings() {
                 }
             }
         }
-        if (stay.mode.usesBridge) {
+        if (showModes && stay.mode.usesBridge) {
             add {
                 ListItem(
                     colors = transparent,
@@ -136,11 +151,74 @@ fun StayConnectedSettings() {
                     },
                 )
             }
+            // Access is already allowed for the bridge: offer the code rescue here, where the user is looking.
+            if (accessGranted && !stay.otpFromZaloNotifications) {
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable { setRescue(true) },
+                        colors = transparent,
+                        leadingContent = { Icon(Icons.Outlined.Password, null) },
+                        headlineContent = { Text("Codes from Zalo's notifications") },
+                        supportingContent = {
+                            Text("Notification access is already allowed. Turn this on to get one-time codes with a Copy button.")
+                        },
+                        trailingContent = { Switch(checked = false, onCheckedChange = { setRescue(true) }) },
+                    )
+                }
+            }
+        }
+    }
+
+    val rescueItems = buildList<@Composable () -> Unit> {
+        add {
+            ListItem(
+                modifier = Modifier.clickable { setRescue(!stay.otpFromZaloNotifications) },
+                colors = transparent,
+                leadingContent = { Icon(Icons.Outlined.Password, null) },
+                headlineContent = { Text("Codes from Zalo's notifications") },
+                supportingContent = {
+                    Text(
+                        "When the Zalo app shows a message with a one-time code (a bank or service OTP), Zalỏ shows the code " +
+                            "in its own notification with a Copy button, and hides it on the lock screen. Works even if Zalo " +
+                            "never sends those messages to Zalỏ. It reads the notification in memory only; nothing is stored or logged.",
+                    )
+                },
+                trailingContent = {
+                    Switch(checked = stay.otpFromZaloNotifications, onCheckedChange = setRescue)
+                },
+            )
+        }
+        if (stay.otpFromZaloNotifications) {
+            add {
+                ListItem(
+                    colors = transparent,
+                    leadingContent = { Icon(Icons.Outlined.NotificationsActive, null) },
+                    headlineContent = { Text("Notification access") },
+                    supportingContent = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                if (accessGranted) {
+                                    "Granted: Zalỏ can read the Zalo app's notifications for codes."
+                                } else {
+                                    "Not granted. Codes can't be read until you allow notification access."
+                                },
+                            )
+                            Button(onClick = openAccess) {
+                                Text(if (accessGranted) "Open notification access" else "Allow notification access")
+                            }
+                        }
+                    },
+                )
+            }
         }
     }
 
     Column {
-        SectionHeader("Stay connected")
-        ExpressiveSettingsGroup(items = items)
+        if (showModes) {
+            SectionHeader("Stay connected")
+            ExpressiveSettingsGroup(items = items)
+        }
+        SectionHeader("Codes from Zalo's notifications")
+        ExpressiveSettingsGroup(items = rescueItems)
     }
 }

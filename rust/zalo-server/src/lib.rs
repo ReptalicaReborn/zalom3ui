@@ -10,6 +10,7 @@ pub mod log;
 pub mod replay;
 pub mod routes;
 pub mod session;
+pub mod socket_log;
 pub mod store;
 pub mod types;
 

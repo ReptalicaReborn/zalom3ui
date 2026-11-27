@@ -631,3 +631,24 @@ async fn stale_on_logged_in_and_load_friends_drop_results_after_logout() {
     assert!(session.friends().is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn frame_events_feed_the_socket_log_and_history_page_msgs_are_stored_silently() {
+    let mut r = rig();
+    let mut report = zalo_proto::framelog::FrameReport::new(1, 501, 3);
+    report.payload_keys = vec!["data".into()];
+    r.session.testing_dispatch(WsEvent::Frame(report)).await;
+    let text = r.session.socket_log().render_text();
+    assert!(text.contains("cmd=501 sub=3"), "{text}");
+    assert!(text.contains("handled"), "{text}");
+
+    r.drain_events();
+    r.session
+        .testing_dispatch(WsEvent::OldPageMessages(vec![incoming("77", 1000, json!({}), false)]))
+        .await;
+    assert!(r.store.get_message("77").is_some());
+    assert!(
+        r.drain_events().iter().all(|e| e["notify"] != json!(true)),
+        "history never notifies"
+    );
+}

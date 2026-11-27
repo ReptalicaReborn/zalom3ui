@@ -91,6 +91,10 @@ pub fn build_app(config: Arc<Config>, session: Arc<ZaloSession>, network_facing:
             get(get_replay_log).delete(clear_replay_log),
         )
         .route(
+            "/api/debug/socket-log",
+            get(get_socket_log).delete(clear_socket_log),
+        )
+        .route(
             "/api/debug/replay-mode",
             get(get_replay_mode).put(put_replay_mode),
         )
@@ -549,6 +553,20 @@ async fn get_replay_log(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn clear_replay_log(State(state): State<AppState>) -> StatusCode {
     state.session.replay().clear();
+    StatusCode::NO_CONTENT
+}
+
+/// The socket log as plain text, newest first (frame structure only, never message text).
+async fn get_socket_log(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        state.session.socket_log().render_text(),
+    )
+}
+
+async fn clear_socket_log(State(state): State<AppState>) -> StatusCode {
+    state.session.socket_log().clear();
     StatusCode::NO_CONTENT
 }
 

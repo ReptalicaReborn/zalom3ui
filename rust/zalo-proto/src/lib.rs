@@ -4,6 +4,7 @@ pub mod api;
 pub mod cookies;
 pub mod crypto;
 pub mod error;
+pub mod framelog;
 pub mod http;
 pub mod listener;
 pub mod login;
@@ -31,7 +32,7 @@ pub use crypto::{
 pub use error::{ProtoError, Result};
 pub use http::{handle_zalo_response, ZaloHttp};
 pub use listener::{
-    decode_frame_header, dispatch_frame, encode_frame, CloseReason, ListenerHandle, ZaloListener,
+    decode_frame_header, dispatch_frame, dispatch_frame_traced, encode_frame, CloseReason, ListenerHandle, ZaloListener,
 };
 pub use login::{login_cookie, login_cookie_with_http, login_qr, DEFAULT_USER_AGENT};
 pub use types::{

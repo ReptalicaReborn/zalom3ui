@@ -47,8 +47,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
-import android.content.ClipData
-import android.content.ClipboardManager
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -120,6 +118,7 @@ import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zalom3ui.app.data.Attachment
 import com.zalom3ui.app.data.isLocalMediaUri
+import com.zalom3ui.app.server.OtpClipboard
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.abs
@@ -505,41 +504,13 @@ private fun FileBadge(ext: String?) {
     }
 }
 
-private val OTP_KEYWORD_RE = Regex(
-    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b""",
-    RegexOption.IGNORE_CASE,
-)
-private val OTP_AFTER_RE = Regex(
-    """\b(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich|pin)|verification\s*code|security\s*code|auth(?:entication)?\s*code|confirm(?:ation)?\s*code|passcode|one[- ]time(?:\s*(?:code|password|pin))?)\b[^\d\n]{0,40}?(?<!\d)(\d{4,8})(?!\d)""",
-    RegexOption.IGNORE_CASE,
-)
-private val OTP_BEFORE_RE = Regex(
-    """(?<!\d)(\d{4,8})(?!\d)[^\d\n]{0,24}\b(?:la\s+)?(?:otp|ma\s*(?:xac\s*(?:thuc|nhan)|bao\s*mat|dang\s*nhap|kich\s*hoat|xac\s*minh|giao\s*dich)|verification\s*code|security\s*code|passcode)\b""",
-    RegexOption.IGNORE_CASE,
-)
-
-/**
- * Extracts a 4–8 digit OTP / verification code when accompanied by an OTP keyword (Vietnamese or English).
- * Ignores 9+ digit phone numbers or account IDs (e.g. `0378795621`).
- */
-internal fun extractOtpCode(text: String): String? {
-    if (text.isBlank()) return null
-    val folded = foldForSearch(text)
-    if (!OTP_KEYWORD_RE.containsMatchIn(folded)) return null
-    OTP_AFTER_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
-    OTP_BEFORE_RE.find(folded)?.groupValues?.getOrNull(1)?.let { return it }
-    return null
-}
-
 /** One-tap chip that copies a detected OTP code to the clipboard. */
 @Composable
 fun OtpCopyChip(otp: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     FilledTonalButton(
         onClick = {
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
-            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+            OtpClipboard.copyWithFeedback(context, otp)
         },
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
         modifier = modifier,
@@ -613,9 +584,7 @@ private fun LinkCard(a: Attachment, onOutgoing: Boolean, onClick: (() -> Unit)?)
                         if (onClick != null) {
                             onClick()
                         } else if (otp != null) {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            cm?.setPrimaryClip(ClipData.newPlainText("OTP", otp))
-                            Toast.makeText(context, "Copied OTP $otp", Toast.LENGTH_SHORT).show()
+                            OtpClipboard.copyWithFeedback(context, otp)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
