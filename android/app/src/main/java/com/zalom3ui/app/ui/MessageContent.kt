@@ -236,6 +236,8 @@ fun AttachmentContent(
             )
         }
         "video" -> {
+            var playUrl by remember { mutableStateOf<String?>(null) }
+            playUrl?.let { VideoPlayerDialog(url = it, thumb = a.remoteThumb, onDismiss = { playUrl = null }) }
             val thumb = a.remoteThumb
             val videoUrl = a.remoteHref
             if (thumb == null && videoUrl == null) {
@@ -248,7 +250,7 @@ fun AttachmentContent(
                         url = thumb,
                         aspect = mediaAspect(a.width, a.height),
                         edgeToEdge = edgeToEdge,
-                        onClick = { videoUrl?.let { openExternally(context, it, "video/*") } },
+                        onClick = { videoUrl?.let { playUrl = it } },
                     )
                 } else {
                     val placeholderMod = if (edgeToEdge) {
@@ -267,7 +269,7 @@ fun AttachmentContent(
                             .background(Color.Black)
                             .then(
                                 if (videoUrl != null) {
-                                    Modifier.clickable { openExternally(context, videoUrl, "video/*") }
+                                    Modifier.clickable { playUrl = videoUrl }
                                 } else {
                                     Modifier
                                 },
