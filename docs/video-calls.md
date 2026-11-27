@@ -22,6 +22,16 @@ From the arm64 `ZaloCall` (symbols, its own packet builders run in an emulator, 
   payload types 118 / 119 exist in the call program; `fecTP: 0` turns them off).
 - **Retransmission and key frames:** RTCP NACK (`videoNack`), PLI / FIR for key frames, and transport-wide congestion
   control feedback (TWCC) — Zalos sends all of these.
+- **Receiver feedback the core sends** (`rust/zalo-media/src/call/rtcp.rs`, `zrtcclient.rs`), because the sender
+  picks its rung of the quality ladder from it. Without it, the first real calls received blurry low-rung video.
+  - TWCC every 50 ms on the audio RTCP kind (5). It covers audio and video, keyed by the transport-wide sequence in
+    the one-byte header extension ID 5.
+  - NACK on the video RTCP kind (15) for missing video packets: retried every ~40 ms, up to 5 times.
+  - Receiver reports once a second.
+  - A once-a-second status forward (control command 32, sub 10, the number of audio packets received in the last
+    second), plus a sub 8 hello after joining.
+  - RTCP from the media server is processed even when its token is not ours. The server relays the peer's reports
+    and key-frame requests that way.
 - **Size and rate** (`zrtc_config`): `maxWidth` 640, `maxHeight` 480, default encode height 360, `codecMaxFps` 24,
   `minBitrate` 150 / `maxBitrate` 800 kbit/s, `startupBitrate` 200, and a ladder in `bwProfiles` (240p 8 fps 30 kbit/s
   … 720p 24 fps 1100 kbit/s).

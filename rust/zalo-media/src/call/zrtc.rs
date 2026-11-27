@@ -208,6 +208,40 @@ pub fn end_call(user_id: u32, call_id: u32, server_id: u32, flag: bool) -> Vec<u
     w.done()
 }
 
+/// Forward request (command 32) to the media server: control header with a forward counter in
+/// bytes 6..10 and the stream token in bytes 14..18, then `body` verbatim.
+pub fn forward(user_id: u32, token: u32, seq: u32, sub: u8, body: &[u8]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(HEADER_BYTES + body.len());
+    w.header(ControlHeader {
+        kind: kind::REQUEST,
+        flag: 1,
+        w2: 0,
+        w6: seq,
+        user_id,
+        w14: token,
+        cmd: cmd::FORWARD,
+        sub,
+    })
+    .bytes(body);
+    w.done()
+}
+
+/// Per-second receive status (forward sub 10). The body is a 32-bit-length string holding five
+/// u32 LE values `[0, 1, 1, audio_rtp_received_last_second, 0]` (so on the wire six u32s, the
+/// first being the length 20).
+pub fn forward_status(user_id: u32, token: u32, seq: u32, audio_rx_last_second: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24);
+    for v in [20u32, 0, 1, 1, audio_rx_last_second, 0] {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    forward(user_id, token, seq, 10, &body)
+}
+
+/// One-off hello after joining (forward sub 8): a 32-bit-length string of four zero bytes.
+pub fn forward_hello(user_id: u32, token: u32) -> Vec<u8> {
+    forward(user_id, token, 0, 8, &[4, 0, 0, 0, 0, 0, 0, 0])
+}
+
 /// RTCP to the media server: kind 5 (audio) or 15 (video), stream token, RTCP packet.
 pub fn rtcp(token: u32, packet: &[u8], video: bool) -> Result<Vec<u8>, ZrtcError> {
     if packet.len() > MAX_PAYLOAD {
@@ -502,6 +536,46 @@ mod tests {
     const C: u32 = 0x3333_3333;
 
     #[test]
+    fn forward_status_and_hello_round_trip() {
+        let st = forward_status(A, B, 7, 49);
+        assert_eq!(st.len(), HEADER_BYTES + 24);
+        assert_eq!(&st[..2], &[1, 1]);
+        assert_eq!(&st[2..6], &[0; 4]);
+        assert_eq!(&st[6..10], &7u32.to_le_bytes());
+        assert_eq!(&st[10..14], &A.to_le_bytes());
+        assert_eq!(&st[14..18], &B.to_le_bytes());
+        assert_eq!(&st[18..20], &32u16.to_le_bytes());
+        assert_eq!(st[20], 10);
+        let vals: Vec<u32> = st[21..]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, [20, 0, 1, 1, 49, 0]);
+        match parse(&st).unwrap() {
+            Packet::Control { header, text, .. } => {
+                assert_eq!(
+                    (header.kind, header.cmd, header.sub),
+                    (kind::REQUEST, cmd::FORWARD, 10)
+                );
+                assert_eq!((header.w6, header.user_id, header.w14), (7, A, B));
+                // str32 of the five remaining u32s.
+                assert_eq!(text.map(|t| t.len()), Some(20));
+            }
+            other => panic!("expected control, got {other:?}"),
+        }
+
+        let hello = forward_hello(A, B);
+        assert_eq!(hello[18..], [32, 0, 8, 4, 0, 0, 0, 0, 0, 0, 0]);
+        match parse(&hello).unwrap() {
+            Packet::Control { header, text, .. } => {
+                assert_eq!((header.cmd, header.sub, header.w6), (cmd::FORWARD, 8, 0));
+                assert_eq!(text.as_deref(), Some("\0\0\0\0"));
+            }
+            other => panic!("expected control, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn init_call_as_caller_matches_zalo_pc() {
         let pkt = init_call(InitCallParams {
             is_caller: true,
@@ -515,7 +589,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             pkt,
-            decode_hex("01 7e 00000000 00000000 11111111 00000000 0b00 55 33333333 22222222 0400 53455353")
+            decode_hex(
+                "01 7e 00000000 00000000 11111111 00000000 0b00 55 33333333 22222222 0400 53455353"
+            )
         );
     }
 
@@ -571,8 +647,14 @@ mod tests {
     fn audio_video_rtcp_and_size_limits() {
         assert_eq!(audio(B, b"RTP").unwrap(), decode_hex("03 22222222 525450"));
         assert_eq!(video(B, b"VID").unwrap(), decode_hex("0d 22222222 564944"));
-        assert_eq!(rtcp(B, b"RC", false).unwrap(), decode_hex("05 22222222 5243"));
-        assert_eq!(rtcp(B, b"RC", true).unwrap(), decode_hex("0f 22222222 5243"));
+        assert_eq!(
+            rtcp(B, b"RC", false).unwrap(),
+            decode_hex("05 22222222 5243")
+        );
+        assert_eq!(
+            rtcp(B, b"RC", true).unwrap(),
+            decode_hex("0f 22222222 5243")
+        );
         assert!(matches!(
             audio(1, &vec![0u8; MAX_PAYLOAD + 1]),
             Err(ZrtcError::PayloadTooLarge(0x579))
@@ -656,7 +738,10 @@ mod tests {
     fn parse_other_responses_and_requests() {
         let mut end = hdr(2, 3, 0);
         end.extend_from_slice(&0u32.to_le_bytes());
-        assert!(matches!(parse(&end).unwrap(), Packet::Control { error: Some(0), .. }));
+        assert!(matches!(
+            parse(&end).unwrap(),
+            Packet::Control { error: Some(0), .. }
+        ));
 
         let mut fwd = hdr(1, 32, 7);
         fwd.extend_from_slice(&8u32.to_le_bytes());
@@ -728,7 +813,10 @@ mod tests {
             }
         );
 
-        assert!(matches!(parse(&[2, 0x7e, 1]), Err(ZrtcError::Truncated { .. })));
+        assert!(matches!(
+            parse(&[2, 0x7e, 1]),
+            Err(ZrtcError::Truncated { .. })
+        ));
         assert!(matches!(parse(&[]), Err(ZrtcError::Empty)));
     }
 

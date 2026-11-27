@@ -7,8 +7,9 @@ pub mod zrtc;
 pub mod zrtcclient;
 
 pub use rtcp::{
-    fir, ntp, ntp_middle, parse_rtcp, pli, receiver_report, rtcp_type, sdes_cname, sender_report,
-    ReceiveStats, ReportBlock, RtcpPacket,
+    fir, nack, ntp, ntp_middle, parse_rtcp, pli, read_tw_seq, receiver_report, rtcp_type,
+    sdes_cname, sender_report, NackRequest, NackTracker, ReceiveStats, ReportBlock, RtcpPacket,
+    TwccRecorder,
 };
 pub use srtp::{derive_key, rtp_header, RtpHeader, SrtpContext, SrtpError, AUTH_TAG_LEN};
 pub use video::{
