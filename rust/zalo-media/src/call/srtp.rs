@@ -29,6 +29,8 @@ pub enum SrtpError {
     InvalidKeySalt,
     #[error("Session too short for an SRTP key")]
     SessionTooShort,
+    #[error("SRTP auth tag length must be 10 or 4")]
+    InvalidTagLen,
     #[error("Not an RTP packet")]
     NotRtpPacket,
     #[error("SRTP packet index reached 2^48")]
@@ -115,11 +117,20 @@ pub struct SrtpContext {
     tx_streams: HashMap<u32, TxStream>,
     rx_streams: HashMap<u32, RxStream>,
     last_rx: Option<(u32, RxStream)>,
+    tag_len: usize,
 }
 
 impl SrtpContext {
     /// Creates an SRTP context from a 16-byte master key and 14-byte master salt.
     pub fn new(master_key: &[u8], master_salt: &[u8]) -> Result<Self, SrtpError> {
+        Self::new_with_tag_len(master_key, master_salt, AUTH_TAG_LEN)
+    }
+
+    /// Like [`Self::new`] with an explicit auth tag length: 10 (`_HMAC_SHA1_80`) or 4 (`_HMAC_SHA1_32`).
+    pub fn new_with_tag_len(master_key: &[u8], master_salt: &[u8], tag_len: usize) -> Result<Self, SrtpError> {
+        if tag_len != AUTH_TAG_LEN && tag_len != 4 {
+            return Err(SrtpError::InvalidTagLen);
+        }
         let mk: &[u8; KEY_LEN] = master_key.try_into().map_err(|_| SrtpError::InvalidKeySalt)?;
         let ms: &[u8; SALT_LEN] = master_salt.try_into().map_err(|_| SrtpError::InvalidKeySalt)?;
         let enc: [u8; KEY_LEN] = derive_key(mk, ms, 0, KEY_LEN).try_into().unwrap();
@@ -135,16 +146,27 @@ impl SrtpContext {
             tx_streams: HashMap::new(),
             rx_streams: HashMap::new(),
             last_rx: None,
+            tag_len,
         })
     }
 
     /// Derives the key Zalo uses for a call: the session's first 30 latin1/ISO-8859-1 bytes.
     pub fn from_session(session: &str) -> Result<Self, SrtpError> {
+        Self::from_session_with_tag_len(session, AUTH_TAG_LEN)
+    }
+
+    /// [`Self::from_session`] with an explicit auth tag length (10 or 4).
+    pub fn from_session_with_tag_len(session: &str, tag_len: usize) -> Result<Self, SrtpError> {
         let raw: Vec<u8> = session.encode_utf16().map(|u| (u & 0xff) as u8).collect();
         if raw.len() < KEY_LEN + SALT_LEN {
             return Err(SrtpError::SessionTooShort);
         }
-        Self::new(&raw[..KEY_LEN], &raw[KEY_LEN..KEY_LEN + SALT_LEN])
+        Self::new_with_tag_len(&raw[..KEY_LEN], &raw[KEY_LEN..KEY_LEN + SALT_LEN], tag_len)
+    }
+
+    /// Authentication tag length in bytes (10 or 4).
+    pub fn tag_len(&self) -> usize {
+        self.tag_len
     }
 
     #[inline]
@@ -236,14 +258,14 @@ impl SrtpContext {
         let iv = self.iv(h.ssrc, index);
         self.apply_aes_cm_in_place(&iv, &mut buf[rtp_offset + h.header_length..]);
         let tag = self.tag(&buf[rtp_offset..], roc);
-        buf.extend_from_slice(&tag);
+        buf.extend_from_slice(&tag[..self.tag_len]);
         Ok(())
     }
 
     /// Encrypts and authenticates `rtp`, appending the SRTP packet into `out`.
     pub fn protect_into(&mut self, rtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         let start = out.len();
-        out.reserve(rtp.len() + AUTH_TAG_LEN);
+        out.reserve(rtp.len() + self.tag_len);
         out.extend_from_slice(rtp);
         if let Err(e) = self.protect_in_place(out, start) {
             out.truncate(start);
@@ -254,7 +276,7 @@ impl SrtpContext {
 
     /// Encrypts and authenticates one RTP packet into an SRTP packet.
     pub fn protect(&mut self, rtp: &[u8]) -> Result<Vec<u8>, SrtpError> {
-        let mut out = Vec::with_capacity(rtp.len() + AUTH_TAG_LEN);
+        let mut out = Vec::with_capacity(rtp.len() + self.tag_len);
         self.protect_into(rtp, &mut out)?;
         Ok(out)
     }
@@ -289,11 +311,11 @@ impl SrtpContext {
     /// Verifies and decrypts `srtp` into `out` (reusing its capacity), returning the parsed
     /// [`RtpHeader`] on success. Returns `None` when tag fails, replayed, damaged, or invalid.
     pub fn unprotect_into(&mut self, srtp: &[u8], out: &mut Vec<u8>) -> Option<RtpHeader> {
-        if srtp.len() < 12 + AUTH_TAG_LEN {
+        if srtp.len() < 12 + self.tag_len {
             return None;
         }
-        let body = &srtp[..srtp.len() - AUTH_TAG_LEN];
-        let tag_in = &srtp[srtp.len() - AUTH_TAG_LEN..];
+        let body = &srtp[..srtp.len() - self.tag_len];
+        let tag_in = &srtp[srtp.len() - self.tag_len..];
         let h = rtp_header(body)?;
 
         let cached_hit = matches!(self.last_rx, Some((s, _)) if s == h.ssrc);
@@ -322,7 +344,7 @@ impl SrtpContext {
         }
 
         let expected_tag = self.tag(body, roc);
-        if !bool::from(expected_tag.ct_eq(tag_in)) {
+        if !bool::from(expected_tag[..self.tag_len].ct_eq(tag_in)) {
             return None;
         }
 
@@ -362,10 +384,10 @@ impl SrtpContext {
     /// Verifies and decrypts an SRTP packet stored in `buf` in place, truncating the auth tag and
     /// any RTP padding, returning the parsed [`RtpHeader`] on success.
     pub fn unprotect_in_place(&mut self, buf: &mut Vec<u8>) -> Option<RtpHeader> {
-        if buf.len() < 12 + AUTH_TAG_LEN {
+        if buf.len() < 12 + self.tag_len {
             return None;
         }
-        let body_len = buf.len() - AUTH_TAG_LEN;
+        let body_len = buf.len() - self.tag_len;
         let h = rtp_header(&buf[..body_len])?;
 
         let cached_hit = matches!(self.last_rx, Some((s, _)) if s == h.ssrc);
@@ -394,7 +416,7 @@ impl SrtpContext {
         }
 
         let expected_tag = self.tag(&buf[..body_len], roc);
-        if !bool::from(expected_tag.ct_eq(&buf[body_len..])) {
+        if !bool::from(expected_tag[..self.tag_len].ct_eq(&buf[body_len..])) {
             return None;
         }
 
@@ -432,7 +454,7 @@ impl SrtpContext {
 
     /// Verifies and decrypts one SRTP packet; returns `None` when tag fails, replayed, damaged, or invalid.
     pub fn unprotect(&mut self, srtp: &[u8]) -> Option<Vec<u8>> {
-        let mut out = Vec::with_capacity(srtp.len().saturating_sub(AUTH_TAG_LEN));
+        let mut out = Vec::with_capacity(srtp.len().saturating_sub(self.tag_len));
         self.unprotect_into(srtp, &mut out)?;
         Some(out)
     }
@@ -679,5 +701,22 @@ mod tests {
             tx.protect(&make_rtp(ssrc, 0, 0, 112, 0, &[1])),
             Err(SrtpError::PacketIndexOverflow)
         );
+    }
+
+    #[test]
+    fn short_tag_is_truncated_long_tag_and_round_trips() {
+        let rtp = make_rtp(0x1234, 7, 960, 111, 0, b"hello opus payload");
+        let mut long = SrtpContext::from_session_with_tag_len(SESSION, 10).unwrap();
+        let mut short = SrtpContext::from_session_with_tag_len(SESSION, 4).unwrap();
+        assert_eq!(short.tag_len(), 4);
+        let a = long.protect(&rtp).unwrap();
+        let b = short.protect(&rtp).unwrap();
+        assert_eq!(b.len(), a.len() - 6);
+        assert_eq!(&a[..b.len()], &b[..]);
+        let mut rx = SrtpContext::from_session_with_tag_len(SESSION, 4).unwrap();
+        assert_eq!(rx.unprotect(&b).unwrap(), rtp);
+        let mut wrong = SrtpContext::from_session_with_tag_len(SESSION, 10).unwrap();
+        assert!(wrong.unprotect(&b).is_none());
+        assert!(SrtpContext::from_session_with_tag_len(SESSION, 7).is_err());
     }
 }

@@ -1322,6 +1322,13 @@ impl CallManager {
             return Err(HttpError::conflict("Call ended while connecting"));
         }
 
+        self.session.call_trace().record(&json!({
+            "kind": "srtp_offer",
+            "callId": call_id,
+            "srtpKey": params.srtp_key.is_some(),
+            "srtpKeyIsSession": params.srtp_key.as_deref().map(|k| same_srtp_material(k, &params.session)),
+            "srtpMode": params.srtp_mode,
+        }));
         let opts = MediaCallOptions::new(
             server,
             params.user_id,
@@ -1329,7 +1336,8 @@ impl CallManager {
             params.call_id,
             params.session.clone(),
             false,
-        );
+        )
+        .with_srtp(params.srtp_key.clone(), params.srtp_mode);
         let (media, ev_rx) = MediaCall::new(opts)
             .await
             .map_err(|e| HttpError::new(502, e))?;
@@ -1573,6 +1581,9 @@ impl CallManager {
                     "video": video,
                     "fields": shape,
                     "servers": m.servers.len(),
+                    "srtpKey": m.srtp_key.is_some(),
+                    "srtpKeyIsSession": m.srtp_key.as_deref().map(|k| same_srtp_material(k, &m.session)),
+                    "srtpMode": m.srtp_mode,
                 }));
                 m
             }
@@ -1609,7 +1620,8 @@ impl CallManager {
                 call_number,
                 offered.session.clone(),
                 true,
-            );
+            )
+            .with_srtp(offered.srtp_key.clone(), offered.srtp_mode);
             let Ok((media, ev_rx)) = MediaCall::new(opts).await else {
                 continue;
             };
@@ -2131,6 +2143,13 @@ impl CallManager {
             }
         }
     }
+}
+
+/// Whether an `srtpKey` and the session would key SRTP the same way (same first 30 characters).
+/// Logged as a yes/no so a call log can tell the two apart without holding either.
+fn same_srtp_material(srtp_key: &str, session: &str) -> bool {
+    let first30 = |s: &str| s.encode_utf16().take(30).collect::<Vec<u16>>();
+    first30(srtp_key) == first30(session)
 }
 
 // ---- Axum Router & Handlers ----

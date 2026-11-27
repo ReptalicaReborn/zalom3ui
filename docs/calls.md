@@ -126,6 +126,16 @@ What a call needs, all from Zalo's servers rather than from a handshake between 
 master key + salt, the same key for both directions (each stream is told apart by its SSRC), with `srtpMode` as the
 crypto suite (1 or 2: AES-128 counter mode with an HMAC-SHA1 tag). That is plain RFC 3711 SRTP. 
 
+**What the core does with them** (`rust/zalo-media/src/call/zrtcclient.rs`): it starts with the profile signalling
+names: the key is `zrtc_config.srtpKey` when there is one (30 characters or more), else the session's first 30; the
+tag is 10 bytes for `srtpMode` 1 (AES_CM_128_HMAC_SHA1_80), 4 bytes for mode 2 (AES_CM_128_HMAC_SHA1_32), and mode 0
+sends plain RTP. It then confirms the profile from the first incoming packets: each candidate (either key × either
+tag) is tried until one authenticates, and that profile is used both ways from then on. If none does after 40 audio
+packets and their Opus TOC bytes look like plaintext, it switches to plain RTP. The call log says which:
+`srtp_offer` / `request_call` (`srtpKey` yes/no, whether it equals the session, `srtpMode`), then `srtp_profile`
+(`session` or `srtpKey`, `tagBytes`, `plain`) or `srtp_no_match`, and `call_done.stats.srtp`. No key material is
+logged.
+
 Where these sit in an incoming call (`voip` / `request` control, read by `_parseActRequest`): `status`, `uidFrom`,
 `uidTo`, `ts`, `uidN` and `params`, which holds `platform`, `protocol`, `id`, `sessId`, `extendData`, `rtpIP`,
 `rtcpIP`, `avatar`, `Dname`, `codec`, `servers` and **`zrtc_config`**. `zrtc_config` (`ZRtcConfig::fromJson`) is
@@ -166,8 +176,10 @@ format, how the SRTP keys are agreed) and feeding it from an Android audio pipel
   the caller kept ringing. Zalỏ also sends `ringring` first, as Zalo PC does when a call arrives. The call log records
   `ringring`, then `declined` with Zalo's answer, or `decline_failed`.
 - **Voice calls work** (answered in Zalỏ, both sides hear each other through Zalo's own media servers).
-- **Outgoing calls** (voice and video, 1:1 chats; written from the Zalos project's engine, not yet confirmed on real
-  calls): `requestcall` (answer: `servers`, `sessId`, `zrtc_config`, `fromId` / `toId`), join the media server as the
+- **Outgoing calls** (voice and video, 1:1 chats; written from the Zalos project's engine). The first real test
+  connected both calls but no media decrypted either way (every packet failed SRTP authentication), because the core
+  always keyed SRTP with the session and an 80-bit tag; it now follows `srtpKey` / `srtpMode` and confirms the
+  profile from incoming packets (above). Not yet confirmed on a real call since: `requestcall` (answer: `servers`, `sessId`, `zrtc_config`, `fromId` / `toId`), join the media server as the
   caller (init call command 11), `request` with that server, the Opus codec and our extendData, then `ring_ring`,
   `answer` (status 0 picks up, 3 declines, 1 busy), `busy`, `reject`, `cancel`. `answerack` once connected; `cancel`
   while it rings, `endcall` afterwards. The API and events are in `docs/call-audio.md` §4. The call log notes the

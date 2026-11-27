@@ -78,6 +78,11 @@ pub struct OutgoingMedia {
     pub session: String,
     pub user_id: u32,
     pub partner_id: u32,
+    /// `zrtc_config.srtpKey`, when the answer has a usable one. Zalo PC keys SRTP with it rather
+    /// than with the session.
+    pub srtp_key: Option<String>,
+    /// `zrtc_config.srtpMode` (libsrtp profile: 1 = 80-bit tag, 2 = 32-bit tag, 0 = none).
+    pub srtp_mode: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,23 @@ pub struct MediaParams {
     pub call_id: u32,
     pub session: String,
     pub srtp_key: Option<String>,
+    /// `zrtc_config.srtpMode` (libsrtp profile: 1 = 80-bit tag, 2 = 32-bit tag, 0 = none).
+    pub srtp_mode: Option<u8>,
+}
+
+/// `zrtc_config.srtpKey` when it is long enough to key SRTP (30 characters: key + salt).
+fn srtp_key_of(zrtc_cfg: Option<&Map<String, Value>>) -> Option<String> {
+    let key = text_of(zrtc_cfg.and_then(|z| z.get("srtpKey")));
+    (key.len() >= MIN_SRTP_SESSION_BYTES).then_some(key)
+}
+
+/// `zrtc_config.srtpMode` as a number (Zalo sends it as a number or a numeric string).
+fn srtp_mode_of(zrtc_cfg: Option<&Map<String, Value>>) -> Option<u8> {
+    match zrtc_cfg?.get("srtpMode")? {
+        Value::Number(n) => n.as_u64().and_then(|m| u8::try_from(m).ok()),
+        Value::String(s) => s.trim().parse::<u8>().ok(),
+        _ => None,
+    }
 }
 
 /// Resolves the voice call service domain from `zpw_service_map_v3`.
@@ -231,12 +253,8 @@ pub fn media_params_of(call: &RingingCall) -> Option<MediaParams> {
     let partner_id = parse_u32_pos(d.get("uidFrom"))?;
     let call_id = parse_u32_pos(Some(&call.raw_call_id))?;
 
-    let raw_srtp = text_of(zrtc_cfg.as_ref().and_then(|z| z.get("srtpKey")));
-    let srtp_key = if !raw_srtp.is_empty() && raw_srtp.len() >= MIN_SRTP_SESSION_BYTES {
-        Some(raw_srtp)
-    } else {
-        None
-    };
+    let srtp_key = srtp_key_of(zrtc_cfg.as_ref());
+    let srtp_mode = srtp_mode_of(zrtc_cfg.as_ref());
 
     let session = {
         let s1 = text_of(d.get("session"));
@@ -260,6 +278,7 @@ pub fn media_params_of(call: &RingingCall) -> Option<MediaParams> {
         call_id,
         session,
         srtp_key,
+        srtp_mode,
     })
 }
 
@@ -325,6 +344,8 @@ pub fn outgoing_media_of(answer: &Value, call_id: u32) -> std::result::Result<Ou
         session,
         user_id,
         partner_id,
+        srtp_key: srtp_key_of(zrtc_cfg.as_ref()),
+        srtp_mode: srtp_mode_of(zrtc_cfg.as_ref()),
     })
 }
 
@@ -696,5 +717,49 @@ fn parse_u32_pos(v: Option<&Value>) -> Option<u32> {
         Some(n as u32)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod srtp_offer_tests {
+    use super::*;
+
+    const SESSION: &str = "SESSIONsessionSESSIONsessionSESSIONsession";
+    const KEY: &str = "KEYkeyKEYkeyKEYkeyKEYkeyKEYkeyKEY";
+
+    fn answer(zrtc_config: Value) -> Value {
+        json!({
+            "status": 0,
+            "id": 42,
+            "fromId": 465816670u32,
+            "toId": 459524852u32,
+            "sessId": SESSION,
+            "servers": [{ "rtpaddr": "171.244.25.108:4200" }],
+            "zrtc_config": zrtc_config,
+        })
+    }
+
+    #[test]
+    fn outgoing_answer_keeps_srtp_key_and_mode_apart_from_the_session() {
+        let m = outgoing_media_of(&answer(json!({ "srtpKey": KEY, "srtpMode": 2 })), 42).unwrap();
+        assert_eq!(m.session, SESSION);
+        assert_eq!(m.srtp_key.as_deref(), Some(KEY));
+        assert_eq!(m.srtp_mode, Some(2));
+    }
+
+    #[test]
+    fn outgoing_answer_reads_zrtc_config_sent_as_a_json_string() {
+        let cfg = json!({ "srtpKey": KEY, "srtpMode": "1" }).to_string();
+        let m = outgoing_media_of(&answer(Value::String(cfg)), 42).unwrap();
+        assert_eq!(m.srtp_key.as_deref(), Some(KEY));
+        assert_eq!(m.srtp_mode, Some(1));
+    }
+
+    #[test]
+    fn outgoing_answer_without_srtp_fields_or_with_a_short_key() {
+        let m = outgoing_media_of(&answer(json!({})), 42).unwrap();
+        assert_eq!((m.srtp_key, m.srtp_mode), (None, None));
+        let m = outgoing_media_of(&answer(json!({ "srtpKey": "short", "srtpMode": 0 })), 42).unwrap();
+        assert_eq!((m.srtp_key, m.srtp_mode), (None, Some(0)));
     }
 }
