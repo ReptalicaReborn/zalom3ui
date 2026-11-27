@@ -10,6 +10,9 @@ import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -651,11 +654,30 @@ internal fun formatSpeed(speed: Float): String = when {
     else -> "1×"
 }
 
-/** Plays one voice message at a time, streamed from Zalo's CDN. */
+/**
+ * Plays one voice message at a time, streamed from Zalo's CDN.
+ *
+ * All [MediaPlayer] operations, callbacks, and position polls are confined to a dedicated
+ * [HandlerThread] so synchronous `mediaserver` binder IPC never blocks the UI thread.
+ */
 object VoicePlayback {
+    private const val POSITION_POLL_MS = 60L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val workerHandler: Handler by lazy {
+        val thread = HandlerThread("voice-playback").apply { start() }
+        Handler(thread.looper)
+    }
+
+    // Incremented immediately on stop() so any already-queued poll/callback bails before mutating state.
+    private val stopSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
+    // Worker-thread-only MediaPlayer state (never touched on the main thread).
     private var player: MediaPlayer? = null
     private var prepared = false
     private var pendingSeekFraction: Float? = null
+    private var generation = 0L
+    private var activeStopSeq = 0L
 
     private val _playing = MutableStateFlow<String?>(null)
     /** URL of the clip playing (or loading), if any. */
@@ -665,44 +687,88 @@ object VoicePlayback {
     /** Full playback state including live position, duration, and speed. */
     val state: StateFlow<VoicePlaybackState> = _state.asStateFlow()
 
-    fun toggle(context: Context, url: String) {
-        val current = _state.value
-        val p = player
-        if (current.url == url && p != null) {
-            if (!prepared) {
-                stop()
-            } else if (current.isPlaying) {
-                runCatching { p.pause() }
-                val pos = runCatching { p.currentPosition }.getOrDefault(current.positionMs).coerceAtLeast(0)
-                _playing.value = null
-                _state.value = current.copy(isPlaying = false, positionMs = pos)
-            } else {
-                applySpeed(p, current.speed)
-                runCatching { p.start() }
-                _playing.value = url
-                _state.value = current.copy(isPlaying = true)
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            val p = player ?: return
+            if (!prepared || stopSeq.get() != activeStopSeq) return
+            val cur = _state.value
+            if (cur.url == null) return
+            val pos = runCatching { p.currentPosition }.getOrNull()?.coerceAtLeast(0) ?: cur.positionMs
+            val dur = runCatching { p.duration }.getOrNull()?.takeIf { it > 0 } ?: cur.durationMs
+            val isPlayingNow = runCatching { p.isPlaying }.getOrDefault(cur.isPlaying)
+            if (stopSeq.get() != activeStopSeq) return
+            if (pos != cur.positionMs || dur != cur.durationMs || isPlayingNow != cur.isPlaying) {
+                _state.value = _state.value.copy(isPlaying = isPlayingNow, positionMs = pos, durationMs = dur)
             }
-        } else {
-            play(context, url)
+            if (isPlayingNow) {
+                workerHandler.postDelayed(this, POSITION_POLL_MS)
+            }
         }
     }
 
-    /** Refreshes [state] with the underlying player's live position and duration. */
+    fun toggle(context: Context, url: String) {
+        val appContext = context.applicationContext
+        workerHandler.post { toggleOnWorker(appContext, url) }
+    }
+
+    /** Refreshes [state] with the underlying player's live position and duration on the worker thread. */
     fun refreshPosition() {
-        val p = player ?: return
-        if (!prepared) return
-        val cur = _state.value
-        val pos = runCatching { p.currentPosition }.getOrNull()?.coerceAtLeast(0) ?: return
-        val dur = runCatching { p.duration }.getOrNull()?.takeIf { it > 0 } ?: cur.durationMs
-        val isPlayingNow = runCatching { p.isPlaying }.getOrDefault(cur.isPlaying)
-        if (pos != cur.positionMs || dur != cur.durationMs || isPlayingNow != cur.isPlaying) {
-            _state.value = cur.copy(isPlaying = isPlayingNow, positionMs = pos, durationMs = dur)
-        }
+        workerHandler.post(pollRunnable)
     }
 
     /** Seeks [url] to [fraction] (`0f..1f`) when it is the active clip. */
     fun seekTo(url: String, fraction: Float) {
         val clamped = fraction.coerceIn(0f, 1f)
+        workerHandler.post { seekToOnWorker(url, clamped) }
+    }
+
+    /** Advances playback speed (`1× -> 1.5× -> 2× -> 1×`) and applies it to the active player. */
+    fun cycleSpeed(): Float {
+        var next = 1f
+        while (true) {
+            val cur = _state.value
+            next = nextPlaybackSpeed(cur.speed)
+            if (_state.compareAndSet(cur, cur.copy(speed = next))) break
+        }
+        val target = next
+        workerHandler.post {
+            player?.takeIf { prepared }?.let { applySpeedOnWorker(it, target) }
+        }
+        return target
+    }
+
+    fun stop() {
+        stopSeq.incrementAndGet()
+        _playing.value = null
+        _state.value = VoicePlaybackState()
+        workerHandler.post { stopOnWorker() }
+    }
+
+    private fun toggleOnWorker(appContext: Context, url: String) {
+        val current = _state.value
+        val p = player
+        if (current.url == url && p != null) {
+            if (!prepared) {
+                stopOnWorker()
+            } else if (current.isPlaying) {
+                workerHandler.removeCallbacks(pollRunnable)
+                runCatching { p.pause() }
+                val pos = runCatching { p.currentPosition }.getOrDefault(current.positionMs).coerceAtLeast(0)
+                _playing.value = null
+                _state.value = _state.value.copy(isPlaying = false, positionMs = pos)
+            } else {
+                applySpeedOnWorker(p, _state.value.speed)
+                runCatching { p.start() }
+                _playing.value = url
+                _state.value = _state.value.copy(isPlaying = true)
+                schedulePollOnWorker()
+            }
+        } else {
+            playOnWorker(appContext, url)
+        }
+    }
+
+    private fun seekToOnWorker(url: String, clamped: Float) {
         val p = player ?: return
         val cur = _state.value
         if (cur.url != url) return
@@ -714,19 +780,11 @@ object VoicePlayback {
         if (dur > 0) {
             val targetMs = (dur * clamped).toInt().coerceIn(0, dur)
             runCatching { p.seekTo(targetMs) }
-            _state.value = cur.copy(positionMs = targetMs, durationMs = dur)
+            _state.value = _state.value.copy(positionMs = targetMs, durationMs = dur)
         }
     }
 
-    /** Advances playback speed (`1× -> 1.5× -> 2× -> 1×`) and applies it to the active player. */
-    fun cycleSpeed(): Float {
-        val next = nextPlaybackSpeed(_state.value.speed)
-        _state.value = _state.value.copy(speed = next)
-        player?.takeIf { prepared }?.let { applySpeed(it, next) }
-        return next
-    }
-
-    private fun applySpeed(p: MediaPlayer, speed: Float) {
+    private fun applySpeedOnWorker(p: MediaPlayer, speed: Float) {
         runCatching {
             val wasPlaying = p.isPlaying
             p.playbackParams = p.playbackParams.setSpeed(speed)
@@ -735,14 +793,18 @@ object VoicePlayback {
         }
     }
 
-    private fun play(context: Context, url: String) {
+    private fun playOnWorker(appContext: Context, url: String) {
         val keepSpeed = if (_state.value.url != null) _state.value.speed else 1f
-        stop()
+        stopOnWorker()
         val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
         val scheme = uri?.scheme?.lowercase()
         if (uri == null || scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
             return
         }
+        val myGen = ++generation
+        val myStopSeq = stopSeq.get()
+        activeStopSeq = myStopSeq
+        // MediaPlayer created on the HandlerThread binds its native callbacks to this thread's Looper.
         val p = MediaPlayer()
         player = p
         prepared = false
@@ -755,41 +817,59 @@ object VoicePlayback {
             )
             p.setDataSource(uri.toString())
             p.setOnPreparedListener { mp ->
-                if (player === mp) {
+                if (player === mp && generation == myGen && stopSeq.get() == myStopSeq) {
                     prepared = true
                     val dur = runCatching { mp.duration }.getOrDefault(0).coerceAtLeast(0)
                     pendingSeekFraction?.let { frac ->
                         if (dur > 0) runCatching { mp.seekTo((dur * frac).toInt().coerceIn(0, dur)) }
                         pendingSeekFraction = null
                     }
-                    applySpeed(mp, _state.value.speed)
+                    applySpeedOnWorker(mp, _state.value.speed)
                     runCatching { mp.start() }
                     val pos = runCatching { mp.currentPosition }.getOrDefault(0).coerceAtLeast(0)
-                    _state.value = _state.value.copy(isPlaying = true, positionMs = pos, durationMs = dur)
+                    if (stopSeq.get() == myStopSeq) {
+                        _state.value = _state.value.copy(isPlaying = true, positionMs = pos, durationMs = dur)
+                        schedulePollOnWorker()
+                    }
                 }
             }
-            p.setOnCompletionListener { if (player === it) stop() }
+            p.setOnCompletionListener { mp ->
+                if (player === mp && generation == myGen && stopSeq.get() == myStopSeq) stopOnWorker()
+            }
             p.setOnErrorListener { mp, _, _ ->
-                if (player === mp) {
-                    stop()
-                    Toast.makeText(context.applicationContext, "Couldn't play this voice message", Toast.LENGTH_SHORT).show()
+                if (player === mp && generation == myGen && stopSeq.get() == myStopSeq) {
+                    stopOnWorker()
+                    showPlaybackError(appContext)
                 }
                 true
             }
             p.prepareAsync()
         } catch (_: Exception) {
-            stop()
-            Toast.makeText(context.applicationContext, "Couldn't play this voice message", Toast.LENGTH_SHORT).show()
+            stopOnWorker()
+            showPlaybackError(appContext)
         }
     }
 
-    fun stop() {
+    private fun stopOnWorker() {
+        generation++
+        workerHandler.removeCallbacks(pollRunnable)
         player?.let { runCatching { it.release() } }
         player = null
         prepared = false
         pendingSeekFraction = null
         _playing.value = null
         _state.value = VoicePlaybackState()
+    }
+
+    private fun schedulePollOnWorker() {
+        workerHandler.removeCallbacks(pollRunnable)
+        workerHandler.postDelayed(pollRunnable, POSITION_POLL_MS)
+    }
+
+    private fun showPlaybackError(appContext: Context) {
+        mainHandler.post {
+            Toast.makeText(appContext, "Couldn't play this voice message", Toast.LENGTH_SHORT).show()
+        }
     }
 }
 
@@ -801,13 +881,6 @@ private fun VoiceClip(a: Attachment, onOutgoing: Boolean) {
     val href = a.href
     val isActiveClip = href != null && playback.url == href
     val isPlaying = isActiveClip && playback.isPlaying
-
-    LaunchedEffect(isPlaying) {
-        while (isPlaying) {
-            VoicePlayback.refreshPosition()
-            delay(60L)
-        }
-    }
 
     val bars = remember(href, a.duration) { voiceWaveformBars(href ?: a.title.orEmpty(), count = 28) }
     var dragProgress by remember(href) { mutableStateOf<Float?>(null) }
