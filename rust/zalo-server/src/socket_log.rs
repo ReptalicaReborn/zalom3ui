@@ -170,6 +170,9 @@ fn render_entry(out: &mut String, r: &FrameReport) {
     if !r.acts.is_empty() {
         out.push_str(&format!("  act: {}\n", r.acts.join(", ")));
     }
+    if let Some(n) = r.note {
+        out.push_str(&format!("  zalỏ: {n}\n"));
+    }
     for a in &r.arrays {
         out.push_str(&format!(
             "  {}[{}] {}\n",
@@ -245,6 +248,8 @@ struct ReportOwned {
     envelope: Vec<String>,
     #[serde(rename = "errorDetail", default)]
     error_detail: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -335,6 +340,7 @@ impl ReportOwned {
             scalars: self.scalars.iter().map(|s| safe_entry(s)).collect(),
             envelope: self.envelope.iter().map(|s| safe_entry(s)).collect(),
             error_detail: self.error_detail.as_deref().map(|d| zalo_proto::framelog::safe_token(d, 80)),
+            note: self.note.as_deref().map(|n| pick(n, &[crate::session::POKE_PULL_NOTE])),
         }
     }
 }

@@ -223,7 +223,7 @@ Zalo PC can ask the official Zalo app to send its chat history. Zalỏ does the 
 (`rust/zalo-server/src/routes/history_sync.rs`): it sends a public key, the phone asks you to allow it, uploads an
 encrypted backup, and the core downloads, decrypts (`zalo-media/src/sync/zdb.rs`), unpacks (`lzma.rs`), reads the
 SQLite database directly (`sqliteread.rs`, no libsqlite3) and imports the messages. *Settings → Sync messages from
-phone*. It follows Zalo PC's protocol but has **not been tried against a real phone yet** ([history-sync.md](history-sync.md)).
+phone*. It follows Zalo PC's protocol and has been confirmed working on a real phone ([history-sync.md](history-sync.md)).
 
 ## 10. Remote-server mode and the standalone server
 
@@ -240,6 +240,17 @@ WebSockets. The web UI in `public/` is optional (`PUBLIC_DIR`).
 is live (`Messages`); on 510/1 it is part of the paged replay (`OldMessages`), and on 510 with another subCmd it is
 history outside the paged replay (`OldPageMessages`: stored, never notifies). The normalizer follows the TS `toRawMessage`
 (a null id falls through to the next id field, a numeric `msgType` is kept as a string, an unusable `ts` becomes now).
+
+**What a real test showed, and asking after an empty frame.** When an Official Account OTP reached the phone, the
+web session got one `cmd=501` frame with every list empty (`msgs`, `pageMsgs`, ...): Zalo signals that something changed
+but leaves the message out. The code still reaches Zalỏ through *Codes from Zalo's notifications* (confirmed on a real
+phone, with Copy, and Zalo's duplicate notification hidden). To get it without the official app, the session answers
+such an empty 501 by asking for missed messages, the same replay request it sends on connect (`request_old_messages`,
+1:1, `lastId` null). It does so at most once per 30 s, never within 30 s of connecting, and opens a one-minute notify
+window so a recent message in the answer still notifies. The answer (the next 1:1 replay batch within 15 s) is kept out
+of the connect's replay report. The socket log marks the frame with `zalỏ: empty frame: asked Zalo for missed
+messages`; the next `cmd=510` entry shows whether the answer held the message. Whether Zalo includes OA messages in
+that answer is what a real test will tell.
 
 **Socket log.** Each decoded frame produces a structure-only `FrameReport` (`zalo-proto/src/framelog.rs`) that the
 listener sends as `WsEvent::Frame` before the frame's other events; `ZaloSession` keeps the last 500 in
@@ -303,5 +314,5 @@ copies, shares and clears it.
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
   APKs, checks the native libraries are inside, and uploads the APKs.
 
-What only a real phone and account can check: the JNI path end to end, call audio and video quality, history sync, the
-notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).
+Confirmed on a real phone so far: the JNI path end to end (the app running the core in-process) and history sync. What
+only a real phone and account can still check: call audio and video quality, the notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).

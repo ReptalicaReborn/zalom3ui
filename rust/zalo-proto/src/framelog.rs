@@ -182,6 +182,9 @@ pub struct FrameReport {
     /// Why decoding failed, reduced to a safe token (our own error text, no payload).
     #[serde(rename = "errorDetail", default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    /// What Zalỏ did because of this frame (from a fixed vocabulary), e.g. asking for missed messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
 
 /// Describes one JSON value without revealing text: numbers and booleans in full, strings as
@@ -225,6 +228,7 @@ impl FrameReport {
             scalars: Vec::new(),
             envelope: Vec::new(),
             error_detail: None,
+            note: None,
         }
     }
 

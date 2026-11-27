@@ -12,6 +12,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OtpLogicTest {
+    @Test
+    fun zaloNotificationIsHiddenOnlyWhileZaloShowsTheCodeItself() {
+        // Posted now, or already shown by Zalỏ: hide Zalo's duplicate when the user wants that.
+        assertTrue(OtpRescue.shouldHideZalo(RescueResult.POSTED, hideSetting = true))
+        assertTrue(OtpRescue.shouldHideZalo(RescueResult.ALREADY_SHOWN, hideSetting = true))
+        // Zalỏ couldn't show it: keep Zalo's, or the user would have no notification at all.
+        assertFalse(OtpRescue.shouldHideZalo(RescueResult.NOT_SHOWN, hideSetting = true))
+        // The switch is off: never hide.
+        assertFalse(OtpRescue.shouldHideZalo(RescueResult.POSTED, hideSetting = false))
+        assertFalse(OtpRescue.shouldHideZalo(RescueResult.ALREADY_SHOWN, hideSetting = false))
+    }
+
     private fun msg(
         text: String = "hi",
         otp: String? = null,

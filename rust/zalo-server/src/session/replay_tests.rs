@@ -603,3 +603,80 @@ async fn the_replay_notifies_through_the_event_stream_while_the_window_is_open()
     let events = r.drain_events();
     assert_eq!(of_type(&events, "message")[0]["notify"], false);
 }
+
+// ---- asking for missed messages after an empty 501 ----
+
+fn frame_501(lens: &[(&str, usize)]) -> WsEvent {
+    let mut r = zalo_proto::framelog::FrameReport::new(1, 501, 0);
+    r.arrays = lens
+        .iter()
+        .map(|(name, len)| zalo_proto::framelog::ArrayReport {
+            name: (*name).to_string(),
+            len: *len,
+            read: true,
+            items: Vec::new(),
+            items_truncated: false,
+        })
+        .collect();
+    WsEvent::Frame(r)
+}
+
+/// What arrived on a web session when an Official Account OTP reached the phone.
+fn empty_501() -> WsEvent {
+    frame_501(&[("msgs", 0), ("pageMsgs", 0), ("seens", 0), ("groupMsgs", 0)])
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_501_asks_for_missed_messages_and_a_recent_one_in_the_answer_notifies() {
+    let mut r = listening();
+    emit(&r, empty_501()).await;
+    assert_eq!(requests(&r), vec!["request_old_messages:user:null"]);
+
+    // The answer: a recent message (the OTP), delivered as 1:1 history.
+    let now = now_ms();
+    emit(
+        &r,
+        old_batch(ThreadType::User, vec![incoming("otp1", now, json!({}), false)]),
+    )
+    .await;
+    let events = r.drain_events();
+    let msgs = of_type(&events, "message");
+    assert_eq!(msgs.len(), 1, "{events:?}");
+    assert_eq!(msgs[0]["notify"], true, "history from the answer notifies");
+
+    // Kept out of the replay report (no connect happened, so there is none at all).
+    assert!(r.session.replay().reports().is_empty());
+    // The socket log says why Zalỏ asked.
+    assert!(r.session.socket_log().render_text().contains(POKE_PULL_NOTE));
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_501s_ask_at_most_once_per_interval() {
+    let r = listening();
+    emit(&r, empty_501()).await;
+    emit(&r, empty_501()).await;
+    assert_eq!(requests(&r).len(), 1);
+
+    // Once the interval has passed, the next empty 501 asks again.
+    if let Ok(mut s) = r.session.inner.write() {
+        s.poke_pull_at -= POKE_PULL_MIN_INTERVAL_MS;
+    }
+    emit(&r, empty_501()).await;
+    assert_eq!(requests(&r).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_501_right_after_connecting_does_not_ask() {
+    let r = listening();
+    emit(&r, WsEvent::Connected).await;
+    let after_connect = requests(&r).len();
+    emit(&r, empty_501()).await;
+    assert_eq!(requests(&r).len(), after_connect, "the connect's own replay is still arriving");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_501_with_messages_does_not_ask() {
+    let r = listening();
+    emit(&r, frame_501(&[("msgs", 1), ("pageMsgs", 0)])).await;
+    assert!(requests(&r).is_empty());
+}

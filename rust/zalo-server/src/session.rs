@@ -54,6 +54,18 @@ const MAX_TEXT_LENGTH: usize = 4000;
 const MAX_FORWARD_TARGETS: usize = 20;
 const VIEWING_TTL_MS: i64 = 90_000;
 const NOTIFY_MAX_AGE_MS: i64 = 10 * 60_000;
+/// A 501 frame with every list empty is Zalo saying "something changed" without the message: that
+/// is how an Official Account OTP showed up on a web session. Zalỏ then asks for missed messages,
+/// at most this often...
+pub const POKE_PULL_MIN_INTERVAL_MS: i64 = 30_000;
+/// ...and not this soon after connecting, so the reply can't be mistaken for the connect's replay.
+pub const POKE_PULL_AFTER_CONNECT_MS: i64 = 30_000;
+/// How long the next 1:1 replay reply counts as the answer to that request.
+const POKE_REPLY_WAIT_MS: i64 = 15_000;
+/// How long replayed messages in that answer may notify (they arrive as history otherwise).
+const POKE_NOTIFY_TTL_MS: i64 = 60_000;
+/// What the socket log says about a frame that made Zalỏ ask.
+pub const POKE_PULL_NOTE: &str = "empty frame: asked Zalo for missed messages";
 /// While a notify window is open, replayed messages notify when they are newer than the window's
 /// trigger time minus this margin.
 pub const NOTIFY_WINDOW_MARGIN_MS: i64 = 2 * 60_000;
@@ -84,6 +96,16 @@ pub fn reconnect_base_delay(attempt: u32) -> Duration {
 fn reconnect_delay(attempt: u32) -> Duration {
     let base = reconnect_base_delay(attempt);
     base.mul_f64(1.0 - rand::random::<f64>() * 0.1)
+}
+
+/// A decoded 501 frame whose message lists are there but all empty: Zalo signalling that something
+/// changed without sending it (seen when an Official Account OTP arrived on the phone).
+pub fn is_empty_message_frame(r: &zalo_proto::framelog::FrameReport) -> bool {
+    r.version == 1
+        && r.cmd == 501
+        && r.error.is_none()
+        && r.arrays.iter().any(|a| a.name == "msgs" || a.name == "pageMsgs")
+        && r.arrays.iter().all(|a| a.len == 0)
 }
 
 fn to_thread_type(kind: ThreadKind) -> ThreadType {
@@ -210,6 +232,12 @@ struct SessionInner {
     /// no reconnects, credentials and login intact.
     pause_requested: bool,
     notify_window: Option<NotifyWindow>,
+    /// When the chat socket last connected (epoch ms), for [`POKE_PULL_AFTER_CONNECT_MS`].
+    connected_at: i64,
+    /// When Zalỏ last asked for missed messages after an empty 501 (epoch ms), and whether that
+    /// answer is still due.
+    poke_pull_at: i64,
+    poke_pull_pending: bool,
 }
 
 /// While open, replayed messages may notify (see [`ZaloSession::set_notify_window`]).
@@ -244,6 +272,9 @@ impl Default for SessionInner {
             looked_up_users: HashSet::new(),
             pause_requested: false,
             notify_window: None,
+            connected_at: 0,
+            poke_pull_at: 0,
+            poke_pull_pending: false,
         }
     }
 }
@@ -997,7 +1028,14 @@ impl ZaloSession {
         generation: u64,
     ) {
         if let WsEvent::Frame(mut report) = event {
-            report.ts = now_ms();
+            let now = now_ms();
+            report.ts = now;
+            if is_empty_message_frame(&report) && self.try_start_poke_pull(now) {
+                // The replay reply is history; let recent messages in it notify for a minute.
+                self.set_notify_window_at(now, POKE_NOTIFY_TTL_MS, now);
+                handle.request_old_messages(ThreadType::User, None);
+                report.note = Some(POKE_PULL_NOTE);
+            }
             self.socket_log.record(report);
             return;
         }
@@ -1011,6 +1049,7 @@ impl ZaloSession {
                 self.call_trace.record(&json!({ "kind": "listening" }));
                 if let Ok(mut s) = self.inner.write() {
                     s.reconnect_attempts = 0;
+                    s.connected_at = now_ms();
                 }
                 self.patch_status(|st| {
                     st.state = SessionState::Ready;
@@ -1033,6 +1072,16 @@ impl ZaloSession {
             WsEvent::Messages(msgs) => {
                 for raw in msgs {
                     let _ = self.ingest_raw(raw, false, generation);
+                }
+            }
+            WsEvent::OldMessages {
+                thread_type,
+                messages,
+            } if thread_type == ThreadType::User && self.take_poke_reply(now_ms()) => {
+                // The answer to an ask after an empty 501: stored as history (it may notify while
+                // the notify window is open), and kept out of the connect's replay report.
+                for raw in messages {
+                    let _ = self.ingest_raw(raw, true, generation);
                 }
             }
             WsEvent::OldMessages {
@@ -2214,6 +2263,34 @@ impl ZaloSession {
             .and_then(|s| s.viewing.clone())
             .is_some_and(|(vkey, until)| vkey == key && until > now);
         !viewing_this
+    }
+
+    /// Whether to ask for missed messages after an empty 501 now: not within
+    /// [`POKE_PULL_AFTER_CONNECT_MS`] of connecting (the connect's own replay is still arriving),
+    /// and at most once per [`POKE_PULL_MIN_INTERVAL_MS`]. Marks the answer as due when it says yes.
+    fn try_start_poke_pull(&self, now: i64) -> bool {
+        let Ok(mut s) = self.inner.write() else {
+            return false;
+        };
+        if now - s.connected_at < POKE_PULL_AFTER_CONNECT_MS
+            || now - s.poke_pull_at < POKE_PULL_MIN_INTERVAL_MS
+        {
+            return false;
+        }
+        s.poke_pull_at = now;
+        s.poke_pull_pending = true;
+        true
+    }
+
+    /// Whether a 1:1 replay batch arriving now is the answer to the last ask after an empty 501.
+    /// Counts once, and only within [`POKE_REPLY_WAIT_MS`] of asking.
+    fn take_poke_reply(&self, now: i64) -> bool {
+        let Ok(mut s) = self.inner.write() else {
+            return false;
+        };
+        let due = s.poke_pull_pending && now - s.poke_pull_at <= POKE_REPLY_WAIT_MS;
+        s.poke_pull_pending = false;
+        due
     }
 
     /// Opens (or extends) the notify window: for `ttl_ms` (clamped to 1 s .. 10 min) replayed

@@ -51,20 +51,26 @@ class ZaloNotificationListener : NotificationListenerService() {
         if (ListenerJobs.Job.BRIDGE in jobs) {
             StayConnectedCoordinator.onZaloMessage(applicationContext, runCatching { sbn?.postTime }.getOrNull() ?: 0L)
         }
-        if (ListenerJobs.Job.OTP_RESCUE in jobs && sbn != null) rescueCode(sbn)
+        if (ListenerJobs.Job.OTP_RESCUE in jobs && sbn != null) rescueCode(sbn, stay.hideZaloNotifications)
     }
 
     /**
      * Reads a one-time code from the Zalo app's message notification and posts Zalỏ's own "Code 482910 · title" with a
      * Copy action. The text is read in memory only: it is never logged or stored, and neither is the code (the log
-     * says only that one was rescued). Never brings the core online.
+     * says only that one was rescued). Never brings the core online. With [hideZalo], the Zalo app's notification is then
+     * removed, but only while Zalỏ shows the code itself (see [OtpRescue.shouldHideZalo]). The rescue only runs for
+     * message notifications, so a call notification is never removed.
      */
-    private fun rescueCode(sbn: StatusBarNotification) {
+    private fun rescueCode(sbn: StatusBarNotification, hideZalo: Boolean) {
         val now = System.currentTimeMillis()
         val text = runCatching { readText(sbn.notification, now) }.getOrNull() ?: return
         val code = OtpRescue.findCode(text) ?: return
-        if (OtpNotifications.postRescued(applicationContext, code, text.title, now)) {
+        val result = OtpNotifications.postRescued(applicationContext, code, text.title, now)
+        if (result == RescueResult.POSTED) {
             StartupLog.write(this, "otp rescued from zalo notification")
+        }
+        if (OtpRescue.shouldHideZalo(result, hideZalo)) {
+            runCatching { cancelNotification(sbn.key) }
         }
     }
 
