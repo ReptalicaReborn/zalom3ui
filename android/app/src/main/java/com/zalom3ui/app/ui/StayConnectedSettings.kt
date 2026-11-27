@@ -210,6 +210,32 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                     },
                 )
             }
+            // The same switch the bridge uses; shown here unless the bridge group above already shows it.
+            if (!(showModes && stay.mode.usesBridge)) {
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable {
+                            stay = stay.copy(hideZaloNotifications = !stay.hideZaloNotifications)
+                            StayConnectedCoordinator.saveHideZaloNotifications(context, stay.hideZaloNotifications)
+                        },
+                        colors = transparent,
+                        leadingContent = { Icon(Icons.Outlined.VisibilityOff, null) },
+                        headlineContent = { Text("Hide Zalo's notification") },
+                        supportingContent = {
+                            Text("Remove the Zalo app's notification once Zalỏ shows the code itself, so you get one notification, not two. Calls are never touched.")
+                        },
+                        trailingContent = {
+                            Switch(
+                                checked = stay.hideZaloNotifications,
+                                onCheckedChange = {
+                                    stay = stay.copy(hideZaloNotifications = it)
+                                    StayConnectedCoordinator.saveHideZaloNotifications(context, it)
+                                },
+                            )
+                        },
+                    )
+                }
+            }
         }
     }
 

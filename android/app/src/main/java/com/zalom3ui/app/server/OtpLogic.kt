@@ -91,9 +91,28 @@ data class ZaloNotificationText(
     val texts: List<String>,
 )
 
+/** What happened when Zalỏ tried to show a code read from the Zalo app's notification. */
+enum class RescueResult {
+    /** Zalỏ posted its own notification with the code just now. */
+    POSTED,
+
+    /** Zalỏ already shows this code (its own message notification, or an earlier rescue): nothing new posted. */
+    ALREADY_SHOWN,
+
+    /** Zalỏ could not show it (no valid code, notifications off or blocked, posting failed). */
+    NOT_SHOWN,
+}
+
 object OtpRescue {
     /** A MessagingStyle message older than this is history, not news. */
     const val FRESH_MS = 5 * 60_000L
+
+    /**
+     * Whether to remove the Zalo app's notification after a rescue: only when the user wants that, and only when Zalỏ
+     * is showing the code itself, so the user is never left with no notification at all.
+     */
+    fun shouldHideZalo(result: RescueResult, hideSetting: Boolean): Boolean =
+        hideSetting && result != RescueResult.NOT_SHOWN
 
     /** Whether a MessagingStyle message stamped [timestamp] is recent enough to hold a code worth announcing. */
     fun isFresh(timestamp: Long, now: Long): Boolean = timestamp <= 0L || now - timestamp <= FRESH_MS

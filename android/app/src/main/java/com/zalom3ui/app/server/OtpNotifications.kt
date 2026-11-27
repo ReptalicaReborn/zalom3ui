@@ -87,9 +87,9 @@ object OtpNotifications {
     }
 
     /** Posts "Code 482910 · title" for a code read from the Zalo app's notification, unless it was announced already. */
-    fun postRescued(context: Context, code: String, zaloTitle: String?, now: Long = System.currentTimeMillis()): Boolean {
-        if (!OtpText.isValidCode(code) || !MessageNotifier.canNotify(context)) return false
-        if (!dedupe.tryRescue(code, now)) return false
+    fun postRescued(context: Context, code: String, zaloTitle: String?, now: Long = System.currentTimeMillis()): RescueResult {
+        if (!OtpText.isValidCode(code) || !MessageNotifier.canNotify(context)) return RescueResult.NOT_SHOWN
+        if (!dedupe.tryRescue(code, now)) return RescueResult.ALREADY_SHOWN
         ensureCodesChannel(context)
         val open = PendingIntent.getActivity(
             context,
@@ -109,9 +109,10 @@ object OtpNotifications {
             .setTimeoutAfter(RESCUE_TIMEOUT_MS)
             .addAction(copyAction(context, code))
         applyLockScreenPrivacy(context, builder, CODES_CHANNEL_ID)
-        return runCatching {
+        val posted = runCatching {
             NotificationManagerCompat.from(context).notify(RESCUE_TAG_PREFIX + code, RESCUE_NOTIFICATION_ID, builder.build())
         }.isSuccess
+        return if (posted) RescueResult.POSTED else RescueResult.NOT_SHOWN
     }
 }
 
