@@ -26,4 +26,6 @@ url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 percent-encoding.workspace = true
-chrono.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

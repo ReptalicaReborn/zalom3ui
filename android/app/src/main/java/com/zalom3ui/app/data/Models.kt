@@ -1,8 +1,10 @@
 package com.zalom3ui.app.data
 
+import androidx.compose.runtime.Immutable
 import kotlinx.serialization.Serializable
 
 /** Mirrors `SessionStatus` in the server's src/session.ts. */
+@Immutable
 @Serializable
 data class SessionStatus(
     val state: String,
@@ -22,6 +24,7 @@ data class SessionStatus(
     val isPaused: Boolean get() = state == "paused"
 }
 
+@Immutable
 @Serializable
 data class CallInfo(
     val video: Boolean = false,
@@ -30,6 +33,7 @@ data class CallInfo(
 )
 
 /** A poll message's pointer to its poll; the options and votes come from [PollDetail]. */
+@Immutable
 @Serializable
 data class PollRef(
     val pollId: Long,
@@ -38,9 +42,11 @@ data class PollRef(
     val event: String? = null,
 )
 
+@Immutable
 @Serializable
 data class PollVoter(val id: String, val name: String = "")
 
+@Immutable
 @Serializable
 data class PollOption(
     val id: Long,
@@ -52,6 +58,7 @@ data class PollOption(
 )
 
 /** Mirrors `PollView` in the server's src/polls.ts. */
+@Immutable
 @Serializable
 data class PollDetail(
     val pollId: Long,
@@ -90,6 +97,7 @@ data class PollDetail(
 }
 
 /** What the create-poll dialog sends. [expiresAt] is epoch ms, 0 for no deadline. */
+@Immutable
 data class CreatePollRequest(
     val question: String,
     val options: List<String>,
@@ -101,6 +109,7 @@ data class CreatePollRequest(
     val isValid: Boolean get() = question.isNotBlank() && options.map { it.trim() }.filter { it.isNotEmpty() }.toSet().size >= 2
 }
 
+@Immutable
 @Serializable
 data class StickerRef(
     val id: Long,
@@ -109,6 +118,7 @@ data class StickerRef(
 )
 
 /** Mirrors `Attachment` in the server's src/store.ts. Messages cached by older servers only have title/href/thumb. */
+@Immutable
 @Serializable
 data class Attachment(
     /** "photo", "sticker", "gif", "video", "voice", "file", "link", "contact", "location", "call", "poll" or "other". */
@@ -161,6 +171,7 @@ internal fun isRemoteMediaUrl(value: String?): Boolean {
     return s.startsWith("http://", ignoreCase = true) || s.startsWith("https://", ignoreCase = true)
 }
 
+@Immutable
 @Serializable
 data class Quote(
     val msgId: String,
@@ -169,6 +180,7 @@ data class Quote(
     val text: String = "",
 )
 
+@Immutable
 @Serializable
 data class Mention(
     val uid: String,
@@ -176,6 +188,7 @@ data class Mention(
     val len: Int,
 )
 
+@Immutable
 @Serializable
 data class ReactionSummary(
     val key: String,
@@ -185,6 +198,7 @@ data class ReactionSummary(
 )
 
 /** Mirrors `ChatMessage` in the server's src/store.ts. */
+@Immutable
 @Serializable
 data class ChatMessage(
     val id: String,
@@ -215,6 +229,7 @@ data class ChatMessage(
 }
 
 /** Mirrors `ThreadSummary` in the server's src/store.ts. */
+@Immutable
 @Serializable
 data class ThreadSummary(
     val id: String,
@@ -231,6 +246,7 @@ data class ThreadSummary(
     val isMuted: Boolean get() = mutedUntil != null
 }
 
+@Immutable
 @Serializable
 data class ThreadSummaryInfo(
     val id: String,
@@ -238,12 +254,14 @@ data class ThreadSummaryInfo(
     val name: String,
 )
 
+@Immutable
 @Serializable
 data class ThreadMessages(
     val thread: ThreadSummaryInfo? = null,
     val messages: List<ChatMessage>,
 )
 
+@Immutable
 @Serializable
 data class GroupMember(
     val id: String,
@@ -251,6 +269,7 @@ data class GroupMember(
 )
 
 /** A friend (`GET /friends`). */
+@Immutable
 @Serializable
 data class Person(
     val id: String,
@@ -259,6 +278,7 @@ data class Person(
 )
 
 /** Someone who asked to be my friend (`GET /friend-requests`). */
+@Immutable
 @Serializable
 data class FriendRequest(
     val id: String,
@@ -269,6 +289,7 @@ data class FriendRequest(
 )
 
 /** `GET /users/find?phone=`. */
+@Immutable
 @Serializable
 data class FoundUser(
     val id: String,
@@ -279,6 +300,7 @@ data class FoundUser(
     val requested: Boolean = false,
 )
 
+@Immutable
 @Serializable
 data class StickerInfo(
     val id: Long,
@@ -287,6 +309,7 @@ data class StickerInfo(
     val url: String,
 )
 
+@Immutable
 @Serializable
 data class CreatedGroup(
     val groupId: String,
@@ -294,12 +317,14 @@ data class CreatedGroup(
     val failed: List<String> = emptyList(),
 )
 
+@Immutable
 @Serializable
 data class AddMembersResult(
     val failed: List<String> = emptyList(),
 )
 
 /** Lightweight thread identity returned by `GET /api/threads/user/{id}/info` commonGroups. */
+@Immutable
 @Serializable
 data class ThreadInfo(
     val id: String,
@@ -311,6 +336,7 @@ data class ThreadInfo(
 }
 
 /** `GET /api/threads/user/{id}/info`. */
+@Immutable
 @Serializable
 data class UserThreadInfo(
     val lastOnline: Long? = null,
@@ -318,6 +344,7 @@ data class UserThreadInfo(
 )
 
 /** `GET`/`POST /api/groups/{id}/link`. */
+@Immutable
 @Serializable
 data class GroupLinkInfo(
     val link: String? = null,
@@ -326,12 +353,14 @@ data class GroupLinkInfo(
 )
 
 /** `POST /api/groups/join-link`. */
+@Immutable
 @Serializable
 data class JoinGroupLinkResponse(
     val groupId: String? = null,
 )
 
 /** One item from `GET /api/groups/{id}/board` or `POST /api/groups/{id}/notes`. */
+@Immutable
 @Serializable
 data class BoardItem(
     val id: String,
@@ -343,12 +372,14 @@ data class BoardItem(
 )
 
 /** `GET /api/groups/{id}/board`. */
+@Immutable
 @Serializable
 data class BoardResponse(
     val items: List<BoardItem> = emptyList(),
 )
 
 /** `GET /threads/:kind/:id/info`: last-online and common groups for users, members for groups. */
+@Immutable
 @Serializable
 data class ThreadDetails(
     val lastOnline: Long? = null,
@@ -356,11 +387,13 @@ data class ThreadDetails(
     val commonGroups: List<ThreadInfo> = emptyList(),
 )
 
+@Immutable
 data class ThreadRef(val kind: String, val id: String) {
     val key: String get() = "$kind:$id"
 }
 
 /** One hit from `GET /api/search?q=...`. */
+@Immutable
 @Serializable
 data class MessageSearchHit(
     val threadId: String,
@@ -376,6 +409,7 @@ typealias QuotedMessage = Quote
 typealias MentionDraft = Mention
 
 /** Optimistic outgoing message kept in [com.zalom3ui.app.ui.ChatState.pending] until sent or dismissed. */
+@Immutable
 data class PendingMessage(
     val localId: String,
     val text: String,
@@ -388,6 +422,7 @@ data class PendingMessage(
 )
 
 /** Text and/or media URIs shared into Zalỏ from another app via ACTION_SEND / ACTION_SEND_MULTIPLE. */
+@Immutable
 data class PendingShare(
     val text: String? = null,
     val uris: List<android.net.Uri> = emptyList(),
@@ -414,6 +449,7 @@ enum class MuteOption(val apiValue: String, val label: String) {
 }
 
 /** Someone is calling (`call` event, type "incoming"); answering happens in the official Zalo app. */
+@Immutable
 @Serializable
 data class IncomingCall(
     val callId: String = "",
@@ -427,6 +463,7 @@ data class IncomingCall(
 )
 
 /** `GET /calls/current`: the call this account is answering or on. [connectedAt] is epoch millis, 0 until connected. */
+@Immutable
 @Serializable
 data class CurrentCall(
     val callId: String = "",

@@ -8,13 +8,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "tcp")]
 use axum::body::Bytes;
 #[cfg(feature = "tcp")]
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+#[cfg(feature = "tcp")]
 use axum::extract::{Extension, Path as AxumPath, State};
+#[cfg(feature = "tcp")]
 use axum::http::{header, StatusCode};
+#[cfg(feature = "tcp")]
 use axum::response::IntoResponse;
+#[cfg(feature = "tcp")]
 use axum::routing::{get, post};
+#[cfg(feature = "tcp")]
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
@@ -33,7 +39,9 @@ use zalo_proto::{
     CALL_ENDING_ACTS, RINGING_MAX_AGE_MS,
 };
 
-use crate::errors::{ApiResult, HttpError};
+#[cfg(feature = "tcp")]
+use crate::errors::ApiResult;
+use crate::errors::HttpError;
 use crate::routes::history_sync::sync_control_of;
 use crate::routes::AppState;
 use crate::session::{ListenerClosed, ZaloSession};
@@ -46,7 +54,7 @@ const HANDLED_CONTROL_TTL_MS: i64 = 10 * 60_000;
 const INCOMING_RING_TIMEOUT_MS: u64 = 45_000;
 const OUTGOING_SETUP_TIMEOUT_MS: u64 = 20_000;
 const OUTGOING_RING_TIMEOUT_MS: u64 = 60_000;
-const ANSWER_TEST_SECONDS: u64 = 30;
+pub(crate) const ANSWER_TEST_SECONDS: u64 = 30;
 #[cfg(feature = "tcp")]
 const WS_HEARTBEAT_SECS: u64 = 30;
 const MAX_AUDIO_FROM_APP_BYTES: usize = 1276;
@@ -2152,12 +2160,19 @@ fn same_srtp_material(srtp_key: &str, session: &str) -> bool {
     first30(srtp_key) == first30(session)
 }
 
-// ---- Axum Router & Handlers ----
+// ---- Manager startup & Axum Router/Handlers ----
 
-/// Builds the Track 1 calls & call-log router with an isolated `CallManager` per server instance.
-pub fn router(state: AppState) -> (Router<AppState>, Arc<CallManager>) {
+/// Creates an isolated [`CallManager`] and starts its background control/listener loops.
+pub fn start_manager(state: &AppState) -> Arc<CallManager> {
     let manager = CallManager::new(Arc::clone(&state.session));
     manager.spawn_background();
+    manager
+}
+
+/// Builds the Track 1 calls & call-log router with an isolated `CallManager` per server instance.
+#[cfg(feature = "tcp")]
+pub fn router(state: AppState) -> (Router<AppState>, Arc<CallManager>) {
+    let manager = start_manager(&state);
 
     let router = Router::new()
         .route("/api/debug/call-log", get(get_call_log).delete(clear_call_log))
@@ -2168,13 +2183,13 @@ pub fn router(state: AppState) -> (Router<AppState>, Arc<CallManager>) {
         .route("/api/calls/start", post(post_start_call))
         .route("/api/calls/hangup", post(post_hangup_call))
         .route("/api/calls/mute", post(post_mute_call))
-        .route("/api/calls/camera", post(post_camera_call));
-    #[cfg(feature = "tcp")]
-    let router = router.route("/ws/call-audio", get(ws_call_audio));
-    let router = router.layer(Extension(Arc::clone(&manager)));
+        .route("/api/calls/camera", post(post_camera_call))
+        .route("/ws/call-audio", get(ws_call_audio))
+        .layer(Extension(Arc::clone(&manager)));
     (router, manager)
 }
 
+#[cfg(feature = "tcp")]
 async fn get_call_log(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.session.call_trace().read_async().await;
     (
@@ -2184,11 +2199,13 @@ async fn get_call_log(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+#[cfg(feature = "tcp")]
 async fn clear_call_log(State(state): State<AppState>) -> StatusCode {
     state.session.call_trace().clear_async().await;
     StatusCode::NO_CONTENT
 }
 
+#[cfg(feature = "tcp")]
 async fn current_call(Extension(manager): Extension<Arc<CallManager>>) -> impl IntoResponse {
     match manager.current_call() {
         Some(call) => (StatusCode::OK, Json(json!(call))).into_response(),
@@ -2200,6 +2217,7 @@ async fn current_call(Extension(manager): Extension<Arc<CallManager>>) -> impl I
     }
 }
 
+#[cfg(feature = "tcp")]
 async fn post_decline_call(
     Extension(manager): Extension<Arc<CallManager>>,
     AxumPath(call_id): AxumPath<String>,
@@ -2208,6 +2226,7 @@ async fn post_decline_call(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn post_answer_call(
     Extension(manager): Extension<Arc<CallManager>>,
     AxumPath(call_id): AxumPath<String>,
@@ -2216,6 +2235,7 @@ async fn post_answer_call(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn post_answer_test(
     Extension(manager): Extension<Arc<CallManager>>,
     AxumPath(call_id): AxumPath<String>,
@@ -2226,6 +2246,7 @@ async fn post_answer_test(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn post_start_call(
     Extension(manager): Extension<Arc<CallManager>>,
     body: Bytes,
@@ -2240,6 +2261,7 @@ async fn post_start_call(
     Ok((StatusCode::OK, Json(call)))
 }
 
+#[cfg(feature = "tcp")]
 async fn post_hangup_call(
     Extension(manager): Extension<Arc<CallManager>>,
 ) -> ApiResult<StatusCode> {
@@ -2247,6 +2269,7 @@ async fn post_hangup_call(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn post_mute_call(
     Extension(manager): Extension<Arc<CallManager>>,
     body: Bytes,
@@ -2257,6 +2280,7 @@ async fn post_mute_call(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(feature = "tcp")]
 async fn post_camera_call(
     Extension(manager): Extension<Arc<CallManager>>,
     body: Bytes,
@@ -2354,6 +2378,7 @@ async fn handle_ws_call_audio(mut socket: WebSocket, manager: Arc<CallManager>) 
 
 // ---- JSON & control helpers ----
 
+#[cfg(feature = "tcp")]
 fn parse_json_body(body: &Bytes) -> Result<Value, HttpError> {
     if body.is_empty() {
         return Ok(Value::Object(Map::new()));
@@ -3261,6 +3286,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn rest_endpoints_lifecycle_over_http() {
         let media = FakeMediaServer::start(true).await;
@@ -3599,6 +3625,7 @@ mod tests {
     }
 
     /// Regression: history-sync controls arriving via the control poller used to be dropped.
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn poll_delivered_sync_control_reaches_history_sync_manager() {
         use axum::body::to_bytes;

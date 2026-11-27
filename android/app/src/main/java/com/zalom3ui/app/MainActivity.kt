@@ -18,12 +18,16 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zalom3ui.app.data.PendingShare
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.data.effectiveReducedMotion
+import com.zalom3ui.app.data.systemReducedMotion
 import com.zalom3ui.app.security.AppLock
 import com.zalom3ui.app.security.AppLockPolicy
 import com.zalom3ui.app.security.AppLockScreen
@@ -60,6 +64,13 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val userReducedMotion by viewModel.reducedMotion.collectAsStateWithLifecycle()
+            var systemReduced by remember { mutableStateOf(systemReducedMotion(this@MainActivity)) }
+            LifecycleResumeEffect(Unit) {
+                systemReduced = systemReducedMotion(this@MainActivity)
+                onPauseOrDispose {}
+            }
+            val reducedMotion = effectiveReducedMotion(userReducedMotion, systemReduced)
             val dark = isAppInDarkTheme(state.appearance)
             // Status/navigation bar icons follow the app's theme, which can differ from the system's.
             DisposableEffect(dark) {
@@ -77,7 +88,7 @@ class MainActivity : ComponentActivity() {
                 )
                 onDispose {}
             }
-            AppTheme(state.appearance) {
+            AppTheme(state.appearance, reducedMotion = reducedMotion) {
                 if (isLocked) {
                     LaunchedEffect(lockPromptGeneration) {
                         triggerUnlock()

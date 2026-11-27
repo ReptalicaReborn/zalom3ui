@@ -1,7 +1,6 @@
-//! In-process core for embedders such as the Android app: the same axum [`Router`] the TCP server
-//! uses, called directly (no socket, port or token), plus the event stream and the call-audio
-//! link as plain handles. Every handler, validation and error mapping is the one the HTTP server
-//! runs; only the transport differs.
+//! In-process core for embedders such as the Android app: runs every `/api/*` route directly
+//! through [`crate::dispatch`] (no socket, port, token, `axum`, or `tower`), plus the event
+//! stream and the call-audio link as plain handles.
 //!
 //! [`EmbeddedCore::start`] spawns tasks, so it must run inside a Tokio runtime. A core can be shut
 //! down and a new one started in the same process.
@@ -10,18 +9,63 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use axum::body::Body;
-use axum::body::Bytes;
-use axum::http::{header, Method, Request, Uri};
-use axum::Router;
+pub use bytes::Bytes;
+pub type Body = Bytes;
+
+use serde_json::json;
 use tokio::sync::watch;
-use tower::ServiceExt;
 
 use crate::config::Config;
-use crate::http::{self, EventStream};
+use crate::dispatch;
 use crate::routes::calls::{AudioLink, AudioWsOut, CallManager, NO_ACTIVE_CALL_CLOSE};
-use crate::session::ZaloSession;
+use crate::routes::history_sync::HistorySyncManager;
+use crate::routes::AppState;
+use crate::session::{ServerBroadcastEvent, ZaloSession};
 use crate::store::ChatStore;
+
+/// The event stream every client of the server sees: first `{"type":"status",...}` with the
+/// current status, then every broadcast event, each as the JSON text sent over `/ws`. Shared by
+/// the WebSocket handler and the in-process embedded subscription.
+pub struct EventStream {
+    rx: tokio::sync::broadcast::Receiver<ServerBroadcastEvent>,
+    initial: Option<Arc<str>>,
+}
+
+impl EventStream {
+    /// Subscribes first, then snapshots the status, so no event is missed in between.
+    pub fn new(session: &ZaloSession) -> Self {
+        let rx = session.subscribe_events();
+        let initial: Arc<str> = json!({
+            "type": "status",
+            "status": session.get_status(),
+        })
+        .to_string()
+        .into();
+        Self {
+            rx,
+            initial: Some(initial),
+        }
+    }
+
+    /// The next event as shared JSON text, or `None` once the server is gone. Cancel-safe.
+    pub async fn next_shared(&mut self) -> Option<Arc<str>> {
+        if let Some(initial) = self.initial.take() {
+            return Some(initial);
+        }
+        loop {
+            match self.rx.recv().await {
+                Ok(payload) => return Some(payload),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// The next event as JSON text, or `None` once the server is gone. Cancel-safe.
+    pub async fn next(&mut self) -> Option<String> {
+        self.next_shared().await.map(|s| s.to_string())
+    }
+}
 
 /// How the embedded core is set up.
 #[derive(Debug, Clone)]
@@ -32,7 +76,7 @@ pub struct EmbeddedConfig {
     pub read_receipts: bool,
 }
 
-/// What a request to the in-process router answered.
+/// What a request to the in-process dispatcher answered.
 #[derive(Debug, Clone)]
 pub struct EmbeddedResponse {
     pub status: u16,
@@ -41,18 +85,19 @@ pub struct EmbeddedResponse {
     pub body: Bytes,
 }
 
-/// The running core: session, store, and the app router.
+/// The running core: session, store, call manager, and history-sync manager.
 pub struct EmbeddedCore {
-    router: Router,
+    state: AppState,
     calls: Arc<CallManager>,
+    history_sync: Arc<HistorySyncManager>,
     session: Arc<ZaloSession>,
     store: ChatStore,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl EmbeddedCore {
-    /// Opens the store, creates and starts the session (resuming saved credentials), and builds
-    /// the router. Must be called inside a Tokio runtime.
+    /// Opens the store, creates and starts the session (resuming saved credentials), and starts
+    /// the call & history-sync managers. Must be called inside a Tokio runtime.
     pub fn start(config: EmbeddedConfig) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
@@ -64,22 +109,28 @@ impl EmbeddedCore {
             public_dir: None,
         };
         let (config, store, session) = crate::open_core(config);
-        // No network-facing checks (Host, Origin, token): only the app itself can call in here.
-        let app = http::build_app(config, Arc::clone(&session), false);
+        let state = AppState {
+            config,
+            session: Arc::clone(&session),
+            store: store.clone(),
+        };
+        let calls = crate::routes::calls::start_manager(&state);
+        let history_sync = crate::routes::history_sync::start_manager(state.clone());
         session.start();
         let (shutdown_tx, _) = watch::channel(false);
         Self {
-            router: app.router,
-            calls: app.calls,
+            state,
+            calls,
+            history_sync,
             session,
             store,
             shutdown_tx,
         }
     }
 
-    /// Runs one request through the router. `path_and_query` is already percent-encoded, e.g.
-    /// `/api/threads?limit=5`. `Err` only for a request that could not be built (bad method or
-    /// URI); HTTP errors come back as ordinary responses.
+    /// Runs one request directly through the API dispatcher. `path_and_query` is already
+    /// percent-encoded, e.g. `/api/threads?limit=5`. `Err` only for a request that could not be
+    /// built (bad method or path); HTTP errors come back as ordinary responses.
     pub async fn request(
         &self,
         method: &str,
@@ -87,42 +138,21 @@ impl EmbeddedCore {
         content_type: Option<&str>,
         body: Body,
     ) -> Result<EmbeddedResponse, String> {
-        let method = Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
-            .map_err(|_| format!("Invalid method: {method}"))?;
-        let uri: Uri = path_and_query
-            .parse()
-            .map_err(|e| format!("Invalid path {path_and_query:?}: {e}"))?;
-        let mut builder = Request::builder().method(method).uri(uri);
-        if let Some(ct) = content_type.filter(|c| !c.is_empty()) {
-            builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        let request = builder
-            .body(body)
-            .map_err(|e| format!("Invalid request: {e}"))?;
-
-        let response = match self.router.clone().oneshot(request).await {
-            Ok(r) => r,
-            Err(e) => match e {},
-        };
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .map_err(|e| format!("Could not read the response: {e}"))?;
-        Ok(EmbeddedResponse {
-            status,
-            content_type,
+        let parsed = dispatch::parse_request(method, path_and_query)?;
+        let ct = content_type.filter(|c| !c.is_empty());
+        Ok(dispatch::dispatch_parsed(
+            &self.state,
+            &self.calls,
+            &self.history_sync,
+            parsed,
+            ct,
             body,
-        })
+        )
+        .await)
     }
 
-    /// Like [`request`](Self::request), with the body streamed from a file in 64 KiB chunks, so a
-    /// 100 MB video never has to sit in the caller's memory.
+    /// Like [`request`](Self::request), reading the body from a file in chunks up to the route's
+    /// body limit so an oversized file is rejected with `413` without loading it into memory.
     pub async fn request_file(
         &self,
         method: &str,
@@ -131,22 +161,45 @@ impl EmbeddedCore {
         file_path: &std::path::Path,
     ) -> Result<EmbeddedResponse, String> {
         use tokio::io::AsyncReadExt;
-        let file = tokio::fs::File::open(file_path)
+
+        let mut file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| format!("Could not open {}: {e}", file_path.display()))?;
-        let stream = futures_util::stream::unfold(file, |mut file| async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            match file.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(n) => {
-                    buf.truncate(n);
-                    Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), file))
-                }
-                Err(e) => Some((Err(e), file)),
+        let parsed = dispatch::parse_request(method, path_and_query)?;
+        let limit = dispatch::body_limit_for(&parsed);
+        let ct = content_type.filter(|c| !c.is_empty());
+
+        if let Ok(meta) = file.metadata().await {
+            if meta.len() > limit as u64 {
+                return Ok(dispatch::payload_too_large());
             }
-        });
-        self.request(method, path_and_query, content_type, Body::from_stream(stream))
-            .await
+        }
+
+        let mut data = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = file
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("Could not read {}: {e}", file_path.display()))?;
+            if n == 0 {
+                break;
+            }
+            if data.len().saturating_add(n) > limit {
+                return Ok(dispatch::payload_too_large());
+            }
+            data.extend_from_slice(&chunk[..n]);
+        }
+
+        Ok(dispatch::dispatch_parsed(
+            &self.state,
+            &self.calls,
+            &self.history_sync,
+            parsed,
+            ct,
+            Bytes::from(data),
+        )
+        .await)
     }
 
     /// Subscribes to events: first `{"type":"status",...}`, then every broadcast event, as the
@@ -384,11 +437,13 @@ mod tests {
         ct: Option<&str>,
         body: Vec<u8>,
     ) -> EmbeddedResponse {
-        core.request(method, path, ct, Body::from(body)).await.unwrap()
+        core.request(method, path, ct, Body::from(body))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn requests_run_the_real_router_without_host_origin_or_token() {
+    async fn requests_run_directly_without_host_origin_or_token() {
         let dir = temp_dir("zalo-embedded-req");
         let core = start(&dir);
 
@@ -433,7 +488,7 @@ mod tests {
         .await;
         assert_ne!(res.status, 413);
 
-        // A file body streams through the same router.
+        // A file body reads through the same dispatcher.
         let file = dir.join("upload.bin");
         fs::write(&file, vec![7u8; 200 * 1024]).unwrap();
         let res = core
@@ -454,13 +509,113 @@ mod tests {
 
         // Requests that cannot be built are errors, not panics.
         assert!(core
-            .request("BAD METHOD", "/api/status", None, Body::empty())
+            .request("BAD METHOD", "/api/status", None, Body::new())
             .await
             .is_err());
         assert!(core
-            .request("GET", "not a path", None, Body::empty())
+            .request("GET", "not a path", None, Body::new())
             .await
             .is_err());
+
+        core.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn embedded_dispatch_parity_across_key_routes() {
+        let dir = temp_dir("zalo-embedded-parity");
+        let core = start(&dir);
+
+        // /api/status
+        let res = call(&core, "GET", "/api/status", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v["state"], "logged_out");
+
+        // /api/reactions
+        let res = call(&core, "GET", "/api/reactions", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 15);
+
+        // /api/threads
+        let res = call(&core, "GET", "/api/threads", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert!(v.is_array());
+
+        // /api/search (missing q -> 400; valid q -> 200)
+        let res = call(&core, "GET", "/api/search", None, vec![]).await;
+        assert_eq!(res.status, 400);
+        let res = call(&core, "GET", "/api/search?q=hello&limit=5", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert!(v["results"].is_array());
+
+        // /api/calls/current -> 404 JSON error
+        let res = call(&core, "GET", "/api/calls/current", None, vec![]).await;
+        assert_eq!(res.status, 404);
+        assert!(res.content_type.starts_with("application/json"));
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v["error"], "No active call");
+
+        // /api/history-sync/status -> 200 with log array
+        let res = call(&core, "GET", "/api/history-sync/status", None, vec![]).await;
+        assert_eq!(res.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(v["state"], "idle");
+        assert!(v["log"].is_array());
+
+        // Debug logs (plain text GET + 204 DELETE)
+        for path in [
+            "/api/debug/call-log",
+            "/api/debug/socket-log",
+            "/api/debug/replay-log",
+        ] {
+            let res = call(&core, "GET", path, None, vec![]).await;
+            assert_eq!(res.status, 200, "GET {path}");
+            assert!(
+                res.content_type.starts_with("text/plain"),
+                "GET {path} content-type={}",
+                res.content_type
+            );
+            let del = call(&core, "DELETE", path, None, vec![]).await;
+            assert_eq!(del.status, 204, "DELETE {path}");
+        }
+
+        // /api/friends/{id}/alias (validation 400 when missing alias; 503 when logged out)
+        let res = call(
+            &core,
+            "PUT",
+            "/api/friends/42/alias",
+            Some("application/json"),
+            b"{}".to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, 400);
+        let res = call(
+            &core,
+            "PUT",
+            "/api/friends/42/alias",
+            Some("application/json"),
+            br#"{"alias":"Buddy"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, 409);
+        let res = call(&core, "DELETE", "/api/friends/42/alias", None, vec![]).await;
+        assert_eq!(res.status, 409);
+
+        // /api/groups/{id}/link (GET / POST / DELETE -> 409 when logged out)
+        for method in ["GET", "POST", "DELETE"] {
+            let res = call(&core, method, "/api/groups/g1/link", None, vec![]).await;
+            assert_eq!(res.status, 409, "{method} /api/groups/g1/link");
+        }
+
+        // Unknown route -> 404, wrong method -> 405
+        let res = call(&core, "GET", "/api/does-not-exist", None, vec![]).await;
+        assert_eq!(res.status, 404);
+        let res = call(&core, "DELETE", "/api/status", None, vec![]).await;
+        assert_eq!(res.status, 405);
 
         core.shutdown();
         let _ = fs::remove_dir_all(&dir);

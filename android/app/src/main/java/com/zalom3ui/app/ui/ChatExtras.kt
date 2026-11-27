@@ -30,6 +30,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
@@ -115,7 +116,12 @@ fun StickerPickerContent(
                 }
             }
             if (search.loading && search.results.isNotEmpty()) {
-                LinearWavyProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
+                val barModifier = Modifier.fillMaxWidth().align(Alignment.TopCenter)
+                if (LocalReducedMotion.current) {
+                    LinearProgressIndicator(barModifier)
+                } else {
+                    LinearWavyProgressIndicator(barModifier)
+                }
             }
         }
     }
@@ -208,11 +214,17 @@ fun UploadingNoteHost(threadKey: String, count: Int) {
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun UploadingNote(count: Int, progress: Float? = null) {
-    val animated by animateFloatAsState(
-        targetValue = progress?.coerceIn(0f, 1f) ?: 0f,
-        animationSpec = tween(durationMillis = 150, easing = LinearEasing),
-        label = "UploadProgress",
-    )
+    val reducedMotion = LocalReducedMotion.current
+    val rawProgress = progress?.coerceIn(0f, 1f) ?: 0f
+    val displayedProgress = if (reducedMotion) {
+        rawProgress
+    } else {
+        animateFloatAsState(
+            targetValue = rawProgress,
+            animationSpec = tween(durationMillis = 150, easing = LinearEasing),
+            label = "UploadProgress",
+        ).value
+    }
     val hasProgress = progress != null
     val label = (if (count == 1) "Sending 1 file…" else "Sending $count files…") +
         (if (progress != null) " ${(progress.coerceIn(0f, 1f) * 100).toInt()}%" else "")
@@ -243,14 +255,23 @@ fun UploadingNote(count: Int, progress: Float? = null) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            LinearWavyProgressIndicator(
-                progress = { animated },
-                modifier = Modifier.fillMaxWidth(),
-                color = MaterialTheme.colorScheme.primary,
-                trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
-                amplitude = { if (hasProgress) 1f else 0f },
-                waveSpeed = 0.dp,
-            )
+            if (reducedMotion) {
+                LinearProgressIndicator(
+                    progress = { displayedProgress },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                )
+            } else {
+                LinearWavyProgressIndicator(
+                    progress = { displayedProgress },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                    amplitude = { if (hasProgress) 1f else 0f },
+                    waveSpeed = 0.dp,
+                )
+            }
         }
     }
 }

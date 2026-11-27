@@ -23,6 +23,7 @@ import kotlinx.serialization.json.putJsonArray
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -611,6 +612,9 @@ class ApiClient internal constructor(private val transport: Transport) {
     companion object {
         private const val JSON = "application/json"
         private const val AUDIO_MP4 = "audio/mp4"
+
+        /** Shared OkHttp client (connection pool + dispatcher) reused by HTTP transport and Coil image loading. */
+        internal fun sharedHttpClient(): OkHttpClient = HttpTransport.SHARED_HTTP
 
         /** The client for the Zalo core running on this phone: direct calls, no socket, port or token. */
         fun onDevice(context: Context): ApiClient {

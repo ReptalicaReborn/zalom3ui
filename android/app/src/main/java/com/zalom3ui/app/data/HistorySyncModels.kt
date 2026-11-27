@@ -1,8 +1,10 @@
 package com.zalom3ui.app.data
 
+import androidx.compose.runtime.Immutable
 import kotlinx.serialization.Serializable
 
 /** What an import added; mirrors `counts` of the server's `HistorySyncStatus` (src/historysync.ts). */
+@Immutable
 @Serializable
 data class HistorySyncCounts(
     val imported: Int = 0,
@@ -16,6 +18,7 @@ data class HistorySyncCounts(
  * "Sync messages from the phone": `GET /api/history-sync/status` and the `history_sync` event on /ws.
  * [state] is idle, waiting_for_phone, downloading, importing, done or failed.
  */
+@Immutable
 @Serializable
 data class HistorySyncStatus(
     val state: String = "idle",

@@ -80,6 +80,10 @@ fun AnimatedVisibilityScope.BackSlideFrame(
     entry: NavBackStackEntry,
     content: @Composable () -> Unit,
 ) {
+    if (LocalReducedMotion.current) {
+        content()
+        return
+    }
     val exiting = transition.targetState == EnterExitState.PostExit
     // Decided once when the screen starts leaving, so it holds through the gesture, the commit and a cancel.
     val byBack = remember(exiting) {

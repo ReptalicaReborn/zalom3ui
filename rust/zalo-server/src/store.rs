@@ -977,6 +977,111 @@ pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Optio
     }
 }
 
+/// Keys retained inside `RawRef.content` for non-text/attachment messages (the exact subset read
+/// by `prepare_qmsg`, `prepare_qmsg_attach`, and `forward_message`, dropping bulky card/layout
+/// metadata arrays and tracking blobs).
+const RAW_CONTENT_KEEP_KEYS: &[&str] = &[
+    "href",
+    "thumb",
+    "title",
+    "description",
+    "params",
+    "action",
+    "id",
+    "catId",
+    "cateId",
+    "type",
+    "childnumber",
+    "properties",
+];
+
+/// Returns `Some(Box<Value>)` only when `is_text` is true (only string-content quotes inspect
+/// `property_ext`) and the value is non-null, non-empty.
+fn slim_property_ext(is_text: bool, raw_prop: Option<&Value>) -> Option<Box<Value>> {
+    if !is_text {
+        return None;
+    }
+    let val = raw_prop?;
+    match val {
+        Value::Null => None,
+        Value::Object(m) if m.is_empty() => None,
+        Value::String(s) if s.is_empty() => None,
+        other => Some(Box::new(other.clone())),
+    }
+}
+
+/// Slims `raw.content` for storage:
+/// - Plain-text string content -> `None` (already stored verbatim in `StoredMessage.text`).
+/// - `chat.todo` -> retains only `"params"` (read by `prepare_qmsg`).
+/// - Other object attachments -> retains only `RAW_CONTENT_KEEP_KEYS` with non-null values.
+/// - Non-string/non-object -> empty object `{}` so `None` unambiguously means plain text.
+fn slim_raw_content(msg_type: &str, content: &Value) -> Option<Box<Value>> {
+    if content.is_string() {
+        return None;
+    }
+    let mut kept = Map::new();
+    if let Some(obj) = content.as_object() {
+        if msg_type == "chat.todo" {
+            if let Some(params) = obj.get("params").filter(|v| !v.is_null()) {
+                kept.insert("params".to_string(), params.clone());
+            }
+        } else {
+            for &key in RAW_CONTENT_KEEP_KEYS {
+                if let Some(v) = obj.get(key) {
+                    if v.is_null() || matches!(v, Value::String(s) if s.is_empty()) {
+                        continue;
+                    }
+                    kept.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    Some(Box::new(Value::Object(kept)))
+}
+
+/// Deduplicates and slims `StoredMessage.raw` after loading an older on-disk file into RAM.
+fn slim_loaded_raw(msg: &mut StoredMessage) {
+    let Some(raw) = msg.raw.as_deref_mut() else {
+        return;
+    };
+    if raw.msg_type.as_deref() == Some(msg.msg_type.as_str()) {
+        raw.msg_type = None;
+    }
+    if raw.uid_from.as_deref() == Some(msg.from_id.as_str()) {
+        raw.uid_from = None;
+    }
+    if raw.id_to.as_deref() == Some(msg.thread_id.as_str()) {
+        raw.id_to = None;
+    }
+    if raw.ts.as_deref().is_some_and(|t| t == msg.ts.to_string()) {
+        raw.ts = None;
+    }
+    if msg.recalled {
+        raw.content = None;
+        raw.property_ext = None;
+        return;
+    }
+    let is_text = match raw.content.as_deref() {
+        Some(Value::String(s)) => {
+            if s == &msg.text && msg.attachment.is_none() {
+                raw.content = None;
+            }
+            true
+        }
+        None => msg.attachment.is_none(),
+        Some(other) => {
+            let msg_type = raw
+                .msg_type
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(msg.msg_type.as_str());
+            raw.content = slim_raw_content(msg_type, other);
+            false
+        }
+    };
+    raw.property_ext = slim_property_ext(is_text, raw.property_ext.as_deref());
+}
+
 /// Normalizes a raw Zalo message `data` payload into a `StoredMessage`, matching
 /// `normalizeMessage` in `src/store.ts`.
 pub fn normalize_message(
@@ -1028,10 +1133,8 @@ pub fn normalize_message(
     let ts_str = val_to_string(raw_data.get("ts"));
     let ts = val_to_i64(raw_data.get("ts"));
     let content_val = raw_data.get("content").cloned().unwrap_or(Value::Null);
-    let property_ext = raw_data
-        .get("propertyExt")
-        .filter(|v| !v.is_null())
-        .cloned();
+    let raw_content = slim_raw_content(&msg_type, &content_val);
+    let raw_property_ext = slim_property_ext(content_val.is_string(), raw_data.get("propertyExt"));
 
     let quote = raw_data.get("quote").and_then(|q| q.as_object()).map(|q| {
         let q_text = non_empty_str(q.get("msg")).unwrap_or_else(|| "[Attachment]".to_string());
@@ -1060,12 +1163,23 @@ pub fn normalize_message(
         })
         .unwrap_or_default();
 
+    let raw_id_to_opt = if id_to == thread_id {
+        None
+    } else {
+        Some(id_to)
+    };
+    let raw_ts_opt = if ts_str == ts.to_string() {
+        None
+    } else {
+        Some(ts_str)
+    };
+
     let mut msg = StoredMessage {
         id: msg_id,
         cli_msg_id,
         thread_id: thread_id.to_string(),
         thread_kind,
-        from_id: uid_from.clone(),
+        from_id: uid_from,
         from_name,
         is_self,
         ts,
@@ -1078,18 +1192,18 @@ pub fn normalize_message(
         reactions: None,
         delivered_to: None,
         seen_by: None,
-        raw: Some(RawRef {
-            msg_type: msg_type.clone(),
-            content: content_val.clone(),
-            property_ext,
-            uid_from,
-            id_to,
-            ts: ts_str,
+        raw: Some(Box::new(RawRef {
+            msg_type: None,
+            content: raw_content,
+            property_ext: raw_property_ext,
+            uid_from: None,
+            id_to: raw_id_to_opt,
+            ts: raw_ts_opt,
             ttl: val_to_i64(raw_data.get("ttl")),
             st: val_to_i64(raw_data.get("st")),
             at: val_to_i64(raw_data.get("at")),
             cmd: val_to_i64(raw_data.get("cmd")),
-        }),
+        })),
         search_folded: SearchCache::default(),
     };
 
@@ -1716,6 +1830,14 @@ impl ChatStore {
                     continue;
                 }
                 let mut moved = m;
+                if let Some(raw) = moved.raw.as_deref_mut() {
+                    if raw.id_to.is_none() {
+                        raw.id_to = Some(moved.thread_id.clone());
+                    }
+                    if kind == ThreadKind::User && !moved.is_self && raw.uid_from.is_none() {
+                        raw.uid_from = Some(moved.from_id.clone());
+                    }
+                }
                 moved.thread_id = to_id.to_string();
                 if kind == ThreadKind::User && !moved.is_self {
                     moved.from_id = to_id.to_string();
@@ -2169,6 +2291,10 @@ impl ChatStore {
             msg.quote = None;
             msg.mentions.clear();
             msg.reactions = None;
+            if let Some(raw) = msg.raw.as_deref_mut() {
+                raw.content = None;
+                raw.property_ext = None;
+            }
             msg.search_folded.clear();
             let cloned = msg.clone();
             s.mark_dirty(&key, has_paths);
@@ -2580,7 +2706,10 @@ impl ChatStore {
                 .and_then(|text| {
                     serde_json::from_str::<ThreadFile>(&text).map_err(|e| e.to_string())
                 }) {
-                Ok(tf) => {
+                Ok(mut tf) => {
+                    for m in &mut tf.messages {
+                        slim_loaded_raw(m);
+                    }
                     if let Ok(mut s) = self.inner.state.write() {
                         for m in &tf.messages {
                             s.index.insert(m.id.clone(), key.clone());
@@ -2649,7 +2778,7 @@ impl ChatStore {
             .and_then(|text| {
                 serde_json::from_str::<LegacySnapshot>(&text).map_err(|e| e.to_string())
             });
-        let snapshot = match parsed {
+        let mut snapshot = match parsed {
             Ok(snap) => snap,
             Err(err) => {
                 if let Ok(mut s) = self.inner.state.write() {
@@ -2659,6 +2788,11 @@ impl ChatStore {
                 return;
             }
         };
+        for list in snapshot.messages.values_mut() {
+            for m in list {
+                slim_loaded_raw(m);
+            }
+        }
 
         if let Ok(mut guard) = self.inner.state.write() {
             let s = &mut *guard;
@@ -3771,6 +3905,126 @@ mod tests {
             .collect();
         assert_eq!(meta_backups.len(), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slim_raw_ref_deduplicates_and_loads_legacy_files() {
+        // 1. Plain-text message omits duplicate content, msgType, uidFrom, ts, and empty propertyExt.
+        let text_msg = normalize_message(
+            &json!({
+                "msgId": "t1",
+                "cliMsgId": "c1",
+                "msgType": "webchat",
+                "uidFrom": "100",
+                "idTo": "me",
+                "dName": "Alice",
+                "ts": "1700000000000",
+                "content": "hello world",
+                "propertyExt": {},
+                "ttl": 0,
+            }),
+            ThreadKind::User,
+            "100",
+            false,
+            Some("me"),
+        );
+        let raw = text_msg.raw.as_deref().unwrap();
+        assert!(raw.content.is_none(), "plain text should not duplicate content");
+        assert!(raw.property_ext.is_none(), "empty propertyExt should be dropped");
+        assert!(raw.msg_type.is_none());
+        assert!(raw.uid_from.is_none());
+        assert_eq!(raw.id_to.as_deref(), Some("me"));
+        assert!(raw.ts.is_none());
+        assert_eq!(raw.content_for_quote(&text_msg), json!("hello world"));
+        assert_eq!(raw.plain_text(&text_msg), Some("hello world"));
+        assert_eq!(raw.resolved_uid_from(&text_msg), "100");
+        assert_eq!(raw.resolved_id_to(&text_msg), "me");
+        assert_eq!(raw.resolved_msg_type(&text_msg), "webchat");
+        assert_eq!(raw.resolved_ts(&text_msg), "1700000000000");
+
+        // 2. Non-text attachment strips bulky non-quote keys & drops propertyExt.
+        let photo_msg = normalize_message(
+            &json!({
+                "msgId": "p1",
+                "cliMsgId": "cp1",
+                "msgType": "chat.photo",
+                "uidFrom": "100",
+                "idTo": "me",
+                "ts": "1700000001000",
+                "propertyExt": { "huge": [1, 2, 3] },
+                "content": {
+                    "href": "https://cdn.example/img.jpg",
+                    "thumb": "https://cdn.example/thumb.jpg",
+                    "title": "pic",
+                    "tracking": { "bulky": "x".repeat(500) },
+                    "extra": "drop me"
+                }
+            }),
+            ThreadKind::User,
+            "100",
+            false,
+            Some("me"),
+        );
+        let praw = photo_msg.raw.as_deref().unwrap();
+        assert!(praw.property_ext.is_none());
+        let pcontent = praw.content.as_deref().unwrap();
+        assert_eq!(pcontent["href"], "https://cdn.example/img.jpg");
+        assert_eq!(pcontent["thumb"], "https://cdn.example/thumb.jpg");
+        assert!(pcontent.get("tracking").is_none());
+        assert!(pcontent.get("extra").is_none());
+
+        // 3. Legacy on-disk thread file with full unslimmed RawRef loads & slims cleanly.
+        let dir = temp_dir("zalo-store-legacy-raw");
+        let threads_dir = dir.join("messages").join("threads");
+        fs::create_dir_all(&threads_dir).unwrap();
+        let legacy_thread = json!({
+            "version": 1,
+            "messages": [
+                {
+                    "id": "leg1",
+                    "cliMsgId": "cleg1",
+                    "threadId": "100",
+                    "threadKind": "user",
+                    "fromId": "100",
+                    "fromName": "Alice",
+                    "isSelf": false,
+                    "ts": 1000,
+                    "msgType": "webchat",
+                    "text": "legacy hello",
+                    "raw": {
+                        "msgType": "webchat",
+                        "content": "legacy hello",
+                        "propertyExt": {},
+                        "uidFrom": "100",
+                        "idTo": "me",
+                        "ts": "1000",
+                        "ttl": 0,
+                        "st": 1,
+                        "at": 2,
+                        "cmd": 501
+                    }
+                }
+            ]
+        });
+        fs::write(
+            threads_dir.join(format!("{}.json", hex::encode("user:100"))),
+            serde_json::to_string(&legacy_thread).unwrap(),
+        )
+        .unwrap();
+
+        let store = ChatStore::open(&dir);
+        let loaded = store.find_message("leg1").unwrap();
+        let lraw = loaded.raw.as_deref().unwrap();
+        assert!(lraw.content.is_none());
+        assert!(lraw.property_ext.is_none());
+        assert_eq!(lraw.content_for_quote(&loaded), json!("legacy hello"));
+        assert_eq!(lraw.plain_text(&loaded), Some("legacy hello"));
+        assert_eq!(lraw.resolved_uid_from(&loaded), "100");
+        assert_eq!(lraw.resolved_id_to(&loaded), "me");
+        assert_eq!(lraw.st, 1);
+        assert_eq!(lraw.at, 2);
+        assert_eq!(lraw.cmd, 501);
         let _ = fs::remove_dir_all(&dir);
     }
 }

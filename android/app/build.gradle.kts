@@ -23,6 +23,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+        resourceConfigurations += listOf("en", "vi")
     }
 
     externalNativeBuild {
@@ -45,6 +46,15 @@ android {
         jniLibs {
             // Compress native libraries in the APK (extracted on install) to keep the download small.
             useLegacyPackaging = true
+        }
+        resources {
+            excludes += setOf(
+                "DebugProbesKt.bin",
+                "kotlin-tooling-metadata.json",
+                "META-INF/androidx/**/LICENSE.txt",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+            )
         }
     }
 

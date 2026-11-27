@@ -1,6 +1,7 @@
 package com.zalom3ui.app.data
 
 import android.content.Context
+import android.provider.Settings
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -195,6 +196,12 @@ class SettingsStore(context: Context) {
             prefs.edit().putBoolean(KEY_SCREEN_SECURITY, value).apply()
         }
 
+    var reducedMotion: Boolean
+        get() = prefs.getBoolean(KEY_REDUCED_MOTION, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_REDUCED_MOTION, value).apply()
+        }
+
     internal companion object {
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
@@ -213,6 +220,7 @@ class SettingsStore(context: Context) {
         const val KEY_APP_LOCK_ENABLED = "app_lock_enabled"
         const val KEY_APP_LOCK_TIMEOUT = "app_lock_timeout"
         const val KEY_SCREEN_SECURITY = "screen_security"
+        const val KEY_REDUCED_MOTION = "reduced_motion"
 
         fun encodeChatAccents(accents: Map<String, ChatAccent>): String =
             Json.encodeToString(accents.mapValues { it.value.key })
@@ -238,3 +246,16 @@ class SettingsStore(context: Context) {
         }
     }
 }
+
+/** True when Android's global animator duration scale disables animations (`0f`). */
+internal fun isAnimatorScaleDisabled(scale: Float): Boolean = scale == 0f
+
+/** True when Android's global "Remove animations" setting sets the animator duration scale to 0. */
+fun systemReducedMotion(context: Context): Boolean = runCatching {
+    isAnimatorScaleDisabled(
+        Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f),
+    )
+}.getOrDefault(false)
+
+/** Reduced motion is active when either the in-app toggle or Android's system setting is enabled. */
+fun effectiveReducedMotion(userPref: Boolean, systemPref: Boolean): Boolean = userPref || systemPref

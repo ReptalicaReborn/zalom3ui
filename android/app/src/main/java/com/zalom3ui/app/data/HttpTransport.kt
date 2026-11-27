@@ -118,19 +118,21 @@ internal class HttpTransport(serverUrl: String, private val token: String?) : Tr
         }
     }
 
-    private companion object {
-        val JSON_MEDIA_TYPE = "application/json".toMediaType()
-        val OCTET_STREAM = "application/octet-stream".toMediaType()
+    internal companion object {
+        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        private val OCTET_STREAM = "application/octet-stream".toMediaType()
 
-        // Shared so the connection pool survives client rebuilds after settings changes.
-        val http = OkHttpClient.Builder()
+        // Shared so the connection pool survives client rebuilds after settings changes and is reused by Coil.
+        internal val SHARED_HTTP: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .pingInterval(30, TimeUnit.SECONDS)
             .build()
 
+        private val http: OkHttpClient get() = SHARED_HTTP
+
         /** Uploads go to Zalo before the server answers: give them minutes, not seconds. */
-        val UPLOAD_HTTP = http.newBuilder()
+        private val UPLOAD_HTTP: OkHttpClient = SHARED_HTTP.newBuilder()
             .writeTimeout(5, TimeUnit.MINUTES)
             .readTimeout(5, TimeUnit.MINUTES)
             .build()

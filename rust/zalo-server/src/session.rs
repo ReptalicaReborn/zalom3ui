@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{Local, TimeZone, Timelike};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
@@ -174,33 +173,7 @@ pub fn mute_until(option: MuteOption) -> i64 {
         MuteOption::OneHour => now_ms() + 3_600_000,
         MuteOption::FourHours => now_ms() + 4 * 3_600_000,
         MuteOption::Forever => -1,
-        MuteOption::Until8Am => {
-            let now = Local::now();
-            let mut target_date = now.date_naive();
-            if now.hour() >= 8 {
-                if let Some(next_day) = target_date.succ_opt() {
-                    target_date = next_day;
-                }
-            }
-            let naive_8am = target_date
-                .and_hms_opt(8, 0, 0)
-                .unwrap_or_else(|| now.naive_local());
-            Local
-                .from_local_datetime(&naive_8am)
-                .earliest()
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or_else(|| {
-                    // Fallback: compute next 8am offset in seconds from midnight
-                    let secs = now.num_seconds_from_midnight() as i64;
-                    let eight = 8 * 3600;
-                    let delta = if secs < eight {
-                        eight - secs
-                    } else {
-                        (24 * 3600 - secs) + eight
-                    };
-                    now_ms() + delta * 1000
-                })
-        }
+        MuteOption::Until8Am => zalo_proto::time_util::next_local_8am_epoch_ms(now_ms()),
     }
 }
 
@@ -2276,17 +2249,17 @@ impl ZaloSession {
                 let params: Vec<SeenMessageInput> = with_raw[start..]
                     .iter()
                     .filter_map(|m| {
-                        let raw = m.raw.as_ref()?;
+                        let raw = m.raw.as_deref()?;
                         Some(SeenMessageInput {
                             msg_id: m.id.clone(),
                             cli_msg_id: m.cli_msg_id.clone(),
-                            uid_from: raw.uid_from.clone(),
-                            id_to: raw.id_to.clone(),
-                            msg_type: raw.msg_type.clone(),
+                            uid_from: raw.resolved_uid_from(m).to_string(),
+                            id_to: raw.resolved_id_to(m).to_string(),
+                            msg_type: raw.resolved_msg_type(m).to_string(),
                             st: Some(raw.st),
                             at: Some(raw.at),
                             cmd: Some(raw.cmd),
-                            ts: raw.ts.parse::<i64>().ok(),
+                            ts: raw.resolved_ts_i64(m),
                         })
                     })
                     .collect();
@@ -2381,9 +2354,9 @@ impl ZaloSession {
     pub async fn delete_thread(&self, kind: ThreadKind, thread_id: &str) -> Result<(), HttpError> {
         let client = self.api()?;
         if let Some(last) = self.store.last_message(kind, thread_id) {
-            if let Some(raw) = last.raw {
+            if let Some(raw) = last.raw.as_deref() {
                 let info = LastMessageInfo {
-                    owner_id: raw.uid_from,
+                    owner_id: raw.resolved_uid_from(&last).to_string(),
                     cli_msg_id: last.cli_msg_id,
                     global_msg_id: last.id,
                 };
@@ -2580,13 +2553,13 @@ impl ZaloSession {
                 return Err(HttpError::bad_request("Can't reply to a recalled message"));
             }
             Some(QuoteInput {
-                uid_from: raw.uid_from,
-                msg_id: q.id,
-                cli_msg_id: q.cli_msg_id,
-                msg_type: raw.msg_type,
-                ts: Value::String(raw.ts),
-                content: raw.content,
-                property_ext: raw.property_ext,
+                uid_from: raw.resolved_uid_from(&q).to_string(),
+                msg_id: q.id.clone(),
+                cli_msg_id: q.cli_msg_id.clone(),
+                msg_type: raw.resolved_msg_type(&q).to_string(),
+                ts: Value::String(raw.resolved_ts(&q)),
+                content: raw.content_for_quote(&q),
+                property_ext: raw.property_ext.as_deref().cloned(),
                 ttl: Some(raw.ttl),
             })
         } else {
@@ -2964,7 +2937,7 @@ impl ZaloSession {
                     thread_type: to_thread_type(kind),
                     msg_id: msg.id.clone(),
                     cli_msg_id: msg.cli_msg_id.clone(),
-                    uid_from: raw.uid_from,
+                    uid_from: raw.resolved_uid_from(&msg).to_string(),
                 },
                 true,
             )
@@ -3014,7 +2987,7 @@ impl ZaloSession {
         }
 
         // 1. Plain text message: batch by thread kind via Zalo's mforward endpoint.
-        if let Some(text) = raw.content.as_str().filter(|s| !s.is_empty()) {
+        if let Some(text) = raw.plain_text(&msg).filter(|s| !s.is_empty()) {
             return self
                 .forward_text_batch(&client, text, Some(&msg), &unique)
                 .await;
@@ -3028,7 +3001,8 @@ impl ZaloSession {
             .and_then(sanitize_remote_url)
             .or_else(|| {
                 raw.content
-                    .get("href")
+                    .as_deref()
+                    .and_then(|c| c.get("href"))
                     .and_then(|v| v.as_str())
                     .and_then(sanitize_remote_url)
             })
@@ -4023,7 +3997,8 @@ impl ZaloSession {
             .ok_or_else(|| HttpError::not_found("Message not found"))?;
         let raw = msg
             .raw
-            .clone()
+            .as_deref()
+            .cloned()
             .ok_or_else(|| HttpError::bad_request("This message is too old to act on"))?;
         Ok((msg, raw))
     }

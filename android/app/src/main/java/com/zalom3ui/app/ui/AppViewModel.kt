@@ -153,6 +153,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val latestDrafts = HashMap<String, String>(_state.value.drafts)
     private val draftSaves = HashMap<String, Job>()
 
+    private val _reducedMotion = MutableStateFlow(settingsStore.reducedMotion)
+    /** User preference for reduced motion (combined with system setting at the theme root). */
+    val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
+
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
     val pollEvents: SharedFlow<Long> = _pollEvents
@@ -241,6 +245,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setAppearance(appearance: Appearance) {
         settingsStore.saveAppearance(appearance)
         _state.update { it.copy(appearance = appearance) }
+    }
+
+    fun setReducedMotion(enabled: Boolean) {
+        settingsStore.reducedMotion = enabled
+        _reducedMotion.value = enabled
     }
 
     /** Called on every keystroke, so it only notes the text; saving it waits for typing to pause. */

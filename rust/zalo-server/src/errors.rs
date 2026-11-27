@@ -1,8 +1,12 @@
-//! Client-safe HTTP errors with status codes and Axum response conversion.
+//! Client-safe HTTP errors with status codes and optional Axum response conversion.
 
+#[cfg(feature = "tcp")]
 use axum::http::StatusCode;
+#[cfg(feature = "tcp")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "tcp")]
 use axum::Json;
+#[cfg(feature = "tcp")]
 use serde_json::json;
 
 /// An error whose message is safe to show the client, with the HTTP status to use.
@@ -50,6 +54,7 @@ impl HttpError {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let code = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -62,10 +67,20 @@ pub type ApiResult<T> = Result<T, HttpError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
 
+    #[test]
+    fn http_error_constructors_set_status_and_message() {
+        let err = HttpError::bad_request("Invalid thread kind");
+        assert_eq!(err.status, 400);
+        assert_eq!(err.to_string(), "Invalid thread kind");
+        assert_eq!(HttpError::not_found("missing").status, 404);
+        assert_eq!(HttpError::conflict("busy").status, 409);
+    }
+
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn http_error_serializes_as_json_error_response() {
+        use axum::body::to_bytes;
         let resp = HttpError::new(400, "Invalid thread kind").into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
@@ -73,6 +88,7 @@ mod tests {
         assert_eq!(val, json!({ "error": "Invalid thread kind" }));
     }
 
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn invalid_status_code_falls_back_to_500() {
         let resp = HttpError::new(9999, "boom").into_response();

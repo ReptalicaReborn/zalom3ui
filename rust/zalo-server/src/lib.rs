@@ -3,8 +3,10 @@
 
 pub mod api;
 pub mod config;
+pub(crate) mod dispatch;
 pub mod embedded;
 pub mod errors;
+#[cfg(feature = "tcp")]
 pub mod http;
 pub mod log;
 pub mod replay;

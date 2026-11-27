@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
+use crate::time_util::now_ms;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -129,7 +129,7 @@ pub fn new_call_id() -> u32 {
 
 /// Builds a [`RingingCall`] representation for an outgoing call we initiate.
 pub fn outgoing_call_of(peer_id: &str, call_id: u32, video: bool) -> RingingCall {
-    let now = Utc::now().timestamp_millis();
+    let now = now_ms();
     RingingCall {
         incoming: IncomingCall {
             call_id: call_id.to_string(),

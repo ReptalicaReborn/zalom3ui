@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use crate::time_util::now_ms;
 use futures_util::future::join_all;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
@@ -330,7 +330,7 @@ impl ZaloClient {
             if is_group { "group" } else { "message" }
         );
         let type_param = if is_group { "11" } else { "2" };
-        let client_id = Utc::now().timestamp_millis();
+        let client_id = now_ms();
         let mut results = Vec::with_capacity(sources.len());
 
         for (src_index, src) in sources.iter().enumerate() {
@@ -603,7 +603,7 @@ impl ZaloClient {
 
         let mut params = Map::new();
         params.insert("message".to_string(), json!(options.msg));
-        params.insert("clientId".to_string(), json!(Utc::now().timestamp_millis()));
+        params.insert("clientId".to_string(), json!(now_ms()));
         params.insert("ttl".to_string(), json!(options.ttl.unwrap_or(0)));
         if has_mentions {
             params.insert(
@@ -702,8 +702,8 @@ impl ZaloClient {
         let mentions = build_mentions(thread_type, &options.msg, &options.mentions)?;
         let is_mentions_valid = !mentions.is_empty() && is_group && non_gifs.len() == 1;
         let is_multi = non_gifs.len() > 1;
-        let group_layout_id = Utc::now().timestamp_millis().to_string();
-        let mut client_id = Utc::now().timestamp_millis();
+        let group_layout_id = now_ms().to_string();
+        let mut client_id = now_ms();
         let mut idx_in_group = 0usize;
         let mut out = Vec::new();
 
@@ -818,7 +818,7 @@ impl ZaloClient {
         // Handle GIFs (upthumb + gif multipart)
         for gif in gifs {
             let upthumb_params = json!({
-                "clientId": Utc::now().timestamp_millis(),
+                "clientId": now_ms(),
                 "imei": self.ctx.imei,
             });
             let enc_up = encode_aes(&self.ctx.secret_key, &upthumb_params.to_string())?;
@@ -846,7 +846,7 @@ impl ZaloClient {
                 .to_string();
 
             let mut m = Map::new();
-            m.insert("clientId".to_string(), json!(Utc::now().timestamp_millis().to_string()));
+            m.insert("clientId".to_string(), json!(now_ms().to_string()));
             m.insert("fileName".to_string(), json!(gif.filename));
             m.insert("totalSize".to_string(), json!(gif.data.len()));
             m.insert("width".to_string(), json!(gif.width.unwrap_or(0)));
@@ -916,7 +916,7 @@ impl ZaloClient {
             0
         };
 
-        let client_id = Utc::now().timestamp_millis().to_string();
+        let client_id = now_ms().to_string();
         let msg_info = json!({
             "voiceUrl": voice_url,
             "m4aUrl": voice_url,
@@ -980,7 +980,7 @@ impl ZaloClient {
         params.insert("stickerId".to_string(), json!(sticker.id));
         params.insert("cateId".to_string(), json!(sticker.cate_id));
         params.insert("type".to_string(), json!(sticker.sticker_type));
-        params.insert("clientId".to_string(), json!(Utc::now().timestamp_millis()));
+        params.insert("clientId".to_string(), json!(now_ms()));
         params.insert("imei".to_string(), json!(self.ctx.imei));
         params.insert("zsource".to_string(), json!(101));
         if is_group {
@@ -1076,7 +1076,7 @@ impl ZaloClient {
             "react_list".to_string(),
             json!([{
                 "message": msg_json,
-                "clientId": Utc::now().timestamp_millis(),
+                "clientId": now_ms(),
             }]),
         );
 
@@ -1113,7 +1113,7 @@ impl ZaloClient {
     ) -> Result<Value> {
         let mut params = Map::new();
         params.insert("msgId".to_string(), json!(target.msg_id));
-        params.insert("clientId".to_string(), json!(Utc::now().timestamp_millis()));
+        params.insert("clientId".to_string(), json!(now_ms()));
         params.insert("cliMsgIdUndo".to_string(), json!(target.cli_msg_id));
 
         let url = match thread_type {
@@ -1154,7 +1154,7 @@ impl ZaloClient {
             params.insert("toid".to_string(), json!(target.thread_id));
             params.insert("imei".to_string(), json!(self.ctx.imei));
         }
-        params.insert("cliMsgId".to_string(), json!(Utc::now().timestamp_millis()));
+        params.insert("cliMsgId".to_string(), json!(now_ms()));
         params.insert(
             "msgs".to_string(),
             json!([{
@@ -1190,7 +1190,7 @@ impl ZaloClient {
             return Err(ProtoError::InvalidArg("Missing thread IDs".into()));
         }
         let base = self.require_service("file")?;
-        let client_id = Utc::now().timestamp_millis().to_string();
+        let client_id = now_ms().to_string();
         let ttl = payload.ttl.unwrap_or(0);
 
         let mut msg_info = Map::new();
@@ -1304,7 +1304,7 @@ impl ZaloClient {
         }
         let qr_data = self.get_qr(&[user_id.to_string()]).await?;
         let base = self.require_service("file")?;
-        let client_id = Utc::now().timestamp_millis().to_string();
+        let client_id = now_ms().to_string();
 
         let mut msg_info = Map::new();
         msg_info.insert("contactUid".to_string(), json!(user_id));
@@ -1392,7 +1392,7 @@ impl ZaloClient {
         params.insert("type".to_string(), json!(2));
         params.insert("media".to_string(), json!(media_str));
         params.insert("ttl".to_string(), json!(ttl.unwrap_or(0)));
-        params.insert("clientId".to_string(), json!(Utc::now().timestamp_millis()));
+        params.insert("clientId".to_string(), json!(now_ms()));
 
         let url = match thread_type {
             ThreadType::Group => {

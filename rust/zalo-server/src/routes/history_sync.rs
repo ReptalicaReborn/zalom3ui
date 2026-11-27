@@ -9,12 +9,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+#[cfg(feature = "tcp")]
 use axum::extract::Extension;
+#[cfg(feature = "tcp")]
 use axum::http::StatusCode;
+#[cfg(feature = "tcp")]
 use axum::response::IntoResponse;
+#[cfg(feature = "tcp")]
 use axum::routing::{get, post};
+#[cfg(feature = "tcp")]
 use axum::{Json, Router};
-use chrono::{DateTime, TimeZone, Utc};
+use zalo_proto::time_util::{format_rfc3339_millis, now_ms as time_now_ms, parse_http_date_epoch_secs};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::sync::Notify;
@@ -154,10 +159,7 @@ pub fn download_retry_delay_ms(
             (capped * 1000) as i64
         })
     } else {
-        DateTime::parse_from_rfc2822(hint)
-            .or_else(|_| DateTime::parse_from_rfc3339(hint))
-            .ok()
-            .map(|dt| dt.timestamp_millis() - now_ms)
+        parse_http_date_epoch_secs(hint).map(|secs| secs * 1000 - now_ms)
     };
 
     match wait_ms {
@@ -363,7 +365,7 @@ pub trait HistorySyncDeps: Send + Sync + 'static {
     }
 
     fn now_ms(&self) -> i64 {
-        Utc::now().timestamp_millis()
+        time_now_ms()
     }
 }
 
@@ -628,11 +630,7 @@ impl HistorySyncManager {
 
     fn log(&self, line: impl AsRef<str>) {
         let ts_ms = self.deps.now_ms();
-        let ts = Utc
-            .timestamp_millis_opt(ts_ms)
-            .single()
-            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-            .unwrap_or_else(|| ts_ms.to_string());
+        let ts = format_rfc3339_millis(ts_ms);
         let entry = format!("{ts} {}", line.as_ref());
         if let Ok(mut s) = self.inner.lock() {
             s.lines.push_back(entry);
@@ -1576,10 +1574,10 @@ where
     }
 }
 
-// ---- Axum Router & HTTP Handlers ----
+// ---- Manager startup & Axum Router/HTTP Handlers ----
 
-/// Builds the Track 2 history-sync sub-router and wires the WebSocket history-sync control listener.
-pub fn router(state: AppState) -> Router<AppState> {
+/// Creates the Track 2 [`HistorySyncManager`] and wires the WebSocket history-sync control listener.
+pub fn start_manager(state: AppState) -> Arc<HistorySyncManager> {
     let manager = HistorySyncManager::for_session(state.clone());
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let mut rx = state.session.subscribe_history_sync_controls();
@@ -1611,6 +1609,13 @@ pub fn router(state: AppState) -> Router<AppState> {
             }
         });
     }
+    manager
+}
+
+/// Builds the Track 2 history-sync sub-router and wires the WebSocket history-sync control listener.
+#[cfg(feature = "tcp")]
+pub fn router(state: AppState) -> Router<AppState> {
+    let manager = start_manager(state);
 
     Router::new()
         .route("/api/history-sync/status", get(get_status))
@@ -1619,6 +1624,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .layer(Extension(manager))
 }
 
+#[cfg(feature = "tcp")]
 async fn get_status(Extension(mgr): Extension<Arc<HistorySyncManager>>) -> impl IntoResponse {
     let status = mgr.get_status();
     let log = mgr.get_log();
@@ -1629,6 +1635,7 @@ async fn get_status(Extension(mgr): Extension<Arc<HistorySyncManager>>) -> impl 
     (StatusCode::OK, Json(val))
 }
 
+#[cfg(feature = "tcp")]
 async fn post_start(
     Extension(mgr): Extension<Arc<HistorySyncManager>>,
 ) -> Result<impl IntoResponse, HttpError> {
@@ -1641,6 +1648,7 @@ async fn post_start(
     Ok((code, Json(status)))
 }
 
+#[cfg(feature = "tcp")]
 async fn post_cancel(Extension(mgr): Extension<Arc<HistorySyncManager>>) -> impl IntoResponse {
     mgr.cancel();
     (StatusCode::OK, Json(mgr.get_status()))
@@ -1654,12 +1662,16 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(feature = "tcp")]
     use axum::body::to_bytes;
+    #[cfg(feature = "tcp")]
     use axum::http::Request;
+    #[cfg(feature = "tcp")]
     use tower::ServiceExt;
 
     use zalo_media::sync::{encrypt_backup_key_pkcs1, pack_zdb_backup};
 
+    #[cfg(feature = "tcp")]
     use crate::config::Config;
     use crate::types::StoredMessage;
 
@@ -1910,7 +1922,7 @@ mod tests {
         );
 
         // Retry backoff & Retry-After
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap().timestamp_millis();
+        let now = parse_http_date_epoch_secs("2026-01-01T12:00:00Z").unwrap() * 1000;
         assert_eq!(download_retry_delay_ms(404, 1, None, now), Some(1000));
         assert_eq!(download_retry_delay_ms(404, 2, None, now), Some(2000));
         assert_eq!(download_retry_delay_ms(500, 4, None, now), Some(8000));
@@ -2241,6 +2253,7 @@ mod tests {
         assert_eq!(deps_tk.calls.lock().unwrap()[0].1["temp_key"], "tk-1");
     }
 
+    #[cfg(feature = "tcp")]
     #[tokio::test]
     async fn axum_routes_status_start_409_and_cancel() {
         let store = ChatStore::in_memory();

@@ -2,6 +2,8 @@ package com.zalom3ui.app.ui
 
 import android.widget.Toast
 import androidx.compose.animation.AnimatedContentScope
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
@@ -71,6 +73,7 @@ private object Routes {
 @Composable
 fun App(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val reducedMotionPref by vm.reducedMotion.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.error) {
         val error = state.error ?: return@LaunchedEffect
@@ -96,6 +99,8 @@ fun App(vm: AppViewModel) {
                     onBack = {},
                     onSave = vm::saveSettings,
                     onAppearance = vm::setAppearance,
+                    reducedMotion = reducedMotionPref,
+                    onReducedMotion = vm::setReducedMotion,
                     onRestartServer = vm::restartLocalServer,
                     onLogout = vm::logout,
                 )
@@ -229,15 +234,22 @@ private fun AppNav(vm: AppViewModel) {
     }
     LaunchedEffect(polls) { vm.pollEvents.collect { polls.onChanged(it) } }
 
+    val reducedMotion = LocalReducedMotion.current
     CompositionLocalProvider(LocalPolls provides polls, LocalUploadProgress provides vm.uploadProgress) {
     NavHost(
         navController = nav,
         startDestination = Routes.HOME,
-        enterTransition = { slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it / 4 } + fadeIn() },
-        exitTransition = { fadeOut() },
+        enterTransition = {
+            if (reducedMotion) {
+                EnterTransition.None
+            } else {
+                slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it / 4 } + fadeIn()
+            }
+        },
+        exitTransition = { if (reducedMotion) ExitTransition.None else fadeOut() },
         // Back slides the screen off to the right under the finger, revealing the previous one (PredictiveBack.kt).
-        popEnterTransition = { backSlideIn() },
-        popExitTransition = { backSlideOut() },
+        popEnterTransition = { if (reducedMotion) EnterTransition.None else backSlideIn() },
+        popExitTransition = { if (reducedMotion) ExitTransition.None else backSlideOut() },
     ) {
         // Each destination collects state itself so it never renders a stale capture.
         screen(Routes.HOME, nav) {
@@ -653,6 +665,7 @@ private fun AppNav(vm: AppViewModel) {
         }
         screen(Routes.SETTINGS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
+            val reducedMotionPref by vm.reducedMotion.collectAsStateWithLifecycle()
             SettingsScreen(
                 current = state.settings,
                 appearance = state.appearance,
@@ -667,6 +680,8 @@ private fun AppNav(vm: AppViewModel) {
                     nav.safePopBackStack(Routes.SETTINGS)
                 },
                 onAppearance = vm::setAppearance,
+                reducedMotion = reducedMotionPref,
+                onReducedMotion = vm::setReducedMotion,
                 onRestartServer = {
                     vm.restartLocalServer()
                     nav.safePopBackStack(Routes.SETTINGS)
