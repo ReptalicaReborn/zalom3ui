@@ -121,6 +121,7 @@ fun SettingsScreen(
     onHideOfficialAccounts: (Boolean) -> Unit = {},
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
+    onShareStartupLog: () -> Unit = {},
     onSyncHistory: () -> Unit = {},
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
@@ -520,6 +521,17 @@ fun SettingsScreen(
                 SectionHeader("Developer")
                 ExpressiveSettingsGroup(
                     items = listOf<@Composable () -> Unit>(
+                        {
+                            ListItem(
+                                modifier = Modifier.clickable(onClick = onShareStartupLog),
+                                colors = transparentListItemColors,
+                                leadingContent = { Icon(Icons.Outlined.Share, null) },
+                                headlineContent = { Text("Share startup log") },
+                                supportingContent = {
+                                    Text("How long the app took to start (one line per cold start), and the core's startup output")
+                                },
+                            )
+                        },
                         {
                             ListItem(
                                 modifier = Modifier.clickable(onClick = onShareCallLog),

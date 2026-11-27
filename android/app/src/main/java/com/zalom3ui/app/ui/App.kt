@@ -713,6 +713,12 @@ private fun AppNav(vm: AppViewModel) {
                 onSyncHistory = vm::startHistorySync,
                 onShareCallLog = { vm.shareCallLog { log -> scope.launch { QrActions.shareCallLog(context, log) } } },
                 onClearCallLog = vm::clearCallLog,
+                onShareStartupLog = {
+                    scope.launch {
+                        val report = withContext(Dispatchers.IO) { StartupLog.report(context) }
+                        QrActions.shareText(context, "zaloo-startup-log.txt", "Share startup log", report)
+                    }
+                },
             )
         }
     }
