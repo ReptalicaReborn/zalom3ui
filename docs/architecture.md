@@ -223,7 +223,7 @@ Zalo PC can ask the official Zalo app to send its chat history. Zalỏ does the 
 (`rust/zalo-server/src/routes/history_sync.rs`): it sends a public key, the phone asks you to allow it, uploads an
 encrypted backup, and the core downloads, decrypts (`zalo-media/src/sync/zdb.rs`), unpacks (`lzma.rs`), reads the
 SQLite database directly (`sqliteread.rs`, no libsqlite3) and imports the messages. *Settings → Sync messages from
-phone*. It follows Zalo PC's protocol but has **not been tried against a real phone yet** ([history-sync.md](history-sync.md)).
+phone*. It follows Zalo PC's protocol and has been confirmed working on a real phone ([history-sync.md](history-sync.md)).
 
 ## 10. Remote-server mode and the standalone server
 
@@ -303,5 +303,5 @@ copies, shares and clears it.
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
   APKs, checks the native libraries are inside, and uploads the APKs.
 
-What only a real phone and account can check: the JNI path end to end, call audio and video quality, history sync, the
-notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).
+Confirmed on a real phone so far: the JNI path end to end (the app running the core in-process) and history sync. What
+only a real phone and account can still check: call audio and video quality, the notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).

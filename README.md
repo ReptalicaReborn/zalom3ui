@@ -38,7 +38,7 @@ the phone.
 - **History:** Zalo Web has no history endpoint for 1:1 chats, so the core keeps its own cache: the last 500 messages
   per chat (2,000 for history synced from the phone). On every reconnect it asks Zalo to replay what it missed. Group
   chats also pull recent history from Zalo when opened. *Sync messages from phone* can ask the official Zalo app to
-  hand over older history ([docs/history-sync.md](docs/history-sync.md); not yet tried against a real phone).
+  hand over older history ([docs/history-sync.md](docs/history-sync.md); confirmed working on a real phone).
 - **Calls:** 1:1 voice and video calls run in the core (Zalo's zrtc media protocol, SRTP, H.264). The app does the
   microphone, speaker, camera and Opus codec ([docs/calls.md](docs/calls.md), [docs/call-audio.md](docs/call-audio.md),
   [docs/video-calls.md](docs/video-calls.md)).

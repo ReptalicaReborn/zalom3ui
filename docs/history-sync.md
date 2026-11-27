@@ -10,7 +10,7 @@ confirmed and what is a guess, and what a real test needs. Code: `rust/zalo-serv
 **Sources.** *Confirmed from code* means written in the Zalos project (`src/core/sync/mobile_history_sync.cpp`,
 `src/core/crypto/db_cross.cpp`, `src/core/network/zalo_session.cpp`, MIT; we mirror it, our Rust is our own) and,
 where marked **[PC]**, also in Zalo PC's own web bundle. *Guessed* means neither source says it, or it differs in our
-setting (Zalo Web instead of Zalo PC). Nothing here has been run against a real phone yet.
+setting (Zalo Web instead of Zalo PC). A full sync has since worked against a real phone (November 2026).
 
 ## 1. Overview
 
@@ -65,7 +65,7 @@ We read both (`session.rs` and the control poller in `routes/calls.rs`, then `sy
 | `act` | Fields | Meaning |
 |---|---|---|
 | `user_confirm` | `user_action` | 1 or 3: allowed. 0: declined. 2: the phone is restoring data, try later. |
-| `transfer_error` | `status`, `error_code` | `status` 2: phone idle (keep the app open, screen on). 1: phone is working. Else an `error_code` ≠ 0 is a failure. Zalos has a table of phone error names; we print the number only. |
+| `transfer_error` | `status`, `error_code` | `status` 2: phone idle (keep the app open, screen on). 1: phone is working. Else an `error_code` ≠ 0 is a failure. Zalos has a table of phone error names; we print the number only. In the first real run a `transfer_error` arrived about a second after `syncmsg_info` and the sync still completed, so it is a status update unless its `error_code` is non-zero. |
 | `syncmsg_info` | `url`, `file_name`, `file_size`, `checksum_code` (or `checksum`), `encrypted_key`, `db_info`, `uid` | The backup is ready. |
 
 Other `act_type`s seen around it: `transfer_after_login` (the `temp_key`, above), `transfer_msg`, and `transfer_sync2`
