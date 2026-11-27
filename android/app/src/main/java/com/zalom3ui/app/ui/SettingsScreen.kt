@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.FormatColorFill
@@ -244,6 +245,23 @@ fun SettingsScreen(
                             Switch(
                                 checked = appearance.tintedBackground,
                                 onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
+                            )
+                        },
+                    )
+                }
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable {
+                            onAppearance(appearance.copy(amoledBlack = !appearance.amoledBlack))
+                        },
+                        colors = transparentListItemColors,
+                        leadingContent = { Icon(Icons.Outlined.Contrast, null) },
+                        headlineContent = { Text("Pure black (AMOLED)") },
+                        supportingContent = { Text("Black backgrounds in dark mode, easier on OLED batteries") },
+                        trailingContent = {
+                            Switch(
+                                checked = appearance.amoledBlack,
+                                onCheckedChange = { onAppearance(appearance.copy(amoledBlack = it)) },
                             )
                         },
                     )
