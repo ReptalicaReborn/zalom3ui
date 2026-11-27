@@ -352,7 +352,7 @@ pub struct SendMessageOptions {
     pub attachments: Vec<UploadSource>,
     pub mentions: Vec<MentionInput>,
     pub quote: Option<QuoteInput>,
-    pub ttl: Option<i64>,
+    pub ttl: Option<u64>,
     pub urgency: Option<u8>,
     /// Optional upload progress receiver for `attachments` (not part of the wire payload).
     #[serde(skip)]

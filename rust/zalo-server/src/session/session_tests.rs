@@ -184,18 +184,21 @@ async fn delete_for_me_calls_delete_message_with_only_me_and_drops_the_message()
 }
 
 #[tokio::test]
-async fn forward_splits_targets_by_thread_type_and_only_forwards_text() {
+async fn forward_splits_targets_by_thread_type_and_forwards_media() {
     let r = rig();
     r.api
         .respond("forward_message", json!({ "success": [], "fail": [] }));
+    r.api.respond("send_link", json!({ "msgId": 88 }));
     r.ingest(incoming("1", 1000, json!({}), false)).await;
     r.ingest(incoming(
         "2",
         2000,
-        json!({ "msgType": "chat.photo", "content": { "href": "https://x" } }),
+        json!({ "msgType": "chat.photo", "content": { "href": "https://x.example/p.jpg" } }),
         false,
     ))
     .await;
+    r.ingest(incoming("3", 3000, json!({}), false)).await;
+    r.store.apply_undo("3");
 
     r.session
         .forward_message(
@@ -223,8 +226,10 @@ async fn forward_splits_targets_by_thread_type_and_only_forwards_text() {
             ("forward_message", json!(["g"]), json!("Group")),
         ]
     );
-    let err = r
-        .session
+
+    // Photo message now forwards cleanly via send_link (instead of rejecting with 400).
+    r.api.clear_calls();
+    r.session
         .forward_message(
             ThreadKind::User,
             "100",
@@ -232,8 +237,26 @@ async fn forward_splits_targets_by_thread_type_and_only_forwards_text() {
             &[(ThreadKind::User, "a".to_string())],
         )
         .await
+        .unwrap();
+    let media_calls = r.api.calls();
+    assert_eq!(media_calls.len(), 1);
+    assert_eq!(media_calls[0].method, "send_link");
+    assert_eq!(media_calls[0].args[0], "https://x.example/p.jpg");
+    assert_eq!(media_calls[0].args[2], "a");
+
+    // Recalled messages are still rejected with 400.
+    let err = r
+        .session
+        .forward_message(
+            ThreadKind::User,
+            "100",
+            "3",
+            &[(ThreadKind::User, "a".to_string())],
+        )
+        .await
         .unwrap_err();
-    assert!(err.message.contains("Only text"), "{}", err.message);
+    assert_eq!(err.status, 400);
+    assert!(err.message.contains("recalled"), "{}", err.message);
 }
 
 #[tokio::test]

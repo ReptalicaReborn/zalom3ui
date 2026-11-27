@@ -88,6 +88,11 @@ macro_rules! with_api_methods {
             reject_friend_request(friend_id: &'a str) -> Value;
             send_friend_request(msg: &'a str, user_id: &'a str) -> Value;
             undo_friend_request(friend_id: &'a str) -> Value;
+            change_friend_alias(alias: &'a str, friend_id: &'a str) -> Value;
+            remove_friend_alias(friend_id: &'a str) -> Value;
+            remove_friend(friend_id: &'a str) -> Value;
+            block_user(user_id: &'a str) -> Value;
+            unblock_user(user_id: &'a str) -> Value;
             // groups
             get_all_groups() -> Value;
             get_group_info(group_ids: &'a [String]) -> Value;
@@ -97,6 +102,14 @@ macro_rules! with_api_methods {
             remove_user_from_group(member_ids: &'a [String], group_id: &'a str) -> Value;
             change_group_name(name: &'a str, group_id: &'a str) -> Value;
             leave_group(group_id: &'a str, silent: bool) -> Value;
+            get_group_link_detail(group_id: &'a str) -> Value;
+            enable_group_link(group_id: &'a str) -> Value;
+            disable_group_link(group_id: &'a str) -> Value;
+            join_group_link(link: &'a str) -> Value;
+            add_group_deputy(member_id: &'a str, group_id: &'a str) -> Value;
+            remove_group_deputy(member_id: &'a str, group_id: &'a str) -> Value;
+            get_list_board(group_id: &'a str, page: Option<u32>, count: Option<u32>) -> Value;
+            create_note(group_id: &'a str, title: &'a str, pin_act: bool) -> Value;
             // messaging
             upload_attachment(sources: &'a [UploadSource], thread_id: &'a str, thread_type: ThreadType) -> Vec<UploadResult>;
             send_message(options: SendMessageOptions, thread_id: &'a str, thread_type: ThreadType) -> SendMessageResponse;
@@ -108,6 +121,8 @@ macro_rules! with_api_methods {
             undo(target: &'a UndoTarget, thread_id: &'a str, thread_type: ThreadType) -> Value;
             delete_message(target: &'a DeleteMessageTarget, only_me: bool) -> Value;
             forward_message(payload: &'a ForwardMessagePayload, thread_ids: &'a [String], thread_type: ThreadType) -> Value;
+            send_card(user_id: &'a str, phone_number: Option<&'a str>, thread_id: &'a str, thread_type: ThreadType, ttl: Option<u64>) -> Value;
+            send_link(link: &'a str, msg: Option<&'a str>, thread_id: &'a str, thread_type: ThreadType, ttl: Option<u64>) -> Value;
             send_typing_event(thread_id: &'a str, thread_type: ThreadType, dest_type: Option<DestType>) -> Value;
             send_seen_event(messages: &'a [SeenMessageInput], thread_type: ThreadType) -> Value;
             get_group_chat_history(group_id: &'a str, count: Option<u32>) -> Value;

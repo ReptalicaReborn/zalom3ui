@@ -22,6 +22,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.GroupAdd
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.People
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.runtime.getValue
@@ -46,6 +47,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.server.StartupLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -175,6 +177,13 @@ private fun AppNav(vm: AppViewModel) {
                 vm.selectManyForForward(msgs)
                 nav.navigate(Routes.FORWARD)
             },
+            onLoadGroupBoard = { if (ref.kind == "group") vm.loadGroupBoard(ref.id) },
+            onCreateGroupNote = { title -> if (ref.kind == "group") vm.createGroupNote(ref.id, title) },
+            onSetDisappearingTtl = { ttl -> vm.setDisappearingTtl(ref, ttl) },
+            onLoadFriends = vm::loadFriends,
+            onSendCard = { person -> vm.sendCard(ref, person.id) },
+            onCancelOutbox = vm::cancelOutboxEntry,
+            onRetryOutbox = vm::retryOutbox,
         )
     // Only these slices are read here, so a state change elsewhere (a message, someone typing) doesn't recompose the NavHost.
     val openState = vm.state.collectAsStateWithLifecycle()
@@ -190,10 +199,15 @@ private fun AppNav(vm: AppViewModel) {
         vm.openChat(thread)
         goToChat()
     }
-    // Content shared into Zalỏ from another app: pick a target chat once ready.
+    // Content shared into Zalỏ from another app: jump straight to Direct Share target or pick a chat once ready.
     LaunchedEffect(pendingShare, sessionState) {
-        if (pendingShare != null && sessionState == "ready") {
-            if (nav.currentDestination?.route != Routes.SHARE) {
+        val share = pendingShare ?: return@LaunchedEffect
+        if (sessionState == "ready") {
+            val target = share.target
+            if (target != null) {
+                val existing = vm.state.value.threads.firstOrNull { it.ref == target }
+                vm.deliverPendingShare(target, existing?.name.orEmpty()) { goToChat() }
+            } else if (nav.currentDestination?.route != Routes.SHARE) {
                 nav.navigate(Routes.SHARE) { launchSingleTop = true }
             }
         }
@@ -250,6 +264,14 @@ private fun AppNav(vm: AppViewModel) {
                         vm.openChatAtMessage(hit.ref, hit.threadName, hit.message.id)
                         goToChat()
                     },
+                    onJoinGroupLink = { link ->
+                        vm.joinGroupLink(link) { thread ->
+                            if (thread != null) {
+                                vm.openChat(thread)
+                                goToChat()
+                            }
+                        }
+                    },
                 )
             }
             val status = state.status
@@ -283,6 +305,9 @@ private fun AppNav(vm: AppViewModel) {
                     chat = state.chat,
                     onCloseChat = { vm.closeChat() },
                     chatPane = { chat ->
+                        val outboxEntries by vm.outboxEntries.collectAsStateWithLifecycle()
+                        val disappearingTtl by vm.disappearingTtl.collectAsStateWithLifecycle()
+                        val groupBoards by vm.groupBoards.collectAsStateWithLifecycle()
                         val actions = remember(chat.ref) { chatActions(chat.ref, onBack = { vm.closeChat(chat.ref) }) }
                         // The composer reads it only when it is created, so read it only then too.
                         val initialDraft = remember(chat.ref) { vm.draft(chat.ref) }
@@ -299,6 +324,10 @@ private fun AppNav(vm: AppViewModel) {
                             appearance = state.appearance,
                             scrollToMsgId = state.scrollToMsgId,
                             onScrolledToMsg = vm::clearScrollToMsgId,
+                            boardItems = if (chat.kind == "group") groupBoards[chat.id].orEmpty() else emptyList(),
+                            disappearingTtlMs = disappearingTtl[chat.ref.key],
+                            outboxEntries = outboxEntries,
+                            friends = state.friends,
                         )
                     },
                 ) { selectedKey ->
@@ -320,6 +349,7 @@ private fun AppNav(vm: AppViewModel) {
         }
         screen(Routes.NEW_CHAT, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
+            var showJoinGroupDialog by remember { mutableStateOf(false) }
             LaunchedEffect(Unit) { vm.loadFriendRequests() }
             ContactsScreen(
                 title = "New message",
@@ -331,12 +361,27 @@ private fun AppNav(vm: AppViewModel) {
                 },
                 actions = listOf(
                     PickerAction("New group", Icons.Outlined.GroupAdd) { nav.navigate(Routes.NEW_GROUP) },
+                    PickerAction("Join group by link", Icons.Outlined.Link) { showJoinGroupDialog = true },
                     PickerAction("Add friend", Icons.Outlined.PersonAdd) { nav.navigate(Routes.ADD_FRIEND) },
                     PickerAction("Contacts and requests", Icons.Outlined.People, badge = state.friendRequests?.size ?: 0) {
                         nav.navigate(Routes.CONTACTS)
                     },
                 ),
             )
+            if (showJoinGroupDialog) {
+                JoinGroupLinkDialog(
+                    onDismiss = { showJoinGroupDialog = false },
+                    onJoin = { link ->
+                        showJoinGroupDialog = false
+                        vm.joinGroupLink(link) { thread ->
+                            if (thread != null) {
+                                vm.openChat(thread)
+                                goToChat()
+                            }
+                        }
+                    },
+                )
+            }
         }
         screen(Routes.NEW_GROUP, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
@@ -395,6 +440,7 @@ private fun AppNav(vm: AppViewModel) {
         }
         screen(Routes.MEMBERS, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
+            val deputiesByGroup by vm.groupDeputies.collectAsStateWithLifecycle()
             val chat = state.chat
             GroupMembersScreen(
                 groupName = chat?.name.orEmpty(),
@@ -404,10 +450,17 @@ private fun AppNav(vm: AppViewModel) {
                 onAdd = { nav.navigate(Routes.ADD_MEMBERS) },
                 onOpen = { member ->
                     val existing = state.threads.firstOrNull { it.kind == "user" && it.id == member.id }
-                    vm.openChat(existing ?: com.zalom3ui.app.data.ThreadSummary(id = member.id, kind = "user", name = member.name))
+                    vm.openChat(existing ?: ThreadSummary(id = member.id, kind = "user", name = member.name))
                     goToChat()
                 },
                 onRemove = vm::removeMember,
+                deputyIds = chat?.id?.let { deputiesByGroup[it] }.orEmpty(),
+                onAddDeputy = { member ->
+                    chat?.id?.let { gid -> vm.addGroupDeputy(gid, member.id, member.name) }
+                },
+                onRemoveDeputy = { member ->
+                    chat?.id?.let { gid -> vm.removeGroupDeputy(gid, member.id, member.name) }
+                },
             )
         }
         screen(Routes.ADD_MEMBERS, nav) {
@@ -434,6 +487,9 @@ private fun AppNav(vm: AppViewModel) {
         }
         screen(Routes.CHAT, nav) { entry ->
             val state by vm.state.collectAsStateWithLifecycle()
+            val outboxEntries by vm.outboxEntries.collectAsStateWithLifecycle()
+            val disappearingTtl by vm.disappearingTtl.collectAsStateWithLifecycle()
+            val groupBoards by vm.groupBoards.collectAsStateWithLifecycle()
             // Close the chat once this screen leaves the back stack (not when covered by "Forward").
             LaunchedEffect(entry) {
                 val ref = vm.state.value.chat?.ref
@@ -461,11 +517,19 @@ private fun AppNav(vm: AppViewModel) {
                     appearance = state.appearance,
                     scrollToMsgId = state.scrollToMsgId,
                     onScrolledToMsg = vm::clearScrollToMsgId,
+                    boardItems = if (chat.kind == "group") groupBoards[chat.id].orEmpty() else emptyList(),
+                    disappearingTtlMs = disappearingTtl[chat.ref.key],
+                    outboxEntries = outboxEntries,
+                    friends = state.friends,
                 )
             }
         }
         screen(Routes.CHAT_INFO, nav) {
             val state by vm.state.collectAsStateWithLifecycle()
+            val disappearingTtl by vm.disappearingTtl.collectAsStateWithLifecycle()
+            val groupBoards by vm.groupBoards.collectAsStateWithLifecycle()
+            val blockedUsers by vm.blockedUsers.collectAsStateWithLifecycle()
+            val deputiesByGroup by vm.groupDeputies.collectAsStateWithLifecycle()
             val chat = state.chat
             if (chat == null) {
                 LaunchedEffect(Unit) { nav.popBackStack(Routes.HOME, inclusive = false) }
@@ -490,7 +554,7 @@ private fun AppNav(vm: AppViewModel) {
                     onAddMembers = { nav.navigate(Routes.ADD_MEMBERS) },
                     onOpenMember = { member ->
                         val existing = state.threads.firstOrNull { it.kind == "user" && it.id == member.id }
-                        vm.openChat(existing ?: com.zalom3ui.app.data.ThreadSummary(id = member.id, kind = "user", name = member.name))
+                        vm.openChat(existing ?: ThreadSummary(id = member.id, kind = "user", name = member.name))
                         goToChat()
                     },
                     onRenameGroup = vm::renameGroup,
@@ -506,6 +570,33 @@ private fun AppNav(vm: AppViewModel) {
                     },
                     chatAccent = state.chatAccents[chat.ref.key],
                     onSetChatAccent = { accent -> vm.setChatAccent(chat.ref, accent) },
+                    disappearingTtlMs = disappearingTtl[chat.ref.key],
+                    onSetDisappearingTtl = { ttl -> vm.setDisappearingTtl(chat.ref, ttl) },
+                    isBlocked = chat.kind == "user" && chat.id in blockedUsers,
+                    onLoadUserInfo = vm::loadUserInfo,
+                    onOpenCommonGroup = { group ->
+                        val existing = state.threads.firstOrNull { it.ref == group.ref }
+                        vm.openChat(existing ?: ThreadSummary(id = group.id, kind = group.kind, name = group.name, avatar = group.avatar))
+                        goToChat()
+                    },
+                    onChangeAlias = { alias -> vm.changeFriendAlias(chat.id, alias) },
+                    onRemoveAlias = { vm.removeFriendAlias(chat.id) },
+                    onBlockUser = { vm.blockUser(chat.id) },
+                    onUnblockUser = { vm.unblockUser(chat.id) },
+                    onRemoveFriend = {
+                        vm.removeFriend(chat.id) {
+                            nav.popBackStack(Routes.HOME, inclusive = false)
+                        }
+                    },
+                    boardItems = if (chat.kind == "group") groupBoards[chat.id].orEmpty() else emptyList(),
+                    onLoadGroupBoard = { if (chat.kind == "group") vm.loadGroupBoard(chat.id) },
+                    onCreateGroupNote = { note -> if (chat.kind == "group") vm.createGroupNote(chat.id, note) },
+                    onLoadGroupLink = { vm.loadGroupLink(chat.id) },
+                    onEnableGroupLink = { vm.enableGroupLink(chat.id) },
+                    onDisableGroupLink = { vm.disableGroupLink(chat.id) },
+                    deputyIds = if (chat.kind == "group") deputiesByGroup[chat.id].orEmpty() else emptySet(),
+                    onAddDeputy = { member -> vm.addGroupDeputy(chat.id, member.id, member.name) },
+                    onRemoveDeputy = { member -> vm.removeGroupDeputy(chat.id, member.id, member.name) },
                 )
             }
         }

@@ -149,6 +149,7 @@ class ThreadListActions(
     val onDelete: (ThreadSummary) -> Unit,
     val onSearchMessages: (String) -> Unit = {},
     val onOpenSearchHit: (MessageSearchHit) -> Unit = {},
+    val onJoinGroupLink: (String) -> Unit = {},
 )
 
 /** Filter modes shown in the chat list's connected pill bar. */
@@ -244,6 +245,7 @@ fun ThreadListScreen(
     var sheetFor by remember { mutableStateOf<ThreadSummary?>(null) }
     var muteFor by remember { mutableStateOf<ThreadSummary?>(null) }
     var deleteFor by remember { mutableStateOf<ThreadSummary?>(null) }
+    var showJoinGroupDialog by rememberSaveable { mutableStateOf(false) }
     val closeSearch: () -> Unit = {
         searching = false
         query = ""
@@ -337,6 +339,7 @@ fun ThreadListScreen(
                         OverflowMenu(
                             hasUnread = unreadChatCount > 0,
                             onMarkAllRead = actions.onMarkAllRead,
+                            onJoinGroupLink = { showJoinGroupDialog = true },
                             onSettings = actions.onSettings,
                         )
                     },
@@ -534,6 +537,15 @@ fun ThreadListScreen(
             },
         )
     }
+    if (showJoinGroupDialog) {
+        JoinGroupLinkDialog(
+            onDismiss = { showJoinGroupDialog = false },
+            onJoin = { link ->
+                showJoinGroupDialog = false
+                actions.onJoinGroupLink(link)
+            },
+        )
+    }
 }
 
 private const val MAX_RESULTS = 100
@@ -658,7 +670,12 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
 }
 
 @Composable
-private fun OverflowMenu(hasUnread: Boolean, onMarkAllRead: () -> Unit, onSettings: () -> Unit) {
+private fun OverflowMenu(
+    hasUnread: Boolean,
+    onMarkAllRead: () -> Unit,
+    onJoinGroupLink: () -> Unit,
+    onSettings: () -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) { Icon(Icons.Outlined.MoreVert, contentDescription = "More options") }
@@ -669,6 +686,13 @@ private fun OverflowMenu(hasUnread: Boolean, onMarkAllRead: () -> Unit, onSettin
                 onClick = {
                     open = false
                     onMarkAllRead()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Join group by link") },
+                onClick = {
+                    open = false
+                    onJoinGroupLink()
                 },
             )
             DropdownMenuItem(

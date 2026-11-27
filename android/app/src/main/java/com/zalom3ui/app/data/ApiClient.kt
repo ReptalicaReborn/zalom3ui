@@ -161,7 +161,14 @@ class ApiClient internal constructor(private val transport: Transport) {
             query = listOfNotNull("limit" to limit.toString(), before?.let { "before" to it.toString() }),
         )
 
-    suspend fun send(kind: String, id: String, text: String, quoteId: String? = null, mentions: List<Mention> = emptyList()) {
+    suspend fun send(
+        kind: String,
+        id: String,
+        text: String,
+        quoteId: String? = null,
+        mentions: List<Mention> = emptyList(),
+        ttl: Long? = null,
+    ) {
         val body = buildJsonObject {
             put("text", text)
             quoteId?.let { put("quoteId", it) }
@@ -176,8 +183,41 @@ class ApiClient internal constructor(private val transport: Transport) {
                     }
                 }
             }
+            ttl?.takeIf { it > 0L }?.let { put("ttl", it) }
         }
         post<Unit>("threads", kind, id, "messages", body = body.toString())
+    }
+
+    /** Sends a Zalo contact card into a thread (`POST /api/threads/:kind/:id/card`). */
+    suspend fun sendCard(
+        kind: String,
+        id: String,
+        userId: String,
+        phone: String? = null,
+        ttl: Long? = null,
+    ) {
+        val body = buildJsonObject {
+            put("userId", userId)
+            phone?.takeIf { it.isNotBlank() }?.let { put("phone", it) }
+            ttl?.takeIf { it > 0L }?.let { put("ttl", it) }
+        }
+        post<Unit>("threads", kind, id, "card", body = body.toString())
+    }
+
+    /** Sends a rich link preview into a thread (`POST /api/threads/:kind/:id/link`). */
+    suspend fun sendLink(
+        kind: String,
+        id: String,
+        link: String,
+        message: String? = null,
+        ttl: Long? = null,
+    ) {
+        val body = buildJsonObject {
+            put("link", link)
+            message?.takeIf { it.isNotBlank() }?.let { put("message", it) }
+            ttl?.takeIf { it > 0L }?.let { put("ttl", it) }
+        }
+        post<Unit>("threads", kind, id, "link", body = body.toString())
     }
 
     /** [reaction] is a reaction key such as "heart", or null to remove ours. */
@@ -348,6 +388,26 @@ class ApiClient internal constructor(private val transport: Transport) {
         httpDelete("friend-requests", userId)
     }
 
+    suspend fun changeFriendAlias(userId: String, alias: String) {
+        httpPut("friends", userId, "alias", body = buildJsonObject { put("alias", alias) }.toString())
+    }
+
+    suspend fun removeFriendAlias(userId: String) {
+        httpDelete("friends", userId, "alias")
+    }
+
+    suspend fun removeFriend(userId: String) {
+        httpDelete("friends", userId)
+    }
+
+    suspend fun blockUser(userId: String) {
+        post<Unit>("users", userId, "block")
+    }
+
+    suspend fun unblockUser(userId: String) {
+        httpDelete("users", userId, "block")
+    }
+
     // ---- Groups ----
 
     suspend fun createGroup(name: String, members: List<String>): CreatedGroup =
@@ -379,9 +439,44 @@ class ApiClient internal constructor(private val transport: Transport) {
         post<Unit>("groups", groupId, "leave", body = buildJsonObject { put("silent", silent) }.toString())
     }
 
+    suspend fun groupLink(groupId: String): GroupLinkInfo = get("groups", groupId, "link")
+
+    suspend fun enableGroupLink(groupId: String): GroupLinkInfo = post("groups", groupId, "link")
+
+    suspend fun disableGroupLink(groupId: String) {
+        httpDelete("groups", groupId, "link")
+    }
+
+    suspend fun joinGroupLink(link: String): JoinGroupLinkResponse =
+        post("groups", "join-link", body = buildJsonObject { put("link", link) }.toString())
+
+    suspend fun addGroupDeputy(groupId: String, userId: String) {
+        post<Unit>("groups", groupId, "deputies", userId)
+    }
+
+    suspend fun removeGroupDeputy(groupId: String, userId: String) {
+        httpDelete("groups", groupId, "deputies", userId)
+    }
+
+    suspend fun groupBoard(groupId: String, page: Int = 1, count: Int = 20): BoardResponse =
+        get("groups", groupId, "board", query = listOf("page" to page.toString(), "count" to count.toString()))
+
+    suspend fun createGroupNote(groupId: String, title: String, pin: Boolean = true): BoardItem =
+        post(
+            "groups", groupId, "notes",
+            body = buildJsonObject {
+                put("title", title)
+                put("pin", pin)
+            }.toString(),
+        )
+
     // ---- Conversations ----
 
     suspend fun details(kind: String, id: String): ThreadDetails = get("threads", kind, id, "info")
+
+    suspend fun userInfo(id: String): UserThreadInfo = get("threads", "user", id, "info")
+
+    suspend fun lastOnline(id: String): Long? = userInfo(id).lastOnline
 
     suspend fun markRead(kind: String, id: String) {
         post<Unit>("threads", kind, id, "read")

@@ -8,16 +8,26 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zalom3ui.app.data.PendingShare
+import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.security.AppLock
+import com.zalom3ui.app.security.AppLockPolicy
+import com.zalom3ui.app.security.AppLockScreen
+import com.zalom3ui.app.server.ConversationShortcuts
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
 import com.zalom3ui.app.ui.AppViewModel
@@ -26,10 +36,28 @@ import com.zalom3ui.app.ui.isAppInDarkTheme
 
 class MainActivity : ComponentActivity() {
     private val viewModel: AppViewModel by viewModels()
+    private var lastBackgroundMs: Long = 0L
+    private var isLocked by mutableStateOf(false)
+    private var lockError by mutableStateOf<String?>(null)
+    private var lockPromptGeneration by mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        val settings = SettingsStore(this)
+        AppLock.applyScreenSecurity(this, settings.screenSecurity)
+        if (savedInstanceState != null) {
+            isLocked = savedInstanceState.getBoolean(KEY_LOCKED, false)
+            lastBackgroundMs = savedInstanceState.getLong(KEY_LAST_BG_MS, 0L)
+        } else {
+            isLocked = AppLockPolicy.shouldLock(
+                enabled = settings.appLockEnabled,
+                lastBackgroundMs = 0L,
+                nowMs = SystemClock.elapsedRealtime(),
+                timeoutMs = settings.appLockTimeout.timeoutMs,
+            )
+            if (isLocked) lockPromptGeneration++
+        }
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
             val dark = isAppInDarkTheme(state.appearance)
@@ -49,7 +77,19 @@ class MainActivity : ComponentActivity() {
                 )
                 onDispose {}
             }
-            AppTheme(state.appearance) { App(viewModel) }
+            AppTheme(state.appearance) {
+                if (isLocked) {
+                    LaunchedEffect(lockPromptGeneration) {
+                        triggerUnlock()
+                    }
+                    AppLockScreen(
+                        onUnlock = { triggerUnlock() },
+                        error = lockError,
+                    )
+                } else {
+                    App(viewModel)
+                }
+            }
         }
         handleOpenChat(intent)
         handleShareIntent(intent)
@@ -61,10 +101,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_LOCKED, isLocked)
+        outState.putLong(KEY_LAST_BG_MS, lastBackgroundMs)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleOpenChat(intent)
         handleShareIntent(intent)
+    }
+
+    private fun triggerUnlock() {
+        lockError = null
+        AppLock.authenticate(
+            activity = this,
+            onSuccess = {
+                isLocked = false
+                lockError = null
+                lastBackgroundMs = 0L
+            },
+            onError = { message ->
+                lockError = message
+            },
+        )
     }
 
     /** A tapped message notification names the chat to open. */
@@ -76,10 +137,12 @@ class MainActivity : ComponentActivity() {
         viewModel.requestOpen(ThreadRef(kind, id))
     }
 
-    /** Content shared into Zalỏ from another app via the Android share sheet. */
+    /** Content shared into Zalỏ from another app via the Android share sheet (including Direct Share targets). */
     private fun handleShareIntent(intent: Intent?) {
         val action = intent?.action ?: return
         if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+        val shortcutId = intent.getStringExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
+        val directTarget = ConversationShortcuts.parseShortcutId(shortcutId)
         val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
         val uris: List<Uri> = when (action) {
             Intent.ACTION_SEND -> {
@@ -104,17 +167,38 @@ class MainActivity : ComponentActivity() {
         intent.action = null
         intent.removeExtra(Intent.EXTRA_TEXT)
         intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.removeExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
         if (text != null || uris.isNotEmpty()) {
-            viewModel.setPendingShare(PendingShare(text = text, uris = uris))
+            viewModel.setPendingShare(PendingShare(text = text, uris = uris, target = directTarget))
         }
     }
 
     override fun onStart() {
         super.onStart()
+        val settings = SettingsStore(this)
+        if (!isLocked && lastBackgroundMs > 0L && AppLockPolicy.shouldLock(
+                enabled = settings.appLockEnabled,
+                lastBackgroundMs = lastBackgroundMs,
+                nowMs = SystemClock.elapsedRealtime(),
+                timeoutMs = settings.appLockTimeout.timeoutMs,
+            )
+        ) {
+            isLocked = true
+            lockError = null
+            lockPromptGeneration++
+        }
         viewModel.startLiveUpdates()
     }
 
+    override fun onResume() {
+        super.onResume()
+        AppLock.applyScreenSecurity(this, SettingsStore(this).screenSecurity)
+    }
+
     override fun onStop() {
+        if (!isLocked && !isChangingConfigurations) {
+            lastBackgroundMs = SystemClock.elapsedRealtime()
+        }
         VoicePlayback.stop()
         viewModel.stopLiveUpdates()
         super.onStop()
@@ -123,6 +207,8 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val EXTRA_KIND = "open_kind"
         private const val EXTRA_ID = "open_id"
+        private const val KEY_LOCKED = "app_lock_locked"
+        private const val KEY_LAST_BG_MS = "app_lock_last_bg_ms"
 
         fun openChatIntent(context: Context, ref: ThreadRef): Intent =
             Intent(context, MainActivity::class.java)
