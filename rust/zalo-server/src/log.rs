@@ -7,8 +7,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value};
+use zalo_proto::time_util::{format_rfc3339_millis, now_ms};
 
 /// Startup rotation threshold for the server log file (256 KiB).
 pub const LOG_STARTUP_ROTATE_BYTES: u64 = 256 * 1024;
@@ -109,7 +109,7 @@ impl RotatingFileLogger {
 
     /// Writes a timestamped log line (`<iso> <level> <message>\n`). Never panics on I/O errors.
     pub fn log(&self, level: &str, message: &str) {
-        let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let ts = format_rfc3339_millis(now_ms());
         let line = format!("{ts} {level} {message}\n");
         self.write_raw(line.as_bytes());
     }
@@ -368,7 +368,7 @@ impl CallTraceInner {
 
 fn format_trace_line(entry: &Value) -> io::Result<String> {
     let safe = redact_for_trace(entry);
-    let at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let at = format_rfc3339_millis(now_ms());
     let mut obj = Map::new();
     obj.insert("at".to_string(), Value::String(at));
     match safe {

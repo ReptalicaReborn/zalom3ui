@@ -16,3 +16,9 @@
 -keep,includedescriptorclasses class com.zalom3ui.app.call.OpusDecoder {
     native <methods>;
 }
+
+# Strip verbose and debug logs in release builds while keeping i/w/e intact for startup and crash diagnostics.
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+}

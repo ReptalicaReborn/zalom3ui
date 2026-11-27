@@ -95,9 +95,14 @@ class CallActivity : ComponentActivity() {
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
             )
         }
-        val appearance = SettingsStore(this).loadAppearance()
+        val settings = SettingsStore(this)
+        val appearance = settings.loadAppearance()
+        val reducedMotion = com.zalom3ui.app.data.effectiveReducedMotion(
+            settings.reducedMotion,
+            com.zalom3ui.app.data.systemReducedMotion(this),
+        )
         setContent {
-            AppTheme(appearance) {
+            AppTheme(appearance, reducedMotion = reducedMotion) {
                 val service by CallService.state.collectAsStateWithLifecycle()
                 val muted by CallService.muted.collectAsStateWithLifecycle()
                 val speaker by CallService.speakerOn.collectAsStateWithLifecycle()

@@ -37,6 +37,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -503,6 +504,7 @@ private fun WavySeekBar(
     waving: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val reducedMotion = LocalReducedMotion.current
     val interactionSource = remember { MutableInteractionSource() }
     val colors = SliderDefaults.colors(
         thumbColor = Color.White,
@@ -522,21 +524,35 @@ private fun WavySeekBar(
         },
         track = { sliderState ->
             val span = sliderState.valueRange.endInclusive - sliderState.valueRange.start
-            LinearWavyProgressIndicator(
-                progress = {
-                    if (span <= 0f) 0f
-                    else ((sliderState.value - sliderState.valueRange.start) / span).coerceIn(0f, 1f)
-                },
-                modifier = Modifier.fillMaxWidth(),
-                color = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
-                trackColor = Color.White.copy(alpha = 0.3f),
-                // Room for the 4dp thumb plus the M3 6dp gap on each side.
-                gapSize = 16.dp,
-                stopSize = 0.dp,
-                amplitude = { if (waving) 1f else 0f },
-                wavelength = 32.dp,
-                waveSpeed = if (waving) 24.dp else 0.dp,
-            )
+            val progress = {
+                if (span <= 0f) 0f
+                else ((sliderState.value - sliderState.valueRange.start) / span).coerceIn(0f, 1f)
+            }
+            val activeColor = if (enabled) Color.White else Color.White.copy(alpha = 0.38f)
+            val inactiveColor = Color.White.copy(alpha = 0.3f)
+            if (reducedMotion) {
+                LinearProgressIndicator(
+                    progress = progress,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = activeColor,
+                    trackColor = inactiveColor,
+                    gapSize = 16.dp,
+                    drawStopIndicator = {},
+                )
+            } else {
+                LinearWavyProgressIndicator(
+                    progress = progress,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = activeColor,
+                    trackColor = inactiveColor,
+                    // Room for the 4dp thumb plus the M3 6dp gap on each side.
+                    gapSize = 16.dp,
+                    stopSize = 0.dp,
+                    amplitude = { if (waving) 1f else 0f },
+                    wavelength = 32.dp,
+                    waveSpeed = if (waving) 24.dp else 0.dp,
+                )
+            }
         },
     )
 }

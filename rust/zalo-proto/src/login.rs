@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use crate::time_util::now_ms;
 use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -490,7 +490,7 @@ pub async fn login_cookie_with_http(http: ZaloHttp, credentials: Credentials) ->
     let jar = Arc::new(RwLock::new(ZaloCookieJar::from_saved(credentials.cookie)));
 
     // 1. getLoginInfo
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = now_ms();
     let encryptor = ParamsEncryptor::new(api_type, &credentials.imei, now_ms)?;
     let login_payload = json!({
         "computer_name": "Web",

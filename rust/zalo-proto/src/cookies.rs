@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use crate::time_util::{format_rfc3339_secs, now_secs, parse_http_date_epoch_secs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -57,29 +57,11 @@ fn parse_expires_epoch_secs(expires: Option<&Value>) -> Option<i64> {
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("infinity") {
                 return None;
             }
-            if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-                return Some(dt.timestamp());
-            }
-            if let Ok(dt) = DateTime::parse_from_rfc2822(trimmed) {
-                return Some(dt.timestamp());
-            }
-            // Try common HTTP-date format: "Wed, 18 Mar 2026 12:34:56 GMT"
-            if let Ok(naive) =
-                chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT")
-            {
-                return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp());
-            }
-            if let Ok(naive) =
-                chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d-%b-%Y %H:%M:%S GMT")
-            {
-                return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp());
-            }
-            None
+            parse_http_date_epoch_secs(trimmed)
         }
         Value::Number(n) => {
             let ms = n.as_i64()?;
-            let secs = if ms > 10_000_000_000 { ms / 1000 } else { ms };
-            DateTime::from_timestamp(secs, 0).map(|dt| dt.timestamp())
+            Some(if ms > 10_000_000_000 { ms / 1000 } else { ms })
         }
         _ => None,
     }
@@ -127,14 +109,14 @@ impl SavedCookie {
         self.expires_cached = true;
     }
 
-    /// Returns whether this cookie is expired relative to `now`.
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+    /// Returns whether this cookie is expired relative to `now_epoch_secs`.
+    pub fn is_expired(&self, now_epoch_secs: i64) -> bool {
         let secs = if self.expires_cached {
             self.expires_epoch_secs
         } else {
             parse_expires_epoch_secs(self.expires.as_ref())
         };
-        secs.is_some_and(|exp_secs| exp_secs <= now.timestamp())
+        secs.is_some_and(|exp_secs| exp_secs <= now_epoch_secs)
     }
 
     /// Normalized domain without a leading dot, lowercase.
@@ -264,7 +246,7 @@ impl ZaloCookieJar {
         let Some(cookie) = parse_set_cookie(header_value, request_url) else {
             return;
         };
-        let now = Utc::now();
+        let now = now_secs();
         if cookie.is_expired(now) {
             self.remove(&cookie.key, cookie.domain_str(), cookie.normalized_path());
         } else {
@@ -319,7 +301,7 @@ impl ZaloCookieJar {
         let req_path = if url.path().is_empty() { "/" } else { url.path() };
         let is_secure = url.scheme().eq_ignore_ascii_case("https")
             || url.scheme().eq_ignore_ascii_case("wss");
-        let now = Utc::now();
+        let now = now_secs();
 
         let mut matched: Vec<&SavedCookie> = self
             .cookies
@@ -498,24 +480,9 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<SavedCookie> 
                     }
                 }
                 "expires" => {
-                    if let Ok(dt) = DateTime::parse_from_rfc2822(v_trim) {
-                        let utc = dt.with_timezone(&Utc);
-                        expires_epoch_secs = Some(utc.timestamp());
-                        expires = Some(Value::String(utc.to_rfc3339()));
-                    } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
-                        v_trim,
-                        "%a, %d %b %Y %H:%M:%S GMT",
-                    ) {
-                        let utc = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
-                        expires_epoch_secs = Some(utc.timestamp());
-                        expires = Some(Value::String(utc.to_rfc3339()));
-                    } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
-                        v_trim,
-                        "%a, %d-%b-%Y %H:%M:%S GMT",
-                    ) {
-                        let utc = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
-                        expires_epoch_secs = Some(utc.timestamp());
-                        expires = Some(Value::String(utc.to_rfc3339()));
+                    if let Some(secs) = parse_http_date_epoch_secs(v_trim) {
+                        expires_epoch_secs = Some(secs);
+                        expires = Some(Value::String(format_rfc3339_secs(secs)));
                     } else {
                         expires_epoch_secs = None;
                         expires = Some(Value::String(v_trim.to_string()));
@@ -523,9 +490,9 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<SavedCookie> 
                 }
                 "max-age" => {
                     if let Ok(secs) = v_trim.parse::<i64>() {
-                        let exp_dt = Utc::now() + chrono::Duration::seconds(secs);
-                        expires_epoch_secs = Some(exp_dt.timestamp());
-                        expires = Some(Value::String(exp_dt.to_rfc3339()));
+                        let exp_secs = now_secs().saturating_add(secs);
+                        expires_epoch_secs = Some(exp_secs);
+                        expires = Some(Value::String(format_rfc3339_secs(exp_secs)));
                     }
                 }
                 "samesite" => {

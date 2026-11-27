@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use chrono::Utc;
+use crate::time_util::now_ms;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -286,7 +286,7 @@ async fn run_listener_loop(
 
     loop {
         let base_ws = &ctx.ws_urls[rotate_idx % ctx.ws_urls.len()];
-        let ts_str = Utc::now().timestamp_millis().to_string();
+        let ts_str = now_ms().to_string();
         let ws_url = match ZaloHttp::make_ctx_url(&ctx, base_ws, &[("t", &ts_str)], true) {
             Ok(u) => u,
             Err(e) => {
@@ -393,7 +393,7 @@ async fn run_listener_loop(
         let (close_code, close_reason, manual_stop) = loop {
             tokio::select! {
                 _ = ping_interval.tick(), if ping_active => {
-                    let payload = json!({ "eventId": Utc::now().timestamp_millis() });
+                    let payload = json!({ "eventId": now_ms() });
                     let frame = encode_frame(1, 2, 1, payload.to_string().as_bytes());
                     if let Err(e) = ws_sink.send(Message::Binary(frame.into())).await {
                         warn!(error = %e, "WS ping send failed");
@@ -1379,7 +1379,7 @@ fn try_normalize_page(
         .get("ts")
         .filter(|v| v.is_string() || v.is_number())
         .cloned()
-        .unwrap_or_else(|| Value::Number(Utc::now().timestamp_millis().into()));
+        .unwrap_or_else(|| Value::Number(now_ms().into()));
 
     let mut data_map = serde_json::Map::new();
     data_map.insert("msgId".to_string(), Value::String(msg_id));

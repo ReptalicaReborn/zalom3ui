@@ -6,8 +6,11 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
 import com.zalom3ui.app.call.CallMediaFactory
 import com.zalom3ui.app.call.EngineCallMedia
+import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.server.StayConnectedCoordinator
 
@@ -27,6 +30,16 @@ class ZalooApp : Application(), ImageLoaderFactory {
 
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
+            .okHttpClient { ApiClient.sharedHttpClient() }
+            .respectCacheHeaders(false)
+            .allowRgb565(true)
+            .memoryCache { MemoryCache.Builder(this).maxSizePercent(0.18).build() }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(cacheDir.resolve("image_cache"))
+                    .maxSizeBytes(100L * 1024 * 1024)
+                    .build()
+            }
             .components {
                 // Android 9+ decodes animated WebP and GIF; older phones animate GIFs only.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) add(ImageDecoderDecoder.Factory()) else add(GifDecoder.Factory())

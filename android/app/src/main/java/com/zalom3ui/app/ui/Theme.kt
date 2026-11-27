@@ -441,7 +441,11 @@ fun isAppInDarkTheme(appearance: Appearance): Boolean = when (appearance.themeMo
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> Unit) {
+fun AppTheme(
+    appearance: Appearance = Appearance(),
+    reducedMotion: Boolean = false,
+    content: @Composable () -> Unit,
+) {
     val dark = isAppInDarkTheme(appearance)
     val dynamic = appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val gold = !dynamic && appearance.accent == ChatAccent.REPTDOC_GOLD
@@ -514,10 +518,11 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
     CompositionLocalProvider(
         LocalChatColors provides chat,
         LocalUltraExpressive provides appearance.ultraExpressive,
+        LocalReducedMotion provides reducedMotion,
     ) {
         MaterialExpressiveTheme(
             colorScheme = colors,
-            motionScheme = MotionScheme.expressive(),
+            motionScheme = if (reducedMotion) MotionScheme.standard() else MotionScheme.expressive(),
             shapes = if (gold) GoldShapes else ExpressiveShapes,
             typography = ExpressiveTypography,
             content = content,
@@ -527,6 +532,9 @@ fun AppTheme(appearance: Appearance = Appearance(), content: @Composable () -> U
 
 /** Easter egg: true when "4x faster mode" (hilariously oversized M3 Expressive buttons) is enabled. */
 val LocalUltraExpressive = staticCompositionLocalOf { false }
+
+/** True when reduced motion is active (user setting or Android's system "Remove animations" accessibility toggle). */
+val LocalReducedMotion = staticCompositionLocalOf { false }
 
 /** A letter avatar's colors: a soft tint behind a strong letter of the same hue. */
 @Immutable

@@ -467,7 +467,7 @@ fn run_request(
             None => {
                 let body = body?;
                 r.core
-                    .request(method, path, ct, axum_body(body))
+                    .request(method, path, ct, request_body(body))
                     .await
             }
         }
@@ -488,7 +488,7 @@ fn do_request(
     }
 }
 
-fn axum_body(bytes: Vec<u8>) -> zalo_server::embedded::Body {
+fn request_body(bytes: Vec<u8>) -> zalo_server::embedded::Body {
     zalo_server::embedded::Body::from(bytes)
 }
 

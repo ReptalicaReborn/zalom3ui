@@ -8,6 +8,7 @@ pub mod framelog;
 pub mod http;
 pub mod listener;
 pub mod login;
+pub mod time_util;
 pub mod types;
 
 pub use api::ctrlpoll::{

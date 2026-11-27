@@ -128,6 +128,7 @@ import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -300,7 +301,10 @@ fun ChatScreen(
     friends: List<Person> = emptyList(),
 ) {
     if (chatAccentOverride != null && appearance != null) {
-        AppTheme(appearance.copy(accent = chatAccentOverride, dynamicColor = false)) {
+        AppTheme(
+            appearance = appearance.copy(accent = chatAccentOverride, dynamicColor = false),
+            reducedMotion = LocalReducedMotion.current,
+        ) {
             ChatScreenContent(
                 chat = chat,
                 thread = thread,
@@ -536,12 +540,17 @@ private fun ChatScreenContent(
 
     val onOpenUrl: (String) -> Unit = { url -> openExternally(context, url) }
 
-    val blurRadius by animateDpAsState(
-        targetValue = if (selectedMsg != null) 12.dp else 0.dp,
-        animationSpec = MaterialTheme.motionScheme.fastEffectsSpec(),
-        label = "chatOverlayBlur",
-    )
-    val scaffoldModifier = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurRadius > 0.dp) {
+    val reducedMotion = LocalReducedMotion.current
+    val blurRadius = if (reducedMotion) {
+        0.dp
+    } else {
+        animateDpAsState(
+            targetValue = if (selectedMsg != null) 12.dp else 0.dp,
+            animationSpec = MaterialTheme.motionScheme.fastEffectsSpec(),
+            label = "chatOverlayBlur",
+        ).value
+    }
+    val scaffoldModifier = if (!reducedMotion && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurRadius > 0.dp) {
         Modifier.fillMaxSize().blur(blurRadius)
     } else {
         Modifier.fillMaxSize()
@@ -725,7 +734,11 @@ private fun ChatScreenContent(
                         onRetryOutbox = actions.onRetryOutbox,
                     )
                     if (chat.loading && chat.messages.isEmpty()) {
-                        LinearWavyProgressIndicator(Modifier.fillMaxWidth())
+                        if (reducedMotion) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                        } else {
+                            LinearWavyProgressIndicator(Modifier.fillMaxWidth())
+                        }
                     }
                 }
             }
@@ -1154,6 +1167,7 @@ private fun MessageList(
         if (start < 0) 0 else chat.messages.drop(start).count { !it.isSelf }
     }
 
+    val reducedMotion = LocalReducedMotion.current
     var highlightedMsgId by remember { mutableStateOf<String?>(null) }
     var highlightNonce by remember { mutableIntStateOf(0) }
 
@@ -1162,7 +1176,11 @@ private fun MessageList(
         val idx = reversedItems.indexOfFirst { it.containsId(id) }
         if (idx >= 0) {
             val listIndex = bottomOffset + idx
-            listState.animateScrollToItem(listIndex)
+            if (reducedMotion) {
+                listState.scrollToItem(listIndex)
+            } else {
+                listState.animateScrollToItem(listIndex)
+            }
             highlightedMsgId = id
             highlightNonce = nonce
         }
@@ -1187,7 +1205,9 @@ private fun MessageList(
     }
     // Follow new messages, queued outbox bubbles, optimistic pending bubbles, and "typing…" when already at the bottom.
     LaunchedEffect(chat.messages.lastOrNull()?.id, chat.pending.size, outboxEntries.size, typing != null) {
-        if (listState.firstVisibleItemIndex <= 1) listState.animateScrollToItem(0)
+        if (listState.firstVisibleItemIndex <= 1) {
+            if (reducedMotion) listState.scrollToItem(0) else listState.animateScrollToItem(0)
+        }
     }
 
     val showJump by remember { derivedStateOf { listState.firstVisibleItemIndex > 2 } }
@@ -1355,7 +1375,14 @@ private fun MessageList(
                 }
             }
             if (chat.loadingMore) {
-                item(key = "loading", contentType = "loading") { LinearWavyProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp)) }
+                item(key = "loading", contentType = "loading") {
+                    val loadingMod = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                    if (reducedMotion) {
+                        LinearProgressIndicator(loadingMod)
+                    } else {
+                        LinearWavyProgressIndicator(loadingMod)
+                    }
+                }
             }
         }
 
@@ -1400,7 +1427,9 @@ private fun MessageList(
                 SmallFloatingActionButton(
                     onClick = {
                         newWhileScrolledUp = 0
-                        scope.launch { listState.animateScrollToItem(0) }
+                        scope.launch {
+                            if (reducedMotion) listState.scrollToItem(0) else listState.animateScrollToItem(0)
+                        }
                     },
                     containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                     contentColor = MaterialTheme.colorScheme.onSurface,

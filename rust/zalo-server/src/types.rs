@@ -458,30 +458,113 @@ pub enum MessageStatus {
     Seen,
 }
 
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
 /// Raw Zalo message fields kept server-side only (needed to quote, react, recall, delete, or mark seen).
+///
+/// Fields that duplicate [`StoredMessage`] (`msg_type`, `uid_from`, `id_to`, `ts`, and plain-text
+/// `content`) are omitted when redundant and reconstructed via the resolver helpers below, while
+/// older on-disk `threads/<hex>.json` files that stored every field explicitly still deserialize
+/// seamlessly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawRef {
-    #[serde(default)]
-    pub msg_type: String,
-    #[serde(default)]
-    pub content: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub property_ext: Option<Value>,
-    #[serde(default)]
-    pub uid_from: String,
-    #[serde(default)]
-    pub id_to: String,
-    #[serde(default)]
-    pub ts: String,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
+    pub msg_type: Option<String>,
+    /// Omitted for plain-text messages (where [`StoredMessage::text`] holds the exact content).
+    /// Present for non-text/attachment messages (slimmed to quote/forward fields) or legacy files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property_ext: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "de_i64_flexible",
+        skip_serializing_if = "is_zero_i64"
+    )]
     pub ttl: i64,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
+    #[serde(
+        default,
+        deserialize_with = "de_i64_flexible",
+        skip_serializing_if = "is_zero_i64"
+    )]
     pub st: i64,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
+    #[serde(
+        default,
+        deserialize_with = "de_i64_flexible",
+        skip_serializing_if = "is_zero_i64"
+    )]
     pub at: i64,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
+    #[serde(
+        default,
+        deserialize_with = "de_i64_flexible",
+        skip_serializing_if = "is_zero_i64"
+    )]
     pub cmd: i64,
+}
+
+impl RawRef {
+    pub fn resolved_msg_type<'a>(&'a self, msg: &'a StoredMessage) -> &'a str {
+        self.msg_type
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(msg.msg_type.as_str())
+    }
+
+    pub fn resolved_uid_from<'a>(&'a self, msg: &'a StoredMessage) -> &'a str {
+        self.uid_from
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(msg.from_id.as_str())
+    }
+
+    pub fn resolved_id_to<'a>(&'a self, msg: &'a StoredMessage) -> &'a str {
+        self.id_to
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(msg.thread_id.as_str())
+    }
+
+    pub fn resolved_ts(&self, msg: &StoredMessage) -> String {
+        self.ts
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| msg.ts.to_string())
+    }
+
+    pub fn resolved_ts_i64(&self, msg: &StoredMessage) -> Option<i64> {
+        match self.ts.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => s.parse::<i64>().ok(),
+            None => Some(msg.ts),
+        }
+    }
+
+    /// Reconstructs the `content` value expected by `QuoteInput`.
+    pub fn content_for_quote(&self, msg: &StoredMessage) -> Value {
+        match self.content.as_deref() {
+            Some(v) => v.clone(),
+            None if msg.attachment.is_none() => Value::String(msg.text.clone()),
+            None => Value::Null,
+        }
+    }
+
+    /// Returns the original plain text if this message was a string-content message.
+    pub fn plain_text<'a>(&'a self, msg: &'a StoredMessage) -> Option<&'a str> {
+        match self.content.as_deref() {
+            Some(Value::String(s)) => Some(s.as_str()),
+            None if msg.attachment.is_none() => Some(msg.text.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Public message view returned by HTTP/WebSocket APIs (`raw`, `deliveredTo`, `seenBy` stripped).
@@ -597,7 +680,7 @@ pub struct StoredMessage {
     pub seen_by: Option<Vec<String>>,
     /// Server-side raw fields; omitted from API responses and absent for imported history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<RawRef>,
+    pub raw: Option<Box<RawRef>>,
     /// Lazily populated diacritic-folded lowercase search string (cleared on recall).
     #[serde(skip)]
     pub search_folded: SearchCache,

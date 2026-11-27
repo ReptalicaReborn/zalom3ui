@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chrono::Utc;
+use crate::time_util::now_secs;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -290,7 +290,7 @@ impl ControlPoller {
                 "{base}/?zpw_ver={}&zpw_type={}&params={cursor}&ts={}",
                 self.ctx.api_version,
                 self.ctx.api_type,
-                Utc::now().timestamp()
+                now_secs()
             );
 
             let req_fut = self.http.request_with_cookies(

@@ -1,4 +1,4 @@
-use chrono::{Local, Timelike, Utc};
+use crate::time_util::{now_ms, now_secs, seconds_until_next_local_8am};
 use serde_json::{json, Value};
 
 use crate::api::ZaloClient;
@@ -9,7 +9,7 @@ impl ZaloClient {
     /// Marks a conversation as unread (`POST /api/conv/addUnreadMark`).
     pub async fn add_unread_mark(&self, thread_id: &str, thread_type: ThreadType) -> Result<Value> {
         let base = self.require_service("conversation")?;
-        let ts = Utc::now().timestamp_millis();
+        let ts = now_ms();
         let is_group = thread_type.is_group();
         let entry = json!([{
             "id": thread_id,
@@ -50,7 +50,7 @@ impl ZaloClient {
         thread_type: ThreadType,
     ) -> Result<Value> {
         let base = self.require_service("conversation")?;
-        let ts = Utc::now().timestamp_millis();
+        let ts = now_ms();
         let is_group = thread_type.is_group();
         let inner = if is_group {
             json!({
@@ -140,7 +140,7 @@ impl ZaloClient {
             "toid": thread_id,
             "duration": mute_duration,
             "action": action as i64,
-            "startTime": Utc::now().timestamp(),
+            "startTime": now_secs(),
             "muteType": if thread_type.is_group() { 2 } else { 1 },
             "imei": self.ctx.imei,
         });
@@ -175,7 +175,7 @@ impl ZaloClient {
         thread_id: &str,
         thread_type: ThreadType,
     ) -> Result<Value> {
-        let ts_str = Utc::now().timestamp_millis().to_string();
+        let ts_str = now_ms().to_string();
         let (url, params) = match thread_type {
             ThreadType::User => {
                 let base = self.require_service("chat")?;
@@ -225,12 +225,5 @@ fn unwrap_string_data_field(data: Value) -> Value {
 }
 
 fn seconds_until_next_8am() -> i64 {
-    let now = Local::now();
-    let secs_since_midnight = now.num_seconds_from_midnight() as i64;
-    let eight_am = 8 * 3600;
-    if secs_since_midnight < eight_am {
-        eight_am - secs_since_midnight
-    } else {
-        (24 * 3600 - secs_since_midnight) + eight_am
-    }
+    seconds_until_next_local_8am(now_ms())
 }

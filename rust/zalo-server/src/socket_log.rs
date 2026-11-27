@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use zalo_proto::framelog::FrameReport;
+use zalo_proto::time_util::format_rfc3339_millis;
 
 /// Entries kept in memory and (after compaction) on disk.
 pub const MAX_ENTRIES: usize = 500;
@@ -258,9 +258,7 @@ impl SocketLog {
 }
 
 fn render_entry(out: &mut String, r: &FrameReport) {
-    let when = DateTime::<Utc>::from_timestamp_millis(r.ts)
-        .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true))
-        .unwrap_or_else(|| "?".into());
+    let when = format_rfc3339_millis(r.ts);
     out.push_str(&format!(
         "{when}  v{} cmd={} sub={}  {}\n",
         r.version,

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.FormatColorFill
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.MotionPhotosOff
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.RestartAlt
@@ -112,6 +113,8 @@ fun SettingsScreen(
     onAppearance: (Appearance) -> Unit,
     onRestartServer: () -> Unit,
     onLogout: () -> Unit,
+    reducedMotion: Boolean = false,
+    onReducedMotion: (Boolean) -> Unit = {},
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
     onSyncHistory: () -> Unit = {},
@@ -260,6 +263,21 @@ fun SettingsScreen(
                             },
                         )
                     }
+                }
+                add {
+                    ListItem(
+                        modifier = Modifier.clickable { onReducedMotion(!reducedMotion) },
+                        colors = transparentListItemColors,
+                        leadingContent = { Icon(Icons.Outlined.MotionPhotosOff, null) },
+                        headlineContent = { Text("Reduced motion") },
+                        supportingContent = { Text("Simplify transitions, disable blur and wave animations") },
+                        trailingContent = {
+                            Switch(
+                                checked = reducedMotion,
+                                onCheckedChange = onReducedMotion,
+                            )
+                        },
+                    )
                 }
                 if (showEasterEgg) {
                     add {

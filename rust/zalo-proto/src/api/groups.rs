@@ -1,4 +1,4 @@
-use chrono::Utc;
+use crate::time_util::now_ms;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
 
@@ -85,7 +85,7 @@ impl ZaloClient {
             ));
         }
         let base = self.require_service("group")?;
-        let now = Utc::now().timestamp_millis();
+        let now = now_ms();
         let (gname, name_changed) = match options.name.as_deref() {
             Some(n) if !n.is_empty() => (n.to_string(), 1),
             _ => (now.to_string(), 0),
@@ -160,7 +160,7 @@ impl ZaloClient {
     pub async fn change_group_name(&self, name: &str, group_id: &str) -> Result<Value> {
         let base = self.require_service("group")?;
         let gname = if name.is_empty() {
-            Utc::now().timestamp_millis().to_string()
+            now_ms().to_string()
         } else {
             name.to_string()
         };

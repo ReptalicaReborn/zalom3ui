@@ -953,12 +953,18 @@ private fun VoiceClip(a: Attachment, onOutgoing: Boolean) {
         else -> 0L
     }
 
-    // Morph smoothly between a circle (paused) and a 12.dp rounded squircle (playing).
-    val playCorner by animateDpAsState(
-        targetValue = if (isPlaying) 12.dp else 22.dp,
-        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
-        label = "voicePlayCorner",
-    )
+    val reducedMotion = LocalReducedMotion.current
+    val targetPlayCorner = if (isPlaying) 12.dp else 22.dp
+    // Morph smoothly between a circle (paused) and a 12.dp rounded squircle (playing); snap under reduced motion.
+    val playCorner = if (reducedMotion) {
+        targetPlayCorner
+    } else {
+        animateDpAsState(
+            targetValue = targetPlayCorner,
+            animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+            label = "voicePlayCorner",
+        ).value
+    }
     val playedColor = if (onOutgoing) Color.White else MaterialTheme.colorScheme.primary
     val unplayedColor = playedColor.copy(alpha = 0.35f)
     val timerColor = LocalContentColor.current.copy(alpha = 0.8f)

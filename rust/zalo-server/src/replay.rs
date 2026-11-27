@@ -24,7 +24,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -685,9 +684,7 @@ fn max_batch(reports: &[ReplayReport]) -> usize {
 // ---- Text rendering ----
 
 fn fmt_ts(ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(ms)
-        .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|| ms.to_string())
+    zalo_proto::time_util::format_rfc3339_secs_from_ms(ms)
 }
 
 fn fmt_opt_ts(ms: Option<i64>) -> String {

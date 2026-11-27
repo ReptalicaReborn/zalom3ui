@@ -39,7 +39,7 @@ use crate::config::is_loopback_host;
 use crate::config::Config;
 use crate::errors::{ApiResult, HttpError};
 use crate::routes::{self, AppState};
-use crate::session::{MuteOption, ServerBroadcastEvent, UploadFile, ZaloSession};
+use crate::session::{MuteOption, UploadFile, ZaloSession};
 use crate::types::{MentionInfo, ReactionChoice, ThreadKind, REACTIONS};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
@@ -431,49 +431,7 @@ async fn ws_events(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl 
         .on_upgrade(move |socket| handle_ws_events(socket, state))
 }
 
-/// The event stream every client of the server sees: first `{"type":"status",...}` with the
-/// current status, then every broadcast event, each as the JSON text sent over `/ws`. Shared by
-/// the WebSocket handler and the in-process embedded subscription.
-pub struct EventStream {
-    rx: tokio::sync::broadcast::Receiver<ServerBroadcastEvent>,
-    initial: Option<Arc<str>>,
-}
-
-impl EventStream {
-    /// Subscribes first, then snapshots the status, so no event is missed in between.
-    pub fn new(session: &ZaloSession) -> Self {
-        let rx = session.subscribe_events();
-        let initial: Arc<str> = json!({
-            "type": "status",
-            "status": session.get_status(),
-        })
-        .to_string()
-        .into();
-        Self {
-            rx,
-            initial: Some(initial),
-        }
-    }
-
-    /// The next event as shared JSON text, or `None` once the server is gone. Cancel-safe.
-    pub async fn next_shared(&mut self) -> Option<Arc<str>> {
-        if let Some(initial) = self.initial.take() {
-            return Some(initial);
-        }
-        loop {
-            match self.rx.recv().await {
-                Ok(payload) => return Some(payload),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    }
-
-    /// The next event as JSON text, or `None` once the server is gone. Cancel-safe.
-    pub async fn next(&mut self) -> Option<String> {
-        self.next_shared().await.map(|s| s.to_string())
-    }
-}
+pub use crate::embedded::EventStream;
 
 #[cfg(feature = "tcp")]
 async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
