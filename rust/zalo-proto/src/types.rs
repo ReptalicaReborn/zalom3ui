@@ -311,6 +311,20 @@ pub struct UploadSource {
     pub data: Vec<u8>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Video metadata; with it an `.mp4` is sent as a playable video message (see [`VideoMeta`]).
+    #[serde(skip)]
+    pub video: Option<VideoMeta>,
+}
+
+/// What a Zalo video message needs besides the uploaded video: a JPEG thumbnail, the duration and the shown size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoMeta {
+    /// JPEG bytes, uploaded as a photo to get the message's `thumbUrl`.
+    pub thumbnail: Vec<u8>,
+    pub duration_ms: u64,
+    /// Width and height as shown (rotation applied), in pixels.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Byte progress of one uploaded file (`index` is its position in the `sources` slice).

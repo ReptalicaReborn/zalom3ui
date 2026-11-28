@@ -39,7 +39,7 @@ use crate::config::is_loopback_host;
 use crate::config::Config;
 use crate::errors::{ApiResult, HttpError};
 use crate::routes::{self, AppState};
-use crate::session::{MuteOption, UploadFile, ZaloSession};
+use crate::session::{MuteOption, ZaloSession};
 use crate::types::{MentionInfo, ReactionChoice, ThreadKind, REACTIONS};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
@@ -759,20 +759,7 @@ async fn upload_attachment(
     if body.is_empty() {
         return Err(HttpError::bad_request("The request body is the file"));
     }
-    let width = query
-        .get("width")
-        .and_then(|s| positive_usize(s))
-        .and_then(|n| u32::try_from(n).ok());
-    let height = query
-        .get("height")
-        .and_then(|s| positive_usize(s))
-        .and_then(|n| u32::try_from(n).ok());
-    let file = UploadFile {
-        data: Vec::from(body),
-        filename: name,
-        width,
-        height,
-    };
+    let file = crate::dispatch::build_upload_file(&query, name, Vec::from(body))?;
     let msg_ids = state.session.send_attachment(kind, &id, file).await?;
     Ok((StatusCode::CREATED, Json(json!({ "msgIds": msg_ids }))))
 }

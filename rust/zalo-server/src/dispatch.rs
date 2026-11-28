@@ -776,6 +776,43 @@ fn handle_put_presence(state: &AppState, body: &Bytes) -> ApiResult<EmbeddedResp
     Ok(empty_response(204))
 }
 
+/// Builds the upload from the request: `width`/`height` (photos), and for videos the optional
+/// `thumbSize` (the body is then `thumbSize` bytes of JPEG thumbnail followed by the video) with
+/// `durationMs`, `width` and `height` (the video's shown size). Without a complete set the
+/// thumbnail is dropped and the file goes out as a plain file.
+pub(crate) fn build_upload_file(
+    query: &HashMap<String, String>,
+    filename: String,
+    mut data: Vec<u8>,
+) -> ApiResult<UploadFile> {
+    let num = |key: &str| query.get(key).and_then(|s| positive_usize(s));
+    let width = num("width").and_then(|n| u32::try_from(n).ok());
+    let height = num("height").and_then(|n| u32::try_from(n).ok());
+    let mut video = None;
+    if let Some(raw) = query.get("thumbSize") {
+        let thumb_len = positive_usize(raw)
+            .filter(|&n| n < data.len())
+            .ok_or_else(|| HttpError::bad_request("thumbSize must be smaller than the body"))?;
+        let rest = data.split_off(thumb_len);
+        let thumbnail = std::mem::replace(&mut data, rest);
+        if let (Some(d), Some(w), Some(h)) = (num("durationMs"), width, height) {
+            video = Some(zalo_proto::VideoMeta {
+                thumbnail,
+                duration_ms: d as u64,
+                width: w,
+                height: h,
+            });
+        }
+    }
+    Ok(UploadFile {
+        data,
+        filename,
+        width,
+        height,
+        video,
+    })
+}
+
 async fn handle_upload_attachment(
     state: &AppState,
     kind: &str,
@@ -798,20 +835,7 @@ async fn handle_upload_attachment(
     if body.is_empty() {
         return Err(HttpError::bad_request("The request body is the file"));
     }
-    let width = query
-        .get("width")
-        .and_then(|s| positive_usize(s))
-        .and_then(|n| u32::try_from(n).ok());
-    let height = query
-        .get("height")
-        .and_then(|s| positive_usize(s))
-        .and_then(|n| u32::try_from(n).ok());
-    let file = UploadFile {
-        data: Vec::from(body),
-        filename: name,
-        width,
-        height,
-    };
+    let file = build_upload_file(query, name, Vec::from(body))?;
     let msg_ids = state.session.send_attachment(kind, id, file).await?;
     Ok(json_response(201, &json!({ "msgIds": msg_ids })))
 }
@@ -1653,4 +1677,50 @@ pub(crate) fn find_multipart_file(
         pos = next_boundary;
     }
     None
+}
+
+#[cfg(test)]
+mod upload_file_tests {
+    use super::*;
+
+    fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn video_body_is_thumbnail_then_video() {
+        let f = build_upload_file(
+            &q(&[("thumbSize", "2"), ("durationMs", "12500"), ("width", "720"), ("height", "1280")]),
+            "a.mp4".into(),
+            vec![9, 8, 1, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(f.data, vec![1, 2, 3]);
+        let v = f.video.unwrap();
+        assert_eq!(v.thumbnail, vec![9, 8]);
+        assert_eq!((v.duration_ms, v.width, v.height), (12500, 720, 1280));
+    }
+
+    #[test]
+    fn without_video_params_the_body_is_the_file() {
+        let f = build_upload_file(&q(&[("width", "4"), ("height", "3")]), "a.jpg".into(), vec![1, 2]).unwrap();
+        assert_eq!(f.data, vec![1, 2]);
+        assert!(f.video.is_none());
+        assert_eq!((f.width, f.height), (Some(4), Some(3)));
+    }
+
+    #[test]
+    fn incomplete_video_metadata_drops_the_thumbnail_but_keeps_the_video() {
+        let f = build_upload_file(&q(&[("thumbSize", "1"), ("width", "5")]), "a.mp4".into(), vec![7, 1, 2]).unwrap();
+        assert_eq!(f.data, vec![1, 2]);
+        assert!(f.video.is_none());
+    }
+
+    #[test]
+    fn a_bad_thumb_size_is_refused() {
+        for bad in ["0", "3", "9", "x"] {
+            let r = build_upload_file(&q(&[("thumbSize", bad)]), "a.mp4".into(), vec![1, 2, 3]);
+            assert!(r.is_err(), "{bad}");
+        }
+    }
 }

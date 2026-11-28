@@ -925,7 +925,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     try {
                         val api = client ?: break
                         file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
-                        api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
+                        api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open, file.video)
                         pushShortcutForRef(chat.ref)
                     } catch (e: CancellationException) {
                         throw e

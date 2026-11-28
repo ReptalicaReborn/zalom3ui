@@ -4,10 +4,12 @@ import android.content.ContentResolver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.exifinterface.media.ExifInterface
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 
@@ -21,7 +23,33 @@ data class PickedFile(
     val height: Int? = null,
     val open: () -> InputStream,
     val cleanup: () -> Unit = {},
+    /** What Zalo needs to show a video as a video message; null for anything else or when it can't be read. */
+    val video: VideoInfo? = null,
 )
+
+/** A video's shown size (rotation applied), duration and a JPEG thumbnail. */
+class VideoInfo(
+    val durationMs: Long,
+    val width: Int,
+    val height: Int,
+    val thumbnailJpeg: ByteArray,
+)
+
+/** Extensions of files that are videos (the picker's MIME type counts too). */
+val VIDEO_EXTENSIONS = setOf("mp4", "mov", "3gp", "webm", "m4v", "mkv")
+
+fun isVideoFile(name: String, mimeType: String?): Boolean =
+    mimeType?.lowercase()?.startsWith("video/") == true || extensionOf(name) in VIDEO_EXTENSIONS
+
+/** Only .mp4 is sent as a video message: the core uploads other containers as files. */
+fun sendsAsVideoMessage(name: String): Boolean = extensionOf(name) == "mp4"
+
+/** Width and height as the video is shown: rotations of 90 and 270 degrees turn it on its side. */
+fun rotatedVideoSize(width: Int, height: Int, rotationDegrees: Int): Pair<Int, Int> =
+    if (((rotationDegrees % 360) + 360) % 360 in setOf(90, 270)) height to width else width to height
+
+/** Longest side of a video thumbnail, in pixels. */
+private const val VIDEO_THUMB_SIDE = 480
 
 /** Zalo sends these as photos; any other picture is converted to JPEG first. */
 val PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
@@ -89,13 +117,51 @@ fun readPickedFile(resolver: ContentResolver, uri: Uri, cacheDir: File): PickedF
     val open = { resolver.openInputStream(uri) ?: throw ApiException("Can't read $name") }
 
     if (needsJpegConversion(name, mime)) return convertToJpeg(name, open, cacheDir)
-    if (extensionOf(name) !in PHOTO_EXTENSIONS) return PickedFile(name, mime, size, open = open)
+    if (extensionOf(name) !in PHOTO_EXTENSIONS) {
+        val video = if (sendsAsVideoMessage(name) && isVideoFile(name, mime)) readVideoInfo(resolver, uri) else null
+        return PickedFile(name, mime, size, open = open, video = video)
+    }
 
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     open().use { BitmapFactory.decodeStream(it, null, bounds) }
     val orientation = runCatching { open().use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } }.getOrDefault(1)
     val (w, h) = orientedSize(bounds.outWidth, bounds.outHeight, orientation)
     return PickedFile(name, mime, size, width = w.takeIf { it > 0 }, height = h.takeIf { it > 0 }, open = open)
+}
+
+/** Duration, shown size and a frame at about one second of the video at [uri]; null when the phone can't read it. */
+private fun readVideoInfo(resolver: ContentResolver, uri: Uri): VideoInfo? {
+    val retriever = MediaMetadataRetriever()
+    var frame: Bitmap? = null
+    var scaled: Bitmap? = null
+    try {
+        resolver.openFileDescriptor(uri, "r")?.use { retriever.setDataSource(it.fileDescriptor) } ?: return null
+        fun meta(key: Int) = retriever.extractMetadata(key)?.toLongOrNull()
+        val duration = meta(MediaMetadataRetriever.METADATA_KEY_DURATION)?.takeIf { it > 0 } ?: return null
+        val rawW = meta(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt()?.takeIf { it > 0 } ?: return null
+        val rawH = meta(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt()?.takeIf { it > 0 } ?: return null
+        val rotation = meta(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0
+        val (w, h) = rotatedVideoSize(rawW, rawH, rotation)
+        val atUs = if (duration >= 1500) 1_000_000L else 0L
+        val decoded = retriever.getFrameAtTime(atUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
+        frame = decoded
+        val longest = maxOf(decoded.width, decoded.height)
+        val out = if (longest > VIDEO_THUMB_SIDE) {
+            val k = VIDEO_THUMB_SIDE.toFloat() / longest
+            Bitmap.createScaledBitmap(decoded, maxOf(1, (decoded.width * k).toInt()), maxOf(1, (decoded.height * k).toInt()), true)
+                .also { scaled = it }
+        } else {
+            decoded
+        }
+        val bytes = ByteArrayOutputStream().also { out.compress(Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray()
+        return if (bytes.isEmpty()) null else VideoInfo(duration, w, h, bytes)
+    } catch (e: Exception) {
+        return null
+    } finally {
+        scaled?.recycle()
+        frame?.recycle()
+        runCatching { retriever.release() }
+    }
 }
 
 private fun convertToJpeg(name: String, open: () -> InputStream, cacheDir: File): PickedFile {

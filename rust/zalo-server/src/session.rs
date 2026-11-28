@@ -19,7 +19,7 @@ use zalo_proto::{
     CreatePollInput, Credentials, DeleteMessageTarget, ForwardMessagePayload, ForwardReference,
     LastMessageInfo, LoginQrEvent, MentionInput, MuteAction, MuteDuration, PollViewContext,
     ProtoError, QuoteInput, RawWsMessage, ReactionTarget, SeenMessageInput, SendMessageOptions,
-    StickerParam, ThreadType, UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient,
+    StickerParam, ThreadType, UndoTarget, UploadResult, UploadSource, VideoMeta, WsEvent, ZaloClient,
 };
 
 use crate::api::{ListenerControl, ListenerStart, ProtoLogin, ZaloApi, ZaloLogin};
@@ -135,6 +135,8 @@ pub struct UploadFile {
     pub filename: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Video metadata for an `.mp4` (sent as a video message when complete).
+    pub video: Option<VideoMeta>,
 }
 
 /// Supported mute durations matching `PUT /api/threads/:kind/:id/mute`.
@@ -2740,6 +2742,7 @@ impl ZaloSession {
                 data: file.data,
                 width: if is_photo { file.width } else { None },
                 height: if is_photo { file.height } else { None },
+                video: if ext == "mp4" { file.video } else { None },
             }],
             progress: Some(self.upload_progress_sink(kind, thread_id)),
             ..Default::default()
@@ -2798,6 +2801,7 @@ impl ZaloSession {
                     data,
                     width: None,
                     height: None,
+                    video: None,
                 }],
                 thread_id,
                 to_thread_type(kind),

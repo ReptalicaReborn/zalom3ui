@@ -42,6 +42,6 @@ pub use types::{
     LastMessageInfo, LoginQrEvent, MentionInput, MuteAction, MuteDuration, PollOptionView,
     PollView, PollViewContext, PollVoter, QuoteInput, RawWsMessage, ReactionTarget,
     SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam, ThreadType,
-    UndoTarget, UploadProgress, UploadProgressSink, UploadResult, UploadSource, WsEvent, ZaloContext, DEFAULT_API_TYPE,
+    UndoTarget, UploadProgress, UploadProgressSink, UploadResult, UploadSource, VideoMeta, WsEvent, ZaloContext, DEFAULT_API_TYPE,
     DEFAULT_API_VERSION,
 };
