@@ -40,6 +40,7 @@ import com.zalom3ui.app.server.ZaloCore
 import com.zalom3ui.app.ui.App
 import com.zalom3ui.app.ui.AppTheme
 import com.zalom3ui.app.ui.AppViewModel
+import com.zalom3ui.app.ui.PerfMonitorHost
 import com.zalom3ui.app.ui.VoicePlayback
 import com.zalom3ui.app.ui.isAppInDarkTheme
 import kotlinx.coroutines.delay
@@ -134,6 +135,9 @@ class MainActivity : ComponentActivity() {
                 } else {
                     App(viewModel)
                 }
+                // Over every screen of this window (stacked on the app, like any second root composable); nothing
+                // is measured while both performance switches in Settings → Developer are off.
+                PerfMonitorHost(viewModel)
             }
         }
         handleOpenChat(intent)

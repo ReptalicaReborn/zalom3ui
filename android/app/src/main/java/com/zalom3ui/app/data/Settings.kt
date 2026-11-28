@@ -220,8 +220,24 @@ class SettingsStore(context: Context) {
             prefs.edit().putStringSet(KEY_HIDDEN_CHATS, value.toSet()).apply()
         }
 
+    /** Developer: show the performance monitor on screen (see docs/performance-monitor.md). */
+    var perfOverlay: Boolean
+        get() = prefs.getBoolean(KEY_PERF_OVERLAY, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PERF_OVERLAY, value).apply()
+        }
+
+    /** Developer: write the performance monitor's numbers to perf.log, with or without the overlay. */
+    var perfLog: Boolean
+        get() = prefs.getBoolean(KEY_PERF_LOG, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PERF_LOG, value).apply()
+        }
+
     internal companion object {
         const val KEY_HIDDEN_CHATS = "hidden_chats"
+        const val KEY_PERF_OVERLAY = "perf_overlay"
+        const val KEY_PERF_LOG = "perf_log"
         const val KEY_HIDE_OFFICIAL_ACCOUNTS = "hide_official_accounts"
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"

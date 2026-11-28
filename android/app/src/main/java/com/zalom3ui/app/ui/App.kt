@@ -20,6 +20,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.material.icons.Icons
@@ -51,6 +52,7 @@ import androidx.navigation.compose.rememberNavController
 import com.zalom3ui.app.data.FoundUser
 import com.zalom3ui.app.data.ThreadRef
 import com.zalom3ui.app.data.ThreadSummary
+import com.zalom3ui.app.perf.PerfMonitor
 import com.zalom3ui.app.server.StartupLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -122,6 +124,14 @@ private fun AppNav(vm: AppViewModel) {
     val nav = rememberNavController()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // The performance monitor names the screen in its log; this only runs when the user navigates.
+    DisposableEffect(nav) {
+        val listener = NavController.OnDestinationChangedListener { _, destination, _ ->
+            PerfMonitor.screen = destination.route.orEmpty()
+        }
+        nav.addOnDestinationChangedListener(listener)
+        onDispose { nav.removeOnDestinationChangedListener(listener) }
+    }
 
     val configuration = LocalConfiguration.current
     // Tablets (not phones turned sideways) show the chat list and the open chat side by side, like Telegram.
@@ -690,9 +700,15 @@ private fun AppNav(vm: AppViewModel) {
             val state by vm.state.collectAsStateWithLifecycle()
             val reducedMotionPref by vm.reducedMotion.collectAsStateWithLifecycle()
             val hideOfficialAccounts by vm.hideOfficialAccounts.collectAsStateWithLifecycle()
+            val perfOverlay by vm.perfOverlay.collectAsStateWithLifecycle()
+            val perfLog by vm.perfLog.collectAsStateWithLifecycle()
             SettingsScreen(
                 hideOfficialAccounts = hideOfficialAccounts,
                 onHideOfficialAccounts = vm::setHideOfficialAccounts,
+                perfOverlay = perfOverlay,
+                onPerfOverlay = vm::setPerfOverlay,
+                perfLog = perfLog,
+                onPerfLog = vm::setPerfLog,
                 current = state.settings,
                 appearance = state.appearance,
                 profileName = state.status?.ownName,

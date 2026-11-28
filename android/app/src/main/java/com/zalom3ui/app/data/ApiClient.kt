@@ -46,9 +46,12 @@ internal val AppJson = Json {
  * server address), or straight into the core running in this process ([onDevice]). Everything above the transport
  * (requests, JSON, error mapping, models) is the same for both.
  */
-class ApiClient internal constructor(private val transport: Transport) {
+class ApiClient internal constructor(rawTransport: Transport) {
     /** A client for the Zalo server at [serverUrl] (the "A server" mode); [token] is its access token. */
     constructor(serverUrl: String, token: String?) : this(HttpTransport(serverUrl, token))
+
+    /** [rawTransport], counted for the performance monitor (it changes nothing about a call; see MeteredTransport). */
+    private val transport: Transport = MeteredTransport(rawTransport)
 
     private val json = AppJson
 

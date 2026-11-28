@@ -162,6 +162,10 @@ fun SettingsScreen(
     onShareCallLog: () -> Unit = {},
     onClearCallLog: () -> Unit = {},
     onShareStartupLog: () -> Unit = {},
+    perfOverlay: Boolean = false,
+    onPerfOverlay: (Boolean) -> Unit = {},
+    perfLog: Boolean = false,
+    onPerfLog: (Boolean) -> Unit = {},
     onSyncHistory: () -> Unit = {},
 ) {
     var onDevice by rememberSaveable { mutableStateOf(current.onDevice) }
@@ -642,7 +646,7 @@ fun SettingsScreen(
                     }
                     SettingsPage.DEVELOPER -> {
                         ExpressiveSettingsGroup(
-                            items = listOf<@Composable () -> Unit>(
+                            items = perfSettingsItems(perfOverlay, onPerfOverlay, perfLog, onPerfLog) + listOf<@Composable () -> Unit>(
                                 {
                                     ListItem(
                                         modifier = Modifier.clickable(onClick = onShareStartupLog),

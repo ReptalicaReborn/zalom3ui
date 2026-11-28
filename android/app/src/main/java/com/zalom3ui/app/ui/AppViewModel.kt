@@ -172,6 +172,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** User preference for reduced motion (combined with system setting at the theme root). */
     val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
 
+    private val _perfOverlay = MutableStateFlow(settingsStore.perfOverlay)
+    /** Developer: the performance monitor on screen (ui/PerfOverlay.kt). */
+    val perfOverlay: StateFlow<Boolean> = _perfOverlay.asStateFlow()
+
+    private val _perfLog = MutableStateFlow(settingsStore.perfLog)
+    /** Developer: the performance monitor writes perf.log (perf/PerfLog.kt). */
+    val perfLog: StateFlow<Boolean> = _perfLog.asStateFlow()
+
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
     val pollEvents: SharedFlow<Long> = _pollEvents
@@ -285,6 +293,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setReducedMotion(enabled: Boolean) {
         settingsStore.reducedMotion = enabled
         _reducedMotion.value = enabled
+    }
+
+    fun setPerfOverlay(enabled: Boolean) {
+        settingsStore.perfOverlay = enabled
+        _perfOverlay.value = enabled
+    }
+
+    fun setPerfLog(enabled: Boolean) {
+        settingsStore.perfLog = enabled
+        _perfLog.value = enabled
     }
 
     /** Called on every keystroke, so it only notes the text; saving it waits for typing to pause. */
