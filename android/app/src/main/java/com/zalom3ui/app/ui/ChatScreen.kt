@@ -63,6 +63,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -393,7 +394,7 @@ private fun ChatScreenContent(
     var showShareContactSheet by rememberSaveable { mutableStateOf(false) }
     var pendingCameraUriStr by rememberSaveable { mutableStateOf<String?>(null) }
     var previewMediaUris by remember(chat.ref) { mutableStateOf<List<Uri>>(emptyList()) }
-    val selectedIds = remember(chat.ref) { mutableStateListOf<String>() }
+    var selectedIds by remember(chat.ref) { mutableStateOf(emptySet<String>()) }
 
     var searching by rememberSaveable { mutableStateOf(initialSearch) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -459,7 +460,7 @@ private fun ChatScreenContent(
     if (selectedMsg != null) overlayMsg = selectedMsg
 
     BackHandler(enabled = selectedMsg != null) { menuFor = null }
-    BackHandler(enabled = selectedIds.isNotEmpty() && selectedMsg == null) { selectedIds.clear() }
+    BackHandler(enabled = selectedIds.isNotEmpty() && selectedMsg == null) { selectedIds = emptySet() }
     BackHandler(enabled = searching && selectedMsg == null && selectedIds.isEmpty()) { closeSearch() }
 
     DisposableEffect(chat.ref) { onDispose { VoicePlayback.stop() } }
@@ -522,11 +523,7 @@ private fun ChatScreenContent(
     val chatPhotos = remember(chatPhotoEntries) { chatPhotoEntries.map { it.second } }
 
     fun toggleSelect(msg: ChatMessage) {
-        if (msg.id in selectedIds) {
-            selectedIds.remove(msg.id)
-        } else {
-            selectedIds.add(msg.id)
-        }
+        selectedIds = if (msg.id in selectedIds) selectedIds - msg.id else selectedIds + msg.id
     }
 
     val onAction: (ChatMessage, MessageAction) -> Unit = { msg, action ->
@@ -548,7 +545,7 @@ private fun ChatScreenContent(
                 }
             }
             MessageAction.SELECT -> {
-                if (msg.id !in selectedIds) selectedIds.add(msg.id)
+                if (msg.id !in selectedIds) selectedIds = selectedIds + msg.id
             }
             MessageAction.RECALL, MessageAction.DELETE -> confirm = action to msg
         }
@@ -578,19 +575,18 @@ private fun ChatScreenContent(
             containerColor = colors.background,
             topBar = {
                 if (selectedIds.isNotEmpty()) {
-                    val idSet = selectedIds.toSet()
-                    val selectedMessages = chat.messages.filter { it.id in idSet }
+                    val selectedMessages = chat.messages.filter { it.id in selectedIds }
                     val forwardable = selectedMessages.filter { !it.recalled }
                     SelectionTopBar(
                         count = selectedIds.size,
                         canForward = forwardable.isNotEmpty(),
-                        onClose = { selectedIds.clear() },
+                        onClose = { selectedIds = emptySet() },
                         onForward = {
-                            selectedIds.clear()
+                            selectedIds = emptySet()
                             if (forwardable.isNotEmpty()) actions.onForwardMany(forwardable)
                         },
                         onDelete = {
-                            selectedIds.clear()
+                            selectedIds = emptySet()
                             if (selectedMessages.isNotEmpty()) actions.onDeleteMany(selectedMessages)
                         },
                     )
@@ -731,7 +727,7 @@ private fun ChatScreenContent(
                         outboxEntries = threadOutbox,
                         jumpTarget = jumpTarget,
                         searchFocusedId = if (searching) activeSearchMatchId else null,
-                        selectedIds = selectedIds.toSet(),
+                        selectedIds = selectedIds,
                         onToggleSelect = ::toggleSelect,
                         onOpenMenu = { menuFor = it.id },
                         onOpenReactions = { reactionsFor = it.id },
@@ -1250,35 +1246,6 @@ private fun MessageList(
         lastSeenNewestId = newestId
     }
 
-    val floatingDateTs by remember(reversedItems, bottomOffset) {
-        derivedStateOf {
-            if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
-            val offset = bottomOffset
-            val layout = listState.layoutInfo
-            val topItem = layout.visibleItemsInfo
-                .lastOrNull { it.index >= offset && (it.index - offset) < reversedItems.size }
-                ?: return@derivedStateOf null
-            val topIndex = topItem.index - offset
-            val item = reversedItems.getOrNull(topIndex) ?: return@derivedStateOf null
-            val older = reversedItems.getOrNull(topIndex + 1)
-            val hasInlineDayHeader = older == null || !sameDay(older.newestTs, item.oldestTs)
-            // If this day's inline header is already visible at the top of the viewport, don't duplicate it with a pill.
-            val inlineHeaderVisible = hasInlineDayHeader && (topItem.offset + topItem.size) <= layout.viewportEndOffset
-            if (inlineHeaderVisible) null else item.oldestTs
-        }
-    }
-    var showDatePill by remember { mutableStateOf(false) }
-    LaunchedEffect(listState.isScrollInProgress, floatingDateTs) {
-        if (listState.isScrollInProgress && floatingDateTs != null) {
-            showDatePill = true
-        } else if (showDatePill) {
-            delay(800)
-            showDatePill = false
-        }
-    }
-    var lastTopTs by remember { mutableStateOf<Long?>(null) }
-    floatingDateTs?.let { lastTopTs = it }
-
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val maxBubble = maxWidth * 0.78f
         LazyColumn(
@@ -1325,7 +1292,7 @@ private fun MessageList(
                 val olderItem = reversedItems.getOrNull(i + 1)
                 val newerItem = reversedItems.getOrNull(i - 1)
                 Column {
-                    if (olderItem == null || !sameDay(olderItem.newestTs, item.oldestTs)) DayHeader(item.oldestTs)
+                    if (olderItem == null || olderItem.newestDayKey != item.oldestDayKey) DayHeader(item.oldestTs)
                     if (item.firstUnreadAnchor && unreadCount > 0) UnreadDivider(unreadCount)
                     when (item) {
                         is ChatItem.CallGroup -> CallGroupRow(
@@ -1338,11 +1305,10 @@ private fun MessageList(
                         )
                         is ChatItem.Single -> {
                             val msg = item.msg
-                            val systemLabel = systemMessageLabel(msg)
                             val isSelected = msg.id in selectedIds
                             val isSearchFocused = searchFocusedId == msg.id
                             when {
-                                !msg.recalled && msg.attachment?.kind == "call" -> CallSystemRow(
+                                item.isCallLog -> CallSystemRow(
                                     msg = msg,
                                     highlighted = highlightedMsgId == msg.id || isSearchFocused,
                                     selected = isSelected,
@@ -1350,8 +1316,8 @@ private fun MessageList(
                                     onClick = { if (selectionMode) onToggleSelect(msg) },
                                     onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
                                 )
-                                systemLabel != null -> SystemInfoRow(
-                                    label = systemLabel,
+                                item.systemLabel != null -> SystemInfoRow(
+                                    label = item.systemLabel,
                                     ts = msg.ts,
                                     highlighted = highlightedMsgId == msg.id || isSearchFocused,
                                     selected = isSelected,
@@ -1360,11 +1326,13 @@ private fun MessageList(
                                     onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
                                 )
                                 else -> {
-                                    val older = (olderItem as? ChatItem.Single)?.msg?.takeIf { !isSystemLikeRow(it) }
-                                    val newer = (newerItem as? ChatItem.Single)?.msg?.takeIf { !isSystemLikeRow(it) }
-                                    val firstOfRun = older == null || older.fromId != msg.fromId || !sameDay(older.ts, msg.ts) ||
+                                    val olderSingle = (olderItem as? ChatItem.Single)?.takeIf { !it.isSystemLike }
+                                    val newerSingle = (newerItem as? ChatItem.Single)?.takeIf { !it.isSystemLike }
+                                    val older = olderSingle?.msg
+                                    val newer = newerSingle?.msg
+                                    val firstOfRun = older == null || older.fromId != msg.fromId || olderSingle.oldestDayKey != item.oldestDayKey ||
                                         msg.ts - older.ts > GROUP_GAP_MS || msg.id == chat.firstUnreadId
-                                    val lastOfRun = newer == null || newer.fromId != msg.fromId || !sameDay(newer.ts, msg.ts) ||
+                                    val lastOfRun = newer == null || newer.fromId != msg.fromId || newerSingle.oldestDayKey != item.oldestDayKey ||
                                         newer.ts - msg.ts > GROUP_GAP_MS || newer.id == chat.firstUnreadId
                                     MessageRow(
                                         msg = msg,
@@ -1408,28 +1376,12 @@ private fun MessageList(
             }
         }
 
-        AnimatedVisibility(
-            visible = showDatePill && floatingDateTs != null && lastTopTs != null,
-            enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()),
-            exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
+        FloatingDateOverlay(
+            listState = listState,
+            reversedItems = reversedItems,
+            bottomOffset = bottomOffset,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
-        ) {
-            lastTopTs?.let { ts ->
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
-                    contentColor = MaterialTheme.colorScheme.onSurface,
-                    shadowElevation = 3.dp,
-                ) {
-                    Text(
-                        formatDay(ts),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                    )
-                }
-            }
-        }
+        )
 
         if (LocalUltraExpressive.current) {
             FourXBadge(
@@ -1472,6 +1424,72 @@ private fun MessageList(
                         modifier = Modifier.align(Alignment.TopEnd).offset(x = 4.dp, y = (-8).dp),
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Sticky date pill shown while scrolling through message history. Scoped to its own composable and keyed by
+ * calendar [dayKey] so scrolling within the same day never recomposes [MessageList] or this pill.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun FloatingDateOverlay(
+    listState: LazyListState,
+    reversedItems: List<ChatItem>,
+    bottomOffset: Int,
+    modifier: Modifier = Modifier,
+) {
+    val floatingDayKey by remember(listState, reversedItems, bottomOffset) {
+        derivedStateOf {
+            if (!listState.canScrollForward && !listState.canScrollBackward) return@derivedStateOf null
+            val layout = listState.layoutInfo
+            val topItem = layout.visibleItemsInfo
+                .lastOrNull { it.index >= bottomOffset && (it.index - bottomOffset) < reversedItems.size }
+                ?: return@derivedStateOf null
+            val topIndex = topItem.index - bottomOffset
+            val item = reversedItems.getOrNull(topIndex) ?: return@derivedStateOf null
+            val older = reversedItems.getOrNull(topIndex + 1)
+            val hasInlineDayHeader = older == null || older.newestDayKey != item.oldestDayKey
+            // If this day's inline header is already visible at the top of the viewport, don't duplicate it with a pill.
+            val inlineHeaderVisible = hasInlineDayHeader && (topItem.offset + topItem.size) <= layout.viewportEndOffset
+            if (inlineHeaderVisible) null else item.oldestDayKey
+        }
+    }
+    var showDatePill by remember { mutableStateOf(false) }
+    var lastTopDayKey by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(floatingDayKey) {
+        if (floatingDayKey != null) lastTopDayKey = floatingDayKey
+    }
+    LaunchedEffect(listState.isScrollInProgress, floatingDayKey) {
+        if (listState.isScrollInProgress && floatingDayKey != null) {
+            showDatePill = true
+        } else if (showDatePill) {
+            delay(800)
+            showDatePill = false
+        }
+    }
+    val displayDayKey = floatingDayKey ?: lastTopDayKey
+    AnimatedVisibility(
+        visible = showDatePill && floatingDayKey != null && displayDayKey != null,
+        enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()),
+        exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
+        modifier = modifier,
+    ) {
+        displayDayKey?.let { key ->
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                shadowElevation = 3.dp,
+            ) {
+                Text(
+                    formatDayKey(key),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                )
             }
         }
     }
@@ -1710,18 +1728,33 @@ internal sealed interface ChatItem {
     val key: String
     val oldestTs: Long
     val newestTs: Long
+    val oldestDayKey: Long
+    val newestDayKey: Long
     val firstUnreadAnchor: Boolean
     fun containsId(id: String): Boolean
 
-    data class Single(val msg: ChatMessage, override val firstUnreadAnchor: Boolean) : ChatItem {
+    data class Single(
+        val msg: ChatMessage,
+        override val firstUnreadAnchor: Boolean,
+        val isCallLog: Boolean = isCallLogMessage(msg),
+        val systemLabel: String? = if (isCallLog) null else systemMessageLabel(msg),
+        override val oldestDayKey: Long = dayKey(msg.ts),
+    ) : ChatItem {
         override val key: String get() = msg.id
         override val oldestTs: Long get() = msg.ts
         override val newestTs: Long get() = msg.ts
+        override val newestDayKey: Long get() = oldestDayKey
+        val isSystemLike: Boolean get() = isCallLog || systemLabel != null
         override fun containsId(id: String): Boolean = msg.id == id
     }
 
     /** Two or more consecutive call log entries within [CALL_GROUP_WINDOW_MS] on the same day. */
-    data class CallGroup(val calls: List<ChatMessage>, override val firstUnreadAnchor: Boolean) : ChatItem {
+    data class CallGroup(
+        val calls: List<ChatMessage>,
+        override val firstUnreadAnchor: Boolean,
+        override val oldestDayKey: Long = dayKey(calls.first().ts),
+        override val newestDayKey: Long = dayKey(calls.last().ts),
+    ) : ChatItem {
         override val key: String get() = "call-group:${calls.first().id}"
         override val oldestTs: Long get() = calls.first().ts
         override val newestTs: Long get() = calls.last().ts
@@ -1731,8 +1764,6 @@ internal sealed interface ChatItem {
 
 private fun isCallLogMessage(msg: ChatMessage): Boolean = !msg.recalled && msg.attachment?.kind == "call"
 
-private fun isSystemLikeRow(msg: ChatMessage): Boolean = isCallLogMessage(msg) || systemMessageLabel(msg) != null
-
 /**
  * Lazy-list content type of a chat row. It follows the same branches the row renders (call group, call log row,
  * system info row, message bubble), so a recycled row is only reused for a row of the same kind.
@@ -1740,8 +1771,8 @@ private fun isSystemLikeRow(msg: ChatMessage): Boolean = isCallLogMessage(msg) |
 private fun chatItemContentType(item: ChatItem): String = when (item) {
     is ChatItem.CallGroup -> "call-group"
     is ChatItem.Single -> when {
-        isCallLogMessage(item.msg) -> "call"
-        systemMessageLabel(item.msg) != null -> "system"
+        item.isCallLog -> "call"
+        item.systemLabel != null -> "system"
         else -> "message"
     }
 }
@@ -1757,8 +1788,15 @@ internal fun buildChatItems(
     var i = 0
     while (i < messages.size) {
         val m = messages[i]
+        val mDayKey = dayKey(m.ts)
         if (!isCallLogMessage(m)) {
-            out += ChatItem.Single(m, firstUnreadAnchor = m.id == firstUnreadId)
+            out += ChatItem.Single(
+                msg = m,
+                firstUnreadAnchor = m.id == firstUnreadId,
+                isCallLog = false,
+                systemLabel = systemMessageLabel(m),
+                oldestDayKey = mDayKey,
+            )
             i++
             continue
         }
@@ -1768,13 +1806,23 @@ internal fun buildChatItems(
             val next = messages[j]
             if (!isCallLogMessage(next)) break
             if (next.id == firstUnreadId) break
-            if (!sameDay(group.last().ts, next.ts)) break
+            if (dayKey(next.ts) != mDayKey) break
             if (next.ts - group.last().ts > windowMs) break
             group += next
             j++
         }
         val anchor = m.id == firstUnreadId
-        out += if (group.size >= 2) ChatItem.CallGroup(group, firstUnreadAnchor = anchor) else ChatItem.Single(m, firstUnreadAnchor = anchor)
+        out += if (group.size >= 2) {
+            ChatItem.CallGroup(group, firstUnreadAnchor = anchor, oldestDayKey = mDayKey, newestDayKey = mDayKey)
+        } else {
+            ChatItem.Single(
+                msg = m,
+                firstUnreadAnchor = anchor,
+                isCallLog = true,
+                systemLabel = null,
+                oldestDayKey = mDayKey,
+            )
+        }
         i = j
     }
     return out
@@ -2369,32 +2417,41 @@ private fun StickerBubble(
 @Composable
 private fun messageText(msg: ChatMessage, onOutgoing: Boolean, onOpenUrl: (String) -> Unit): AnnotatedString {
     val linkColor = if (onOutgoing) LocalChatColors.current.onOutgoing else MaterialTheme.colorScheme.primary
-    return buildAnnotatedString {
-        val text = bubbleText(msg)
-        append(text)
-        for (m in msg.mentions) {
-            val start = m.pos.coerceIn(0, text.length)
-            val end = (m.pos + m.len).coerceIn(start, text.length)
-            if (end > start) addStyle(SpanStyle(fontWeight = FontWeight.Bold), start, end)
-        }
-        val linkStyle = TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline))
-        for (range in extractUrls(text)) {
-            val url = text.substring(range)
-            addLink(
-                LinkAnnotation.Url(
-                    url = url,
-                    styles = linkStyle,
-                    linkInteractionListener = LinkInteractionListener { onOpenUrl(url) },
-                ),
-                start = range.first,
-                end = range.last + 1,
-            )
-        }
-        msg.attachment?.let { a ->
-            val label = a.title?.takeIf { it.isNotBlank() } ?: a.href ?: "Attachment"
-            if (text != label && !text.endsWith(label)) {
-                if (text.isNotBlank()) append("\n")
-                append("📎 $label")
+    val currentOnOpenUrl by rememberUpdatedState(onOpenUrl)
+    val text = bubbleText(msg)
+    val attachmentLabel = msg.attachment?.let { a -> a.title?.takeIf { it.isNotBlank() } ?: a.href ?: "Attachment" }
+    return remember(text, msg.mentions, attachmentLabel, linkColor) {
+        val urls = extractUrls(text)
+        val appendAttachment = attachmentLabel != null && text != attachmentLabel && !text.endsWith(attachmentLabel)
+        if (msg.mentions.isEmpty() && urls.isEmpty() && !appendAttachment) {
+            AnnotatedString(text)
+        } else {
+            buildAnnotatedString {
+                append(text)
+                for (m in msg.mentions) {
+                    val start = m.pos.coerceIn(0, text.length)
+                    val end = (m.pos + m.len).coerceIn(start, text.length)
+                    if (end > start) addStyle(SpanStyle(fontWeight = FontWeight.Bold), start, end)
+                }
+                if (urls.isNotEmpty()) {
+                    val linkStyle = TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline))
+                    for (range in urls) {
+                        val url = text.substring(range)
+                        addLink(
+                            LinkAnnotation.Url(
+                                url = url,
+                                styles = linkStyle,
+                                linkInteractionListener = LinkInteractionListener { currentOnOpenUrl(url) },
+                            ),
+                            start = range.first,
+                            end = range.last + 1,
+                        )
+                    }
+                }
+                if (appendAttachment) {
+                    if (text.isNotBlank()) append("\n")
+                    append("📎 $attachmentLabel")
+                }
             }
         }
     }
@@ -2404,20 +2461,28 @@ private fun messageText(msg: ChatMessage, onOutgoing: Boolean, onOpenUrl: (Strin
 private fun linkifiedAnnotatedString(text: String, onOutgoing: Boolean, onOpenUrl: (String) -> Unit): AnnotatedString {
     if (text.isEmpty()) return AnnotatedString("")
     val linkColor = if (onOutgoing) LocalChatColors.current.onOutgoing else MaterialTheme.colorScheme.primary
-    return buildAnnotatedString {
-        append(text)
-        val linkStyle = TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline))
-        for (range in extractUrls(text)) {
-            val url = text.substring(range)
-            addLink(
-                LinkAnnotation.Url(
-                    url = url,
-                    styles = linkStyle,
-                    linkInteractionListener = LinkInteractionListener { onOpenUrl(url) },
-                ),
-                start = range.first,
-                end = range.last + 1,
-            )
+    val currentOnOpenUrl by rememberUpdatedState(onOpenUrl)
+    return remember(text, linkColor) {
+        val urls = extractUrls(text)
+        if (urls.isEmpty()) {
+            AnnotatedString(text)
+        } else {
+            buildAnnotatedString {
+                append(text)
+                val linkStyle = TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline))
+                for (range in urls) {
+                    val url = text.substring(range)
+                    addLink(
+                        LinkAnnotation.Url(
+                            url = url,
+                            styles = linkStyle,
+                            linkInteractionListener = LinkInteractionListener { currentOnOpenUrl(url) },
+                        ),
+                        start = range.first,
+                        end = range.last + 1,
+                    )
+                }
+            }
         }
     }
 }
@@ -3704,7 +3769,7 @@ internal fun findMessageMatches(messages: List<ChatMessage>, query: String): Lis
 
 /** Ranges of `http://` / `https://` URLs in [text], with trailing sentence punctuation stripped. */
 internal fun extractUrls(text: String): List<IntRange> {
-    if (text.isEmpty()) return emptyList()
+    if (text.length < 8 || !text.contains("://")) return emptyList()
     val out = mutableListOf<IntRange>()
     for (match in URL_REGEX.findAll(text)) {
         val start = match.range.first

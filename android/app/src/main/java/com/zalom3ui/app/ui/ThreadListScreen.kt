@@ -110,7 +110,6 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
@@ -125,8 +124,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.zalom3ui.app.R
@@ -337,6 +337,9 @@ fun ThreadListScreen(
     val visibleChats = remember(chats, activeFilter, searching, hideOfficialAccounts, hiddenChats) {
         if (searching) chats else chatsForFilter(chats, activeFilter, hideOfficialAccounts, hiddenChats)
     }
+    val (pinnedChats, otherChats) = remember(visibleChats) {
+        visibleChats.partition { it.pinned }
+    }
     val folded = foldForSearch(query.trim())
     val matches = remember(threads, folded) {
         if (folded.isEmpty()) emptyList() else threads.filter { foldForSearch(it.name).contains(folded) }
@@ -439,12 +442,12 @@ fun ThreadListScreen(
         },
     ) { padding ->
         val ultra = LocalUltraExpressive.current
+        val listContentPadding = remember(padding, ultra) {
+            ExtraBottomPaddingValues(padding, extraBottom = if (ultra) 180.dp else 120.dp)
+        }
         Box(Modifier.fillMaxSize()) {
             LazyColumn(
-                contentPadding = PaddingValues(
-                    top = padding.calculateTopPadding(),
-                    bottom = padding.calculateBottomPadding() + if (ultra) 180.dp else 120.dp,
-                ),
+                contentPadding = listContentPadding,
                 modifier = Modifier.fillMaxSize(),
             ) {
             if (searching && query.isNotBlank()) {
@@ -562,11 +565,9 @@ fun ThreadListScreen(
                         }
                     }
                 } else {
-                    val pinned = visibleChats.filter { it.pinned }
-                    val others = visibleChats.filterNot { it.pinned }
-                    if (pinned.isNotEmpty()) {
+                    if (pinnedChats.isNotEmpty()) {
                         item(key = "h-pinned", contentType = "header") { SectionHeader("Pinned") }
-                        items(pinned, key = { it.key }, contentType = { "thread" }) { thread ->
+                        items(pinnedChats, key = { it.key }, contentType = { "thread" }) { thread ->
                             ConversationRow(
                                 thread = thread,
                                 selected = thread.key == selectedKey,
@@ -578,9 +579,9 @@ fun ThreadListScreen(
                                 onAction = { onRowAction(thread, it) },
                             )
                         }
-                        if (others.isNotEmpty()) item(key = "h-chats", contentType = "header") { SectionHeader("Chats") }
+                        if (otherChats.isNotEmpty()) item(key = "h-chats", contentType = "header") { SectionHeader("Chats") }
                     }
-                    items(others, key = { it.key }, contentType = { "thread" }) { thread ->
+                    items(otherChats, key = { it.key }, contentType = { "thread" }) { thread ->
                         ConversationRow(
                             thread = thread,
                             selected = thread.key == selectedKey,
@@ -609,7 +610,8 @@ fun ThreadListScreen(
                     size = 86.dp,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(top = padding.calculateTopPadding() + 4.dp, end = 12.dp),
+                        .padding(padding)
+                        .padding(top = 4.dp, end = 12.dp),
                 )
             }
         }
@@ -651,6 +653,23 @@ fun ThreadListScreen(
             },
         )
     }
+}
+
+/**
+ * Delegating [PaddingValues] that adds [extraBottom] without reading [base] during composition, so collapsing a
+ * [MediumFlexibleTopAppBar] only re-measures the [LazyColumn] instead of recomposing [ThreadListScreen].
+ */
+private class ExtraBottomPaddingValues(
+    private val base: PaddingValues,
+    private val extraBottom: Dp,
+) : PaddingValues {
+    override fun calculateLeftPadding(layoutDirection: LayoutDirection): Dp = base.calculateLeftPadding(layoutDirection)
+    override fun calculateTopPadding(): Dp = base.calculateTopPadding()
+    override fun calculateRightPadding(layoutDirection: LayoutDirection): Dp = base.calculateRightPadding(layoutDirection)
+    override fun calculateBottomPadding(): Dp = base.calculateBottomPadding() + extraBottom
+    override fun equals(other: Any?): Boolean =
+        other is ExtraBottomPaddingValues && base == other.base && extraBottom == other.extraBottom
+    override fun hashCode(): Int = 31 * base.hashCode() + extraBottom.hashCode()
 }
 
 private const val MAX_RESULTS = 100
@@ -872,10 +891,6 @@ private fun ConversationRow(
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
     val reducedMotion = LocalReducedMotion.current
-    var rowWidthPx by remember { mutableFloatStateOf(0f) }
-    // Like Gmail/Messages: the action arms at ~38% of the row width and the row can travel up to 65%.
-    val thresholdPx = swipeThresholdPx(rowWidthPx, with(density) { 72.dp.toPx() })
-    val maxSwipePx = if (rowWidthPx > 0f) rowWidthPx * SWIPE_MAX_FRACTION else with(density) { 140.dp.toPx() }
     val labelRevealStartPx = with(density) { 36.dp.toPx() }
     val labelRevealSpanPx = with(density) { 84.dp.toPx() }
     val resetSpec = MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
@@ -907,7 +922,7 @@ private fun ConversationRow(
         }
     }
 
-    Box(Modifier.fillMaxWidth().onSizeChanged { rowWidthPx = it.width.toFloat() }) {
+    Box(Modifier.fillMaxWidth()) {
         if (offsetX != 0f) {
             val swipingRight = offsetX > 0f
             val progress = ((abs(offsetX) - labelRevealStartPx) / labelRevealSpanPx).coerceIn(0f, 1f)
@@ -980,17 +995,24 @@ private fun ConversationRow(
                 .fillMaxWidth()
                 .offset { IntOffset(offsetX.roundToInt(), 0) }
                 .background(colors.background)
-                .pointerInput(swipeEnabled, thread.key, thresholdPx, maxSwipePx) {
+                .pointerInput(swipeEnabled, thread.key) {
                     if (!swipeEnabled) return@pointerInput
+                    // Like Gmail/Messages: the action arms at ~38% of the row width and the row can travel up to 65%.
+                    val fallbackThresholdPx = 72.dp.toPx()
+                    val fallbackMaxSwipePx = 140.dp.toPx()
                     var crossed = false
                     detectHorizontalDragGestures(
                         onDragStart = {
                             resetJob?.cancel()
+                            val thresholdPx = swipeThresholdPx(size.width.toFloat(), fallbackThresholdPx)
                             crossed = abs(offsetX) >= thresholdPx
                             armed = crossed
                         },
                         onHorizontalDrag = { change, dragAmount ->
                             change.consume()
+                            val widthPx = size.width.toFloat()
+                            val thresholdPx = swipeThresholdPx(widthPx, fallbackThresholdPx)
+                            val maxSwipePx = if (widthPx > 0f) widthPx * SWIPE_MAX_FRACTION else fallbackMaxSwipePx
                             val damped = if (abs(offsetX) > thresholdPx && offsetX * dragAmount > 0f) {
                                 dragAmount * 0.35f
                             } else {
@@ -1009,6 +1031,7 @@ private fun ConversationRow(
                             }
                         },
                         onDragEnd = {
+                            val thresholdPx = swipeThresholdPx(size.width.toFloat(), fallbackThresholdPx)
                             val current = latestThread
                             when {
                                 offsetX > 0f && swipeTriggers(offsetX, thresholdPx) -> latestOnAction(if (current.unread > 0) RowAction.READ else RowAction.UNREAD)

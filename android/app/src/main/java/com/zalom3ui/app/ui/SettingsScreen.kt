@@ -210,9 +210,7 @@ fun SettingsScreen(
     ) { padding ->
         AnimatedContent(
             targetState = page,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+            modifier = Modifier.fillMaxSize(),
             transitionSpec = {
                 if (reducedMotion) {
                     EnterTransition.None togetherWith ExitTransition.None
@@ -224,12 +222,21 @@ fun SettingsScreen(
             },
             label = "settingsPage",
         ) { target ->
-            Column(
+            // Keep Scaffold padding inside the unbounded scroll child rather than on AnimatedContent:
+            // collapsing MediumFlexibleTopAppBar then shifts only this Box's placement instead of
+            // changing height constraints and re-measuring every settings card on every pixel.
+            Box(
                 Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState()),
             ) {
-                if (target != SettingsPage.TOP) Spacer(Modifier.height(8.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(padding),
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        if (target != SettingsPage.TOP) Spacer(Modifier.height(8.dp))
                 when (target) {
                     SettingsPage.TOP -> {
                         if (loggedIn) {
@@ -682,6 +689,8 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(Modifier.height(28.dp))
+                    }
+                }
             }
         }
     }

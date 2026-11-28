@@ -42,6 +42,7 @@ import com.zalom3ui.app.data.isOfficialShownOverride
 import com.zalom3ui.app.ui.call.CallActivity
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -92,6 +93,12 @@ class MessageNotifier(
     @Volatile
     private var lastThreadsFetchMs = 0L
 
+    /** Thread keys seen in the latest thread list, so known non-OA 1:1 chats skip forced `/api/threads` refreshes. */
+    private val knownThreadKeys = ConcurrentHashMap.newKeySet<String>()
+    /** Monotonic counter bumped on `ThreadsChanged` and caught up after each successful thread-list fetch. */
+    private val threadsEventGen = AtomicLong(0L)
+    private val threadsSyncedGen = AtomicLong(-1L)
+
     /** Thread keys of Official Accounts, refreshed with the thread list; read when "Hide official accounts" is on. */
     private val officialAccountKeys = ConcurrentHashMap.newKeySet<String>()
     private val settings by lazy { SettingsStore(context) }
@@ -124,10 +131,15 @@ class MessageNotifier(
             is ServerEvent.Read -> cancel(event.thread)
             is ServerEvent.CallIncoming -> showCall(event.call)
             is ServerEvent.CallEnded -> endCall(event.callId)
-            is ServerEvent.ThreadsChanged -> scope?.launch(Dispatchers.IO) { refreshAvatarUrls(force = false) }
+            is ServerEvent.ThreadsChanged -> {
+                threadsEventGen.incrementAndGet()
+                scope?.launch(Dispatchers.IO) { refreshAvatarUrls(force = false) }
+            }
             else -> Unit
         }
     }
+
+    private fun hasPendingThreadChanges(): Boolean = threadsSyncedGen.get() < threadsEventGen.get()
 
     /** With "Hide official accounts" on, an Official Account's message posts no notification. */
     private fun showUnlessOfficial(msg: ChatMessage, threadName: String) {
@@ -138,10 +150,17 @@ class MessageNotifier(
             show(msg, threadName)
             return
         }
+        if (key in officialAccountKeys) return
+        if (key in knownThreadKeys && !hasPendingThreadChanges()) {
+            show(msg, threadName)
+            return
+        }
         val targetScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
         targetScope.launch(Dispatchers.IO) {
             // The core flags the chat before it announces the message, so a fresh list already knows a new OA.
-            if (key !in officialAccountKeys) refreshAvatarUrls(force = true)
+            if (key !in officialAccountKeys && (key !in knownThreadKeys || hasPendingThreadChanges())) {
+                refreshAvatarUrls(force = true)
+            }
             if (key !in officialAccountKeys) show(msg, threadName)
         }
     }
@@ -150,11 +169,14 @@ class MessageNotifier(
         val now = SystemClock.elapsedRealtime()
         if (!force && now - lastThreadsFetchMs < THREADS_REFRESH_MIN_MS) return
         lastThreadsFetchMs = now
+        val targetGen = threadsEventGen.get()
         val threads = runCatching { ApiClient.onDevice(context).threads() }.getOrNull() ?: return
         for (t in threads) {
+            knownThreadKeys.add(t.key)
             if (t.avatar.isNotBlank()) avatarUrls[t.key] = t.avatar
             if (t.isOfficialAccount) officialAccountKeys.add(t.key) else officialAccountKeys.remove(t.key)
         }
+        threadsSyncedGen.updateAndGet { prev -> maxOf(prev, targetGen) }
     }
 
     private fun show(msg: ChatMessage, threadName: String) {

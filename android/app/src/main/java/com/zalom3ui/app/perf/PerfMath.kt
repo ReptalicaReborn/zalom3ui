@@ -36,9 +36,10 @@ class FrameAccumulator(initialBudgetNs: Long) {
     @Volatile
     var budgetNs: Long = initialBudgetNs
 
-    fun add(durationNs: Long) {
+    fun add(durationNs: Long, deadlineNs: Long = budgetNs) {
         if (durationNs < 0) return
-        val over = durationNs > budgetNs
+        val limit = if (deadlineNs > 0L) deadlineNs else budgetNs
+        val over = durationNs > limit
         synchronized(lock) {
             count++
             sumNs += durationNs

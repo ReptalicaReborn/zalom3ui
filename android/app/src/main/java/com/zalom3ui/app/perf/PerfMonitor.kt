@@ -184,7 +184,12 @@ internal class PerfSampler(
         val h = Handler(thread.looper)
         handler = h
         val listener = Window.OnFrameMetricsAvailableListener { _, metrics, _ ->
-            onFrame(metrics.getMetric(FrameMetrics.TOTAL_DURATION))
+            val deadlineNs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                metrics.getMetric(FrameMetrics.DEADLINE)
+            } else {
+                0L
+            }
+            onFrame(metrics.getMetric(FrameMetrics.TOTAL_DURATION), deadlineNs)
         }
         // Only drawn frames are reported (unlike a Choreographer callback, which ticks on every vsync).
         if (runCatching { window.addOnFrameMetricsAvailableListener(listener, h) }.isSuccess) frameListener = listener
@@ -227,9 +232,10 @@ internal class PerfSampler(
     }
 
     /** On the frame-metrics thread: one frame was drawn. */
-    private fun onFrame(totalNs: Long) {
-        frames.add(totalNs)
-        if (log && totalNs >= JANK_EVENT_NS && jankLimiter.allow(SystemClock.elapsedRealtime())) {
+    private fun onFrame(totalNs: Long, deadlineNs: Long) {
+        frames.add(totalNs, deadlineNs)
+        val effectiveDeadline = if (deadlineNs > 0L) deadlineNs else frames.budgetNs
+        if (log && totalNs >= JANK_EVENT_NS && totalNs > effectiveDeadline && jankLimiter.allow(SystemClock.elapsedRealtime())) {
             PerfLog.write(app, PerfFormat.jankLine(totalNs / 1_000_000f, PerfMonitor.screen))
         }
     }

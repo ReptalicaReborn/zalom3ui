@@ -60,6 +60,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 data class ChatState(
@@ -257,6 +258,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** The foreground-service start waiting for the chat list to draw (see [startLiveUpdates]). */
     private var serviceStartJob: Job? = null
     private var messageSearchJob: Job? = null
+    private var openChatJob: Job? = null
+    private var groupBoardJob: Job? = null
+    private var syncShortcutsJob: Job? = null
+    /** Elapsed-realtime timestamp of the last shortcut push per [ThreadRef.key], throttled by [SHORTCUT_PUSH_TTL_MS]. */
+    private val lastShortcutPushMs = ConcurrentHashMap<String, Long>()
     private var visible = false
     private var lastTypingSent = 0L
     /** When the live loop last (re)started the on-phone server; errors are expected while it boots. */
@@ -439,6 +445,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val wasOnWatch = _state.value.settings.onDevice
         restartJob?.cancel()
         restartJob = null
+        openChatJob?.cancel()
+        openChatJob = null
+        groupBoardJob?.cancel()
+        groupBoardJob = null
+        syncShortcutsJob?.cancel()
+        syncShortcutsJob = null
+        lastShortcutPushMs.clear()
         settingsStore.save(settings)
         if (wasOnWatch && !settings.onDevice) {
             // Leaving the on-phone core: stop its service and the core, so it stops talking to Zalo.
@@ -482,6 +495,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun logout() {
         VoicePlayback.stop()
+        openChatJob?.cancel()
+        openChatJob = null
+        groupBoardJob?.cancel()
+        groupBoardJob = null
+        syncShortcutsJob?.cancel()
+        syncShortcutsJob = null
+        lastShortcutPushMs.clear()
         outbox.clear()
         _disappearingTtl.value = emptyMap()
         _groupBoards.value = emptyMap()
@@ -631,28 +651,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(thread: ThreadSummary) {
         // On a tablet this leaves the chat beside the list without closing it: its draft shows in the list at once.
         flushDrafts()
+        openChatJob?.cancel()
+        openChatJob = null
+        groupBoardJob?.cancel()
+        groupBoardJob = null
         _state.update { it.copy(chat = ChatState(thread.kind, thread.id, thread.name)) }
         pushShortcutForRef(thread.ref, fallbackName = thread.name, fallbackAvatar = thread.avatar)
         if (visible) viewModelScope.launch { runCatching { client?.setPresence(thread.ref) } }
-        launchApi(onDone = { updateChat(thread.ref) { it.copy(loading = false) } }) { api ->
-            val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
-            val unread = _state.value.threads.firstOrNull { it.ref == thread.ref }?.unread ?: thread.unread
-            val firstUnread = if (unread > 0) res.messages.filter { !it.isSelf }.takeLast(unread).firstOrNull()?.id else null
-            updateChat(thread.ref) {
-                it.copy(
-                    name = it.name.ifBlank { res.thread?.name.orEmpty() },
-                    messages = merge(it.messages, res.messages),
-                    loading = false,
-                    hasMore = res.messages.size >= PAGE_SIZE,
-                    firstUnreadId = firstUnread,
-                )
+        val api = client
+        if (api == null) {
+            updateChat(thread.ref) { it.copy(loading = false) }
+            return
+        }
+        openChatJob = viewModelScope.launch {
+            try {
+                val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
+                val unread = _state.value.threads.firstOrNull { it.ref == thread.ref }?.unread ?: thread.unread
+                val firstUnread = if (unread > 0) res.messages.filter { !it.isSelf }.takeLast(unread).firstOrNull()?.id else null
+                updateChat(thread.ref) {
+                    it.copy(
+                        name = it.name.ifBlank { res.thread?.name.orEmpty() },
+                        messages = merge(it.messages, res.messages),
+                        loading = false,
+                        hasMore = res.messages.size >= PAGE_SIZE,
+                        firstUnreadId = firstUnread,
+                    )
+                }
+                // While the saved session still reconnects, Zalo can't be told this chat was seen, and marking it read here
+                // would drop that receipt for good: it is marked once signed in (see the status event).
+                if (unread > 0 && _state.value.status?.connectingWithSavedSession() != true) {
+                    markRead(api, thread.ref)
+                }
+                val details = try {
+                    api.details(thread.kind, thread.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                if (details?.lastOnline != null) updateChat(thread.ref) { it.copy(lastOnline = details.lastOnline) }
+                if (details?.members != null) updateChat(thread.ref) { it.copy(members = details.members) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message ?: "Something went wrong") }
+            } finally {
+                updateChat(thread.ref) { it.copy(loading = false) }
             }
-            // While the saved session still reconnects, Zalo can't be told this chat was seen, and marking it read here
-            // would drop that receipt for good: it is marked once signed in (see the status event).
-            if (_state.value.status?.connectingWithSavedSession() != true) markRead(api, thread.ref)
-            val details = runCatching { api.details(thread.kind, thread.id) }.getOrNull()
-            if (details?.lastOnline != null) updateChat(thread.ref) { it.copy(lastOnline = details.lastOnline) }
-            if (details?.members != null) updateChat(thread.ref) { it.copy(members = details.members) }
         }
     }
 
@@ -661,7 +706,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         flushDrafts()
         val closing = _state.value.chat?.ref
         _state.update { if (ref == null || it.chat?.ref == ref) it.copy(chat = null, scrollToMsgId = null) else it }
-        if (closing != null && _state.value.chat == null) viewModelScope.launch { runCatching { client?.setPresence(null) } }
+        if (closing != null && _state.value.chat == null) {
+            openChatJob?.cancel()
+            openChatJob = null
+            groupBoardJob?.cancel()
+            groupBoardJob = null
+            viewModelScope.launch { runCatching { client?.setPresence(null) } }
+        }
     }
 
     fun loadEarlier() {
@@ -697,18 +748,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_state.value.status?.state != "ready") return
         if (outbox.pendingCount() == 0) return
         viewModelScope.launch {
-            val sent = outbox.flushAll { entry ->
+            outbox.flushAll { entry ->
                 runCatching {
                     sendTextOrLink(api, entry.thread, entry.text, entry.quoteId, entry.mentions, entry.ttl)
                     pushShortcutForRef(entry.thread)
-                }
-            }
-            if (sent > 0) {
-                _state.value.chat?.let { chat ->
-                    val res = runCatching { api.messages(chat.kind, chat.id, PAGE_SIZE) }.getOrNull()
-                    if (res != null) {
-                        updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages)) }
-                    }
                 }
             }
         }
@@ -782,13 +825,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 sendTextOrLink(api, ref, item.text, item.quoteId, item.mentions, ttl)
                 pushShortcutForRef(ref)
-                val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
                 updateChat(ref) { chat ->
-                    val updatedMessages = if (res != null) merge(chat.messages, res.messages) else chat.messages
-                    chat.copy(
-                        messages = updatedMessages,
-                        pending = chat.pending.filterNot { it.localId == item.localId },
-                    )
+                    chat.copy(pending = chat.pending.filterNot { it.localId == item.localId })
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -855,10 +893,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         launchApi { api ->
             api.sendCard(ref.kind, ref.id, userId, phone = phone, ttl = ttl)
             pushShortcutForRef(ref)
-            val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
-            if (res != null) {
-                updateChat(ref) { it.copy(messages = merge(it.messages, res.messages)) }
-            }
             _state.update { it.copy(notice = "Contact shared") }
         }
     }
@@ -869,10 +903,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         launchApi { api ->
             api.sendLink(ref.kind, ref.id, link, message = message, ttl = ttl)
             pushShortcutForRef(ref)
-            val res = runCatching { api.messages(ref.kind, ref.id, PAGE_SIZE) }.getOrNull()
-            if (res != null) {
-                updateChat(ref) { it.copy(messages = merge(it.messages, res.messages)) }
-            }
         }
     }
 
@@ -965,7 +995,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Uploads a recorded voice message to the open chat, refreshes messages, and deletes the temp file. */
+    /** Uploads a recorded voice message to the open chat and deletes the temp file. */
     fun sendVoice(file: File) {
         val chat = _state.value.chat
         if (chat == null) {
@@ -978,10 +1008,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val api = client ?: throw ApiException("Not connected to the server")
                 api.sendVoice(chat.ref, file)
                 pushShortcutForRef(chat.ref)
-                val res = runCatching { api.messages(chat.kind, chat.id, PAGE_SIZE) }.getOrNull()
-                if (res != null) {
-                    updateChat(chat.ref) { it.copy(messages = merge(it.messages, res.messages)) }
-                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1093,6 +1119,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         launchApi { api ->
             api.changeFriendAlias(userId, trimmed)
             val ref = ThreadRef("user", userId)
+            lastShortcutPushMs.remove(ref.key)
             updateChat(ref) { it.copy(name = trimmed) }
             refreshThreads(api)
             _state.update { it.copy(notice = "Nickname updated") }
@@ -1103,6 +1130,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         api.removeFriendAlias(userId)
         refreshThreads(api)
         val ref = ThreadRef("user", userId)
+        lastShortcutPushMs.remove(ref.key)
         val refreshedName = _state.value.threads.firstOrNull { it.ref == ref }?.name
         if (!refreshedName.isNullOrBlank()) {
             updateChat(ref) { it.copy(name = refreshedName) }
@@ -1182,6 +1210,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (chat.kind != "group" || trimmed.isEmpty()) return
         launchApi { api ->
             api.renameGroup(chat.id, trimmed)
+            lastShortcutPushMs.remove(chat.ref.key)
             updateChat(chat.ref) { it.copy(name = trimmed) }
         }
     }
@@ -1192,6 +1221,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (chat.kind != "group") return
         launchApi { api ->
             api.leaveGroup(chat.id, silent)
+            lastShortcutPushMs.remove(chat.ref.key)
             ConversationShortcuts.removeShortcut(getApplication(), chat.ref)
             _state.update { it.copy(notice = "You left ${chat.name}") }
             onLeft()
@@ -1241,10 +1271,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadGroupBoard(groupId: String) {
         val api = client ?: return
-        viewModelScope.launch {
-            runCatching { api.groupBoard(groupId) }.onSuccess { resp ->
+        groupBoardJob?.cancel()
+        groupBoardJob = viewModelScope.launch {
+            try {
+                val resp = api.groupBoard(groupId)
                 val items = resp.items.map { it.toBoardNoteItem() }
                 _groupBoards.update { it + (groupId to items) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
             }
         }
     }
@@ -1370,6 +1405,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteConversation(ref: ThreadRef) = launchApi { api ->
         api.deleteConversation(ref.kind, ref.id)
+        lastShortcutPushMs.remove(ref.key)
         ConversationShortcuts.removeShortcut(getApplication(), ref)
         updateChat(ref) { it.copy(messages = emptyList(), hasMore = false) }
     }
@@ -1539,13 +1575,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun syncShortcutsAsync(threads: List<ThreadSummary>) {
         val app = getApplication<Application>()
-        viewModelScope.launch(Dispatchers.IO) {
+        syncShortcutsJob?.cancel()
+        syncShortcutsJob = viewModelScope.launch(Dispatchers.IO) {
             delay(SHORTCUT_SYNC_DELAY_MS) // not needed while the first frames draw
             runCatching { ConversationShortcuts.syncRecentShortcuts(app, threads) }
         }
     }
 
     private fun pushShortcutForRef(ref: ThreadRef, fallbackName: String = "", fallbackAvatar: String? = null) {
+        val now = SystemClock.elapsedRealtime()
+        val lastPush = lastShortcutPushMs[ref.key]
+        if (lastPush != null && now - lastPush < SHORTCUT_PUSH_TTL_MS) return
         val thread = _state.value.threads.firstOrNull { it.ref == ref }
         val openChat = _state.value.chat?.takeIf { it.ref == ref }
         val title = thread?.name?.ifBlank { null }
@@ -1553,6 +1593,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             ?: fallbackName.ifBlank { null }
             ?: return
         val avatar = thread?.avatar?.takeIf { it.isNotBlank() } ?: fallbackAvatar?.takeIf { it.isNotBlank() }
+        lastShortcutPushMs[ref.key] = now
         val app = getApplication<Application>()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
@@ -1613,6 +1654,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private const val SERVICE_START_AFTER_DATA_MS = 500L
         private const val SERVICE_START_MAX_WAIT_MS = 2_000L
         private const val SHORTCUT_SYNC_DELAY_MS = 1_500L
+        private const val SHORTCUT_PUSH_TTL_MS = 5 * 60_000L
         private const val LOCAL_BOOT_RETRY_MS = 1_000L
         private const val MESSAGE_SEARCH_DEBOUNCE_MS = 250L
         /** How long typing must pause before a draft is saved. */

@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
@@ -45,6 +45,10 @@ const GROUP_INFO_BATCH: usize = 50;
 const MEMBER_INFO_BATCH: usize = 100;
 const MEMBERS_CACHE_MS: i64 = 10 * 60_000;
 const MAX_MEMBERS_CACHE: usize = 200;
+const LAST_ONLINE_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_LAST_ONLINE_CACHE: usize = 256;
+const GROUP_BOARD_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_GROUP_BOARD_CACHE: usize = 128;
 const MAX_POLL_GROUPS_CACHE: usize = 500;
 const MAX_LOOKED_UP_USERS: usize = 2_000;
 const SEEN_RECEIPT_LIMIT: usize = 50;
@@ -215,6 +219,8 @@ struct SessionInner {
     resuming: bool,
     members: HashMap<String, (i64, Vec<GroupMember>)>,
     group_member_ids: HashMap<String, HashSet<String>>,
+    last_online_cache: HashMap<String, (Instant, Option<i64>)>,
+    group_board_cache: HashMap<(String, Option<u32>, Option<u32>), (Instant, Vec<BoardItem>)>,
     poll_groups: HashMap<i64, String>,
     poll_group_order: VecDeque<i64>,
     friend_list: HashMap<String, Person>,
@@ -241,6 +247,11 @@ impl SessionInner {
     /// (logged in, rejected, logged out, replaced by a QR login) and a QR login never claims one.
     fn sync_resuming(&mut self) {
         self.status.resuming = self.resuming && self.status.state == SessionState::LoggingIn;
+    }
+
+    fn invalidate_group_board(&mut self, group_id: &str) {
+        self.group_board_cache
+            .retain(|(gid, _, _), _| gid != group_id);
     }
 
     fn remember_poll_group(&mut self, poll_id: i64, group_id: String) {
@@ -285,6 +296,8 @@ impl Default for SessionInner {
             resuming: false,
             members: HashMap::new(),
             group_member_ids: HashMap::new(),
+            last_online_cache: HashMap::new(),
+            group_board_cache: HashMap::new(),
             poll_groups: HashMap::new(),
             poll_group_order: VecDeque::new(),
             friend_list: HashMap::new(),
@@ -823,6 +836,8 @@ impl ZaloSession {
                 s.client = None;
                 s.members.clear();
                 s.group_member_ids.clear();
+                s.last_online_cache.clear();
+                s.group_board_cache.clear();
                 s.poll_groups.clear();
                 s.poll_group_order.clear();
                 s.friend_list.clear();
@@ -1286,6 +1301,7 @@ impl ZaloSession {
                 }
                 if let Ok(mut s) = self.inner.write() {
                     s.members.remove(&thread_id);
+                    s.invalidate_group_board(&thread_id);
                 }
                 let session = Arc::clone(self);
                 let c = Arc::clone(client);
@@ -1543,6 +1559,7 @@ impl ZaloSession {
             if msg.thread_kind == ThreadKind::Group {
                 if let Ok(mut s) = self.inner.write() {
                     s.remember_poll_group(poll.poll_id, msg.thread_id.clone());
+                    s.invalidate_group_board(&msg.thread_id);
                 }
             }
             if poll.event.is_some() {
@@ -2235,6 +2252,13 @@ impl ZaloSession {
 
     pub async fn last_online(&self, user_id: &str) -> Result<Option<i64>, HttpError> {
         let client = self.api()?;
+        if let Ok(s) = self.inner.read() {
+            if let Some(&(at, value)) = s.last_online_cache.get(user_id) {
+                if at.elapsed() < LAST_ONLINE_CACHE_TTL {
+                    return Ok(value);
+                }
+            }
+        }
         let res = client.last_online(user_id).await.map_err(proto_to_http_error)?;
         let show = res
             .get("settings")
@@ -2242,11 +2266,29 @@ impl ZaloSession {
             .map(js_truthy)
             .unwrap_or(false);
         let ts = res.get("lastOnline").map(|v| val_to_i64(Some(v))).unwrap_or(0);
-        if show && ts > 0 {
-            Ok(Some(ts))
-        } else {
-            Ok(None)
+        let value = if show && ts > 0 { Some(ts) } else { None };
+        if let Ok(mut s) = self.inner.write() {
+            let now = Instant::now();
+            if s.last_online_cache.len() >= MAX_LAST_ONLINE_CACHE
+                && !s.last_online_cache.contains_key(user_id)
+            {
+                s.last_online_cache
+                    .retain(|_, (at, _)| at.elapsed() < LAST_ONLINE_CACHE_TTL);
+                if s.last_online_cache.len() >= MAX_LAST_ONLINE_CACHE {
+                    if let Some(oldest_key) = s
+                        .last_online_cache
+                        .iter()
+                        .min_by_key(|(_, (at, _))| *at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        s.last_online_cache.remove(&oldest_key);
+                    }
+                }
+            }
+            s.last_online_cache
+                .insert(user_id.to_string(), (now, value));
         }
+        Ok(value)
     }
 
     pub async fn group_members(&self, group_id: &str) -> Result<Vec<GroupMember>, HttpError> {
@@ -2417,6 +2459,15 @@ impl ZaloSession {
 
     pub async fn mark_read(&self, kind: ThreadKind, thread_id: &str) -> Result<(), HttpError> {
         let unread = self.store.unread_messages(kind, thread_id);
+        let has_unread = !unread.is_empty()
+            || self
+                .store
+                .list_threads()
+                .iter()
+                .any(|t| t.kind == kind && t.id == thread_id && t.unread > 0);
+        if !has_unread {
+            return Ok(());
+        }
         let was_marked_unread = self.store.mark_read(kind, thread_id, None);
         self.broadcast_event(json!({
             "type": "read",
@@ -2554,6 +2605,11 @@ impl ZaloSession {
             }
         }
         self.store.clear_thread_messages(kind, thread_id);
+        if kind == ThreadKind::Group {
+            if let Ok(mut s) = self.inner.write() {
+                s.invalidate_group_board(thread_id);
+            }
+        }
         self.broadcast_event(json!({ "type": "threads" }));
         Ok(())
     }
@@ -3806,6 +3862,7 @@ impl ZaloSession {
         if let Ok(mut s) = self.inner.write() {
             s.members.remove(group_id);
             s.group_member_ids.remove(group_id);
+            s.invalidate_group_board(group_id);
         }
         self.store.delete_thread(ThreadKind::Group, group_id);
         self.broadcast_event(json!({ "type": "threads" }));
@@ -3934,15 +3991,43 @@ impl ZaloSession {
         count: Option<u32>,
     ) -> Result<Vec<BoardItem>, HttpError> {
         let client = self.api()?;
+        let cache_key = (group_id.to_string(), page, count);
+        if let Ok(s) = self.inner.read() {
+            if let Some((at, items)) = s.group_board_cache.get(&cache_key) {
+                if at.elapsed() < GROUP_BOARD_CACHE_TTL {
+                    return Ok(items.clone());
+                }
+            }
+        }
         let res = client
             .get_list_board(group_id, page, count)
             .await
             .map_err(proto_to_http_error)?;
-        let items = res
+        let items: Vec<BoardItem> = res
             .get("items")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(parse_board_item).collect())
             .unwrap_or_default();
+        if let Ok(mut s) = self.inner.write() {
+            let now = Instant::now();
+            if s.group_board_cache.len() >= MAX_GROUP_BOARD_CACHE
+                && !s.group_board_cache.contains_key(&cache_key)
+            {
+                s.group_board_cache
+                    .retain(|_, (at, _)| at.elapsed() < GROUP_BOARD_CACHE_TTL);
+                if s.group_board_cache.len() >= MAX_GROUP_BOARD_CACHE {
+                    if let Some(oldest_key) = s
+                        .group_board_cache
+                        .iter()
+                        .min_by_key(|(_, (at, _))| *at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        s.group_board_cache.remove(&oldest_key);
+                    }
+                }
+            }
+            s.group_board_cache.insert(cache_key, (now, items.clone()));
+        }
         Ok(items)
     }
 
@@ -3966,6 +4051,9 @@ impl ZaloSession {
             .create_note(group_id, trimmed, pin)
             .await
             .map_err(proto_to_http_error)?;
+        if let Ok(mut s) = self.inner.write() {
+            s.invalidate_group_board(group_id);
+        }
         let id = res.get("id").map(val_to_string).unwrap_or_default();
         let resolved_title = extract_board_title(&res).unwrap_or_else(|| trimmed.to_string());
         let creator_id = non_empty_str(res.get("creatorId"))
@@ -3997,6 +4085,9 @@ impl ZaloSession {
             .create_poll(&input, group_id)
             .await
             .map_err(proto_to_http_error)?;
+        if let Ok(mut s) = self.inner.write() {
+            s.invalidate_group_board(group_id);
+        }
         let poll_id = val_to_i64(detail.get("poll_id"));
         if poll_id > 0 {
             if let Ok(mut s) = self.inner.write() {
@@ -4120,6 +4211,11 @@ impl ZaloSession {
     }
 
     async fn refreshed_poll(&self, poll_id: i64) -> Result<PollView, HttpError> {
+        if let Ok(mut s) = self.inner.write() {
+            if let Some(gid) = s.poll_groups.get(&poll_id).cloned() {
+                s.invalidate_group_board(&gid);
+            }
+        }
         let view = self.get_poll(poll_id).await?;
         self.broadcast_event(json!({ "type": "poll", "pollId": poll_id }));
         Ok(view)

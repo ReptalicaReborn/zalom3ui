@@ -199,6 +199,7 @@ async fn notifications_not_mine_not_muted_not_the_open_chat_not_old_history() {
 #[tokio::test]
 async fn reading_a_chat_tells_clients_so_its_notification_goes_away() {
     let mut r = features_rig();
+    r.ingest(incoming("1", 1000, json!({}), true)).await;
     r.drain_events();
     r.session.mark_read(ThreadKind::Group, "g1").await.unwrap();
     let events = r.drain_events();
@@ -206,6 +207,11 @@ async fn reading_a_chat_tells_clients_so_its_notification_goes_away() {
         of_type(&events, "read")[0],
         &json!({ "type": "read", "threadKind": "group", "threadId": "g1" })
     );
+
+    // Marking an already-read thread does not broadcast another "read" event.
+    r.session.mark_read(ThreadKind::Group, "g1").await.unwrap();
+    let events_again = r.drain_events();
+    assert!(of_type(&events_again, "read").is_empty());
 }
 
 #[tokio::test]
@@ -396,4 +402,79 @@ async fn removing_a_member_zalo_refuses_says_why() {
         "{}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn mark_read_clears_manually_marked_unread_thread_and_broadcasts() {
+    let mut r = features_rig();
+    r.ingest(incoming("1", 1000, json!({}), false)).await;
+    r.session.mark_read(ThreadKind::User, "100").await.unwrap();
+    r.session.mark_unread(ThreadKind::User, "100").await.unwrap();
+    r.drain_events();
+    r.api.clear_calls();
+
+    r.session.mark_read(ThreadKind::User, "100").await.unwrap();
+    let events = r.drain_events();
+    assert_eq!(
+        of_type(&events, "read"),
+        vec![&json!({ "type": "read", "threadKind": "user", "threadId": "100" })]
+    );
+    assert_eq!(r.api.methods(), vec!["remove_unread_mark"]);
+    assert_eq!(r.store.list_threads()[0].unread, 0);
+}
+
+#[tokio::test]
+async fn last_online_is_cached_within_ttl() {
+    let r = features_rig();
+    r.api.respond(
+        "last_online",
+        json!({
+            "settings": { "show_online_status": 1 },
+            "lastOnline": 1700001234
+        }),
+    );
+
+    assert_eq!(r.session.last_online("u1").await.unwrap(), Some(1700001234));
+    assert_eq!(r.session.last_online("u1").await.unwrap(), Some(1700001234));
+    assert_eq!(r.api.calls_to("last_online").len(), 1);
+
+    // Distinct user id misses the cache.
+    assert_eq!(r.session.last_online("u2").await.unwrap(), Some(1700001234));
+    assert_eq!(r.api.calls_to("last_online").len(), 2);
+}
+
+#[tokio::test]
+async fn group_board_is_cached_and_invalidated_on_mutation_and_group_event() {
+    let r = features_rig();
+    r.api.respond(
+        "get_list_board",
+        json!({
+            "items": [{
+                "boardType": 1,
+                "data": { "id": "n1", "params": "{\"title\":\"Standup\"}", "creatorId": "me", "createTime": 1000 }
+            }]
+        }),
+    );
+    r.api.respond(
+        "create_note",
+        json!({ "id": "n2", "params": "{\"title\":\"Updated\"}", "creatorId": "me", "createTime": 2000 }),
+    );
+
+    let first = r.session.get_group_board("g1", None, None).await.unwrap();
+    let second = r.session.get_group_board("g1", None, None).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(r.api.calls_to("get_list_board").len(), 1);
+
+    // Mutating the board invalidates the cache for g1.
+    r.session.create_group_note("g1", "Updated", true).await.unwrap();
+    r.session.get_group_board("g1", None, None).await.unwrap();
+    assert_eq!(r.api.calls_to("get_list_board").len(), 2);
+
+    // Incoming GroupEvent also invalidates the cache for g1.
+    r.session
+        .testing_dispatch(WsEvent::GroupEvent(json!({ "threadId": "g1", "type": 1 })))
+        .await;
+    r.session.get_group_board("g1", None, None).await.unwrap();
+    assert_eq!(r.api.calls_to("get_list_board").len(), 3);
 }
