@@ -202,3 +202,13 @@ fun preview(msg: ChatMessage?): String {
         else -> body
     }
 }
+
+private const val UNSUPPORTED_LABEL = "[Unsupported message]"
+
+/**
+ * Text shown in a message bubble: an unsupported message names its Zalo `msgType`
+ * ("[Unsupported message · chat.xyz]") so an unknown record can be identified from a screenshot.
+ * The thread list keeps the short server text.
+ */
+fun bubbleText(msg: ChatMessage): String =
+    if (msg.text == UNSUPPORTED_LABEL && msg.msgType.isNotBlank()) "[Unsupported message · ${msg.msgType}]" else msg.text

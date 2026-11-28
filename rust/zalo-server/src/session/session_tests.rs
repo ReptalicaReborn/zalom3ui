@@ -726,3 +726,112 @@ async fn frame_events_feed_the_socket_log_and_history_page_msgs_are_stored_silen
         "history never notifies"
     );
 }
+
+// ---- delete-for-me sync records (self-sent echo of "Delete for me"; shape inferred) ----
+
+fn sync_shapes() -> Vec<(&'static str, Value)> {
+    vec![
+        ("chat.delete", json!({ "globalMsgId": 1 })),
+        ("chat.undo", json!({ "globalMsgId": "1", "cliMsgId": "c1" })),
+        ("chat.delete", json!({ "msgs": [{ "globalMsgId": 1, "cliMsgId": "c1" }], "onlyMe": 1 })),
+        // by client id only
+        ("chat.deleted", json!({ "cliMsgId": "c1" })),
+        // untyped (webchat) reference-only content
+        ("webchat", json!({ "msgs": [{ "globalMsgId": 1, "cliMsgId": "c1" }] })),
+    ]
+}
+
+#[tokio::test]
+async fn delete_sync_record_removes_target_in_user_and_group_threads_without_a_bubble() {
+    for group in [false, true] {
+        for (i, (ty, content)) in sync_shapes().into_iter().enumerate() {
+            let mut r = rig();
+            let kind = if group { ThreadKind::Group } else { ThreadKind::User };
+            let tid = if group { "g1" } else { "100" };
+            r.ingest(incoming("1", 1000, json!({}), group)).await;
+            r.ingest(incoming("2", 1100, json!({}), group)).await;
+            r.drain_events();
+            let rec_id = format!("sync{i}");
+            r.ingest(incoming(
+                &rec_id,
+                2000,
+                json!({ "uidFrom": "me", "msgType": ty, "content": content }),
+                group,
+            ))
+            .await;
+            assert!(r.store.get_message("1").is_none(), "{group} {ty} {content}");
+            assert!(r.store.is_deleted_for_me(kind, tid, "1"));
+            assert!(r.store.get_message("2").is_some(), "other message kept");
+            assert!(r.store.get_message(&rec_id).is_none(), "no bubble");
+            assert!(r.store.is_deleted_for_me(kind, tid, &rec_id));
+            let events = r.drain_events();
+            assert!(of_type(&events, "message").is_empty());
+            assert_eq!(
+                of_type(&events, "message_deleted")[0],
+                &json!({ "type": "message_deleted", "threadKind": kind, "threadId": tid, "id": "1" })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_sync_record_without_target_is_dropped() {
+    let r = rig();
+    r.ingest(incoming("1", 1000, json!({}), true)).await;
+    r.ingest(incoming(
+        "s1",
+        2000,
+        json!({ "uidFrom": "me", "msgType": "chat.delete", "content": {} }),
+        true,
+    ))
+    .await;
+    r.ingest(incoming(
+        "s2",
+        2100,
+        json!({ "uidFrom": "me", "msgType": "chat.undo", "content": { "globalMsgId": 999 } }),
+        true,
+    ))
+    .await;
+    assert!(r.store.get_message("s1").is_none());
+    assert!(r.store.get_message("s2").is_none());
+    assert!(r.store.get_message("1").is_some());
+}
+
+#[tokio::test]
+async fn someone_elses_delete_shaped_message_never_deletes_anything() {
+    let r = rig();
+    r.ingest(incoming("1", 1000, json!({}), true)).await;
+    r.ingest(incoming(
+        "x1",
+        2000,
+        json!({ "msgType": "chat.delete", "content": { "globalMsgId": 1 } }),
+        true,
+    ))
+    .await;
+    r.ingest(incoming("x2", 2100, json!({ "content": "chat.delete 1" }), true))
+        .await;
+    assert!(r.store.get_message("1").is_some());
+    assert!(r.store.get_message("x2").is_some());
+    // our own ordinary text is untouched too
+    r.ingest(incoming("m1", 2200, json!({ "uidFrom": "me", "content": "delete 1" }), true))
+        .await;
+    assert!(r.store.get_message("m1").is_some());
+    assert!(r.store.get_message("1").is_some());
+}
+
+#[tokio::test]
+async fn real_recall_still_shows_message_recalled() {
+    let r = rig();
+    r.ingest(incoming("1", 1000, json!({ "uidFrom": "me" }), true)).await;
+    r.ingest(incoming(
+        "u1",
+        2000,
+        json!({ "uidFrom": "me", "msgType": "chat.undo", "content": { "deleteMsg": 1, "globalMsgId": 1 } }),
+        true,
+    ))
+    .await;
+    let m = r.store.get_message("1").unwrap();
+    assert!(m.recalled);
+    assert_eq!(m.text, "Message recalled");
+    assert!(!r.store.is_deleted_for_me(ThreadKind::Group, "g1", "1"));
+}

@@ -28,7 +28,8 @@ use crate::log::{create_dir_private, CallTrace};
 use crate::replay::{BatchStats, ReplayHub};
 use crate::socket_log::SocketLog;
 use crate::store::{
-    normalize_message, raw_is_undo_without_target, recalled_message_id, to_public_message, ChatStore,
+    delete_sync_record, normalize_message, raw_is_undo_without_target, recalled_message_id,
+    to_public_message, ChatStore, DeleteSync,
 };
 use crate::types::{
     reaction_code, sanitize_remote_url, thread_key, AttachmentKind, BoardItem, ChatMessage,
@@ -1432,6 +1433,12 @@ impl ZaloSession {
         }
         let kind = from_thread_type(raw.thread_type);
         let own_id = self.own_id();
+        if let Some(sync) = delete_sync_record(&raw.data, raw.is_self, own_id.as_deref()) {
+            // Our own "Delete for me" echoed to this device: remove the referenced messages (the
+            // record itself is never a bubble, even when it names no target).
+            self.apply_delete_sync(kind, &raw.thread_id, &raw.data, &sync);
+            return Ingested::Undo { already_stored: false };
+        }
         let msg = normalize_message(&raw.data, kind, &raw.thread_id, raw.is_self, own_id.as_deref());
         if kind == ThreadKind::User
             && is_official_account_message(&raw.data, &msg.msg_type, msg.is_self)
@@ -1506,6 +1513,41 @@ impl ZaloSession {
             }
         }
         outcome
+    }
+
+    /// Applies a delete-for-me sync record (see `store::delete_sync_record`): tombstones and
+    /// removes each referenced message in the thread, broadcasting `message_deleted` like
+    /// `delete_message`, and tombstones the record's own id so it can never come back as a bubble.
+    fn apply_delete_sync(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        raw_data: &Value,
+        sync: &DeleteSync,
+    ) {
+        let mut targets: Vec<String> = sync.global_ids.clone();
+        for id in self.store.ids_by_cli_msg_id(kind, thread_id, &sync.cli_ids) {
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        for id in targets {
+            if self.store.delete_for_me(kind, thread_id, &id).is_some() {
+                self.broadcast_event(json!({
+                    "type": "message_deleted",
+                    "threadKind": kind,
+                    "threadId": thread_id,
+                    "id": id,
+                }));
+            }
+        }
+        let own_record = ["msgId", "globalMsgId", "cliMsgId"]
+            .iter()
+            .map(|k| raw_data.get(*k).map(val_to_string).unwrap_or_default())
+            .find(|s| !s.is_empty() && s != "0");
+        if let Some(id) = own_record {
+            let _ = self.store.delete_for_me(kind, thread_id, &id);
+        }
     }
 
     fn resolve_user_thread(self: &Arc<Self>, user_id: String, generation: u64) {

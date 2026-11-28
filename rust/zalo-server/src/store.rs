@@ -546,6 +546,118 @@ pub fn raw_is_undo_without_target(raw_data: &Value) -> bool {
     content.contains_key("deleteMsg") && recalled_message_id(raw_data).is_none()
 }
 
+/// `msgType` values a delete-for-me sync record might carry. INFERRED, not confirmed by any
+/// capture: zca-js has no handling for this record, so these are the plausible names (the same
+/// guesses an earlier version used to render "Message recalled", which was wrong because the
+/// receiver still has the message). They are only trusted together with `is_self` and no
+/// `deleteMsg` (see [`delete_sync_record`]).
+const DELETE_SYNC_MSG_TYPES: &[&str] = &[
+    "chat.delete",
+    "chat.deleted",
+    "chat.undo",
+    "chat.recall",
+    "chat.recalled",
+    "undo",
+    "delete",
+];
+
+/// Content keys that only reference another message (no renderable payload). A self-sent content
+/// object made of nothing but these (and at least one id) is a sync reference, not a message.
+const DELETE_SYNC_REF_KEYS: &[&str] = &[
+    "globalMsgId",
+    "msgId",
+    "cliMsgId",
+    "msgs",
+    "onlyMe",
+    "ownerId",
+    "destId",
+    "srcId",
+    "uidFrom",
+    "grid",
+    "toid",
+    "idTo",
+    "imei",
+];
+
+/// Message ids a delete-for-me sync record points at.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeleteSync {
+    /// Server message ids (`globalMsgId` / `msgId`).
+    pub global_ids: Vec<String>,
+    /// Client message ids (`cliMsgId`), for matching against stored `cli_msg_id`.
+    pub cli_ids: Vec<String>,
+}
+
+fn push_unique(v: &mut Vec<String>, id: String) {
+    if !id.is_empty() && id != "0" && !v.contains(&id) {
+        v.push(id);
+    }
+}
+
+fn collect_sync_refs(obj: &Map<String, Value>, out: &mut DeleteSync) {
+    push_unique(&mut out.global_ids, val_to_string(obj.get("globalMsgId")));
+    push_unique(&mut out.global_ids, val_to_string(obj.get("msgId")));
+    push_unique(&mut out.cli_ids, val_to_string(obj.get("cliMsgId")));
+}
+
+/// Recognises a delete-for-me sync record: Zalo echoes our own "Delete for me" to our other
+/// devices as a self-sent 501/521 item. The exact shape is unconfirmed (see
+/// [`DELETE_SYNC_MSG_TYPES`]), so it matches either a self item whose `msgType` is delete/undo
+/// shaped, or a self item whose content object holds only message references. Items with
+/// `deleteMsg` are excluded (real recalls go through [`recalled_message_id`]), and items from
+/// anyone else are never deletions. Returns the referenced targets (possibly none: the record is
+/// then simply dropped).
+pub fn delete_sync_record(
+    raw_data: &Value,
+    is_self: bool,
+    own_id: Option<&str>,
+) -> Option<DeleteSync> {
+    let uid_from = val_to_string(raw_data.get("uidFrom"));
+    let from_me = is_self
+        || uid_from == "0"
+        || own_id.is_some_and(|o| !o.is_empty() && uid_from == o);
+    if !from_me {
+        return None;
+    }
+    let content_val = raw_data.get("content").cloned().unwrap_or(Value::Null);
+    let content_obj: Option<Map<String, Value>> = match &content_val {
+        Value::Object(m) => Some(m.clone()),
+        Value::String(s) if s.trim_start().starts_with('{') => {
+            match serde_json::from_str::<Value>(s.trim()) {
+                Ok(Value::Object(m)) => Some(m),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if content_obj.as_ref().is_some_and(|m| m.contains_key("deleteMsg")) {
+        return None;
+    }
+    let msg_type = non_empty_str(raw_data.get("msgType")).unwrap_or_default();
+    let typed = DELETE_SYNC_MSG_TYPES.contains(&msg_type.as_str());
+    let ref_only = content_obj.as_ref().is_some_and(|m| {
+        !m.is_empty() && m.keys().all(|k| DELETE_SYNC_REF_KEYS.contains(&k.as_str()))
+    });
+    if !typed && !ref_only {
+        return None;
+    }
+    let mut out = DeleteSync::default();
+    if let Some(m) = &content_obj {
+        collect_sync_refs(m, &mut out);
+        if let Some(arr) = m.get("msgs").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(o) = item.as_object() {
+                    collect_sync_refs(o, &mut out);
+                }
+            }
+        }
+    }
+    if !typed && out.global_ids.is_empty() && out.cli_ids.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 /// Parses a Zalo message's non-text attachment payload (`content` may be a JSON object or an
 /// array for `chat.list.action`), matching `parseAttachment` in `src/store.ts`.
 pub fn parse_attachment(msg_type: &str, content: &Value, is_self: bool) -> Option<Attachment> {
@@ -1856,6 +1968,7 @@ impl ChatStore {
             }),
         };
         store.load();
+        store.purge_delete_sync_records();
         store
     }
 
@@ -2526,6 +2639,73 @@ impl ChatStore {
         };
         self.schedule_save();
         removed
+    }
+
+    /// Ids of stored messages in a thread whose client id is one of `cli_ids`.
+    pub fn ids_by_cli_msg_id(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        cli_ids: &[String],
+    ) -> Vec<String> {
+        if cli_ids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(s) = self.inner.state.read() else {
+            return Vec::new();
+        };
+        s.messages
+            .get(&thread_key(kind, thread_id))
+            .map(|list| {
+                list.iter()
+                    .filter(|m| cli_ids.iter().any(|c| *c == m.cli_msg_id))
+                    .map(|m| m.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One-time cleanup of "[Unsupported message]" self records an earlier build stored for a
+    /// delete-for-me sync echo. Only the stored `msg_type` survives (the raw content is slimmed),
+    /// so this matches self, unsupported-label, delete-shaped msgType records. Returns the count.
+    pub fn purge_delete_sync_records(&self) -> usize {
+        let has_paths = self.inner.paths.is_some();
+        let purged = {
+            let Ok(mut s) = self.inner.state.write() else {
+                return 0;
+            };
+            let keys: Vec<String> = s.messages.keys().cloned().collect();
+            let mut n = 0;
+            for key in keys {
+                let mut gone: Vec<String> = Vec::new();
+                if let Some(list) = s.messages.get_mut(&key) {
+                    list.retain(|m| {
+                        let hit = m.is_self
+                            && !m.recalled
+                            && m.attachment.is_none()
+                            && DELETE_SYNC_MSG_TYPES.contains(&m.msg_type.as_str())
+                            && m.text.starts_with("[Unsupported message]");
+                        if hit {
+                            gone.push(m.id.clone());
+                        }
+                        !hit
+                    });
+                }
+                if !gone.is_empty() {
+                    for id in &gone {
+                        s.index.remove(id);
+                        s.add_tombstone(&key, id, has_paths);
+                    }
+                    s.thread_changed(&key, has_paths);
+                    n += gone.len();
+                }
+            }
+            n
+        };
+        if purged > 0 {
+            self.schedule_save();
+        }
+        purged
     }
 
     /// Whether `msg_id` was deleted for me in this thread.
@@ -4200,6 +4380,38 @@ mod tests {
         assert!(!norm(json!({ "content": "tin nhắn" })).recalled);
         assert!(!norm(json!({ "content": "Tin nhắn đã bị xóa" })).recalled);
         assert!(!norm(json!({ "content": "Tin nhắn đã được thu hồi" })).recalled);
+    }
+
+    #[test]
+    fn purge_removes_old_unsupported_delete_sync_self_records_only() {
+        let store = ChatStore::in_memory();
+        let mk = |id: &str, ty: &str, uid: &str| {
+            let raw = make_raw(json!({ "msgId": id, "cliMsgId": id, "msgType": ty, "uidFrom": uid,
+                "content": { "x": 1 } }));
+            normalize_message(&raw, ThreadKind::Group, "g1", uid == "me", Some("me"))
+        };
+        assert!(store.add_message(mk("a", "chat.delete", "me")));
+        assert!(store.add_message(mk("b", "chat.delete", "100")));
+        assert!(store.add_message(mk("c", "chat.weird", "me")));
+        assert_eq!(store.purge_delete_sync_records(), 1);
+        assert!(store.get_message("a").is_none());
+        assert!(store.get_message("b").is_some());
+        assert!(store.get_message("c").is_some());
+    }
+
+    #[test]
+    fn delete_sync_record_shapes() {
+        let me = Some("me");
+        let r = |v: Value| delete_sync_record(&make_raw(v), true, me);
+        assert!(r(json!({ "msgType": "chat.delete", "content": {} })).is_some());
+        assert_eq!(
+            r(json!({ "msgType": "chat.undo", "content": { "globalMsgId": 5, "cliMsgId": 6 } })),
+            Some(DeleteSync { global_ids: vec!["5".into()], cli_ids: vec!["6".into()] })
+        );
+        assert!(r(json!({ "msgType": "chat.undo", "content": { "deleteMsg": 1, "globalMsgId": 5 } })).is_none());
+        assert!(r(json!({ "content": { "globalMsgId": 5, "title": "card" } })).is_none());
+        assert!(r(json!({ "content": "hello" })).is_none());
+        assert!(delete_sync_record(&make_raw(json!({ "msgType": "chat.delete", "content": {} })), false, me).is_none());
     }
 
     #[test]

@@ -2370,7 +2370,7 @@ private fun StickerBubble(
 private fun messageText(msg: ChatMessage, onOutgoing: Boolean, onOpenUrl: (String) -> Unit): AnnotatedString {
     val linkColor = if (onOutgoing) LocalChatColors.current.onOutgoing else MaterialTheme.colorScheme.primary
     return buildAnnotatedString {
-        val text = msg.text
+        val text = bubbleText(msg)
         append(text)
         for (m in msg.mentions) {
             val start = m.pos.coerceIn(0, text.length)
