@@ -101,6 +101,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -184,6 +185,9 @@ fun mediaAspect(width: Int?, height: Int?): Float {
     return (width.toFloat() / height).coerceIn(0.6f, 2f)
 }
 
+/** Height in dp of an edge-to-edge media frame 280dp wide: from the aspect, capped so portrait media stays short. */
+fun edgeToEdgeFrameHeightDp(aspect: Float): Float = (280f / aspect).coerceIn(140f, 340f)
+
 /** Opens a link, file or video in another app (browser, player, downloads). */
 fun openExternally(context: Context, url: String, mimeType: String? = null) {
     val uri = runCatching { Uri.parse(url.trim()) }.getOrNull()
@@ -253,7 +257,7 @@ fun AttachmentContent(
                 UnavailableMediaRow(label = "Video unavailable", isVideo = true, onOutgoing = onOutgoing)
                 return
             }
-            Box(contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.clipToBounds(), contentAlignment = Alignment.Center) {
                 if (thumb != null) {
                     MediaFrame(
                         url = thumb,
@@ -384,11 +388,12 @@ private fun MediaFrame(
 ) {
     var activeUrl by remember(url, fallbackUrl) { mutableStateOf(url) }
     val frameMod = if (edgeToEdge) {
-        val frameHeight = (280.dp / aspect).coerceIn(140.dp, 340.dp)
+        // Crop-scaled images draw past their bounds unless clipped (tall thumbnails spilled over the next message).
         Modifier
             .widthIn(max = 280.dp)
             .fillMaxWidth()
-            .height(frameHeight)
+            .height(edgeToEdgeFrameHeightDp(aspect).dp)
+            .clipToBounds()
     } else {
         Modifier
             .widthIn(max = 260.dp)

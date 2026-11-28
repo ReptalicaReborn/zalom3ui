@@ -112,6 +112,9 @@ class MediaTest {
         assertEquals(16f / 9f, mediaAspect(1920, 1080), 0.001f)
         assertEquals("very tall photos are cropped", 0.6f, mediaAspect(100, 1000), 0.001f)
         assertEquals("unknown size", 4f / 3f, mediaAspect(null, 10), 0.001f)
+        assertEquals("portrait is capped", 340f, edgeToEdgeFrameHeightDp(0.6f), 0.001f)
+        assertEquals("panorama has a floor", 140f, edgeToEdgeFrameHeightDp(2f), 0.001f)
+        assertEquals(210f, edgeToEdgeFrameHeightDp(4f / 3f), 0.001f)
     }
 
     @Test
