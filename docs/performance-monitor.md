@@ -42,13 +42,13 @@ The overlay updates twice a second.
 
 Taken from `FrameMetrics` of the app window, so only frames that were really drawn count. An app that draws nothing for a second shows 0 fps, which is fine: it is idle, not slow.
 
-- **fps**: frames drawn per second. It is not the refresh rate. A static screen draws nothing.
+- **fps**: frames drawn per second. It is not the refresh rate. A static screen draws nothing. Android can report the same frame more than once for one vsync; those repeats are not counted, so fps never goes above what the display can show. If it happens, the log line gets a ` dup=N` key (repeats in that window), placed after `slow=`; the key is absent when there were none.
 - **avg / max**: average and longest time to produce a frame in the sample (the total duration Android measures: input, layout, draw and the GPU hand-off).
-- **jank**: the share of frames in the sample that took longer than the display's frame budget, in percent. The budget is one refresh: 16.7 ms at 60 Hz, 8.3 ms at 120 Hz (read from the display, 16.7 ms if unknown). Jank 0% means every frame made its refresh. Jank above about 5% is visible as stutter; above 20% is a bad stutter.
+- **jank**: the share of frames in the sample that took longer than their frame budget, in percent. On Android 12 and newer the budget is the deadline Android gives each frame (it follows an adaptive display as it changes rate). Otherwise, or if that value looks wrong, it is one refresh: 16.7 ms at 60 Hz, 8.3 ms at 120 Hz (read from the display, 16.7 ms if unknown). Jank 0% means every frame made its refresh. Jank above about 5% is visible as stutter; above 20% is a bad stutter.
 - **slow**: the number of those frames.
 - **worst**: the longest frame in the last 30 seconds. It stays after the stutter is over, so you can look away and still see it.
 
-The top right of the section says the refresh rate and the budget in use. Phones that change their refresh rate on their own (adaptive 10 to 120 Hz) report the current mode, not what the display really does at that moment, so jank is only an approximation there.
+The top right of the section says the refresh rate and the budget in use. Phones that change their refresh rate on their own (adaptive 10 to 120 Hz) report the current mode, not what the display really does at that moment; the refresh-rate budget is therefore only an approximation there, which is why Android 12 and newer use each frame's own deadline.
 
 ### MEMORY
 

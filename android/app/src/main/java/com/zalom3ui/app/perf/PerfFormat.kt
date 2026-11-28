@@ -31,6 +31,8 @@ data class PerfSnapshot(
     val frameMaxMs: Float = 0f,
     val jankPct: Float = 0f,
     val slowFrames: Int = 0,
+    /** Extra frame reports for an already-counted vsync (not in [fps]); only logged when above 0. */
+    val dupFrames: Int = 0,
     /** The longest frame in the last 30 seconds. */
     val worstFrameMs: Float = 0f,
     val budgetMs: Float = 16.7f,
@@ -93,6 +95,7 @@ object PerfFormat {
         append(" frame=").append(oneDecimal(s.frameAvgMs)).append('/').append(s.frameMaxMs.roundToInt()).append("ms")
         append(" jank=").append(s.jankPct.roundToInt()).append('%')
         append(" slow=").append(s.slowFrames)
+        if (s.dupFrames > 0) append(" dup=").append(s.dupFrames)
         append(" cpu=").append(s.cpuPct.roundToInt()).append('%')
         append(" pss=").append(mbOfKb(s.pssKb)).append("MB")
         append(" rss=").append(mbOfKb(s.rssKb)).append("MB")

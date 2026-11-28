@@ -123,6 +123,46 @@ class PerfMathTest {
     }
 
     @Test
+    fun aSecondReportForTheSameVsyncIsNotAnotherFrame() {
+        val acc = FrameAccumulator(budget60)
+        acc.add(ms(5.0), vsyncNs = 1_000)
+        acc.add(ms(30.0), vsyncNs = 1_000) // same vsync: the same frame on screen
+        acc.add(ms(6.0), vsyncNs = 2_000)
+        val totals = acc.drain()
+        assertEquals(2, totals.count)
+        assertEquals(1, totals.dup)
+        assertEquals(ms(11.0), totals.sumNs) // the repeat adds neither to the count nor to the average
+        assertEquals(ms(30.0), totals.maxNs) // but a long repeat still counts for the worst frame
+        // A window never reports more frames than there were vsyncs.
+        assertEquals(4f, frameStats(totals, windowMs = 500.0).fps, 0.001f)
+        assertEquals(1, frameStats(totals, windowMs = 500.0).dup)
+    }
+
+    @Test
+    fun theLastVsyncIsRememberedAcrossWindowsAndUnknownVsyncsNeverMatch() {
+        val acc = FrameAccumulator(budget60)
+        acc.add(ms(5.0), vsyncNs = 7_000)
+        acc.drain()
+        acc.add(ms(5.0), vsyncNs = 7_000)
+        assertEquals(0, acc.drain().count)
+        // Without a vsync (-1) every report is its own frame.
+        acc.add(ms(5.0))
+        acc.add(ms(5.0))
+        assertEquals(2, acc.drain().count)
+    }
+
+    @Test
+    fun theFramesOwnDeadlineReplacesTheRefreshBudgetWhenBelievable() {
+        val acc = FrameAccumulator(budget60) // 16.7 ms
+        acc.add(ms(10.0), vsyncNs = 1, deadlineNs = ms(8.3)) // over its deadline (an adaptive display at 120 Hz)
+        acc.add(ms(10.0), vsyncNs = 2, deadlineNs = ms(33.3)) // fine against a 30 Hz deadline
+        assertEquals(1, acc.drain().slow)
+        // Nonsense deadlines (negative, zero, over 100 ms) fall back to the refresh-rate budget.
+        for ((i, d) in listOf(-5L, 0L, ms(500.0)).withIndex()) acc.add(ms(20.0), vsyncNs = 10L + i, deadlineNs = d)
+        assertEquals(3, acc.drain().slow)
+    }
+
+    @Test
     fun theBudgetCanChangeWhileMeasuring() {
         val acc = FrameAccumulator(budget60)
         acc.add(ms(10.0)) // fine at 60 Hz

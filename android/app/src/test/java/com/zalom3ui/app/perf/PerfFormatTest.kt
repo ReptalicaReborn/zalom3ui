@@ -39,6 +39,13 @@ class PerfFormatTest {
     }
 
     @Test
+    fun dupIsOnlyLoggedWhenFramesWereReportedTwice() {
+        assertTrue(" dup=" !in PerfFormat.logLine(snapshot))
+        val line = PerfFormat.logLine(snapshot.copy(dupFrames = 40))
+        assertTrue(line, " slow=2 dup=40 cpu=12% " in line)
+    }
+
+    @Test
     fun logLineKeysDoNotChangeWithTheValues() {
         fun keys(line: String) = line.split(' ').map { it.substringBefore('=') }
         val busy = snapshot.copy(

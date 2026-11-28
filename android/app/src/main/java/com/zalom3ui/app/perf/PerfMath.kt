@@ -16,10 +16,16 @@ data class FrameTotals(
     val maxNs: Long = 0L,
     /** Frames that took longer than the display's frame budget. */
     val slow: Int = 0,
+    /** Extra reports for a vsync that already had a frame: not counted as frames (see [FrameAccumulator.add]). */
+    val dup: Int = 0,
 ) {
     operator fun plus(other: FrameTotals): FrameTotals =
-        FrameTotals(count + other.count, sumNs + other.sumNs, max(maxNs, other.maxNs), slow + other.slow)
+        FrameTotals(count + other.count, sumNs + other.sumNs, max(maxNs, other.maxNs), slow + other.slow, dup + other.dup)
 }
+
+/** A per-frame deadline outside this range is not believed (it falls back to the refresh-rate budget). */
+private const val MIN_DEADLINE_NS = 1_000_000L
+private const val MAX_DEADLINE_NS = 100_000_000L
 
 /**
  * Collects the duration of every drawn frame. [add] runs on the frame-metrics thread, [drain] on the sampler thread;
@@ -31,29 +37,46 @@ class FrameAccumulator(initialBudgetNs: Long) {
     private var sumNs = 0L
     private var maxNs = 0L
     private var slow = 0
+    private var dup = 0
+    private var lastVsyncNs = -1L
 
     /** A frame longer than this counts as slow ("jank"): the time one display refresh lasts. */
     @Volatile
     var budgetNs: Long = initialBudgetNs
 
-    fun add(durationNs: Long) {
+    /**
+     * One drawn frame that took [durationNs]. [vsyncNs] is the vsync the frame was meant for: a second report for the
+     * same vsync is the same frame on screen, so it is not counted again (only kept if it is the longest), which keeps
+     * fps from going above what the display can show. [deadlineNs] is how long Android allowed this frame (API 31+);
+     * when it is a believable value it replaces the refresh-rate [budgetNs], which is only the current mode of an
+     * adaptive display.
+     */
+    fun add(durationNs: Long, vsyncNs: Long = -1L, deadlineNs: Long = -1L) {
         if (durationNs < 0) return
-        val over = durationNs > budgetNs
+        val budget = if (deadlineNs in MIN_DEADLINE_NS..MAX_DEADLINE_NS) deadlineNs else budgetNs
+        val over = durationNs > budget
         synchronized(lock) {
-            count++
-            sumNs += durationNs
-            if (durationNs > maxNs) maxNs = durationNs
-            if (over) slow++
+            if (vsyncNs > 0 && vsyncNs == lastVsyncNs) {
+                dup++
+                if (durationNs > maxNs) maxNs = durationNs
+            } else {
+                lastVsyncNs = vsyncNs
+                count++
+                sumNs += durationNs
+                if (durationNs > maxNs) maxNs = durationNs
+                if (over) slow++
+            }
         }
     }
 
     /** The totals since the last call; starts the next window. */
     fun drain(): FrameTotals = synchronized(lock) {
-        val totals = FrameTotals(count, sumNs, maxNs, slow)
+        val totals = FrameTotals(count, sumNs, maxNs, slow, dup)
         count = 0
         sumNs = 0L
         maxNs = 0L
         slow = 0
+        dup = 0
         totals
     }
 }
@@ -66,16 +89,19 @@ data class FrameStats(
     val slow: Int,
     /** Slow frames as a percentage of the frames drawn (0 when none were drawn). */
     val jankPct: Float,
+    /** Extra reports for an already-counted vsync in the window (0 on phones that report one per frame). */
+    val dup: Int = 0,
 )
 
 fun frameStats(totals: FrameTotals, windowMs: Double): FrameStats {
-    if (totals.count <= 0 || windowMs <= 0.0) return FrameStats(0f, 0f, 0f, 0, 0f)
+    if (totals.count <= 0 || windowMs <= 0.0) return FrameStats(0f, 0f, 0f, 0, 0f, totals.dup)
     return FrameStats(
         fps = (totals.count * 1000.0 / windowMs).toFloat(),
         avgMs = (totals.sumNs / totals.count / 1_000_000.0).toFloat(),
         maxMs = (totals.maxNs / 1_000_000.0).toFloat(),
         slow = totals.slow,
         jankPct = (totals.slow * 100.0 / totals.count).toFloat(),
+        dup = totals.dup,
     )
 }
 
