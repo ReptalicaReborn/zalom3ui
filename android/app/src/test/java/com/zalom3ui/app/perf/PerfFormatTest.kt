@@ -32,10 +32,20 @@ class PerfFormatTest {
     @Test
     fun logLineHasEveryKeyInAFixedOrder() {
         assertEquals(
-            "fps=58 frame=9.1/22ms jank=3% slow=2 cpu=12% pss=312MB rss=400MB java=48MB native=120MB avail=1.1GB " +
+            "fps=58 hz=60 frame=9.1/22ms jank=3% slow=2 cpu=12% pss=312MB rss=400MB java=48MB native=120MB avail=1.1GB " +
                 "core=14req/s lat=3.2/18ms inflight=0 ev=3.2/s io=1/34KB/s gc=0.5 thr=46 therm=0 temp=31.2 screen=chat",
             PerfFormat.logLine(snapshot),
         )
+    }
+
+    @Test
+    fun theRefreshRateIsOnEveryLineAndAChangeHasItsOwnLine() {
+        assertTrue(" hz=120 " in PerfFormat.logLine(snapshot.copy(refreshHz = 120f)))
+        assertTrue(" hz=90 " in PerfFormat.logLine(snapshot.copy(refreshHz = 90.2f)))
+        assertEquals("HZ 120->90 screen=chat", PerfFormat.hzLine(120f, 90f, "chat"))
+        assertEquals("HZ 60->120 screen=-", PerfFormat.hzLine(60f, 119.97f, ""))
+        // The header lists the key in the same place as the line.
+        assertTrue(PerfFormat.logLine(snapshot).startsWith("fps=58 hz=60 frame="))
     }
 
     @Test
@@ -114,7 +124,7 @@ class PerfFormatTest {
         assertEquals("app: Zalỏ 1.0.0 (code 7, release)", lines[0])
         assertEquals("device: samsung SM-A135F (hw mt6765), Android 14 (API 34), arm64-v8a, armeabi-v7a", lines[1])
         assertEquals("ram: 3.6GB, cores: 8, display: 60Hz", lines[2])
-        assertTrue(lines[3].startsWith("fields: fps frame=avg/max"))
+        assertTrue(lines[3].startsWith("fields: fps hz frame=avg/max"))
         assertFalse(text.endsWith("\n"))
     }
 }

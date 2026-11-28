@@ -92,6 +92,7 @@ object PerfFormat {
      */
     fun logLine(s: PerfSnapshot): String = buildString {
         append("fps=").append(s.fps.roundToInt())
+        append(" hz=").append(s.refreshHz.roundToInt())
         append(" frame=").append(oneDecimal(s.frameAvgMs)).append('/').append(s.frameMaxMs.roundToInt()).append("ms")
         append(" jank=").append(s.jankPct.roundToInt()).append('%')
         append(" slow=").append(s.slowFrames)
@@ -121,6 +122,10 @@ object PerfFormat {
     /** Written for a frame that took [ms]. */
     fun jankLine(ms: Float, screen: String): String = "JANK ${ms.roundToInt()}ms screen=${screen.ifBlank { "-" }}"
 
+    /** The display's refresh rate changed (what `Display.refreshRate` reports, so on an adaptive display the current mode). */
+    fun hzLine(fromHz: Float, toHz: Float, screen: String): String =
+        "HZ ${fromHz.roundToInt()}->${toHz.roundToInt()} screen=${screen.ifBlank { "-" }}"
+
     fun trimLine(level: Int): String = "TRIM ${trimLevelName(level)}"
 
     fun lowMemLine(availBytes: Long, thresholdBytes: Long): String =
@@ -148,7 +153,7 @@ object PerfFormat {
         appendLine("device: $device (hw $hardware), Android $androidRelease (API $sdk), $abis")
         appendLine("ram: ${size(totalRamBytes)}, cores: $cores, display: ${refreshHz.roundToInt()}Hz")
         append(
-            "fields: fps frame=avg/max jank slow cpu(% of one core) pss rss java native avail core lat=avg/max " +
+            "fields: fps hz frame=avg/max jank slow cpu(% of one core) pss rss java native avail core lat=avg/max " +
                 "inflight ev io=up/down gc thr therm temp screen",
         )
     }

@@ -93,10 +93,10 @@ Each time logging starts (the switch is turned on, or the app process starts wit
 While Zalỏ is on screen and logging is on, a line is written every 2 seconds:
 
 ```
-14:03:22.101 fps=58 frame=9.1/22ms jank=3% slow=2 cpu=12% pss=312MB rss=401MB java=48MB native=120MB avail=1.1GB core=14req/s lat=3.2/18ms inflight=0 ev=3.2/s io=1/34KB/s gc=0.0 thr=46 therm=0 temp=31.2 screen=chat
+14:03:22.101 fps=58 hz=120 frame=9.1/22ms jank=3% slow=2 cpu=12% pss=312MB rss=401MB java=48MB native=120MB avail=1.1GB core=14req/s lat=3.2/18ms inflight=0 ev=3.2/s io=1/34KB/s gc=0.0 thr=46 therm=0 temp=31.2 screen=chat
 ```
 
-Every key is always there, in this order, as `key=value`, so the log can be grepped and plotted. Unknown values read `-1`. `frame` and `lat` are `average/maximum`, `io` is `up/down`, `therm` is Android's thermal status number (0 is none, 2 is moderate, 3 is severe), `temp` is the battery temperature in degrees Celsius. The line covers the 2 seconds since the previous one: fps, jank and the core numbers are averages (and maxima) over that time.
+Every key is always there, in this order, as `key=value`, so the log can be grepped and plotted. Unknown values read `-1`. `hz` is the display's refresh rate at that moment, so a log shows when it dropped (the app never asks for a rate itself, so a change is the system's doing). `frame` and `lat` are `average/maximum`, `io` is `up/down`, `therm` is Android's thermal status number (0 is none, 2 is moderate, 3 is severe), `temp` is the battery temperature in degrees Celsius. The line covers the 2 seconds since the previous one: fps, jank and the core numbers are averages (and maxima) over that time.
 
 Other lines mark events:
 
@@ -104,6 +104,7 @@ Other lines mark events:
 | --- | --- |
 | `FG` / `BG` | the app came on screen / left it |
 | `JANK 142ms screen=chat` | a single frame took 100 ms or more (at most one per second) |
+| `HZ 120->90 screen=chat` | the display's refresh rate changed (as `Display.refreshRate` reports it: on an adaptive display, the current mode), with the screen the app was on; checked every 2 seconds |
 | `TRIM RUNNING_LOW` | Android asked the app to free memory (`onTrimMemory`); the level is named. This also logs while the app is in the background, if the process is alive. |
 | `LOWMEM avail=… threshold=…` | Android says the phone is low on memory (at most one per 30 seconds) |
 | `GC-HEAVY gc=6.5/s java=48MB` | 4 or more garbage collections per second (at most one per 10 seconds) |

@@ -172,6 +172,7 @@ internal class PerfSampler(
     private var thermal = -1
     private var batteryTempC = -1f
     private var refreshHz = 60f
+    private var hzSeen = false
     private var budgetMs = DEFAULT_BUDGET_NS / 1_000_000f
 
     private val jankLimiter = RateLimiter(JANK_EVENT_GAP_MS)
@@ -376,6 +377,11 @@ internal class PerfSampler(
         runCatching {
             val hz = refreshRateOf(activityRef)
             if (hz > 0f) {
+                // A change is written down when it happens (not the first reading, which only sets the baseline).
+                if (log && hzSeen && kotlin.math.abs(hz - refreshHz) >= 0.5f) {
+                    PerfLog.write(app, PerfFormat.hzLine(refreshHz, hz, PerfMonitor.screen))
+                }
+                hzSeen = true
                 refreshHz = hz
                 frames.budgetNs = frameBudgetNs(hz)
                 budgetMs = frames.budgetNs / 1_000_000f
