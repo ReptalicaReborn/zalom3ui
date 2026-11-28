@@ -184,6 +184,57 @@ async fn delete_for_me_calls_delete_message_with_only_me_and_drops_the_message()
 }
 
 #[tokio::test]
+async fn delete_for_me_is_tombstoned_and_replay_never_resurrects_or_recalls_it() {
+    let r = rig();
+    r.ingest(incoming("1", 1000, json!({}), false)).await;
+    r.session
+        .delete_message(ThreadKind::User, "100", "1")
+        .await
+        .unwrap();
+    assert!(r.store.get_message("1").is_none());
+    assert!(r.store.is_deleted_for_me(ThreadKind::User, "100", "1"));
+    // history replay of the original message
+    r.ingest(incoming("1", 1000, json!({}), false)).await;
+    assert!(r.store.get_message("1").is_none(), "no resurrection");
+    // a late echo naming the message, and one naming nothing: neither makes a placeholder
+    r.ingest(incoming(
+        "u1",
+        3000,
+        json!({ "content": { "deleteMsg": 1, "globalMsgId": 1 } }),
+        false,
+    ))
+    .await;
+    r.ingest(incoming("u2", 3100, json!({ "content": { "deleteMsg": 1 } }), false))
+        .await;
+    assert!(r.store.get_message("1").is_none());
+    assert!(r.store.get_message("u1").is_none());
+    assert!(r.store.get_message("u2").is_none(), "no stray recalled bubble");
+    assert!(r.store.get_messages(ThreadKind::User, "100", None, None).is_empty());
+}
+
+#[tokio::test]
+async fn recalled_message_can_be_deleted_even_if_zalo_rejects_it() {
+    let r = rig();
+    r.ingest(incoming("1", 1000, json!({}), false)).await;
+    r.ingest(incoming(
+        "u1",
+        2000,
+        json!({ "content": { "deleteMsg": 1, "globalMsgId": 1 } }),
+        false,
+    ))
+    .await;
+    assert!(r.store.get_message("1").unwrap().recalled);
+    r.api
+        .fail("delete_message", || zalo_proto::ProtoError::InvalidArg("rejected".into()));
+    r.session
+        .delete_message(ThreadKind::User, "100", "1")
+        .await
+        .unwrap();
+    assert!(r.store.get_message("1").is_none());
+    assert!(r.store.is_deleted_for_me(ThreadKind::User, "100", "1"));
+}
+
+#[tokio::test]
 async fn forward_splits_targets_by_thread_type_and_forwards_media() {
     let r = rig();
     r.api

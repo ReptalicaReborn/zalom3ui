@@ -27,7 +27,9 @@ use crate::errors::HttpError;
 use crate::log::{create_dir_private, CallTrace};
 use crate::replay::{BatchStats, ReplayHub};
 use crate::socket_log::SocketLog;
-use crate::store::{normalize_message, recalled_message_id, to_public_message, ChatStore};
+use crate::store::{
+    normalize_message, raw_is_undo_without_target, recalled_message_id, to_public_message, ChatStore,
+};
 use crate::types::{
     reaction_code, sanitize_remote_url, thread_key, AttachmentKind, BoardItem, ChatMessage,
     FoundUser, FriendRequest, GroupLinkInfo, GroupMember, MentionInfo, MessageSearchHit, Person,
@@ -1416,6 +1418,11 @@ impl ZaloSession {
         is_old: bool,
         generation: u64,
     ) -> Ingested {
+        if raw_is_undo_without_target(&raw.data) {
+            // A recall/delete record naming no message (e.g. the echo of a delete-for-me): never
+            // turn it into a "Message recalled" placeholder of its own.
+            return Ingested::Undo { already_stored: false };
+        }
         if let Some(recalled_id) = recalled_message_id(&raw.data) {
             let already_stored = self.store.has_message(&recalled_id);
             if let Some(updated) = self.store.apply_undo(&recalled_id) {
@@ -2977,8 +2984,13 @@ impl ZaloSession {
         msg_id: &str,
     ) -> Result<(), HttpError> {
         let client = self.api()?;
-        let (msg, raw) = self.require_message(kind, thread_id, msg_id)?;
-        client
+        let (msg, raw) = match self.require_message(kind, thread_id, msg_id) {
+            Ok(found) => found,
+            // Already gone locally: make sure it stays gone and report success.
+            Err(_) if self.store.is_deleted_for_me(kind, thread_id, msg_id) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let result = client
             .delete_message(
                 &DeleteMessageTarget {
                     thread_id: thread_id.to_string(),
@@ -2989,9 +3001,14 @@ impl ZaloSession {
                 },
                 true,
             )
-            .await
-            .map_err(proto_to_http_error)?;
-        if self.store.delete_message(&msg.id).is_some() {
+            .await;
+        // Zalo may refuse to delete an already-recalled message; the local removal still stands.
+        if let Err(err) = result {
+            if !msg.recalled {
+                return Err(proto_to_http_error(err));
+            }
+        }
+        if self.store.delete_for_me(kind, thread_id, &msg.id).is_some() {
             self.broadcast_event(json!({
                 "type": "message_deleted",
                 "threadKind": kind,

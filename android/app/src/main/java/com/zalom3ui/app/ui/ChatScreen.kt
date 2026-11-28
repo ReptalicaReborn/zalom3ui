@@ -2706,7 +2706,7 @@ private fun FocusedMessageOverlay(
                 if (!msg.recalled && msg.isSelf) {
                     ToolbarActionItem("Recall", Icons.AutoMirrored.Outlined.Undo, destructive = true) { onAction(MessageAction.RECALL) }
                 }
-                ToolbarActionItem("Delete", Icons.Outlined.DeleteOutline, destructive = true) { onAction(MessageAction.DELETE) }
+                ToolbarActionItem("Delete for me", Icons.Outlined.DeleteOutline, destructive = true) { onAction(MessageAction.DELETE) }
             }
         }
     }

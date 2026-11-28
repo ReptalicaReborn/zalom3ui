@@ -28,6 +28,8 @@ pub const MAX_MESSAGES_PER_THREAD: usize = 500;
 pub const HISTORY_MESSAGES_PER_THREAD: usize = 2000;
 
 const META_FILE: &str = "meta.json";
+/// Most "deleted for me" message ids remembered per thread.
+const MAX_TOMBSTONES_PER_THREAD: usize = 1000;
 const THREADS_DIR: &str = "threads";
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
@@ -533,6 +535,15 @@ pub fn recalled_message_id(raw_data: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// A recall record (`content.deleteMsg`) that names no target message id: it can only become a
+/// stray placeholder, so ingest drops it.
+pub fn raw_is_undo_without_target(raw_data: &Value) -> bool {
+    let Some(content) = raw_data.get("content").and_then(|c| c.as_object()) else {
+        return false;
+    };
+    content.contains_key("deleteMsg") && recalled_message_id(raw_data).is_none()
 }
 
 /// Parses a Zalo message's non-text attachment payload (`content` may be a JSON object or an
@@ -1093,17 +1104,10 @@ fn phone_from_zalo_me_url(url: &str) -> Option<String> {
         .then(|| seg.to_string())
 }
 
-/// Whether a raw message is a "deleted / recalled" placeholder rather than real content: a
-/// zca-js undo record (`content.deleteMsg`), a deletion msgType, or the placeholder text Zalo
-/// substitutes. Several of these shapes are best guesses (see the tests).
-pub fn is_deleted_payload(msg_type: &str, content: &Value) -> bool {
-    if matches!(
-        msg_type,
-        "chat.undo" | "chat.delete" | "chat.recalled" | "chat.deleted" | "chat.recall" | "undo"
-    ) {
-        return true;
-    }
-    // Text content is never taken as a deletion marker: someone can type "Tin nhắn đã bị xóa".
+/// Whether a raw message is a recall ("undo") record: zca-js (`listen.js`) treats a 501/521 item
+/// whose `content` object has a `deleteMsg` key as an `Undo` event. No other shape is guessed;
+/// text content is never taken as a deletion marker (someone can type "Tin nhắn đã bị xóa").
+pub fn is_deleted_payload(_msg_type: &str, content: &Value) -> bool {
     match content {
         Value::Object(m) => m.contains_key("deleteMsg"),
         _ => false,
@@ -1556,6 +1560,9 @@ struct MetaFile {
     /// Thread keys detected as Official Accounts (news / shops / ZNS senders).
     #[serde(default)]
     official_accounts: Vec<String>,
+    /// Per-thread ids of messages deleted "for me" (tombstones, so replay can't resurrect them).
+    #[serde(default)]
+    deleted_ids: HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -1571,6 +1578,8 @@ struct MetaFileRef<'a> {
     message_cap: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     official_accounts: Vec<&'a str>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    deleted_ids: &'a HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1656,6 +1665,8 @@ struct StoreState {
     marked_unread: HashSet<String>,
     /// Thread keys detected as Official Accounts.
     official_accounts: HashSet<String>,
+    /// thread key -> ids deleted for me (insertion order, capped at `MAX_TOMBSTONES_PER_THREAD`).
+    deleted_ids: HashMap<String, Vec<String>>,
     /// message id -> thread key
     index: HashMap<String, String>,
     own_id: Option<String>,
@@ -1668,6 +1679,25 @@ struct StoreState {
 }
 
 impl StoreState {
+    fn is_tombstoned(&self, key: &str, msg_id: &str) -> bool {
+        self.deleted_ids
+            .get(key)
+            .is_some_and(|ids| ids.iter().any(|i| i == msg_id))
+    }
+
+    fn add_tombstone(&mut self, key: &str, msg_id: &str, has_paths: bool) {
+        if self.is_tombstoned(key, msg_id) {
+            return;
+        }
+        let ids = self.deleted_ids.entry(key.to_string()).or_default();
+        ids.push(msg_id.to_string());
+        if ids.len() > MAX_TOMBSTONES_PER_THREAD {
+            let excess = ids.len() - MAX_TOMBSTONES_PER_THREAD;
+            ids.drain(0..excess);
+        }
+        self.meta_changed(has_paths);
+    }
+
     fn new() -> Self {
         Self {
             message_cap: MAX_MESSAGES_PER_THREAD,
@@ -1731,6 +1761,7 @@ impl StoreState {
                 None
             },
             official_accounts,
+            deleted_ids: &self.deleted_ids,
         };
         serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string())
     }
@@ -1754,6 +1785,7 @@ impl StoreState {
         self.muted_until = meta.muted_until;
         self.marked_unread = meta.marked_unread.into_iter().collect();
         self.official_accounts = meta.official_accounts.into_iter().collect();
+        self.deleted_ids = meta.deleted_ids;
         if let Some(cap) = meta.message_cap {
             if cap > MAX_MESSAGES_PER_THREAD {
                 self.message_cap = cap;
@@ -2087,6 +2119,9 @@ impl ChatStore {
                 return false;
             }
             let key = thread_key(msg.thread_kind, &msg.thread_id);
+            if s.is_tombstoned(&key, &msg.id) {
+                return false;
+            }
             let msg_id = msg.id.clone();
             let msg_ts = msg.ts;
             let msg_is_self = msg.is_self;
@@ -2464,6 +2499,42 @@ impl ChatStore {
         };
         self.schedule_save();
         Some(updated)
+    }
+
+    /// Removes a message for good ("delete for me"): drops it if stored and remembers its id so
+    /// history replay or old-message fetches cannot bring it back. Works for recalled messages too.
+    pub fn delete_for_me(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        msg_id: &str,
+    ) -> Option<StoredMessage> {
+        let has_paths = self.inner.paths.is_some();
+        let removed = {
+            let mut s = self.inner.state.write().ok()?;
+            let key = thread_key(kind, thread_id);
+            s.add_tombstone(&key, msg_id, has_paths);
+            let removed = s.messages.get_mut(&key).and_then(|list| {
+                let pos = list.iter().position(|m| m.id == msg_id)?;
+                Some(list.remove(pos))
+            });
+            if removed.is_some() {
+                s.index.remove(msg_id);
+                s.thread_changed(&key, has_paths);
+            }
+            removed
+        };
+        self.schedule_save();
+        removed
+    }
+
+    /// Whether `msg_id` was deleted for me in this thread.
+    pub fn is_deleted_for_me(&self, kind: ThreadKind, thread_id: &str, msg_id: &str) -> bool {
+        self.inner
+            .state
+            .read()
+            .map(|s| s.is_tombstoned(&thread_key(kind, thread_id), msg_id))
+            .unwrap_or(false)
     }
 
     /// Deletes a single message from the store and its dedupe index.
@@ -3002,6 +3073,7 @@ impl ChatStore {
                 marked_unread: snapshot.marked_unread,
                 message_cap: snapshot.message_cap,
                 official_accounts: Vec::new(),
+                deleted_ids: HashMap::new(),
             });
             s.messages = snapshot.messages;
             s.index.clear();
@@ -4105,10 +4177,6 @@ mod tests {
             // zca-js undo record delivered as a history message with its own id
             json!({ "content": { "deleteMsg": 1, "globalMsgId": 77 } }),
             json!({ "content": { "deleteMsg": 0 } }),
-            // deletion msgTypes (guesses)
-            json!({ "msgType": "chat.undo", "content": { "a": 1 } }),
-            json!({ "msgType": "chat.delete", "content": "" }),
-            json!({ "msgType": "chat.recalled", "content": {} }),
         ];
         for over in shapes {
             let m = norm(json!({
@@ -4124,10 +4192,47 @@ mod tests {
             assert!(m.attachment.is_none() && m.quote.is_none() && m.mentions.is_empty());
             assert!(m.raw.as_ref().unwrap().content.is_none());
         }
+        // guessed msgTypes are no longer treated as deletions (zca-js has no such evidence)
+        for t in ["chat.undo", "chat.delete", "chat.recalled", "chat.deleted", "undo"] {
+            assert!(!norm(json!({ "msgType": t, "content": "x" })).recalled, "{t}");
+        }
         // ordinary text is untouched, even when it reads like a deletion notice
         assert!(!norm(json!({ "content": "tin nhắn" })).recalled);
         assert!(!norm(json!({ "content": "Tin nhắn đã bị xóa" })).recalled);
         assert!(!norm(json!({ "content": "Tin nhắn đã được thu hồi" })).recalled);
+    }
+
+    #[test]
+    fn delete_for_me_tombstones_persist_and_block_re_adding() {
+        let store = ChatStore::in_memory();
+        store.add_message(make_msg("1", 1000, "100", "Dd", true));
+        store.add_message(make_msg("2", 2000, "100", "keep", true));
+        store.apply_undo("1");
+        assert!(store.delete_for_me(ThreadKind::User, "100", "1").unwrap().recalled);
+        assert!(store.get_message("1").is_none());
+        assert!(!store.add_message(make_msg("1", 1000, "100", "Dd", true)));
+        assert!(!store.add_history_message(make_msg("1", 1000, "100", "Dd", true)));
+        assert!(store.get_message("1").is_none());
+        // unknown ids are tombstoned too (nothing removed)
+        assert!(store.delete_for_me(ThreadKind::User, "100", "9").is_none());
+        assert!(store.is_deleted_for_me(ThreadKind::User, "100", "9"));
+        assert!(!store.is_deleted_for_me(ThreadKind::Group, "100", "9"));
+        // survives serialization
+        let meta = store.inner.state.read().unwrap().meta_json();
+        let parsed: MetaFile = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed.deleted_ids["user:100"], vec!["1".to_string(), "9".to_string()]);
+        // old meta without the field still loads
+        let old: MetaFile = serde_json::from_str("{\"version\":1}").unwrap();
+        assert!(old.deleted_ids.is_empty());
+    }
+
+    #[test]
+    fn undo_without_target_is_detected() {
+        assert!(raw_is_undo_without_target(&make_raw(json!({ "content": { "deleteMsg": 1 } }))));
+        assert!(!raw_is_undo_without_target(&make_raw(
+            json!({ "content": { "deleteMsg": 1, "globalMsgId": 5 } })
+        )));
+        assert!(!raw_is_undo_without_target(&make_raw(json!({ "content": "hi" }))));
     }
 
     #[test]
