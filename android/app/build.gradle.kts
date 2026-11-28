@@ -32,12 +32,14 @@ android {
         }
     }
 
-    // arm64 only (every current phone): keeps the APK name (app-arm64-v8a-debug.apk) and limits native builds to arm64-v8a.
+    // One APK per ABI, no universal APK: app-arm64-v8a-<type>.apk for almost every phone, and
+    // app-armeabi-v7a-<type>.apk for 32-bit-only phones and phones running a 32-bit Android. The ABIs listed here are
+    // also the ones the CMake build (Opus) targets. Do not add ndk { abiFilters }: AGP rejects it next to abi splits.
     splits {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a")
+            include("arm64-v8a", "armeabi-v7a")
             isUniversalApk = false
         }
     }
@@ -80,7 +82,14 @@ android {
     }
 }
 
-/** Compiles the embedded Rust Zalo server (libzalocore.so) for arm64-v8a using the Android NDK toolchain. */
+/**
+ * One ABI the Rust core is built for: [abi] is the folder name inside the APK, [triple] the Rust target, [clangPrefix]
+ * the NDK clang wrapper that compiles and links it (it says armv7a where the Rust target says armv7), and [rustflags]
+ * extra RUSTFLAGS for that target only.
+ */
+class RustAbi(val abi: String, val triple: String, val clangPrefix: String, val rustflags: String?)
+
+/** Compiles the embedded Rust Zalo server (libzalocore.so) for arm64-v8a and armeabi-v7a using the Android NDK toolchain. */
 abstract class BuildRustCoreTask : DefaultTask() {
     @get:Internal abstract val rustDir: DirectoryProperty
     @get:Internal abstract val sdkDir: DirectoryProperty
@@ -117,41 +126,67 @@ abstract class BuildRustCoreTask : DefaultTask() {
         val rust = rustDir.get().asFile
         val ndk = resolveNdkDir()
         val isWindows = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
-        val clangName = if (isWindows) "aarch64-linux-android26-clang.cmd" else "aarch64-linux-android26-clang"
         val arName = if (isWindows) "llvm-ar.exe" else "llvm-ar"
         val cargo = if (isWindows) "cargo.exe" else "cargo"
-
         val prebuiltRoot = File(ndk, "toolchains/llvm/prebuilt")
-        val llvmBin = prebuiltRoot.listFiles()
-            ?.filter { it.isDirectory }
-            ?.map { File(it, "bin") }
-            ?.firstOrNull { File(it, clangName).isFile && File(it, arName).isFile }
-            ?: throw GradleException(
-                "Could not locate $clangName and $arName under ${prebuiltRoot.absolutePath}",
-            )
 
-        val clang = File(llvmBin, clangName).absolutePath
-        val llvmAr = File(llvmBin, arName).absolutePath
+        // Keep this list in step with `splits { abi { include(...) } }` above: every ABI that gets an APK needs its core.
+        val abis = listOf(
+            RustAbi(
+                abi = "arm64-v8a",
+                triple = "aarch64-linux-android",
+                clangPrefix = "aarch64-linux-android26",
+                // Hardware AES / GHASH (ARMv8 Crypto Extensions) for message crypto and call SRTP. RustCrypto
+                // only builds them in with these cfgs; at runtime they are used if the CPU has them and fall back
+                // to software otherwise. Without the cfgs every AES block ran in software.
+                rustflags = "--cfg aes_armv8 --cfg polyval_armv8",
+            ),
+            // 32-bit ARM (Cortex-A7 and the like): no hardware AES, so none of those cfgs (they are aarch64 only).
+            RustAbi(
+                abi = "armeabi-v7a",
+                triple = "armv7-linux-androideabi",
+                clangPrefix = "armv7a-linux-androideabi26",
+                rustflags = null,
+            ),
+        )
 
-        execOps.exec {
-            workingDir = rust
-            environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", clang)
-            environment("CC_aarch64_linux_android", clang)
-            environment("AR_aarch64_linux_android", llvmAr)
-            // Hardware AES / GHASH (ARMv8 Crypto Extensions) for message crypto and call SRTP. RustCrypto
-            // only builds them in with these cfgs; at runtime they are used if the CPU has them and fall back
-            // to software otherwise. Without the cfgs every AES block ran in software.
-            environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS", "--cfg aes_armv8 --cfg polyval_armv8")
-            commandLine(cargo, "build", "--release", "--target", "aarch64-linux-android", "-p", "zalo-android")
+        for (target in abis) {
+            val clangName = if (isWindows) "${target.clangPrefix}-clang.cmd" else "${target.clangPrefix}-clang"
+            val llvmBin = prebuiltRoot.listFiles()
+                ?.filter { it.isDirectory }
+                ?.map { File(it, "bin") }
+                ?.firstOrNull { File(it, clangName).isFile && File(it, arName).isFile }
+                ?: throw GradleException(
+                    "Could not locate $clangName and $arName under ${prebuiltRoot.absolutePath}",
+                )
+
+            val clang = File(llvmBin, clangName).absolutePath
+            val llvmAr = File(llvmBin, arName).absolutePath
+            // aarch64-linux-android -> AARCH64_LINUX_ANDROID / aarch64_linux_android, the spelling cargo and the cc crate read.
+            val tripleLower = target.triple.replace('-', '_')
+            val tripleUpper = tripleLower.uppercase()
+            val rustflags = target.rustflags
+            val triple = target.triple
+
+            execOps.exec {
+                workingDir = rust
+                environment("CARGO_TARGET_${tripleUpper}_LINKER", clang)
+                environment("CC_$tripleLower", clang)
+                environment("AR_$tripleLower", llvmAr)
+                if (rustflags != null) {
+                    environment("CARGO_TARGET_${tripleUpper}_RUSTFLAGS", rustflags)
+                }
+                commandLine(cargo, "build", "--release", "--target", triple, "-p", "zalo-android")
+            }
+
+            val built = File(rust, "target/${target.triple}/release/libzalocore.so")
+            if (!built.isFile) {
+                throw GradleException("Expected compiled Rust library not found at ${built.absolutePath}")
+            }
+            val dest = File(outputDir.get().asFile, "${target.abi}/libzalocore.so")
+            dest.parentFile.mkdirs()
+            built.copyTo(dest, overwrite = true)
         }
-
-        val built = File(rust, "target/aarch64-linux-android/release/libzalocore.so")
-        if (!built.isFile) {
-            throw GradleException("Expected compiled Rust library not found at ${built.absolutePath}")
-        }
-        val dest = File(outputDir.get().asFile, "arm64-v8a/libzalocore.so")
-        dest.parentFile.mkdirs()
-        built.copyTo(dest, overwrite = true)
     }
 }
 

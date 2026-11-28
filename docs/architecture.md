@@ -301,9 +301,12 @@ copies, shares and clears it.
 ## 13. Building and testing
 
 - **Build.** `cd android && ./gradlew assembleRelease`. The Gradle task `buildRustCore<Variant>` runs
-  `cargo build --release --target aarch64-linux-android -p zalo-android` with the NDK's clang and packs
-  `libzalocore.so` into the APK. The Opus codec (`libzaloopus.so`) is built from C with CMake. The app is arm64-only.
-  The release APK is about 5.7 MB.
+  `cargo build --release --target <triple> -p zalo-android` with the NDK's clang for `aarch64-linux-android` (arm64-v8a;
+  hardware AES through `--cfg aes_armv8 --cfg polyval_armv8`) and for `armv7-linux-androideabi` (armeabi-v7a, 32-bit;
+  no hardware AES), and packs each `libzalocore.so` into the APK of its ABI. The Opus codec (`libzaloopus.so`) is built
+  from C with CMake for both ABIs. The app ships as two APKs (`app-arm64-v8a-release.apk`, `app-armeabi-v7a-release.apk`,
+  no universal APK); the arm64 release APK is about 5.7 MB. The 32-bit one is only checked by CI (it compiles and holds
+  32-bit ARM libraries), not run on real hardware.
 - **Rust tests** (`cd rust && cargo test --workspace`, 222 tests):
   - protocol and media units (encryption, frames, SRTP, RTCP, H.264, LZMA, SQLite and ZDB against real fixtures in
     `rust/fixtures/`);
@@ -319,7 +322,8 @@ copies, shares and clears it.
   decisions (pause/resume timing, busy checks, which Zalo notifications count), the code detector (same vectors as
   Rust), code de-duplication and which notification-listener job runs.
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
-  APKs, checks the native libraries are inside, and uploads the APKs.
+  APKs (arm64-v8a and armeabi-v7a each), checks the native libraries are inside and match each APK's architecture, and
+  uploads the APKs.
 
 Confirmed on a real phone so far: the JNI path end to end (the app running the core in-process) and history sync. What
 only a real phone and account can still check: call audio and video quality, the notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).

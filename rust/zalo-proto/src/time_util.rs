@@ -360,7 +360,9 @@ pub fn next_local_8am_epoch_ms(now_ms: i64) -> i64 {
 
 #[cfg(unix)]
 fn next_local_8am_unix(now_ms: i64) -> Option<i64> {
-    let now_secs = now_ms.div_euclid(1000) as libc::time_t;
+    // `time_t` is 32 bits on 32-bit Android (until 2038): a time that does not fit must fall back to the UTC
+    // computation, not wrap around into 1901..1970.
+    let now_secs = libc::time_t::try_from(now_ms.div_euclid(1000)).ok()?;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let res = unsafe { libc::localtime_r(&now_secs, &mut tm) };
     if res.is_null() {
@@ -512,6 +514,11 @@ mod tests {
             target - now
         );
         assert_eq!(target % 60_000, 0, "8:00:00 is on a minute boundary");
+
+        // A time beyond 32-bit `time_t` (year 2100) must still give a target within a day, not a wrapped one.
+        let far = days_from_civil(2100, 6, 15) * 86_400_000 + 3_600_000;
+        let far_target = next_local_8am_epoch_ms(far);
+        assert!(far_target > far && far_target - far <= 25 * 3_600_000, "far={far} target={far_target}");
 
         // UTC fallback check at 07:00 UTC -> 08:00 UTC same day (+1h)
         let utc_7am = days_from_civil(2026, 6, 15) * 86_400_000 + 7 * 3_600_000;

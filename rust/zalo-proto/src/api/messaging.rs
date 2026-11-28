@@ -345,7 +345,8 @@ impl ZaloClient {
                 )));
             }
             let total_size = src.data.len();
-            if total_size > max_size_mb * 1024 * 1024 {
+            // In u64: `max_size_mb * 1024 * 1024` overflows a 32-bit usize from 4096 MB on.
+            if total_size as u64 > (max_size_mb as u64).saturating_mul(1024 * 1024) {
                 return Err(ProtoError::InvalidArg(format!(
                     "File {} size exceeds maximum size of {}MB",
                     src.filename, max_size_mb

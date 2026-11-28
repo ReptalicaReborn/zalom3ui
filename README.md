@@ -82,8 +82,17 @@ The details (how a request travels, events, calls, storage, the connection lifec
 
 ## Install
 
-1. Download `zalom3ui-release-apk` from the latest **CI** run on GitHub. It holds one APK, for `arm64-v8a` phones
-   (almost every current phone; check with `adb shell getprop ro.product.cpu.abi`). It is about 6 MB.
+1. Download `zalom3ui-release-apk` from the latest **CI** run on GitHub. It holds two APKs, one per phone
+   architecture (the arm64 one is about 6 MB). Install one of them:
+   - `app-arm64-v8a-release.apk`: for almost every phone. Try this one first.
+   - `app-armeabi-v7a-release.apk`: for old phones that are 32-bit only, and for phones running a 32-bit Android (some
+     phones with a 64-bit chip, such as a Cortex-A53, ship a 32-bit system). To tell: `adb shell getprop
+     ro.product.cpu.abi` prints `arm64-v8a` or `armeabi-v7a`; on the phone, an app such as CPU-Z shows the
+     architecture (`aarch64` is 64-bit, `armv7l` is 32-bit). If Android answers "App not installed" for the arm64 APK,
+     install the other one. Do not use it on a 64-bit phone that can run the arm64 one: it is slower there.
+
+   The 32-bit build has no hardware AES (the Cortex-A7 has none), so it does the message and call encryption in
+   software and video calls may be slow. It builds in CI, but it has not been tried on real 32-bit hardware yet.
 2. Copy the APK to the phone and open it (allow installing from that app when asked), or `adb install` it.
 3. Open **Zalỏ** and log in. Android 8.0 or newer. Zalỏ has its own app id (`com.zalom3ui.app`), so it installs next to
    Zalo Lite or the official app.
@@ -163,16 +172,18 @@ The Android emulator reaches a server on your computer at `http://10.0.2.2:3000`
 
 ## Building
 
-You need Rust (stable) with the `aarch64-linux-android` target, the Android SDK and NDK, and JDK 17.
+You need Rust (stable) with the `aarch64-linux-android` and `armv7-linux-androideabi` targets, the Android SDK and NDK,
+and JDK 17.
 
 ```bash
-rustup target add aarch64-linux-android
+rustup target add aarch64-linux-android armv7-linux-androideabi
 cd android
 ./gradlew testDebugUnitTest assembleDebug assembleRelease
 ```
 
-Gradle compiles the Rust core for the phone itself (task `buildRustCore*`, using the NDK's clang) and packs it into the
-APK next to the small Opus codec (`libzaloopus.so`, C). Rust tests: `cd rust && cargo test --workspace`.
+Gradle compiles the Rust core for the phone itself, once for 64-bit ARM and once for 32-bit ARM (task `buildRustCore*`,
+using the NDK's clang), and packs each into its own APK (`app-arm64-v8a-*.apk`, `app-armeabi-v7a-*.apk`) next to the
+small Opus codec (`libzaloopus.so`, C). Rust tests: `cd rust && cargo test --workspace`.
 
 | Folder | What it is |
 |---|---|
