@@ -664,6 +664,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         openChatJob = viewModelScope.launch {
+            // Asked at the same time as the messages, not after them: opening a chat waited for both one by one.
+            val detailsCall = async {
+                try {
+                    api.details(thread.kind, thread.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+            }
             try {
                 val res = api.messages(thread.kind, thread.id, PAGE_SIZE)
                 val unread = _state.value.threads.firstOrNull { it.ref == thread.ref }?.unread ?: thread.unread
@@ -682,18 +692,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (unread > 0 && _state.value.status?.connectingWithSavedSession() != true) {
                     markRead(api, thread.ref)
                 }
-                val details = try {
-                    api.details(thread.kind, thread.id)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    null
+                val details = detailsCall.await()
+                // One update for both, so the chat redraws once.
+                if (details != null && (details.lastOnline != null || details.members != null)) {
+                    updateChat(thread.ref) {
+                        it.copy(
+                            lastOnline = details.lastOnline ?: it.lastOnline,
+                            members = details.members ?: it.members,
+                        )
+                    }
                 }
-                if (details?.lastOnline != null) updateChat(thread.ref) { it.copy(lastOnline = details.lastOnline) }
-                if (details?.members != null) updateChat(thread.ref) { it.copy(members = details.members) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                detailsCall.cancel()
                 _state.update { it.copy(error = e.message ?: "Something went wrong") }
             } finally {
                 updateChat(thread.ref) { it.copy(loading = false) }

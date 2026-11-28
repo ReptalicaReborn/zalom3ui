@@ -835,3 +835,53 @@ async fn real_recall_still_shows_message_recalled() {
     assert_eq!(m.text, "Message recalled");
     assert!(!r.store.is_deleted_for_me(ThreadKind::Group, "g1", "1"));
 }
+
+#[tokio::test]
+async fn opening_a_small_group_answers_from_the_cache_and_fetches_history_in_the_background() {
+    let r = rig();
+    r.ingest(incoming("m1", 1000, json!({}), true)).await;
+    // Zalo never answers: the open must not wait for it.
+    r.api.on_async("get_group_chat_history", |_| {
+        Box::pin(futures_util::future::pending())
+    });
+
+    let (_, messages) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        r.session.get_messages(ThreadKind::Group, "g1", None, None),
+    )
+    .await
+    .expect("the open waited for the history fetch")
+    .unwrap();
+    assert_eq!(messages.len(), 1);
+    settle().await;
+    assert_eq!(r.api.calls_to("get_group_chat_history").len(), 1);
+
+    // A second open does not ask Zalo again this session.
+    r.session
+        .get_messages(ThreadKind::Group, "g1", None, None)
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(r.api.calls_to("get_group_chat_history").len(), 1);
+}
+
+#[tokio::test]
+async fn opening_an_empty_group_waits_for_its_history_and_retries_after_a_failure() {
+    let r = rig();
+    r.api.fail("get_group_chat_history", || {
+        zalo_proto::ProtoError::WebSocket("offline".into())
+    });
+    r.session
+        .get_messages(ThreadKind::Group, "g1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(r.api.calls_to("get_group_chat_history").len(), 1);
+
+    // It failed, so the next open tries again (and waits, there is nothing to show).
+    r.api.respond("get_group_chat_history", json!({ "groupMsgs": [] }));
+    r.session
+        .get_messages(ThreadKind::Group, "g1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(r.api.calls_to("get_group_chat_history").len(), 2);
+}

@@ -51,6 +51,9 @@ const GROUP_BOARD_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_GROUP_BOARD_CACHE: usize = 128;
 const MAX_POLL_GROUPS_CACHE: usize = 500;
 const MAX_LOOKED_UP_USERS: usize = 2_000;
+/// Opening a group with fewer cached messages than this fetches its history from Zalo (once a session).
+const GROUP_HISTORY_MIN_CACHED: usize = 20;
+const MAX_GROUP_HISTORY_FETCHED: usize = 2_000;
 const SEEN_RECEIPT_LIMIT: usize = 50;
 const RESUME_RETRY_MIN_MS: u64 = 5_000;
 const RESUME_RETRY_MAX_MS: u64 = 60_000;
@@ -228,6 +231,9 @@ struct SessionInner {
     sticker_order: VecDeque<i64>,
     viewing: Option<(String, i64)>,
     looked_up_users: HashSet<String>,
+    /// Groups whose server history was fetched (or is being fetched) this session, so opening a
+    /// small group does not ask Zalo again each time (see [`ZaloSession::get_messages`]).
+    group_history_fetched: HashSet<String>,
     /// The chat listener is paused (or will be once the login in flight completes): no listener,
     /// no reconnects, credentials and login intact.
     pause_requested: bool,
@@ -305,6 +311,7 @@ impl Default for SessionInner {
             sticker_order: VecDeque::new(),
             viewing: None,
             looked_up_users: HashSet::new(),
+            group_history_fetched: HashSet::new(),
             pause_requested: false,
             notify_window: None,
             connected_at: 0,
@@ -845,6 +852,7 @@ impl ZaloSession {
                 s.sticker_order.clear();
                 s.viewing = None;
                 s.looked_up_users.clear();
+                s.group_history_fetched.clear();
                 s.status = SessionStatus::default();
             }
         }
@@ -2400,18 +2408,51 @@ impl ZaloSession {
         before: Option<i64>,
         limit: Option<usize>,
     ) -> Result<(Option<ThreadInfo>, Vec<ChatMessage>), HttpError> {
-        if kind == ThreadKind::Group
-            && before.is_none()
-            && self.store.message_count(kind, id) < 20
-        {
-            if let Err(err) = self.fetch_group_history(id, Some(50)).await {
-                warn!("Group history failed for {id}: {err}");
+        if kind == ThreadKind::Group && before.is_none() {
+            let cached = self.store.message_count(kind, id);
+            if cached < GROUP_HISTORY_MIN_CACHED && self.claim_group_history(id) {
+                if cached == 0 {
+                    // Nothing to show yet: wait for the history, the chat would open empty otherwise.
+                    if let Err(err) = self.fetch_group_history(id, Some(50)).await {
+                        warn!("Group history failed for {id}: {err}");
+                        self.release_group_history(id);
+                    }
+                } else {
+                    // Answer with what is cached now; the fetched messages arrive as message events.
+                    // Waiting here held the chat open for as long as Zalo took (seconds on a slow link).
+                    let session = Arc::clone(self);
+                    let group_id = id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(err) = session.fetch_group_history(&group_id, Some(50)).await {
+                            warn!("Group history failed for {group_id}: {err}");
+                            session.release_group_history(&group_id);
+                        }
+                    });
+                }
             }
         }
         Ok((
             self.store.get_thread(kind, id),
             self.store.get_messages(kind, id, before, limit),
         ))
+    }
+
+    /// Marks `group_id`'s history as fetched this session; false when it already was.
+    fn claim_group_history(&self, group_id: &str) -> bool {
+        let Ok(mut s) = self.inner.write() else {
+            return true;
+        };
+        if s.group_history_fetched.len() >= MAX_GROUP_HISTORY_FETCHED {
+            s.group_history_fetched.clear();
+        }
+        s.group_history_fetched.insert(group_id.to_string())
+    }
+
+    /// The fetch failed: the next open of the chat tries again.
+    fn release_group_history(&self, group_id: &str) {
+        if let Ok(mut s) = self.inner.write() {
+            s.group_history_fetched.remove(group_id);
+        }
     }
 
     pub async fn fetch_group_history(
