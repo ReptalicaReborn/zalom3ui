@@ -1421,7 +1421,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 // The saved session was rejected while its chats were showing: the login screen takes over, so a chat
                 // that was opened meanwhile closes with it (its screen pops itself once there is no open chat).
-                if (wasConnecting && !event.status.isLoggedIn && !event.status.connectingWithSavedSession()) closeChat()
+                if ((wasConnecting || wasLoggedIn) && !event.status.isLoggedIn && !event.status.connectingWithSavedSession()) closeChat()
                 if (event.status.state == "ready" && (!wasReady || outbox.pendingCount() > 0)) {
                     flushOutbox()
                 }

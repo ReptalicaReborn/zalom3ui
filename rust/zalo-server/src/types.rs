@@ -754,6 +754,13 @@ pub struct SessionStatus {
     /// `logging_in`; absent in older cores, hence the default.
     #[serde(default)]
     pub resuming: bool,
+    /// Why the session is `logged_out` when Zalo ended it (as opposed to a fresh start or an
+    /// explicit logout): `"elsewhere"` (kicked / logged out from another device while Zalỏ was
+    /// connected) or `"expired"` (the saved session was rejected at sign-in). `None` otherwise,
+    /// and always `None` outside `logged_out`. Chats stay cached on disk; a client shows the
+    /// login screen with a note. Absent in older cores, hence the default.
+    #[serde(default)]
+    pub logged_out_reason: Option<String>,
 }
 
 impl Default for SessionStatus {
@@ -768,6 +775,7 @@ impl Default for SessionStatus {
             error: None,
             retrying: false,
             resuming: false,
+            logged_out_reason: None,
         }
     }
 }
@@ -1090,7 +1098,18 @@ mod tests {
         assert_eq!(sv["qrImage"], "data:image/png;base64,AAA");
         assert_eq!(sv["retrying"], false);
         assert_eq!(sv["resuming"], false);
+        assert!(sv["loggedOutReason"].is_null());
         assert!(sv["ownId"].is_null());
+
+        // `loggedOutReason` is camelCase on the wire, and optional on the way in.
+        let out = SessionStatus {
+            logged_out_reason: Some("elsewhere".into()),
+            ..Default::default()
+        };
+        let ov = serde_json::to_value(&out).unwrap();
+        assert_eq!(ov["loggedOutReason"], "elsewhere");
+        let back: SessionStatus = serde_json::from_value(ov).unwrap();
+        assert_eq!(back.logged_out_reason.as_deref(), Some("elsewhere"));
 
         // `resuming` is camelCase on the wire and optional on the way in (status JSON from an
         // older core, or saved before the field existed, has none).
@@ -1116,5 +1135,6 @@ mod tests {
         .unwrap();
         assert!(old.retrying);
         assert!(!old.resuming);
+        assert_eq!(old.logged_out_reason, None);
     }
 }

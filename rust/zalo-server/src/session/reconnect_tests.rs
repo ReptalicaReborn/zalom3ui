@@ -268,3 +268,129 @@ async fn a_listener_that_cannot_start_is_retried_with_backoff() {
     assert_eq!(api.listener_starts(), 2);
     assert_eq!(session.get_status().state, SessionState::Disconnected);
 }
+
+// ---- a dead session is told apart from a dropped network ----
+
+/// Like [`session_with_listener`], but with saved credentials and scripted re-logins (what the
+/// reconnect uses to check that Zalo still honours the session).
+fn session_with_logins(
+    steps: Vec<crate::testing::LoginStep>,
+) -> (Arc<ZaloSession>, Arc<FakeZaloApi>, Arc<FakeLogin>, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("zalo-reconnect-{:016x}", rand::random::<u64>()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("credentials.json"),
+        json!({ "imei": "i", "cookie": [], "userAgent": "ua" }).to_string(),
+    )
+    .unwrap();
+    let login = FakeLogin::new(steps);
+    let session = Arc::new(ZaloSession::with_login(
+        ChatStore::in_memory(),
+        dir.clone(),
+        true,
+        login.clone(),
+    ));
+    let api = FakeZaloApi::new("me");
+    session.testing_attach(api.clone());
+    session.testing_start_listener().unwrap();
+    (session, api, login, dir)
+}
+
+fn rejected() -> ProtoError {
+    ProtoError::Login(-1, "Đăng nhập thất bại".into())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_with_a_rejected_session_goes_logged_out_and_stops_reconnecting() {
+    use crate::testing::LoginStep;
+    let (session, api, login, dir) = session_with_logins(vec![LoginStep::cookie_error(rejected)]);
+    drop_connection(&api).await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggedOut);
+    assert_eq!(s.logged_out_reason.as_deref(), Some(LOGGED_OUT_ELSEWHERE));
+    assert_eq!(s.error.as_deref(), Some(LOGGED_OUT_ELSEWHERE_MSG));
+    assert!(!s.resuming && !s.retrying);
+    assert_eq!(login.attempts(), 1);
+
+    advance(Duration::from_secs(600)).await;
+    assert_eq!(api.listener_starts(), 1, "no reconnect with a dead session");
+    assert_eq!(login.attempts(), 1, "and no more login attempts");
+    assert_eq!(session.get_status().state, SessionState::LoggedOut);
+    assert!(dir.join("credentials.json").exists(), "credentials stay on disk");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kick_close_with_a_rejected_session_goes_logged_out() {
+    use crate::testing::LoginStep;
+    let (session, api, _login, dir) = session_with_logins(vec![LoginStep::cookie_error(rejected)]);
+    assert!(api.emit(closed(CloseReason::KickConnection as u16)));
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::LoggedOut);
+    assert_eq!(s.logged_out_reason.as_deref(), Some(LOGGED_OUT_ELSEWHERE));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_duplicate_connection_close_stays_disconnected_without_a_login_check() {
+    use crate::testing::LoginStep;
+    let (session, api, login, dir) = session_with_logins(vec![LoginStep::cookie_error(rejected)]);
+    assert!(api.emit(closed(CloseReason::DuplicateConnection as u16)));
+    settle().await;
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::Disconnected);
+    assert_eq!(s.logged_out_reason, None);
+    assert_eq!(login.attempts(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_while_offline_keeps_reconnecting_and_is_not_a_logout() {
+    use crate::testing::LoginStep;
+    let (session, api, login, dir) = session_with_logins(vec![LoginStep::cookie_error(|| {
+        ProtoError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer closed connection without sending TLS close_notify",
+        ))
+    })]);
+    drop_connection(&api).await;
+    assert_eq!(session.get_status().state, SessionState::Disconnected);
+    advance(Duration::from_millis(5_100)).await;
+    assert_eq!(api.listener_starts(), 2, "reconnected after the backoff");
+    assert!(login.attempts() >= 1, "the session was checked");
+    let s = session.get_status();
+    assert_eq!(s.state, SessionState::Disconnected);
+    assert_eq!(s.logged_out_reason, None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_with_a_still_valid_session_keeps_reconnecting() {
+    use crate::testing::LoginStep;
+    let (session, api, _login, dir) =
+        session_with_logins(vec![LoginStep::cookie_ok(FakeZaloApi::new("me"))]);
+    drop_connection(&api).await;
+    advance(Duration::from_millis(5_100)).await;
+    assert_eq!(api.listener_starts(), 2);
+    assert_ne!(session.get_status().state, SessionState::LoggedOut);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_a_zalo_refusal_counts_as_a_rejected_session() {
+    assert!(is_session_rejected(&ProtoError::Login(-1, "x".into())));
+    assert!(is_session_rejected(&ProtoError::Login(114, "x".into())));
+    assert!(is_session_rejected(&ProtoError::Login(401, "x".into())));
+    assert!(is_session_rejected(&ProtoError::Api { code: 3000, message: "x".into() }));
+    assert!(is_session_rejected(&ProtoError::HttpStatus { status: 403, message: "x".into() }));
+    assert!(!is_session_rejected(&ProtoError::Login(503, "HTTP 503".into())));
+    assert!(!is_session_rejected(&ProtoError::Login(429, "HTTP 429".into())));
+    assert!(!is_session_rejected(&ProtoError::HttpStatus { status: 502, message: "x".into() }));
+    assert!(!is_session_rejected(&ProtoError::WebSocket("x".into())));
+    assert!(!is_session_rejected(&ProtoError::Io(std::io::Error::other("x"))));
+    assert!(!is_session_rejected(&ProtoError::Crypto("x".into())));
+    // And a 5xx at sign-in is retried, not treated as an expired session.
+    assert!(is_transient_proto_error(&ProtoError::Login(503, "HTTP 503".into())));
+    assert!(!is_transient_proto_error(&ProtoError::Login(-1, "x".into())));
+}

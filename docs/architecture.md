@@ -125,6 +125,13 @@ detector is `extract_otp_code` in `store.rs`, mirrored by `extractOtpCode` in `u
 - **Drops.** If the socket closes unexpectedly, the session reconnects with one tracked task: 5 s, doubling up to
   5 minutes, with a little jitter, reset after a successful connect. `POST /api/retry` (sent by the app when the network
   comes back) skips the wait. Logout, a new login and `POST /api/reconnect` cancel it.
+- **Session ended.** Before every reconnect attempt (and after a 3003 kick) the core re-logs in with the saved cookies.
+  If Zalo refuses the session (a login error code, a Zalo API error, HTTP 401/403) it stops reconnecting, drops the
+  client and goes `logged_out` with `loggedOutReason: "elsewhere"` (the status `error` is *You were logged out on
+  another device. Log in again.*). A saved session rejected at start-up is `loggedOutReason: "expired"`. The chats and
+  `credentials.json` stay on disk; the app shows the login screen with a note. Network errors, 5xx, 408 and 429 never
+  count: the core keeps reconnecting. `loggedOutReason` is optional (absent in older cores) and only set while
+  `logged_out`.
 - **Kicked.** Zalo allows one web connection per account. If Zalo Web or PC connects elsewhere, Zalo closes Zalỏ's socket
   as a duplicate. The session does not fight back: it shows *Zalo Web was opened somewhere else* and waits for you to
   tap *Reconnect*.

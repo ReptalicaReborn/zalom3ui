@@ -511,7 +511,7 @@ fun ThreadListScreen(
                 if (status?.state == "disconnected" || connectionError != null) {
                     item(key = "banner", contentType = "banner") {
                         StatusBanner(
-                            text = connectionError ?: status?.error ?: "Disconnected from Zalo",
+                            text = connectionBannerText(status?.error, connectionError),
                             action = if (status?.state == "disconnected") "Reconnect" else null,
                             onAction = actions.onReconnect,
                         )
