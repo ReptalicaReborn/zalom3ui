@@ -164,7 +164,18 @@ fun LoginScreen(
                     }
                 }
 
-                status.error?.let { error ->
+                val loggedOutNote = loggedOutNoteFor(status)
+                if (loggedOutNote != null) {
+                    Spacer(Modifier.height(20.dp))
+                    Text(
+                        loggedOutNote,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                // The note says why; the core's longer message would only repeat it.
+                status.error?.takeIf { loggedOutNote == null }?.let { error ->
                     Spacer(Modifier.height(20.dp))
                     Card(
                         shape = RoundedCornerShape(24.dp),

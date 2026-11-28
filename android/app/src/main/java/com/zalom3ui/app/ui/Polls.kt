@@ -5,6 +5,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -417,6 +419,7 @@ internal fun buildPollRequest(
 )
 
 /** Question, two or more options, multiple-choice and "members can add options" switches, optional deadline. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CreatePollDialog(onDismiss: () -> Unit) {
     val polls = LocalPolls.current ?: return
@@ -467,9 +470,17 @@ fun CreatePollDialog(onDismiss: () -> Unit) {
                 SwitchRow("Multiple choice", multiple) { multiple = it }
                 SwitchRow("Members can add options", allowAdd) { allowAdd = it }
                 Text("Deadline", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Chips wrap onto a new line as whole units; a label never gets squeezed into one letter per line.
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
                     POLL_DEADLINES.forEach { (label, ms) ->
-                        FilterChip(selected = deadline == ms, onClick = { deadline = ms }, label = { Text(label) })
+                        FilterChip(
+                            selected = deadline == ms,
+                            onClick = { deadline = ms },
+                            label = { Text(label, maxLines = 1, softWrap = false) },
+                        )
                     }
                 }
                 error?.let {

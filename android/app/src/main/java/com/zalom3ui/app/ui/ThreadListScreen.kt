@@ -49,6 +49,7 @@ import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.WifiOff
 import androidx.compose.material3.ButtonGroupDefaults
@@ -109,6 +110,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
@@ -132,6 +134,8 @@ import com.zalom3ui.app.data.MessageSearchHit
 import com.zalom3ui.app.data.MuteOption
 import com.zalom3ui.app.data.SessionStatus
 import com.zalom3ui.app.data.ThreadSummary
+import com.zalom3ui.app.data.isManuallyHidden
+import com.zalom3ui.app.data.isOfficialShownOverride
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
@@ -151,6 +155,10 @@ class ThreadListActions(
     val onMarkUnread: (ThreadSummary) -> Unit,
     /** Turns on "Hide official accounts" (from an OA chat's long-press menu). */
     val onHideOfficialAccounts: () -> Unit = {},
+    /** Hides one chat by hand ("Hide chat" in the long-press sheet). */
+    val onHideChat: (ThreadSummary) -> Unit = {},
+    /** Brings a hidden chat back ("Unhide" in the hidden-chats list). */
+    val onUnhideChat: (ThreadSummary) -> Unit = {},
     val onDelete: (ThreadSummary) -> Unit,
     val onSearchMessages: (String) -> Unit = {},
     val onOpenSearchHit: (MessageSearchHit) -> Unit = {},
@@ -162,7 +170,7 @@ enum class ChatFilter {
     ALL,
     UNREAD,
     GROUPS,
-    /** Only Official Accounts; reached from the "Official accounts (N)" row, not from the pill bar. */
+    /** Only hidden chats (Official Accounts and chats hidden by hand); reached from the "Hidden chats (N)" row. */
     OFFICIAL,
 }
 
@@ -174,18 +182,40 @@ internal fun filterChats(chats: List<ThreadSummary>, filter: ChatFilter): List<T
     ChatFilter.OFFICIAL -> chats.filter { it.isOfficialAccount }
 }
 
+/** True when [chat] is hidden: hidden by hand, or an Official Account while [hideOfficialAccounts] is on. */
+internal fun isChatHidden(chat: ThreadSummary, hideOfficialAccounts: Boolean, hiddenKeys: Set<String>): Boolean =
+    isManuallyHidden(hiddenKeys, chat.key) ||
+        (hideOfficialAccounts && chat.isOfficialAccount && !isOfficialShownOverride(hiddenKeys, chat.key))
+
 /**
  * The chats the list shows for [filter]. With [hideOfficialAccounts] on, Official Accounts are left out of every
  * filter except [ChatFilter.OFFICIAL], which exists to reach them.
  */
-internal fun chatsForFilter(chats: List<ThreadSummary>, filter: ChatFilter, hideOfficialAccounts: Boolean): List<ThreadSummary> {
-    val base = if (hideOfficialAccounts && filter != ChatFilter.OFFICIAL) chats.filterNot { it.isOfficialAccount } else chats
+internal fun chatsForFilter(
+    chats: List<ThreadSummary>,
+    filter: ChatFilter,
+    hideOfficialAccounts: Boolean,
+    hiddenKeys: Set<String> = emptySet(),
+): List<ThreadSummary> {
+    if (filter == ChatFilter.OFFICIAL) {
+        // The hidden-chats list: every hidden chat, plus Official Accounts (all of them when they are not hidden).
+        return chats.filter { it.isOfficialAccount || isManuallyHidden(hiddenKeys, it.key) }
+    }
+    val base = if (hideOfficialAccounts || hiddenKeys.isNotEmpty()) {
+        chats.filterNot { isChatHidden(it, hideOfficialAccounts, hiddenKeys) }
+    } else {
+        chats
+    }
     return filterChats(base, filter)
 }
 
 /** How many Official Account chats the "Official accounts (N)" row stands for; 0 when they are not hidden. */
 internal fun hiddenOfficialAccountCount(chats: List<ThreadSummary>, hideOfficialAccounts: Boolean): Int =
     if (hideOfficialAccounts) chats.count { it.isOfficialAccount } else 0
+
+/** How many chats the "Hidden chats (N)" row stands for: OA chats (when hiding them) plus chats hidden by hand. */
+internal fun hiddenChatCount(chats: List<ThreadSummary>, hideOfficialAccounts: Boolean, hiddenKeys: Set<String>): Int =
+    chats.count { isChatHidden(it, hideOfficialAccounts, hiddenKeys) }
 
 private val WHITESPACE_REGEX = Regex("\\s+")
 
@@ -241,7 +271,7 @@ internal fun findHighlightRanges(text: String, query: String): List<IntRange> {
     return ranges
 }
 
-private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE, HIDE_OFFICIAL }
+private enum class RowAction { PIN, UNPIN, MUTE, UNMUTE, READ, UNREAD, DELETE, HIDE_OFFICIAL, HIDE_CHAT, UNHIDE_CHAT }
 
 /**
  * The chat list. It takes only the parts of [UiState] it shows, so it skips recomposing when anything else changes;
@@ -267,6 +297,8 @@ fun ThreadListScreen(
     selectedKey: String? = null,
     /** "Hide official accounts" setting: OA chats move behind an "Official accounts (N)" row. */
     hideOfficialAccounts: Boolean = false,
+    /** Thread keys hidden by hand; shown behind the same row as hidden Official Accounts. */
+    hiddenChats: Set<String> = emptySet(),
 ) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -294,14 +326,16 @@ fun ThreadListScreen(
     val chats = remember(threads, drafts) {
         threads.filter { it.lastMessage != null || it.pinned || it.unread > 0 || !drafts[it.ref.key].isNullOrBlank() }
     }
-    val unreadChatCount = remember(chats, hideOfficialAccounts) {
-        chats.count { it.unread > 0 && !(hideOfficialAccounts && it.isOfficialAccount) }
+    val unreadChatCount = remember(chats, hideOfficialAccounts, hiddenChats) {
+        chats.count { it.unread > 0 && !isChatHidden(it, hideOfficialAccounts, hiddenChats) }
     }
-    val officialCount = remember(chats, hideOfficialAccounts) { hiddenOfficialAccountCount(chats, hideOfficialAccounts) }
-    // If the setting is turned off while the official-accounts list is open, fall back to all chats.
-    val activeFilter = if (filter == ChatFilter.OFFICIAL && !hideOfficialAccounts) ChatFilter.ALL else filter
-    val visibleChats = remember(chats, activeFilter, searching, hideOfficialAccounts) {
-        if (searching) chats else chatsForFilter(chats, activeFilter, hideOfficialAccounts)
+    val officialCount = remember(chats, hideOfficialAccounts, hiddenChats) {
+        hiddenChatCount(chats, hideOfficialAccounts, hiddenChats)
+    }
+    // If nothing is hidden any more while the hidden-chats list is open, fall back to all chats.
+    val activeFilter = if (filter == ChatFilter.OFFICIAL && officialCount == 0) ChatFilter.ALL else filter
+    val visibleChats = remember(chats, activeFilter, searching, hideOfficialAccounts, hiddenChats) {
+        if (searching) chats else chatsForFilter(chats, activeFilter, hideOfficialAccounts, hiddenChats)
     }
     val folded = foldForSearch(query.trim())
     val matches = remember(threads, folded) {
@@ -319,6 +353,8 @@ fun ThreadListScreen(
             RowAction.UNREAD -> actions.onMarkUnread(thread)
             RowAction.DELETE -> deleteFor = thread
             RowAction.HIDE_OFFICIAL -> actions.onHideOfficialAccounts()
+            RowAction.HIDE_CHAT -> actions.onHideChat(thread)
+            RowAction.UNHIDE_CHAT -> actions.onUnhideChat(thread)
         }
     }
 
@@ -475,7 +511,7 @@ fun ThreadListScreen(
                 if (status?.state == "disconnected" || connectionError != null) {
                     item(key = "banner", contentType = "banner") {
                         StatusBanner(
-                            text = connectionError ?: status?.error ?: "Disconnected from Zalo",
+                            text = connectionBannerText(status?.error, connectionError),
                             action = if (status?.state == "disconnected") "Reconnect" else null,
                             onAction = actions.onReconnect,
                         )
@@ -493,7 +529,7 @@ fun ThreadListScreen(
                 if (!searching && officialCount > 0 && activeFilter == ChatFilter.OFFICIAL) {
                     item(key = "official-back", contentType = "official-row") {
                         OfficialAccountsRow(
-                            text = "Official accounts ($officialCount)",
+                            text = "Hidden chats ($officialCount)",
                             hint = "Back to all chats",
                             onClick = { filter = ChatFilter.ALL },
                         )
@@ -504,7 +540,7 @@ fun ThreadListScreen(
                 } else if (visibleChats.isEmpty()) {
                     item(key = "empty-filtered", contentType = "empty") {
                         val (title, subtitle) = when (activeFilter) {
-                            ChatFilter.OFFICIAL -> "No official accounts" to "News, shops and notification senders appear here."
+                            ChatFilter.OFFICIAL -> "No hidden chats" to "Chats you hide appear here."
                             ChatFilter.UNREAD -> "All caught up" to "No unread conversations right now."
                             ChatFilter.GROUPS -> "No group chats" to "Group conversations you join or create appear here."
                             ChatFilter.ALL -> "No chats yet" to "New messages appear here. Tap the pencil to write to a friend or group."
@@ -519,8 +555,8 @@ fun ThreadListScreen(
                     if (officialCount > 0 && activeFilter == ChatFilter.ALL) {
                         item(key = "official-row", contentType = "official-row") {
                             OfficialAccountsRow(
-                                text = "Official accounts ($officialCount)",
-                                hint = "Hidden from your chat list",
+                                text = "Hidden chats ($officialCount)",
+                                hint = "Official accounts and chats you hid",
                                 onClick = { filter = ChatFilter.OFFICIAL },
                             )
                         }
@@ -559,8 +595,8 @@ fun ThreadListScreen(
                     if (officialCount > 0 && activeFilter == ChatFilter.ALL) {
                         item(key = "official-row", contentType = "official-row") {
                             OfficialAccountsRow(
-                                text = "Official accounts ($officialCount)",
-                                hint = "Hidden from your chat list",
+                                text = "Hidden chats ($officialCount)",
+                                hint = "Official accounts and chats you hid",
                                 onClick = { filter = ChatFilter.OFFICIAL },
                             )
                         }
@@ -582,6 +618,8 @@ fun ThreadListScreen(
     sheetFor?.let { thread ->
         ThreadActionsSheet(
             thread = thread,
+            hidden = isChatHidden(thread, hideOfficialAccounts, hiddenChats) ||
+                (activeFilter == ChatFilter.OFFICIAL && thread.isOfficialAccount && !isOfficialShownOverride(hiddenChats, thread.key)),
             onDismiss = { sheetFor = null },
             onAction = { onRowAction(thread, it) },
         )
@@ -616,6 +654,19 @@ fun ThreadListScreen(
 }
 
 private const val MAX_RESULTS = 100
+
+/** How far (fraction of the row width) a swiped row can travel. */
+private const val SWIPE_MAX_FRACTION = 0.65f
+
+/** Fraction of the row width a swipe must pass before releasing runs the action. */
+internal const val SWIPE_THRESHOLD_FRACTION = 0.38f
+
+/** Swipe distance that arms the row action: [SWIPE_THRESHOLD_FRACTION] of [rowWidthPx], or [fallbackPx] before measuring. */
+internal fun swipeThresholdPx(rowWidthPx: Float, fallbackPx: Float): Float =
+    if (rowWidthPx > 0f) rowWidthPx * SWIPE_THRESHOLD_FRACTION else fallbackPx
+
+/** Whether releasing a swipe at [offsetPx] triggers the action (either direction). */
+internal fun swipeTriggers(offsetPx: Float, thresholdPx: Float): Boolean = kotlin.math.abs(offsetPx) >= thresholdPx
 
 /** Compact row that stands in for hidden Official Accounts and opens (or leaves) their own list. */
 @Composable
@@ -820,11 +871,17 @@ private fun ConversationRow(
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
-    val thresholdPx = with(density) { 72.dp.toPx() }
-    val maxSwipePx = with(density) { 104.dp.toPx() }
+    val reducedMotion = LocalReducedMotion.current
+    var rowWidthPx by remember { mutableFloatStateOf(0f) }
+    // Like Gmail/Messages: the action arms at ~38% of the row width and the row can travel up to 65%.
+    val thresholdPx = swipeThresholdPx(rowWidthPx, with(density) { 72.dp.toPx() })
+    val maxSwipePx = if (rowWidthPx > 0f) rowWidthPx * SWIPE_MAX_FRACTION else with(density) { 140.dp.toPx() }
+    val labelRevealStartPx = with(density) { 36.dp.toPx() }
+    val labelRevealSpanPx = with(density) { 84.dp.toPx() }
     val resetSpec = MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
 
     var offsetX by remember(thread.key) { mutableFloatStateOf(0f) }
+    var armed by remember(thread.key) { mutableStateOf(false) }
     var resetJob by remember(thread.key) { mutableStateOf<Job?>(null) }
     val latestThread by rememberUpdatedState(thread)
     val latestOnAction by rememberUpdatedState(onAction)
@@ -832,8 +889,13 @@ private fun ConversationRow(
 
     fun settleBack() {
         resetJob?.cancel()
+        armed = false
         val start = offsetX
         if (start == 0f) return
+        if (reducedMotion) {
+            offsetX = 0f
+            return
+        }
         resetJob = scope.launch {
             animate(
                 initialValue = start,
@@ -845,12 +907,22 @@ private fun ConversationRow(
         }
     }
 
-    Box(Modifier.fillMaxWidth()) {
+    Box(Modifier.fillMaxWidth().onSizeChanged { rowWidthPx = it.width.toFloat() }) {
         if (offsetX != 0f) {
             val swipingRight = offsetX > 0f
-            val progress = (abs(offsetX) / thresholdPx).coerceIn(0f, 1f)
-            val pillColor = if (swipingRight) colors.primary else colors.secondaryContainer
-            val pillContentColor = if (swipingRight) colors.onPrimary else colors.onSecondaryContainer
+            val progress = ((abs(offsetX) - labelRevealStartPx) / labelRevealSpanPx).coerceIn(0f, 1f)
+            val pillColor = when {
+                swipingRight && armed -> colors.primary
+                swipingRight -> colors.primaryContainer
+                armed -> colors.secondary
+                else -> colors.secondaryContainer
+            }
+            val pillContentColor = when {
+                swipingRight && armed -> colors.onPrimary
+                swipingRight -> colors.onPrimaryContainer
+                armed -> colors.onSecondary
+                else -> colors.onSecondaryContainer
+            }
             val pillIcon = when {
                 swipingRight && unread -> Icons.Outlined.Drafts
                 swipingRight -> Icons.Outlined.MarkChatUnread
@@ -866,20 +938,16 @@ private fun ConversationRow(
             Box(
                 modifier = Modifier
                     .matchParentSize()
-                    .padding(horizontal = 12.dp, vertical = 4.dp)
-                    .clip(RoundedCornerShape(20.dp))
                     .background(pillColor)
-                    .padding(horizontal = 20.dp),
+                    .padding(horizontal = 24.dp),
                 contentAlignment = if (swipingRight) Alignment.CenterStart else Alignment.CenterEnd,
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.graphicsLayer {
-                        val scale = 0.85f + 0.15f * progress
-                        scaleX = scale
-                        scaleY = scale
-                        alpha = progress.coerceAtLeast(0.35f)
+                        // Fades in only once the revealed strip is wide enough for the whole label, so it never shows clipped.
+                        alpha = progress
                     },
                 ) {
                     if (swipingRight) {
@@ -889,6 +957,8 @@ private fun ConversationRow(
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                             color = pillContentColor,
+                            maxLines = 1,
+                            softWrap = false,
                         )
                     } else {
                         Text(
@@ -896,6 +966,8 @@ private fun ConversationRow(
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                             color = pillContentColor,
+                            maxLines = 1,
+                            softWrap = false,
                         )
                         Icon(pillIcon, contentDescription = null, tint = pillContentColor, modifier = Modifier.size(22.dp))
                     }
@@ -908,13 +980,14 @@ private fun ConversationRow(
                 .fillMaxWidth()
                 .offset { IntOffset(offsetX.roundToInt(), 0) }
                 .background(colors.background)
-                .pointerInput(swipeEnabled, thread.key) {
+                .pointerInput(swipeEnabled, thread.key, thresholdPx, maxSwipePx) {
                     if (!swipeEnabled) return@pointerInput
                     var crossed = false
                     detectHorizontalDragGestures(
                         onDragStart = {
                             resetJob?.cancel()
                             crossed = abs(offsetX) >= thresholdPx
+                            armed = crossed
                         },
                         onHorizontalDrag = { change, dragAmount ->
                             change.consume()
@@ -927,16 +1000,19 @@ private fun ConversationRow(
                             val nowCrossed = abs(offsetX) >= thresholdPx
                             if (nowCrossed && !crossed) {
                                 crossed = true
+                                armed = true
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             } else if (!nowCrossed && crossed) {
                                 crossed = false
+                                armed = false
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             }
                         },
                         onDragEnd = {
                             val current = latestThread
                             when {
-                                offsetX >= thresholdPx -> latestOnAction(if (current.unread > 0) RowAction.READ else RowAction.UNREAD)
-                                offsetX <= -thresholdPx -> latestOnAction(if (current.pinned) RowAction.UNPIN else RowAction.PIN)
+                                offsetX > 0f && swipeTriggers(offsetX, thresholdPx) -> latestOnAction(if (current.unread > 0) RowAction.READ else RowAction.UNREAD)
+                                offsetX < 0f && swipeTriggers(offsetX, thresholdPx) -> latestOnAction(if (current.pinned) RowAction.UNPIN else RowAction.PIN)
                             }
                             settleBack()
                         },
@@ -1201,6 +1277,7 @@ private fun MessageSearchHitRow(
 @Composable
 private fun ThreadActionsSheet(
     thread: ThreadSummary,
+    hidden: Boolean,
     onDismiss: () -> Unit,
     onAction: (RowAction) -> Unit,
 ) {
@@ -1287,6 +1364,19 @@ private fun ThreadActionsSheet(
                     label = "Hide official accounts",
                     icon = Icons.Outlined.VisibilityOff,
                     onClick = { onAction(RowAction.HIDE_OFFICIAL) },
+                )
+            }
+            if (hidden) {
+                SheetActionRow(
+                    label = "Unhide",
+                    icon = Icons.Outlined.Visibility,
+                    onClick = { onAction(RowAction.UNHIDE_CHAT) },
+                )
+            } else {
+                SheetActionRow(
+                    label = "Hide chat",
+                    icon = Icons.Outlined.VisibilityOff,
+                    onClick = { onAction(RowAction.HIDE_CHAT) },
                 )
             }
             HorizontalDivider(

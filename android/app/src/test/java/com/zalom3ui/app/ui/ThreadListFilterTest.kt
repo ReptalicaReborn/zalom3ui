@@ -98,3 +98,19 @@ class ThreadListFilterTest {
         assertTrue(findHighlightRanges("Hello world", "xyz").isEmpty())
     }
 }
+
+class SwipeThresholdTest {
+    @Test
+    fun threshold_isFractionOfWidth_orFallback() {
+        assertEquals(380f, swipeThresholdPx(1000f, 72f), 0.001f)
+        assertEquals(72f, swipeThresholdPx(0f, 72f), 0.001f)
+    }
+
+    @Test
+    fun triggers_onlyPastThreshold_inEitherDirection() {
+        assertEquals(false, swipeTriggers(379f, 380f))
+        assertEquals(true, swipeTriggers(380f, 380f))
+        assertEquals(true, swipeTriggers(-400f, 380f))
+        assertEquals(false, swipeTriggers(-100f, 380f))
+    }
+}

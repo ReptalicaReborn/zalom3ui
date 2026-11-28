@@ -305,7 +305,6 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
     var controlsVisible by remember { mutableStateOf(true) }
     var interaction by remember { mutableIntStateOf(0) }
     var dragging by remember { mutableStateOf(false) }
-    var dragValue by remember { mutableStateOf(0f) }
 
     val isPlaying = controller.isPlaying
     LaunchedEffect(controlsVisible, isPlaying, dragging, interaction) {
@@ -337,6 +336,7 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
             AndroidView(
                 factory = { ctx ->
                     SurfaceView(ctx).apply {
+                        keepScreenOn = true
                         holder.addCallback(object : SurfaceHolder.Callback {
                             override fun surfaceCreated(holder: SurfaceHolder) {
                                 controller.setSurface(holder.surface)
@@ -350,7 +350,6 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
                         })
                     }
                 },
-                update = { it.keepScreenOn = isPlaying },
                 modifier = Modifier
                     .align(Alignment.Center)
                     .then(
@@ -453,38 +452,54 @@ fun VideoPlayerDialog(url: String, thumb: String?, onDismiss: () -> Unit) {
                     }
 
                     if (!controller.error) {
-                        val total = controller.durationMs.coerceAtLeast(0)
-                        val shownPos = if (dragging) dragValue else controller.positionMs.toFloat()
-                        Row(
-                            modifier = Modifier
-                                .align(Alignment.BottomStart)
-                                .fillMaxWidth()
-                                .navigationBarsPadding()
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(formatDuration(shownPos.toLong()), color = Color.White)
-                            WavySeekBar(
-                                value = shownPos.coerceIn(0f, total.coerceAtLeast(1).toFloat()),
-                                valueRange = 0f..total.coerceAtLeast(1).toFloat(),
-                                onValueChange = {
-                                    dragging = true
-                                    dragValue = it
-                                },
-                                onValueChangeFinished = {
-                                    controller.seekTo(dragValue.toInt())
-                                    dragging = false
-                                },
-                                enabled = controller.ready,
-                                waving = isPlaying && !controller.buffering && !controller.completed,
-                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
-                            )
-                            Text(formatDuration(total.toLong()), color = Color.White)
-                        }
+                        SeekRow(
+                            controller = controller,
+                            onDraggingChange = { dragging = it },
+                            modifier = Modifier.align(Alignment.BottomStart),
+                        )
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * Time labels and seek bar. Lives in its own scope so the 250 ms position updates recompose only this row, not the
+ * whole dialog.
+ */
+@Composable
+private fun SeekRow(controller: VideoController, onDraggingChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+    var dragging by remember { mutableStateOf(false) }
+    var dragValue by remember { mutableStateOf(0f) }
+    val total = controller.durationMs.coerceAtLeast(0)
+    val shownPos = if (dragging) dragValue else controller.positionMs.toFloat()
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(formatDuration(shownPos.toLong()), color = Color.White)
+        WavySeekBar(
+            value = shownPos.coerceIn(0f, total.coerceAtLeast(1).toFloat()),
+            valueRange = 0f..total.coerceAtLeast(1).toFloat(),
+            onValueChange = {
+                dragging = true
+                onDraggingChange(true)
+                dragValue = it
+            },
+            onValueChangeFinished = {
+                controller.seekTo(dragValue.toInt())
+                dragging = false
+                onDraggingChange(false)
+            },
+            enabled = controller.ready,
+            waving = controller.isPlaying && !controller.buffering && !controller.completed,
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+        )
+        Text(formatDuration(total.toLong()), color = Color.White)
     }
 }
 

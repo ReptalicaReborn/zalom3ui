@@ -499,6 +499,7 @@ async fn send_attachment_broadcasts_upload_progress_events() {
                 filename: "pic.png".into(),
                 width: Some(4),
                 height: Some(3),
+                video: None,
             },
         )
         .await

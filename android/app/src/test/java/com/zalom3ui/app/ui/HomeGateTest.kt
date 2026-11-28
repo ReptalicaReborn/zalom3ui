@@ -36,6 +36,15 @@ class HomeGateTest {
     }
 
     @Test
+    fun aSessionZaloEnded_showsTheLoginScreen_evenWithCachedChats() {
+        for (reason in listOf("elsewhere", "expired")) {
+            val ended = SessionStatus(state = "logged_out", loggedOutReason = reason)
+            assertEquals(reason, HomeGate.Login, homeGateFor(ended, hasCachedThreads = true))
+            assertEquals(reason, HomeGate.Login, homeGateFor(ended, hasCachedThreads = false))
+        }
+    }
+
+    @Test
     fun signedIn_showsTheHome_whateverTheSavedChats() {
         for (state in listOf("ready", "disconnected", "paused")) {
             for (cached in listOf(true, false)) {

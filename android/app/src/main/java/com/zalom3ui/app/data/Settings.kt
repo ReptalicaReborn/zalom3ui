@@ -213,7 +213,31 @@ class SettingsStore(context: Context) {
             prefs.edit().putBoolean(KEY_HIDE_OFFICIAL_ACCOUNTS, value).apply()
         }
 
+    /** Thread keys ("kind:id") the user hid from the chat list by hand ("Hide chat"); they don't notify either. */
+    var hiddenChats: Set<String>
+        get() = prefs.getStringSet(KEY_HIDDEN_CHATS, emptySet()).orEmpty().toSet()
+        set(value) {
+            prefs.edit().putStringSet(KEY_HIDDEN_CHATS, value.toSet()).apply()
+        }
+
+    /** Developer: show the performance monitor on screen (see docs/performance-monitor.md). */
+    var perfOverlay: Boolean
+        get() = prefs.getBoolean(KEY_PERF_OVERLAY, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PERF_OVERLAY, value).apply()
+        }
+
+    /** Developer: write the performance monitor's numbers to perf.log, with or without the overlay. */
+    var perfLog: Boolean
+        get() = prefs.getBoolean(KEY_PERF_LOG, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PERF_LOG, value).apply()
+        }
+
     internal companion object {
+        const val KEY_HIDDEN_CHATS = "hidden_chats"
+        const val KEY_PERF_OVERLAY = "perf_overlay"
+        const val KEY_PERF_LOG = "perf_log"
         const val KEY_HIDE_OFFICIAL_ACCOUNTS = "hide_official_accounts"
         const val KEY_STAY_CONNECTED = "stay_connected"
         const val KEY_HIDE_ZALO_NOTIFICATIONS = "hide_zalo_notifications"
@@ -259,6 +283,16 @@ class SettingsStore(context: Context) {
         }
     }
 }
+
+/** Entry in [SettingsStore.hiddenChats] that keeps an Official Account visible although "Hide official accounts" is on. */
+fun shownOfficialOverrideKey(threadKey: String): String = "show:$threadKey"
+
+/** True when [threadKey] is hidden by hand and not overridden. */
+fun isManuallyHidden(hiddenKeys: Set<String>, threadKey: String): Boolean = threadKey in hiddenKeys
+
+/** True when an Official Account [threadKey] was explicitly unhidden by the user. */
+fun isOfficialShownOverride(hiddenKeys: Set<String>, threadKey: String): Boolean =
+    shownOfficialOverrideKey(threadKey) in hiddenKeys
 
 /** True when Android's global animator duration scale disables animations (`0f`). */
 internal fun isAnimatorScaleDisabled(scale: Float): Boolean = scale == 0f

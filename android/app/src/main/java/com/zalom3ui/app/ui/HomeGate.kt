@@ -13,6 +13,8 @@ enum class HomeGate { Login, Home }
  * session) always gets the login screen.
  */
 fun homeGateFor(status: SessionStatus, hasCachedThreads: Boolean): HomeGate = when {
+    // Zalo ended the session: log in again, whatever chats are cached.
+    status.loggedOutReason != null -> HomeGate.Login
     status.isLoggedIn -> HomeGate.Home
     status.connectingWithSavedSession() && hasCachedThreads -> HomeGate.Home
     else -> HomeGate.Login

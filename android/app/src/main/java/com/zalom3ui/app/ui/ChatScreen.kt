@@ -657,6 +657,7 @@ private fun ChatScreenContent(
                                 onMute = { dialog = "mute" },
                                 onUnmute = { actions.onMute(null) },
                                 onMarkUnread = actions.onMarkUnread,
+                                onDisappearing = { showDisappearingDialog = true },
                                 onDelete = { dialog = "delete" },
                             )
                         },
@@ -1083,6 +1084,7 @@ private fun ChatMenu(
     onMute: () -> Unit,
     onUnmute: () -> Unit,
     onMarkUnread: () -> Unit,
+    onDisappearing: () -> Unit,
     onDelete: () -> Unit,
 ) {
     var open by remember { mutableStateOf(false) }
@@ -1128,6 +1130,10 @@ private fun ChatMenu(
             MenuEntry("Mark as unread", Icons.Outlined.MarkChatUnread) {
                 open = false
                 onMarkUnread()
+            }
+            MenuEntry("Disappearing messages", Icons.Outlined.Timer) {
+                open = false
+                onDisappearing()
             }
             HorizontalDivider()
             MenuEntry("Delete conversation", Icons.Outlined.Delete, destructive = true) {
@@ -2364,7 +2370,7 @@ private fun StickerBubble(
 private fun messageText(msg: ChatMessage, onOutgoing: Boolean, onOpenUrl: (String) -> Unit): AnnotatedString {
     val linkColor = if (onOutgoing) LocalChatColors.current.onOutgoing else MaterialTheme.colorScheme.primary
     return buildAnnotatedString {
-        val text = msg.text
+        val text = bubbleText(msg)
         append(text)
         for (m in msg.mentions) {
             val start = m.pos.coerceIn(0, text.length)
@@ -2700,7 +2706,7 @@ private fun FocusedMessageOverlay(
                 if (!msg.recalled && msg.isSelf) {
                     ToolbarActionItem("Recall", Icons.AutoMirrored.Outlined.Undo, destructive = true) { onAction(MessageAction.RECALL) }
                 }
-                ToolbarActionItem("Delete", Icons.Outlined.DeleteOutline, destructive = true) { onAction(MessageAction.DELETE) }
+                ToolbarActionItem("Delete for me", Icons.Outlined.DeleteOutline, destructive = true) { onAction(MessageAction.DELETE) }
             }
         }
     }
@@ -3278,11 +3284,6 @@ private fun Composer(
                 keyboard?.hide()
                 onOpenShareContact()
             },
-            onDisappearingTimer = {
-                attachSheet = false
-                keyboard?.hide()
-                onOpenDisappearingTimer()
-            },
             onCreatePoll = if (canCreatePoll) {
                 {
                     attachSheet = false
@@ -3404,19 +3405,20 @@ private fun AttachmentSheet(
     onPickFiles: () -> Unit,
     onPickSticker: () -> Unit,
     onShareContact: () -> Unit,
-    onDisappearingTimer: () -> Unit,
     onCreatePoll: (() -> Unit)? = null,
 ) {
     val cs = MaterialTheme.colorScheme
+    // One tonal family for every tile so none of them reads as disabled.
+    val tile = cs.secondaryContainer
+    val onTile = cs.onSecondaryContainer
     val actions = buildList {
-        add(AttachAction("Camera", Icons.Outlined.PhotoCamera, cs.primaryContainer, cs.onPrimaryContainer, onTakePhoto))
-        add(AttachAction("Gallery", Icons.Outlined.PhotoLibrary, cs.tertiaryContainer, cs.onTertiaryContainer, onPickMedia))
-        add(AttachAction("File", Icons.Outlined.AttachFile, cs.secondaryContainer, cs.onSecondaryContainer, onPickFiles))
-        add(AttachAction("Sticker", Icons.Outlined.Mood, cs.surfaceContainerHighest, cs.primary, onPickSticker))
-        add(AttachAction("Contact", Icons.Outlined.ContactPage, cs.secondaryContainer, cs.onSecondaryContainer, onShareContact))
-        add(AttachAction("Auto-delete", Icons.Outlined.Timer, cs.tertiaryContainer, cs.onTertiaryContainer, onDisappearingTimer))
+        add(AttachAction("Camera", Icons.Outlined.PhotoCamera, tile, onTile, onTakePhoto))
+        add(AttachAction("Gallery", Icons.Outlined.PhotoLibrary, tile, onTile, onPickMedia))
+        add(AttachAction("File", Icons.Outlined.AttachFile, tile, onTile, onPickFiles))
+        add(AttachAction("Sticker", Icons.Outlined.Mood, tile, onTile, onPickSticker))
+        add(AttachAction("Contact", Icons.Outlined.ContactPage, tile, onTile, onShareContact))
         if (onCreatePoll != null) {
-            add(AttachAction("Poll", Icons.Outlined.Poll, cs.primaryContainer, cs.onPrimaryContainer, onCreatePoll))
+            add(AttachAction("Poll", Icons.Outlined.Poll, tile, onTile, onCreatePoll))
         }
     }
     ModalBottomSheet(
@@ -3431,7 +3433,7 @@ private fun AttachmentSheet(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                "Share",
+                "Attach",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(start = 8.dp, bottom = 8.dp),

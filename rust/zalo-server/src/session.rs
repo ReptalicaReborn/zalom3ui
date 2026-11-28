@@ -19,7 +19,7 @@ use zalo_proto::{
     CreatePollInput, Credentials, DeleteMessageTarget, ForwardMessagePayload, ForwardReference,
     LastMessageInfo, LoginQrEvent, MentionInput, MuteAction, MuteDuration, PollViewContext,
     ProtoError, QuoteInput, RawWsMessage, ReactionTarget, SeenMessageInput, SendMessageOptions,
-    StickerParam, ThreadType, UndoTarget, UploadResult, UploadSource, WsEvent, ZaloClient,
+    StickerParam, ThreadType, UndoTarget, UploadResult, UploadSource, VideoMeta, WsEvent, ZaloClient,
 };
 
 use crate::api::{ListenerControl, ListenerStart, ProtoLogin, ZaloApi, ZaloLogin};
@@ -27,7 +27,10 @@ use crate::errors::HttpError;
 use crate::log::{create_dir_private, CallTrace};
 use crate::replay::{BatchStats, ReplayHub};
 use crate::socket_log::SocketLog;
-use crate::store::{normalize_message, recalled_message_id, to_public_message, ChatStore};
+use crate::store::{
+    delete_sync_record, normalize_message, raw_is_undo_without_target, recalled_message_id,
+    to_public_message, ChatStore, DeleteSync,
+};
 use crate::types::{
     reaction_code, sanitize_remote_url, thread_key, AttachmentKind, BoardItem, ChatMessage,
     FoundUser, FriendRequest, GroupLinkInfo, GroupMember, MentionInfo, MessageSearchHit, Person,
@@ -50,6 +53,11 @@ const RESUME_RETRY_MAX_MS: u64 = 60_000;
 const RECONNECT_MIN_MS: u64 = 5_000;
 const RECONNECT_MAX_MS: u64 = 5 * 60_000;
 const SESSION_EXPIRED: &str = "Your Zalo session has ended. Log in again with the QR code.";
+const LOGGED_OUT_ELSEWHERE_MSG: &str = "You were logged out on another device. Log in again.";
+/// `status.logged_out_reason`: the live session was ended by Zalo (kicked / logged out elsewhere).
+pub const LOGGED_OUT_ELSEWHERE: &str = "elsewhere";
+/// `status.logged_out_reason`: the saved session was rejected at sign-in.
+pub const LOGGED_OUT_EXPIRED: &str = "expired";
 const STICKER_SEARCH_LIMIT: usize = 30;
 const MAX_STICKERS_CACHE: usize = 500;
 const MAX_GROUP_NAME: usize = 100;
@@ -135,6 +143,8 @@ pub struct UploadFile {
     pub filename: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Video metadata for an `.mp4` (sent as a video message when complete).
+    pub video: Option<VideoMeta>,
 }
 
 /// Supported mute durations matching `PUT /api/threads/:kind/:id/mute`.
@@ -520,6 +530,7 @@ impl ZaloSession {
             s.status.qr_image = None;
             s.status.scanned_by = None;
             s.status.error = None;
+            s.status.logged_out_reason = None;
             s.status.retrying = false;
             s.sync_resuming();
             (s.generation, s.status.clone())
@@ -571,6 +582,7 @@ impl ZaloSession {
                             st.scanned_by = None;
                             st.retrying = false;
                             st.error = Some(SESSION_EXPIRED.to_string());
+                            st.logged_out_reason = Some(LOGGED_OUT_EXPIRED.to_string());
                         });
                         break;
                     }
@@ -1340,6 +1352,18 @@ impl ZaloSession {
                 });
                 if !kicked {
                     self.schedule_reconnect(Arc::clone(client), generation);
+                } else if code == CloseReason::KickConnection as u16 {
+                    // A kick may mean the session itself was ended: check, so the app shows the
+                    // login screen rather than a dead "Disconnected".
+                    let session = Arc::clone(self);
+                    let client = Arc::clone(client);
+                    tokio::spawn(async move {
+                        if session.verify_saved_session().await == SessionCheck::Rejected
+                            && session.is_generation_and_client(generation, &client)
+                        {
+                            session.mark_logged_out(generation, LOGGED_OUT_ELSEWHERE);
+                        }
+                    });
                 }
             }
             WsEvent::Error(err) => {
@@ -1369,8 +1393,81 @@ impl ZaloSession {
         task.abort();
     }
 
+    /// Re-logs in with the saved credentials to learn whether Zalo still honours the session.
+    /// `Unknown` when there are no credentials or the check failed for any reason but a rejection
+    /// (offline, 5xx, garbage), so a network drop is never taken for a logout.
+    async fn verify_saved_session(&self) -> SessionCheck {
+        let Some(creds) = self.read_credentials() else {
+            return SessionCheck::Unknown;
+        };
+        match self.login.login_cookie(creds).await {
+            Ok(_) => SessionCheck::Valid,
+            Err(err) if is_session_rejected(&err) => {
+                warn!("Zalo rejected the saved session: {err}");
+                SessionCheck::Rejected
+            }
+            Err(err) => {
+                debug!("Could not verify the Zalo session ({err}); assuming it is still valid");
+                SessionCheck::Unknown
+            }
+        }
+    }
+
+    /// Zalo ended the session while Zalỏ was running: stops the listener and every reconnect,
+    /// drops the live client and goes `logged_out` with `reason` (and no `resuming`). The chat
+    /// cache and `credentials.json` stay on disk; only a new login or an explicit logout changes
+    /// them. A no-op when `generation` is stale (a logout or new login already won).
+    fn mark_logged_out(&self, generation: u64, reason: &str) {
+        {
+            let Ok(mut s) = self.inner.write() else {
+                return;
+            };
+            if s.generation != generation {
+                return;
+            }
+            s.generation = s.generation.wrapping_add(1);
+            s.resuming = false;
+            if let Some(h) = s.listener_handle.take() {
+                h.stop();
+            }
+            if let Some(t) = s.listener_task.take() {
+                t.abort();
+            }
+            if let Some(t) = s.reconnect_task.take() {
+                t.abort();
+            }
+            s.reconnect_attempts = 0;
+            s.client = None;
+        }
+        self.replay.note_disconnected(now_ms());
+        self.retry_notify.notify_one();
+        self.reconnect_wake.notify_waiters();
+        let message = if reason == LOGGED_OUT_ELSEWHERE {
+            LOGGED_OUT_ELSEWHERE_MSG
+        } else {
+            SESSION_EXPIRED
+        };
+        warn!(reason, "Zalo session ended; showing the login screen");
+        self.patch_status(|st| {
+            st.state = SessionState::LoggedOut;
+            st.qr_image = None;
+            st.scanned_by = None;
+            st.retrying = false;
+            st.error = Some(message.to_string());
+            st.logged_out_reason = Some(reason.to_string());
+        });
+    }
+
     async fn reconnect_loop(self: &Arc<Self>, client: Arc<dyn ZaloApi>, generation: u64) {
         loop {
+            if self.verify_saved_session().await == SessionCheck::Rejected {
+                if self.is_generation_and_client(generation, &client)
+                    && self.get_status().state == SessionState::Disconnected
+                {
+                    self.mark_logged_out(generation, LOGGED_OUT_ELSEWHERE);
+                }
+                return;
+            }
             let attempt = self
                 .inner
                 .read()
@@ -1414,6 +1511,11 @@ impl ZaloSession {
         is_old: bool,
         generation: u64,
     ) -> Ingested {
+        if raw_is_undo_without_target(&raw.data) {
+            // A recall/delete record naming no message (e.g. the echo of a delete-for-me): never
+            // turn it into a "Message recalled" placeholder of its own.
+            return Ingested::Undo { already_stored: false };
+        }
         if let Some(recalled_id) = recalled_message_id(&raw.data) {
             let already_stored = self.store.has_message(&recalled_id);
             if let Some(updated) = self.store.apply_undo(&recalled_id) {
@@ -1423,6 +1525,12 @@ impl ZaloSession {
         }
         let kind = from_thread_type(raw.thread_type);
         let own_id = self.own_id();
+        if let Some(sync) = delete_sync_record(&raw.data, raw.is_self, own_id.as_deref()) {
+            // Our own "Delete for me" echoed to this device: remove the referenced messages (the
+            // record itself is never a bubble, even when it names no target).
+            self.apply_delete_sync(kind, &raw.thread_id, &raw.data, &sync);
+            return Ingested::Undo { already_stored: false };
+        }
         let msg = normalize_message(&raw.data, kind, &raw.thread_id, raw.is_self, own_id.as_deref());
         if kind == ThreadKind::User
             && is_official_account_message(&raw.data, &msg.msg_type, msg.is_self)
@@ -1497,6 +1605,41 @@ impl ZaloSession {
             }
         }
         outcome
+    }
+
+    /// Applies a delete-for-me sync record (see `store::delete_sync_record`): tombstones and
+    /// removes each referenced message in the thread, broadcasting `message_deleted` like
+    /// `delete_message`, and tombstones the record's own id so it can never come back as a bubble.
+    fn apply_delete_sync(
+        &self,
+        kind: ThreadKind,
+        thread_id: &str,
+        raw_data: &Value,
+        sync: &DeleteSync,
+    ) {
+        let mut targets: Vec<String> = sync.global_ids.clone();
+        for id in self.store.ids_by_cli_msg_id(kind, thread_id, &sync.cli_ids) {
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        for id in targets {
+            if self.store.delete_for_me(kind, thread_id, &id).is_some() {
+                self.broadcast_event(json!({
+                    "type": "message_deleted",
+                    "threadKind": kind,
+                    "threadId": thread_id,
+                    "id": id,
+                }));
+            }
+        }
+        let own_record = ["msgId", "globalMsgId", "cliMsgId"]
+            .iter()
+            .map(|k| raw_data.get(*k).map(val_to_string).unwrap_or_default())
+            .find(|s| !s.is_empty() && s != "0");
+        if let Some(id) = own_record {
+            let _ = self.store.delete_for_me(kind, thread_id, &id);
+        }
     }
 
     fn resolve_user_thread(self: &Arc<Self>, user_id: String, generation: u64) {
@@ -2740,6 +2883,7 @@ impl ZaloSession {
                 data: file.data,
                 width: if is_photo { file.width } else { None },
                 height: if is_photo { file.height } else { None },
+                video: if ext == "mp4" { file.video } else { None },
             }],
             progress: Some(self.upload_progress_sink(kind, thread_id)),
             ..Default::default()
@@ -2798,6 +2942,7 @@ impl ZaloSession {
                     data,
                     width: None,
                     height: None,
+                    video: None,
                 }],
                 thread_id,
                 to_thread_type(kind),
@@ -2973,8 +3118,13 @@ impl ZaloSession {
         msg_id: &str,
     ) -> Result<(), HttpError> {
         let client = self.api()?;
-        let (msg, raw) = self.require_message(kind, thread_id, msg_id)?;
-        client
+        let (msg, raw) = match self.require_message(kind, thread_id, msg_id) {
+            Ok(found) => found,
+            // Already gone locally: make sure it stays gone and report success.
+            Err(_) if self.store.is_deleted_for_me(kind, thread_id, msg_id) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let result = client
             .delete_message(
                 &DeleteMessageTarget {
                     thread_id: thread_id.to_string(),
@@ -2985,9 +3135,14 @@ impl ZaloSession {
                 },
                 true,
             )
-            .await
-            .map_err(proto_to_http_error)?;
-        if self.store.delete_message(&msg.id).is_some() {
+            .await;
+        // Zalo may refuse to delete an already-recalled message; the local removal still stands.
+        if let Err(err) = result {
+            if !msg.recalled {
+                return Err(proto_to_http_error(err));
+            }
+        }
+        if self.store.delete_for_me(kind, thread_id, &msg.id).is_some() {
             self.broadcast_event(json!({
                 "type": "message_deleted",
                 "threadKind": kind,
@@ -4100,6 +4255,9 @@ impl ZaloSession {
                 return;
             };
             f(&mut s.status);
+            if s.status.state != SessionState::LoggedOut {
+                s.status.logged_out_reason = None;
+            }
             // `resuming` is derived, never set by the callers (see `SessionInner::sync_resuming`).
             s.sync_resuming();
             s.status.clone()
@@ -4259,7 +4417,35 @@ fn convert_poll_view(v: zalo_proto::PollView) -> PollView {
 fn is_transient_proto_error(err: &ProtoError) -> bool {
     match err {
         ProtoError::Http(_) | ProtoError::Io(_) | ProtoError::WebSocket(_) => true,
-        ProtoError::HttpStatus { status, .. } => *status >= 500 || *status == 408 || *status == 429,
+        ProtoError::HttpStatus { status, .. } => is_transient_http_status(*status),
+        // `login_cookie` reports a bad HTTP status as `Login(status, ..)`.
+        ProtoError::Login(code, _) => is_transient_http_status(*code),
+        _ => false,
+    }
+}
+
+fn is_transient_http_status(status: impl TryInto<u16>) -> bool {
+    matches!(status.try_into(), Ok(s) if s >= 500 || s == 408 || s == 429)
+}
+
+/// Result of re-checking the saved session with a fresh login (see `verify_saved_session`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCheck {
+    Valid,
+    /// Zalo answered and refused the session (error code / 401 / 403): it is gone.
+    Rejected,
+    /// No credentials, or no clear answer (offline, 5xx, unreadable reply).
+    Unknown,
+}
+
+/// True only for a clear Zalo "this session is not valid" answer: an error code from the login
+/// endpoints, a Zalo API error, or HTTP 401/403. Network failures, 5xx/408/429 and undecodable
+/// replies are not, so a plain connection drop never logs the user out.
+fn is_session_rejected(err: &ProtoError) -> bool {
+    match err {
+        ProtoError::Login(code, _) => !is_transient_http_status(*code),
+        ProtoError::Api { .. } => true,
+        ProtoError::HttpStatus { status, .. } => *status == 401 || *status == 403,
         _ => false,
     }
 }

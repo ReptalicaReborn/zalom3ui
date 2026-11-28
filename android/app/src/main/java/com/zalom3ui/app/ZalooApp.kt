@@ -13,6 +13,7 @@ import com.zalom3ui.app.call.CallMediaFactory
 import com.zalom3ui.app.call.EngineCallMedia
 import com.zalom3ui.app.data.ApiClient
 import com.zalom3ui.app.data.SettingsStore
+import com.zalom3ui.app.perf.PerfMonitor
 import com.zalom3ui.app.server.StayConnectedCoordinator
 
 /** Gives Coil animated image decoding, so stickers (animated WebP) and GIFs move as they do in Zalo. */
@@ -25,6 +26,8 @@ class ZalooApp : Application(), ImageLoaderFactory {
         }.getOrDefault(true)
         SettingsStore(this).ensureStayConnectedInitialised(isUpgrade = upgrade)
         StayConnectedCoordinator.init(this)
+        // Performance monitor: only listens for the system's memory warnings here (written to perf.log if that is on).
+        PerfMonitor.attach(this, logEnabled = SettingsStore(this).perfLog)
         // Calls get the real microphone/speaker/Opus engine (CallService asks the factory when a call connects).
         CallMediaFactory.create = { context -> EngineCallMedia(context) }
         // Build Coil and OkHttp off the main thread, so the first avatar doesn't pay for them during the first frames.

@@ -33,6 +33,7 @@ import com.zalom3ui.app.data.SessionStatus
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.data.shownOfficialOverrideKey
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.data.UserThreadInfo
 import com.zalom3ui.app.data.readPickedFile
@@ -163,9 +164,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** "Hide official accounts": the chat list hides OA chats behind an "Official accounts (N)" row. */
     val hideOfficialAccounts: StateFlow<Boolean> = _hideOfficialAccounts.asStateFlow()
 
+    private val _hiddenChats = MutableStateFlow(settingsStore.hiddenChats)
+    /** Thread keys hidden by hand from the chat list ("Hide chat"). */
+    val hiddenChats: StateFlow<Set<String>> = _hiddenChats.asStateFlow()
+
     private val _reducedMotion = MutableStateFlow(settingsStore.reducedMotion)
     /** User preference for reduced motion (combined with system setting at the theme root). */
     val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
+
+    private val _perfOverlay = MutableStateFlow(settingsStore.perfOverlay)
+    /** Developer: the performance monitor on screen (ui/PerfOverlay.kt). */
+    val perfOverlay: StateFlow<Boolean> = _perfOverlay.asStateFlow()
+
+    private val _perfLog = MutableStateFlow(settingsStore.perfLog)
+    /** Developer: the performance monitor writes perf.log (perf/PerfLog.kt). */
+    val perfLog: StateFlow<Boolean> = _perfLog.asStateFlow()
 
     private val _pollEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
     /** Ids of polls that changed (voted on, closed); polls on screen reload themselves. */
@@ -265,9 +278,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _hideOfficialAccounts.value = hide
     }
 
+    /** Hides or unhides a chat. Unhiding an Official Account also overrides "Hide official accounts" for it. */
+    fun setChatHidden(thread: ThreadRef, hidden: Boolean, official: Boolean = false) {
+        val override = shownOfficialOverrideKey(thread.key)
+        val next = if (hidden) {
+            _hiddenChats.value + thread.key - override
+        } else {
+            _hiddenChats.value - thread.key + (if (official) setOf(override) else emptySet())
+        }
+        settingsStore.hiddenChats = next
+        _hiddenChats.value = next
+    }
+
     fun setReducedMotion(enabled: Boolean) {
         settingsStore.reducedMotion = enabled
         _reducedMotion.value = enabled
+    }
+
+    fun setPerfOverlay(enabled: Boolean) {
+        settingsStore.perfOverlay = enabled
+        _perfOverlay.value = enabled
+    }
+
+    fun setPerfLog(enabled: Boolean) {
+        settingsStore.perfLog = enabled
+        _perfLog.value = enabled
     }
 
     /** Called on every keystroke, so it only notes the text; saving it waits for typing to pause. */
@@ -908,7 +943,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     try {
                         val api = client ?: break
                         file = withContext(Dispatchers.IO) { readPickedFile(app.contentResolver, uri, app.cacheDir) }
-                        api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open)
+                        api.sendAttachment(chat.kind, chat.id, file.name, file.mimeType, file.length, file.width, file.height, file.open, file.video)
                         pushShortcutForRef(chat.ref)
                     } catch (e: CancellationException) {
                         throw e
@@ -1404,7 +1439,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 // The saved session was rejected while its chats were showing: the login screen takes over, so a chat
                 // that was opened meanwhile closes with it (its screen pops itself once there is no open chat).
-                if (wasConnecting && !event.status.isLoggedIn && !event.status.connectingWithSavedSession()) closeChat()
+                if ((wasConnecting || wasLoggedIn) && !event.status.isLoggedIn && !event.status.connectingWithSavedSession()) closeChat()
                 if (event.status.state == "ready" && (!wasReady || outbox.pendingCount() > 0)) {
                     flushOutbox()
                 }

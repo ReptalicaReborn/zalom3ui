@@ -24,9 +24,11 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.SequenceInputStream
 
 class ApiException(message: String, val code: Int = 0) : IOException(message)
 
@@ -44,9 +46,12 @@ internal val AppJson = Json {
  * server address), or straight into the core running in this process ([onDevice]). Everything above the transport
  * (requests, JSON, error mapping, models) is the same for both.
  */
-class ApiClient internal constructor(private val transport: Transport) {
+class ApiClient internal constructor(rawTransport: Transport) {
     /** A client for the Zalo server at [serverUrl] (the "A server" mode); [token] is its access token. */
     constructor(serverUrl: String, token: String?) : this(HttpTransport(serverUrl, token))
+
+    /** [rawTransport], counted for the performance monitor (it changes nothing about a call; see MeteredTransport). */
+    private val transport: Transport = MeteredTransport(rawTransport)
 
     private val json = AppJson
 
@@ -261,12 +266,28 @@ class ApiClient internal constructor(private val transport: Transport) {
         width: Int? = null,
         height: Int? = null,
         open: () -> InputStream,
+        video: VideoInfo? = null,
     ) {
-        val query = listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
+        val query = attachmentQuery(name, width, height, video)
         InFlightWork.track {
-            execute<Unit>("POST", path("threads", kind, id, "attachments", query = query), ApiBody.Stream(mimeType, length, open), upload = true)
+            execute<Unit>(
+                "POST",
+                path("threads", kind, id, "attachments", query = query),
+                videoBody(mimeType, length, open, video),
+                upload = true,
+            )
         }
     }
+
+    private fun videoBody(mimeType: String?, length: Long, open: () -> InputStream, video: VideoInfo?): ApiBody.Stream =
+        if (video != null && video.thumbnailJpeg.isNotEmpty()) {
+            // An unknown length (-1) stays unknown: adding the thumbnail to it would cut the upload short.
+            ApiBody.Stream(mimeType, if (length >= 0) length + video.thumbnailJpeg.size else length) {
+                SequenceInputStream(ByteArrayInputStream(video.thumbnailJpeg), open())
+            }
+        } else {
+            ApiBody.Stream(mimeType, length, open)
+        }
 
     /** Full-text search across messages on the server (`GET /api/search?q=...&limit=...`). */
     suspend fun searchMessages(query: String, limit: Int = 50): List<MessageSearchHit> =
@@ -650,3 +671,20 @@ class ApiClient internal constructor(private val transport: Transport) {
         }
     }
 }
+
+/**
+ * Query of an attachment upload. A video with a thumbnail adds `thumbSize` (the body is then the JPEG thumbnail
+ * followed by the video), `durationMs`, and its shown `width`/`height`.
+ */
+internal fun attachmentQuery(name: String, width: Int?, height: Int?, video: VideoInfo?): List<Pair<String, String>> =
+    if (video != null && video.thumbnailJpeg.isNotEmpty()) {
+        listOf(
+            "name" to name,
+            "width" to video.width.toString(),
+            "height" to video.height.toString(),
+            "durationMs" to video.durationMs.toString(),
+            "thumbSize" to video.thumbnailJpeg.size.toString(),
+        )
+    } else {
+        listOfNotNull("name" to name, width?.let { "width" to it.toString() }, height?.let { "height" to it.toString() })
+    }

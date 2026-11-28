@@ -61,3 +61,37 @@ class OfficialAccountFilterTest {
         assertFalse(old.isOfficialAccount)
     }
 }
+
+class HiddenChatsFilterTest {
+    private fun thread(id: String, official: Boolean = false, unread: Int = 0) =
+        ThreadSummary(id = id, kind = "user", name = "Chat $id", unread = unread, isOfficialAccount = official)
+
+    private val chats = listOf(
+        thread("friend", unread = 1),
+        thread("zalo", unread = 2),
+        thread("oa", official = true),
+    )
+
+    @Test
+    fun manualHidden_isRemovedEvenWhenOaSettingOff() {
+        val hidden = setOf("user:zalo")
+        assertEquals(listOf("friend", "oa"), chatsForFilter(chats, ChatFilter.ALL, false, hidden).map { it.id })
+        assertEquals(listOf("friend"), chatsForFilter(chats, ChatFilter.UNREAD, true, hidden).map { it.id })
+    }
+
+    @Test
+    fun hiddenList_combinesOaAndManual() {
+        val hidden = setOf("user:zalo")
+        assertEquals(listOf("zalo", "oa"), chatsForFilter(chats, ChatFilter.OFFICIAL, true, hidden).map { it.id })
+        assertEquals(2, hiddenChatCount(chats, true, hidden))
+        assertEquals(1, hiddenChatCount(chats, false, hidden))
+        assertEquals(0, hiddenChatCount(chats, false, emptySet()))
+    }
+
+    @Test
+    fun unhideOverride_keepsOaVisible() {
+        val hidden = setOf("show:user:oa")
+        assertEquals(listOf("friend", "zalo", "oa"), chatsForFilter(chats, ChatFilter.ALL, true, hidden).map { it.id })
+        assertEquals(0, hiddenChatCount(chats, true, hidden))
+    }
+}

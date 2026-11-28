@@ -125,6 +125,13 @@ detector is `extract_otp_code` in `store.rs`, mirrored by `extractOtpCode` in `u
 - **Drops.** If the socket closes unexpectedly, the session reconnects with one tracked task: 5 s, doubling up to
   5 minutes, with a little jitter, reset after a successful connect. `POST /api/retry` (sent by the app when the network
   comes back) skips the wait. Logout, a new login and `POST /api/reconnect` cancel it.
+- **Session ended.** Before every reconnect attempt (and after a 3003 kick) the core re-logs in with the saved cookies.
+  If Zalo refuses the session (a login error code, a Zalo API error, HTTP 401/403) it stops reconnecting, drops the
+  client and goes `logged_out` with `loggedOutReason: "elsewhere"` (the status `error` is *You were logged out on
+  another device. Log in again.*). A saved session rejected at start-up is `loggedOutReason: "expired"`. The chats and
+  `credentials.json` stay on disk; the app shows the login screen with a note. Network errors, 5xx, 408 and 429 never
+  count: the core keeps reconnecting. `loggedOutReason` is optional (absent in older cores) and only set while
+  `logged_out`.
 - **Kicked.** Zalo allows one web connection per account. If Zalo Web or PC connects elsewhere, Zalo closes Zalỏ's socket
   as a duplicate. The session does not fight back: it shows *Zalo Web was opened somewhere else* and waits for you to
   tap *Reconnect*.
@@ -294,9 +301,12 @@ copies, shares and clears it.
 ## 13. Building and testing
 
 - **Build.** `cd android && ./gradlew assembleRelease`. The Gradle task `buildRustCore<Variant>` runs
-  `cargo build --release --target aarch64-linux-android -p zalo-android` with the NDK's clang and packs
-  `libzalocore.so` into the APK. The Opus codec (`libzaloopus.so`) is built from C with CMake. The app is arm64-only.
-  The release APK is about 5.7 MB.
+  `cargo build --release --target <triple> -p zalo-android` with the NDK's clang for `aarch64-linux-android` (arm64-v8a;
+  hardware AES through `--cfg aes_armv8 --cfg polyval_armv8`) and for `armv7-linux-androideabi` (armeabi-v7a, 32-bit;
+  no hardware AES), and packs each `libzalocore.so` into the APK of its ABI. The Opus codec (`libzaloopus.so`) is built
+  from C with CMake for both ABIs. The app ships as two APKs (`app-arm64-v8a-release.apk`, `app-armeabi-v7a-release.apk`,
+  no universal APK); the arm64 release APK is about 5.7 MB. The 32-bit one is only checked by CI (it compiles and holds
+  32-bit ARM libraries), not run on real hardware.
 - **Rust tests** (`cd rust && cargo test --workspace`, 222 tests):
   - protocol and media units (encryption, frames, SRTP, RTCP, H.264, LZMA, SQLite and ZDB against real fixtures in
     `rust/fixtures/`);
@@ -312,7 +322,8 @@ copies, shares and clears it.
   decisions (pause/resume timing, busy checks, which Zalo notifications count), the code detector (same vectors as
   Rust), code de-duplication and which notification-listener job runs.
 - **CI** (`.github/workflows/ci.yml`) runs both, builds the standalone server and smoke-tests it, builds debug and release
-  APKs, checks the native libraries are inside, and uploads the APKs.
+  APKs (arm64-v8a and armeabi-v7a each), checks the native libraries are inside and match each APK's architecture, and
+  uploads the APKs.
 
 Confirmed on a real phone so far: the JNI path end to end (the app running the core in-process) and history sync. What
 only a real phone and account can still check: call audio and video quality, the notification bridge in Doze, and how much history Zalo replays after time offline ([replay-test.md](replay-test.md)).

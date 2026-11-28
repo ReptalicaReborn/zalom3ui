@@ -21,6 +21,12 @@ data class SessionStatus(
      * fresh QR login: the chats are already on the phone. Absent from older cores, where it stays false.
      */
     val resuming: Boolean = false,
+    /**
+     * Why a `logged_out` session is logged out when Zalo ended it: "elsewhere" (logged out / kicked from another
+     * device) or "expired" (the saved session was rejected). Null otherwise and from older cores. The chats stay cached
+     * but the login screen shows (ui/HomeGate.kt), with the reason (ui/ConnectionText.kt).
+     */
+    val loggedOutReason: String? = null,
 ) {
     /** Logged in, whether or not the chat listener is connected (a paused session is still logged in). */
     val isLoggedIn: Boolean get() = state == "ready" || state == "disconnected" || state == "paused"

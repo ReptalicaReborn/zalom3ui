@@ -15,6 +15,7 @@ use crate::types::{
     DeleteMessageTarget, DestType, ForwardMessagePayload, MentionInput, QuoteInput,
     ReactionTarget, SeenMessageInput, SendMessageOptions, SendMessageResponse, StickerParam,
     ThreadType, UndoTarget, UploadProgress, UploadProgressSink, UploadResult, UploadSource,
+    VideoMeta,
 };
 
 const UPLOAD_FILE_DONE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -344,7 +345,8 @@ impl ZaloClient {
                 )));
             }
             let total_size = src.data.len();
-            if total_size > max_size_mb * 1024 * 1024 {
+            // In u64: `max_size_mb * 1024 * 1024` overflows a 32-bit usize from 4096 MB on.
+            if total_size as u64 > (max_size_mb as u64).saturating_mul(1024 * 1024) {
                 return Err(ProtoError::InvalidArg(format!(
                     "File {} size exceeds maximum size of {}MB",
                     src.filename, max_size_mb
@@ -660,6 +662,42 @@ impl ZaloClient {
             .await
     }
 
+    /// Uploads a video's JPEG thumbnail through the photo upload (no progress events) and returns
+    /// the URL to use as the video message's `thumbUrl`.
+    async fn upload_video_thumbnail(
+        &self,
+        meta: &VideoMeta,
+        thread_id: &str,
+        thread_type: ThreadType,
+    ) -> Result<String> {
+        let src = UploadSource {
+            filename: "thumb.jpg".to_string(),
+            data: meta.thumbnail.clone(),
+            width: Some(meta.width),
+            height: Some(meta.height),
+            video: None,
+        };
+        let res = self.upload_attachment(&[src], thread_id, thread_type).await?;
+        match res.into_iter().next() {
+            Some(UploadResult::Image {
+                normal_url,
+                hd_url,
+                thumb_url,
+                ..
+            }) => [normal_url, hd_url, thumb_url]
+                .into_iter()
+                .find(|u| !u.is_empty())
+                .ok_or_else(|| ProtoError::Api {
+                    code: -1,
+                    message: "Thumbnail upload returned no URL".into(),
+                }),
+            _ => Err(ProtoError::Api {
+                code: -1,
+                message: "Thumbnail upload failed".into(),
+            }),
+        }
+    }
+
     async fn send_attachments_part(
         &self,
         options: &SendMessageOptions,
@@ -707,7 +745,40 @@ impl ZaloClient {
         let mut idx_in_group = 0usize;
         let mut out = Vec::new();
 
-        for item in &uploaded {
+        for (item_idx, item) in uploaded.iter().enumerate() {
+            // A video with metadata goes out as a video message (zca-js `sendVideo`), not a file share.
+            if let UploadResult::Video {
+                file_url,
+                total_size,
+                ..
+            } = item
+            {
+                if let Some(meta) = video_meta_for_message(non_gifs.get(item_idx), file_url) {
+                    {
+                        let thumb_url = self.upload_video_thumbnail(meta, thread_id, thread_type).await?;
+                        let params = build_video_message_params(
+                            file_url,
+                            &thumb_url,
+                            meta,
+                            *total_size,
+                            &options.msg,
+                            options.ttl.unwrap_or(0),
+                            thread_id,
+                            is_group,
+                            client_id,
+                            &self.ctx.imei,
+                        );
+                        client_id += 1;
+                        let url = format!("{att_base}forward");
+                        let res = self
+                            .http
+                            .post_encrypted(&self.ctx, &url, &Value::Object(params), &[])
+                            .await?;
+                        out.push(res);
+                        continue;
+                    }
+                }
+            }
             let (endpoint, mut params) = match item {
                 UploadResult::Image {
                     width,
@@ -1561,8 +1632,118 @@ fn val_to_str(v: &Value) -> String {
     }
 }
 
+/// The metadata to send an uploaded video as a video message; `None` (a file message, as before)
+/// without a thumbnail, or when the upload gave no URL.
+pub(crate) fn video_meta_for_message<'a>(src: Option<&'a UploadSource>, file_url: &str) -> Option<&'a VideoMeta> {
+    src.and_then(|s| s.video.as_ref())
+        .filter(|m| !m.thumbnail.is_empty() && !file_url.is_empty())
+}
+
+/// Params of a Zalo video message, as zca-js `sendVideo` builds them (`POST {file}/api/message/forward`
+/// for a user, `/api/group/forward` for a group; msgType 5, zsource 704, `msgInfo` a JSON string).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_video_message_params(
+    video_url: &str,
+    thumb_url: &str,
+    meta: &VideoMeta,
+    file_size: usize,
+    title: &str,
+    ttl: u64,
+    thread_id: &str,
+    is_group: bool,
+    client_id: i64,
+    imei: &str,
+) -> Map<String, Value> {
+    let msg_info = json!({
+        "videoUrl": video_url,
+        "thumbUrl": thumb_url,
+        "duration": meta.duration_ms,
+        "width": meta.width,
+        "height": meta.height,
+        "fileSize": file_size,
+        "properties": {
+            "color": -1,
+            "size": -1,
+            "type": 1003,
+            "subType": 0,
+            "ext": { "sSrcType": -1, "sSrcStr": "", "msg_warning_type": 0 },
+        },
+        "title": title,
+    });
+    let mut m = Map::new();
+    if is_group {
+        m.insert("grid".to_string(), json!(thread_id));
+        m.insert("visibility".to_string(), json!(0));
+    } else {
+        m.insert("toId".to_string(), json!(thread_id));
+    }
+    m.insert("clientId".to_string(), json!(client_id.to_string()));
+    m.insert("ttl".to_string(), json!(ttl));
+    m.insert("zsource".to_string(), json!(704));
+    m.insert("msgType".to_string(), json!(5));
+    m.insert("msgInfo".to_string(), json!(msg_info.to_string()));
+    m.insert("imei".to_string(), json!(imei));
+    m
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_without_metadata_falls_back_to_a_file_message() {
+        let mut src = UploadSource {
+            filename: "a.mp4".into(),
+            data: vec![1],
+            width: None,
+            height: None,
+            video: None,
+        };
+        assert!(video_meta_for_message(Some(&src), "https://v").is_none());
+        assert!(video_meta_for_message(None, "https://v").is_none());
+        src.video = Some(VideoMeta { thumbnail: vec![], duration_ms: 1, width: 1, height: 1 });
+        assert!(video_meta_for_message(Some(&src), "https://v").is_none());
+        src.video = Some(VideoMeta { thumbnail: vec![1], duration_ms: 1, width: 1, height: 1 });
+        assert!(video_meta_for_message(Some(&src), "https://v").is_some());
+        assert!(video_meta_for_message(Some(&src), "").is_none());
+    }
+
+    #[test]
+    fn video_message_params_match_zca_js_send_video() {
+        let meta = VideoMeta {
+            thumbnail: vec![1],
+            duration_ms: 12_500,
+            width: 720,
+            height: 1280,
+        };
+        let user = build_video_message_params("https://v/x.mp4", "https://t/x.jpg", &meta, 1_100_000, "hi", 0, "42", false, 99, "imei1");
+        assert_eq!(user["toId"], "42");
+        assert!(!user.contains_key("grid"));
+        assert_eq!(user["clientId"], "99");
+        assert_eq!(user["ttl"], 0);
+        assert_eq!(user["zsource"], 704);
+        assert_eq!(user["msgType"], 5);
+        assert_eq!(user["imei"], "imei1");
+        let info: Value = serde_json::from_str(user["msgInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            info,
+            json!({
+                "videoUrl": "https://v/x.mp4",
+                "thumbUrl": "https://t/x.jpg",
+                "duration": 12500,
+                "width": 720,
+                "height": 1280,
+                "fileSize": 1100000,
+                "properties": { "color": -1, "size": -1, "type": 1003, "subType": 0,
+                    "ext": { "sSrcType": -1, "sSrcStr": "", "msg_warning_type": 0 } },
+                "title": "hi",
+            })
+        );
+        let group = build_video_message_params("u", "t", &meta, 1, "", 5000, "g1", true, 1, "i");
+        assert_eq!(group["grid"], "g1");
+        assert_eq!(group["visibility"], 0);
+        assert!(!group.contains_key("toId"));
+        assert_eq!(group["ttl"], 5000);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -77,6 +77,38 @@ jobs:
               fi
             done
           done
+      # One APK per ABI (app-arm64-v8a-<type>.apk, app-armeabi-v7a-<type>.apk). Nobody can run the 32-bit one in CI, so at
+      # least check that each APK holds native libraries of its own architecture (ELF class and machine) and no other ABI's.
+      - name: Check each APK carries native libraries for its own ABI
+        run: |
+          tmp=$(mktemp -d)
+          for type in debug release; do
+            count=$(ls app/build/outputs/apk/$type/*.apk | wc -l)
+            [ "$count" = 2 ] || { echo "::error::expected 2 $type APKs (arm64-v8a, armeabi-v7a), found $count"; ls app/build/outputs/apk/$type; exit 1; }
+            for abi in arm64-v8a armeabi-v7a; do
+              apk="app/build/outputs/apk/$type/app-$abi-$type.apk"
+              [ -f "$apk" ] || { echo "::error::$apk missing"; ls app/build/outputs/apk/$type; exit 1; }
+              case "$abi" in
+                arm64-v8a) class=02; machine=b700 ;;   # ELFCLASS64, EM_AARCH64 (0xb7)
+                armeabi-v7a) class=01; machine=2800 ;; # ELFCLASS32, EM_ARM (0x28)
+              esac
+              for f in libzalocore.so libzaloopus.so; do
+                rm -f "$tmp/$f"
+                unzip -q -j "$apk" "lib/$abi/$f" -d "$tmp" || { echo "::error::lib/$abi/$f missing from $apk"; exit 1; }
+                hdr=$(od -An -tx1 -N20 "$tmp/$f" | tr -d ' \n')
+                if [ "${hdr:0:8}" != 7f454c46 ] || [ "${hdr:8:2}" != "$class" ] || [ "${hdr:36:4}" != "$machine" ]; then
+                  echo "::error::lib/$abi/$f in $apk is not an ELF for $abi (header $hdr)"
+                  exit 1
+                fi
+              done
+              if unzip -Z1 "$apk" | grep '^lib/' | grep -qv "^lib/$abi/"; then
+                echo "::error::$apk holds native libraries for another ABI"
+                unzip -Z1 "$apk" | grep '^lib/'
+                exit 1
+              fi
+              echo "$apk: native libraries are $abi"
+            done
+          done
       # Without the compiled baseline profile, a sideloaded APK cold-starts interpreted (no Play Store cloud profile).
       - name: Check the release APK carries the baseline profile
         run: |
@@ -87,7 +119,7 @@ jobs:
           for f in app/build/intermediates/merged_art_profile/release/*/baseline-prof.txt app/build/intermediates/merged_art_profile/release/baseline-prof.txt; do
             [ -f "$f" ] && echo "$f: $(wc -l < "$f") rules, $(grep -c 'zalom3ui' "$f" || true) for com.zalom3ui"
           done || true
-      # Debug and R8-optimized release APKs, for arm64-v8a phones.
+      # Debug and R8-optimized release APKs: two each, one for arm64-v8a phones and one for 32-bit armeabi-v7a phones.
       - uses: actions/upload-artifact@v4
         with:
           name: zalom3ui-debug-apk

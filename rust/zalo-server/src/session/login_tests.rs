@@ -324,6 +324,7 @@ async fn a_rejected_saved_session_stops_resuming_and_keeps_the_expiry_error() {
     assert!(!s.resuming);
     assert!(!s.retrying);
     assert_eq!(s.error.as_deref(), Some(SESSION_EXPIRED));
+    assert_eq!(s.logged_out_reason.as_deref(), Some(LOGGED_OUT_EXPIRED));
 
     let seen = statuses(&mut events);
     let last = seen.last().expect("status events");

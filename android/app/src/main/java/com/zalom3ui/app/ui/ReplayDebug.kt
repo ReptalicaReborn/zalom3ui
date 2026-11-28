@@ -80,7 +80,7 @@ private fun ReplayLogRow() {
         leadingContent = { Icon(Icons.Outlined.History, null) },
         headlineContent = { Text("Replay log") },
         supportingContent = {
-            Text(error ?: "What Zalo replayed each time Zalỏ connected, and whether history has a gap (ids and counts only)")
+            Text(error ?: "What Zalo replayed on each connect, and any history gap")
         },
     )
     log?.let { text ->

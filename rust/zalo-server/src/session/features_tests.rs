@@ -31,6 +31,7 @@ async fn a_photo_is_sent_with_its_pixel_size_a_file_with_only_its_size() {
                 filename: "a.JPG".into(),
                 width: Some(640),
                 height: Some(480),
+                video: None,
             },
         )
         .await
@@ -57,6 +58,7 @@ async fn a_photo_is_sent_with_its_pixel_size_a_file_with_only_its_size() {
                 filename: "notes.pdf".into(),
                 width: None,
                 height: None,
+                video: None,
             },
         )
         .await
@@ -75,6 +77,7 @@ async fn attachments_zalo_cant_take_here_are_refused_before_anything_is_sent() {
         filename: filename.into(),
         width: None,
         height: None,
+        video: None,
     };
     let refused = |name: &'static str, data: Vec<u8>, expected: &'static str| {
         let session = Arc::clone(&r.session);

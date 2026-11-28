@@ -65,7 +65,9 @@ zalo-media = { path = "zalo-media" }
 zalo-server = { path = "zalo-server", default-features = false }
 
 [profile.release]
-opt-level = "z"
+# Built for speed: storage is cheap next to a slow watch CPU. (opt-level "z" was 2.5 MB compressed
+# vs 3.5 MB here; the APK grows by about 1 MB.)
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 # Unwind (not abort): the core runs inside the app process, so a panic must stay catchable at the JNI
