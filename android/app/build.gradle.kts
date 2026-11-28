@@ -138,6 +138,10 @@ abstract class BuildRustCoreTask : DefaultTask() {
             environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", clang)
             environment("CC_aarch64_linux_android", clang)
             environment("AR_aarch64_linux_android", llvmAr)
+            // Hardware AES / GHASH (ARMv8 Crypto Extensions) for message crypto and call SRTP. RustCrypto
+            // only builds them in with these cfgs; at runtime they are used if the CPU has them and fall back
+            // to software otherwise. Without the cfgs every AES block ran in software.
+            environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS", "--cfg aes_armv8 --cfg polyval_armv8")
             commandLine(cargo, "build", "--release", "--target", "aarch64-linux-android", "-p", "zalo-android")
         }
 

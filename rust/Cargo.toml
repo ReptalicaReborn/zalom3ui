@@ -72,3 +72,28 @@ codegen-units = 1
 # boundary (catch_unwind) and inside one tokio task, instead of killing the whole app.
 panic = "unwind"
 strip = "symbols"
+
+# The rest of the core is built for size ("z" above). The few crates that run per byte or per packet
+# (message crypto, call SRTP and media, decompression, JSON) are built for speed instead.
+[profile.release.package.zalo-media]
+opt-level = 3
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.aes-gcm]
+opt-level = 3
+[profile.release.package.ghash]
+opt-level = 3
+[profile.release.package.polyval]
+opt-level = 3
+[profile.release.package.ctr]
+opt-level = 3
+[profile.release.package.cbc]
+opt-level = 3
+[profile.release.package.hmac]
+opt-level = 3
+[profile.release.package.sha1]
+opt-level = 3
+[profile.release.package.miniz_oxide]
+opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
