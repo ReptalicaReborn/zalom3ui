@@ -226,6 +226,7 @@ fun systemMessageLabel(msg: ChatMessage): String? {
     if (msg.recalled) return null
     if (msg.attachment?.kind == "call") return null
     if (msg.msgType == "chat.call.feedback") return "Call audio issue?"
+    msg.attachment?.poll?.takeIf { it.event != null }?.let { return pollEventLabel(msg, it.question) }
     val text = msg.text
     var start = 0
     var end = text.length
@@ -265,6 +266,22 @@ fun systemMessageLabel(msg: ChatMessage): String? {
         return raw.removePrefix("[System]").removePrefix("[system]").trim().ifBlank { null }
     }
     return null
+}
+
+/** A vote or close on a poll: a system line, not a bubble (the poll itself is the card it points to). */
+private fun pollEventLabel(msg: ChatMessage, question: String): String {
+    val who = when {
+        msg.isSelf -> "You"
+        msg.fromName.isNotBlank() -> msg.fromName.trim()
+        else -> null
+    }
+    val q = question.replace(SPACE_RUN_REGEX, " ").trim()
+    return when {
+        who != null && q.isNotEmpty() -> "$who updated the poll: $q"
+        who != null -> "$who updated a poll"
+        q.isNotEmpty() -> "Poll updated: $q"
+        else -> "Poll updated"
+    }
 }
 
 /** Lowercase and strip Vietnamese diacritics so "duc" finds "Đức". */

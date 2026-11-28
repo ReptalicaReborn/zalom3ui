@@ -1316,15 +1316,24 @@ private fun MessageList(
                                     onClick = { if (selectionMode) onToggleSelect(msg) },
                                     onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
                                 )
-                                item.systemLabel != null -> SystemInfoRow(
-                                    label = item.systemLabel,
-                                    ts = msg.ts,
-                                    highlighted = highlightedMsgId == msg.id || isSearchFocused,
-                                    selected = isSelected,
-                                    selectionMode = selectionMode,
-                                    onClick = { if (selectionMode) onToggleSelect(msg) },
-                                    onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
-                                )
+                                item.systemLabel != null -> {
+                                    // A poll update points at the poll: tapping the line opens it, as the bubble did.
+                                    val pollId = msg.attachment?.poll?.takeIf { it.event != null }?.pollId
+                                    var pollOpen by remember { mutableStateOf(false) }
+                                    SystemInfoRow(
+                                        label = item.systemLabel,
+                                        ts = msg.ts,
+                                        highlighted = highlightedMsgId == msg.id || isSearchFocused,
+                                        selected = isSelected,
+                                        selectionMode = selectionMode,
+                                        icon = if (pollId != null) Icons.Outlined.Poll else Icons.Outlined.Info,
+                                        onClick = {
+                                            if (selectionMode) onToggleSelect(msg) else if (pollId != null) pollOpen = true
+                                        },
+                                        onLongPress = { if (selectionMode) onToggleSelect(msg) else onOpenMenu(msg) },
+                                    )
+                                    if (pollOpen && pollId != null) PollSheet(pollId, onDismiss = { pollOpen = false })
+                                }
                                 else -> {
                                     val olderSingle = (olderItem as? ChatItem.Single)?.takeIf { !it.isSystemLike }
                                     val newerSingle = (newerItem as? ChatItem.Single)?.takeIf { !it.isSystemLike }
@@ -1988,6 +1997,7 @@ private fun SystemInfoRow(
     highlighted: Boolean,
     selected: Boolean = false,
     selectionMode: Boolean = false,
+    icon: ImageVector = Icons.Outlined.Info,
     onClick: () -> Unit = {},
     onLongPress: () -> Unit,
 ) {
@@ -2026,7 +2036,7 @@ private fun SystemInfoRow(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
             ) {
                 Icon(
-                    Icons.Outlined.Info,
+                    icon,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(14.dp),

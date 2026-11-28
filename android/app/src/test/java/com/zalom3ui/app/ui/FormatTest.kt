@@ -2,6 +2,7 @@ package com.zalom3ui.app.ui
 
 import com.zalom3ui.app.data.Attachment
 import com.zalom3ui.app.data.ChatMessage
+import com.zalom3ui.app.data.PollRef
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -173,5 +174,18 @@ class FormatTest {
         )) {
             assertNull("expected null for '$normal'", systemMessageLabel(msg(normal)))
         }
+    }
+
+    @Test
+    fun pollUpdatesAreSystemLinesAndThePollItselfIsNot() {
+        fun poll(event: String?, isSelf: Boolean = true, fromName: String = "") =
+            msg("", attachment = Attachment(kind = "poll", poll = PollRef(pollId = 7, question = " Lunch   where? ", event = event)))
+                .copy(isSelf = isSelf, fromName = fromName)
+
+        assertEquals("You updated the poll: Lunch where?", systemMessageLabel(poll("vote")))
+        assertEquals("An updated the poll: Lunch where?", systemMessageLabel(poll("vote", isSelf = false, fromName = "An")))
+        assertEquals("Poll updated: Lunch where?", systemMessageLabel(poll("close", isSelf = false)))
+        // The poll's creation stays a card in a bubble.
+        assertNull(systemMessageLabel(poll(null)))
     }
 }
