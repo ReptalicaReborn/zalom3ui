@@ -50,9 +50,9 @@ fun IncomingCallSettings() {
                 supportingContent = {
                     Text(
                         if (overApps) {
-                            "On: a call opens its screen whatever you're doing"
+                            "On: calls open over whatever you're doing"
                         } else {
-                            "Off: calls only show a notification while you use the device. Tap, then allow \"Display over other apps\""
+                            "Off: calls only show a notification. Tap to allow"
                         },
                     )
                 },
@@ -67,7 +67,7 @@ fun IncomingCallSettings() {
                     leadingContent = { Icon(Icons.Outlined.Fullscreen, null) },
                     headlineContent = { Text("Full screen on the lock screen") },
                     supportingContent = {
-                        Text(if (fullScreen) "On: a call wakes the screen and shows Answer / Decline" else "Off: tap, then allow full-screen notifications")
+                        Text(if (fullScreen) "On: calls wake the screen with Answer / Decline" else "Off: tap to allow full-screen notifications")
                     },
                     trailingContent = { Switch(checked = fullScreen, onCheckedChange = { CallPopup.open(context, CallPopup.fullScreenSettings(context)) }) },
                 )
@@ -81,7 +81,7 @@ fun IncomingCallSettings() {
                     leadingContent = { Icon(Icons.Outlined.PhoneInTalk, null) },
                     headlineContent = { Text("Xiaomi pop-up permissions") },
                     supportingContent = {
-                        Text("Allow \"Display pop-up windows while running in the background\" and \"Show on Lock screen\"")
+                        Text("Allow background pop-ups and lock screen display")
                     },
                 )
             }
@@ -94,7 +94,7 @@ fun IncomingCallSettings() {
                 headlineContent = { Text("Call notification") },
                 supportingContent = {
                     Text(
-                        "Sound, banners (floating notifications) and lock screen for \"Incoming calls\"",
+                        "Sound, banners and lock screen for calls",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 },

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.Password
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -50,10 +51,11 @@ import com.zalom3ui.app.server.ZaloNotificationListener
  * access is already granted.
  */
 @Composable
-fun StayConnectedSettings(showModes: Boolean = true) {
+fun StayConnectedSettings(showModes: Boolean = true, showCodes: Boolean = true) {
     val context = LocalContext.current
     val store = remember { SettingsStore(context) }
     var stay by remember { mutableStateOf(store.loadStay()) }
+    var modesHelpOpen by remember { mutableStateOf(false) }
     var accessGranted by remember { mutableStateOf(ZaloNotificationListener.isAccessGranted(context)) }
     LifecycleResumeEffect(Unit) {
         accessGranted = ZaloNotificationListener.isAccessGranted(context)
@@ -93,12 +95,33 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(mode.label, style = MaterialTheme.typography.bodyLarge)
                         Text(
-                            mode.summary,
+                            shortSummary(mode),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
+            }
+        }
+        if (showModes) {
+            add {
+                ListItem(
+                    modifier = Modifier.clickable { modesHelpOpen = !modesHelpOpen },
+                    colors = transparent,
+                    leadingContent = { Icon(Icons.Outlined.Info, null) },
+                    headlineContent = { Text("How these modes differ") },
+                    supportingContent = {
+                        if (modesHelpOpen) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                StayConnected.entries.forEach { m ->
+                                    Text("${m.label}: ${m.summary}")
+                                }
+                            }
+                        } else {
+                            Text("Tap to read the details")
+                        }
+                    },
+                )
             }
         }
         if (showModes && stay.mode.usesBridge) {
@@ -111,10 +134,9 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
                                 if (accessGranted) {
-                                    "Granted: Zalỏ notices when the Zalo app shows a message notification."
+                                    "Allowed: Zalỏ sees the Zalo app's message notifications."
                                 } else {
-                                    "Not granted. Until you allow it, this works like \"While open\": " +
-                                        "nothing connects when the Zalo app shows a notification."
+                                    "Not allowed yet. Until then this works like \"While open\"."
                                 },
                             )
                             Button(onClick = {
@@ -138,7 +160,7 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                     leadingContent = { Icon(Icons.Outlined.VisibilityOff, null) },
                     headlineContent = { Text("Hide Zalo's notifications") },
                     supportingContent = {
-                        Text("Remove the Zalo app's message notification once Zalỏ has shown its own for that chat. Calls are never touched.")
+                        Text("Remove Zalo's message notification once Zalỏ shows its own. Calls are untouched.")
                     },
                     trailingContent = {
                         Switch(
@@ -160,7 +182,7 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                         leadingContent = { Icon(Icons.Outlined.Password, null) },
                         headlineContent = { Text("Codes from Zalo's notifications") },
                         supportingContent = {
-                            Text("Notification access is already allowed. Turn this on to get one-time codes with a Copy button.")
+                            Text("Show one-time codes with a Copy button")
                         },
                         trailingContent = { Switch(checked = false, onCheckedChange = { setRescue(true) }) },
                     )
@@ -177,11 +199,7 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                 leadingContent = { Icon(Icons.Outlined.Password, null) },
                 headlineContent = { Text("Codes from Zalo's notifications") },
                 supportingContent = {
-                    Text(
-                        "When the Zalo app shows a message with a one-time code (a bank or service OTP), Zalỏ shows the code " +
-                            "in its own notification with a Copy button, and hides it on the lock screen. Works even if Zalo " +
-                            "never sends those messages to Zalỏ. It reads the notification in memory only; nothing is stored or logged.",
-                    )
+                    Text("Show one-time codes from Zalo's notifications with a Copy button. Read in memory only, never stored.")
                 },
                 trailingContent = {
                     Switch(checked = stay.otpFromZaloNotifications, onCheckedChange = setRescue)
@@ -198,9 +216,9 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
                                 if (accessGranted) {
-                                    "Granted: Zalỏ can read the Zalo app's notifications for codes."
+                                    "Allowed: Zalỏ can read codes from Zalo's notifications."
                                 } else {
-                                    "Not granted. Codes can't be read until you allow notification access."
+                                    "Not allowed yet, so codes can't be read."
                                 },
                             )
                             Button(onClick = openAccess) {
@@ -222,7 +240,7 @@ fun StayConnectedSettings(showModes: Boolean = true) {
                         leadingContent = { Icon(Icons.Outlined.VisibilityOff, null) },
                         headlineContent = { Text("Hide Zalo's notification") },
                         supportingContent = {
-                            Text("Remove the Zalo app's notification once Zalỏ shows the code itself, so you get one notification, not two. Calls are never touched.")
+                            Text("Remove Zalo's notification once Zalỏ shows the code, so you get one. Calls are untouched.")
                         },
                         trailingContent = {
                             Switch(
@@ -244,7 +262,15 @@ fun StayConnectedSettings(showModes: Boolean = true) {
             SectionHeader("Stay connected")
             ExpressiveSettingsGroup(items = items)
         }
-        SectionHeader("Codes from Zalo's notifications")
-        ExpressiveSettingsGroup(items = rescueItems)
+        if (showCodes) {
+            SectionHeader("Codes from Zalo's notifications")
+            ExpressiveSettingsGroup(items = rescueItems)
+        }
     }
+}
+
+private fun shortSummary(mode: StayConnected): String = when (mode) {
+    StayConnected.ALWAYS -> "Always connected, even when Zalỏ is closed"
+    StayConnected.WHILE_OPEN -> "Connected only while Zalỏ is open"
+    StayConnected.WHILE_OPEN_BRIDGE -> "While open, plus a brief wake-up on Zalo notifications"
 }

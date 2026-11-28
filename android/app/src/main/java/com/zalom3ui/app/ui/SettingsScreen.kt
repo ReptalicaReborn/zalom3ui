@@ -2,6 +2,15 @@ package com.zalom3ui.app.ui
 
 import android.os.Build
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.BorderStroke
@@ -28,15 +37,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.Campaign
+import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.FormatColorFill
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.ManageAccounts
 import androidx.compose.material.icons.outlined.MotionPhotosOff
+import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.RestartAlt
@@ -80,6 +94,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -99,6 +114,31 @@ import com.zalom3ui.app.data.ServerSettings
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThemeMode
 import com.zalom3ui.app.security.AppLock
+
+
+private enum class SettingsPage(val title: String) {
+    TOP("Settings"),
+    APPEARANCE("Appearance"),
+    PRIVACY("Privacy & security"),
+    NOTIFICATIONS("Notifications & calls"),
+    CHATS("Chats"),
+    CONNECTION("Connection"),
+    ACCOUNT("Account"),
+    DEVELOPER("Developer"),
+}
+
+/** One row of the top-level Settings list: icon, title, one-line state, chevron. */
+@Composable
+private fun SettingsCategoryRow(icon: ImageVector, title: String, summary: String, onClick: () -> Unit) {
+    ListItem(
+        modifier = Modifier.clickable(onClick = onClick),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        leadingContent = { Icon(icon, null) },
+        headlineContent = { Text(title) },
+        supportingContent = { Text(summary, maxLines = 1) },
+        trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+    )
+}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -138,14 +178,23 @@ fun SettingsScreen(
     val dynamicActive = appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val transparentListItemColors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    val showAccount = current.onDevice || loggedIn
+    val showDeveloper = current.onDevice && loggedIn
+    // First run (nothing to go back to): open straight on the page where the server is chosen.
+    var page by rememberSaveable { mutableStateOf(if (canGoBack) SettingsPage.TOP else SettingsPage.CONNECTION) }
+    BackHandler(enabled = page != SettingsPage.TOP) { page = SettingsPage.TOP }
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
             MediumFlexibleTopAppBar(
-                title = { Text("Settings") },
+                title = { Text(page.title) },
                 navigationIcon = {
-                    if (canGoBack) {
+                    if (page != SettingsPage.TOP) {
+                        IconButton(onClick = { page = SettingsPage.TOP }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    } else if (canGoBack) {
                         IconButton(onClick = onBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
@@ -155,406 +204,481 @@ fun SettingsScreen(
             )
         },
     ) { padding ->
-        Column(
-            Modifier
+        AnimatedContent(
+            targetState = page,
+            modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState()),
-        ) {
-            if (loggedIn) {
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerLow,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Avatar(profileName.orEmpty(), profileAvatar.orEmpty(), key = profileId ?: "me", isGroup = false, size = 64.dp)
-                        Spacer(Modifier.width(16.dp))
-                        Column {
-                            Text(profileName ?: "Zalo account", style = MaterialTheme.typography.titleLarge)
-                            Text(
-                                "Logged in to Zalo",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
+                .padding(padding),
+            transitionSpec = {
+                if (reducedMotion) {
+                    EnterTransition.None togetherWith ExitTransition.None
+                } else {
+                    val forward = targetState != SettingsPage.TOP
+                    (fadeIn() + slideInHorizontally { if (forward) it / 10 else -it / 10 }) togetherWith
+                        (fadeOut() + slideOutHorizontally { if (forward) -it / 10 else it / 10 })
                 }
-            }
-
-            SectionHeader("Appearance")
-            val showEasterEgg = easterEggUnlocked || appearance.ultraExpressive
-            val appearanceItems = buildList<@Composable () -> Unit> {
-                add {
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                    ) {
-                        MiniChatPreview(
-                            ultraExpressive = appearance.ultraExpressive,
-                            onTap = {
-                                if (!showEasterEgg) {
-                                    previewTaps++
-                                    if (previewTaps >= 5) {
-                                        easterEggUnlocked = true
-                                        onAppearance(appearance.copy(ultraExpressive = true))
+            },
+            label = "settingsPage",
+        ) { target ->
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                if (target != SettingsPage.TOP) Spacer(Modifier.height(8.dp))
+                when (target) {
+                    SettingsPage.TOP -> {
+                        if (loggedIn) {
+                            Surface(
+                                shape = RoundedCornerShape(24.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                            ) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(16.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Avatar(profileName.orEmpty(), profileAvatar.orEmpty(), key = profileId ?: "me", isGroup = false, size = 64.dp)
+                                    Spacer(Modifier.width(16.dp))
+                                    Column {
+                                        Text(profileName ?: "Zalo account", style = MaterialTheme.typography.titleLarge)
+                                        Text(
+                                            "Logged in to Zalo",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        val context = LocalContext.current
+                        val store = remember(context) { SettingsStore(context) }
+                        val appearanceSummary = listOfNotNull(
+                            appearance.themeMode.label,
+                            if (dynamicActive) "Wallpaper colors" else appearance.accent.label,
+                            if (appearance.amoledBlack) "Pure black" else null,
+                        ).joinToString(" · ")
+                        val connectionSummary = if (current.onDevice) {
+                            "This phone · " + store.loadStay().mode.label
+                        } else {
+                            "Remote server"
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        ExpressiveSettingsGroup(
+                            items = buildList<@Composable () -> Unit> {
+                                add { SettingsCategoryRow(Icons.Outlined.Palette, "Appearance", appearanceSummary) { page = SettingsPage.APPEARANCE } }
+                                add {
+                                    SettingsCategoryRow(
+                                        Icons.Outlined.Lock,
+                                        "Privacy & security",
+                                        if (store.appLockEnabled) "App lock on" else "App lock off",
+                                    ) { page = SettingsPage.PRIVACY }
+                                }
+                                add {
+                                    SettingsCategoryRow(
+                                        Icons.Outlined.Notifications,
+                                        "Notifications & calls",
+                                        if (current.onDevice) "Incoming calls, one-time codes" else "One-time codes",
+                                    ) { page = SettingsPage.NOTIFICATIONS }
+                                }
+                                add {
+                                    SettingsCategoryRow(
+                                        Icons.Outlined.ChatBubbleOutline,
+                                        "Chats",
+                                        if (hideOfficialAccounts) "Official accounts hidden" else "Official accounts shown",
+                                    ) { page = SettingsPage.CHATS }
+                                }
+                                add { SettingsCategoryRow(Icons.Outlined.Cloud, "Connection", connectionSummary) { page = SettingsPage.CONNECTION } }
+                                if (showAccount) {
+                                    add {
+                                        SettingsCategoryRow(
+                                            Icons.Outlined.ManageAccounts,
+                                            "Account",
+                                            if (loggedIn) "Sync, restart, log out" else "Restart Zalo service",
+                                        ) { page = SettingsPage.ACCOUNT }
                                     }
                                 }
                             },
                         )
-                        if (!showEasterEgg && previewTaps in 2..4) {
-                            val left = 5 - previewTaps
-                            Text(
-                                "Tap $left more ${if (left == 1) "time" else "times"} to make the app 4x faster…",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary,
+                        if (showDeveloper) {
+                            Spacer(Modifier.height(16.dp))
+                            ExpressiveSettingsGroup(
+                                modifier = Modifier.alpha(0.7f),
+                                items = listOf<@Composable () -> Unit>(
+                                    { SettingsCategoryRow(Icons.Outlined.Code, "Developer", "Logs and debugging") { page = SettingsPage.DEVELOPER } },
+                                ),
                             )
                         }
-                        AccentSwatchPicker(
-                            selected = appearance.accent,
-                            enabled = !dynamicActive,
-                            onSelect = { onAppearance(appearance.copy(accent = it)) },
-                        )
                     }
-                }
-                add {
-                    ListItem(
-                        modifier = Modifier.clickable { pickTheme = true },
-                        colors = transparentListItemColors,
-                        leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
-                        headlineContent = { Text("Dark mode") },
-                        supportingContent = { Text(appearance.themeMode.label) },
-                    )
-                }
-                add {
-                    ListItem(
-                        modifier = Modifier.clickable {
-                            onAppearance(appearance.copy(tintedBackground = !appearance.tintedBackground))
-                        },
-                        colors = transparentListItemColors,
-                        leadingContent = { Icon(Icons.Outlined.FormatColorFill, null) },
-                        headlineContent = { Text("Tinted chat background") },
-                        supportingContent = { Text("Subtle accent wash behind messages") },
-                        trailingContent = {
-                            Switch(
-                                checked = appearance.tintedBackground,
-                                onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
-                            )
-                        },
-                    )
-                }
-                add {
-                    ListItem(
-                        modifier = Modifier.clickable {
-                            onAppearance(appearance.copy(amoledBlack = !appearance.amoledBlack))
-                        },
-                        colors = transparentListItemColors,
-                        leadingContent = { Icon(Icons.Outlined.Contrast, null) },
-                        headlineContent = { Text("Pure black (AMOLED)") },
-                        supportingContent = { Text("Black backgrounds in dark mode, easier on OLED batteries") },
-                        trailingContent = {
-                            Switch(
-                                checked = appearance.amoledBlack,
-                                onCheckedChange = { onAppearance(appearance.copy(amoledBlack = it)) },
-                            )
-                        },
-                    )
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    add {
-                        ListItem(
-                            modifier = Modifier.clickable {
-                                onAppearance(appearance.copy(dynamicColor = !appearance.dynamicColor))
-                            },
-                            colors = transparentListItemColors,
-                            leadingContent = { Icon(Icons.Outlined.Palette, null) },
-                            headlineContent = { Text("Wallpaper colors") },
-                            supportingContent = { Text("Use colors from your wallpaper instead of Color") },
-                            trailingContent = {
-                                Switch(
-                                    checked = appearance.dynamicColor,
-                                    onCheckedChange = { onAppearance(appearance.copy(dynamicColor = it)) },
-                                )
-                            },
-                        )
-                    }
-                }
-                add {
-                    ListItem(
-                        modifier = Modifier.clickable { onReducedMotion(!reducedMotion) },
-                        colors = transparentListItemColors,
-                        leadingContent = { Icon(Icons.Outlined.MotionPhotosOff, null) },
-                        headlineContent = { Text("Reduced motion") },
-                        supportingContent = { Text("Simplify transitions, disable blur and wave animations") },
-                        trailingContent = {
-                            Switch(
-                                checked = reducedMotion,
-                                onCheckedChange = onReducedMotion,
-                            )
-                        },
-                    )
-                }
-                if (showEasterEgg) {
-                    add {
-                        ListItem(
-                            modifier = Modifier.clickable {
-                                onAppearance(appearance.copy(ultraExpressive = !appearance.ultraExpressive))
-                            },
-                            colors = transparentListItemColors,
-                            leadingContent = { FourXBadge(size = 36.dp, compact = true) },
-                            headlineContent = { Text("4x faster mode") },
-                            supportingContent = {
-                                Text("Easter egg · Users spot key buttons up to 4x faster (M3 Expressive™)")
-                            },
-                            trailingContent = {
-                                Switch(
-                                    checked = appearance.ultraExpressive,
-                                    onCheckedChange = { onAppearance(appearance.copy(ultraExpressive = it)) },
-                                )
-                            },
-                        )
-                    }
-                }
-            }
-            ExpressiveSettingsGroup(items = appearanceItems)
-
-            PrivacySecuritySettings()
-
-            SectionHeader("Zalo runs on")
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-            ) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                ) {
-                    val serverToggleColors = ToggleButtonDefaults.tonalToggleButtonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        checkedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                        checkedContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
-                    ) {
-                        ToggleButton(
-                            checked = onDevice,
-                            onCheckedChange = { if (it) onDevice = true },
-                            shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
-                            colors = serverToggleColors,
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Icon(
-                                Icons.Outlined.PhoneAndroid,
-                                contentDescription = null,
-                                modifier = Modifier.size(ToggleButtonDefaults.IconSize),
-                            )
-                            Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
-                            Text("This phone")
-                        }
-                        ToggleButton(
-                            checked = !onDevice,
-                            onCheckedChange = { if (it) onDevice = false },
-                            shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
-                            colors = serverToggleColors,
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Icon(
-                                Icons.Outlined.Cloud,
-                                contentDescription = null,
-                                modifier = Modifier.size(ToggleButtonDefaults.IconSize),
-                            )
-                            Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
-                            Text("Remote server")
-                        }
-                    }
-                    Text(
-                        if (onDevice) {
-                            "The Zalo connection runs inside this app and stays connected in the background."
-                        } else {
-                            "Connect to a Zalỏ server running on another computer or VPS."
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 12.dp),
-                    )
-                    if (!onDevice) {
-                        Spacer(Modifier.height(14.dp))
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            OutlinedTextField(
-                                value = serverUrl,
-                                onValueChange = { serverUrl = it },
-                                label = { Text("Server address") },
-                                placeholder = { Text("https://zalo.example.com") },
-                                singleLine = true,
-                                isError = serverUrl.isNotBlank() && !urlValid,
-                                supportingText = if (serverUrl.isNotBlank() && !urlValid) ({ Text("Not a valid address") }) else null,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                            OutlinedTextField(
-                                value = token,
-                                onValueChange = { token = it },
-                                label = { Text("Access token") },
-                                singleLine = true,
-                                visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
-                                trailingIcon = {
-                                    IconButton(onClick = { showToken = !showToken }) {
-                                        Icon(
-                                            if (showToken) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
-                                            contentDescription = if (showToken) "Hide token" else "Show token",
+                    SettingsPage.APPEARANCE -> {
+                        val showEasterEgg = easterEggUnlocked || appearance.ultraExpressive
+                        val appearanceItems = buildList<@Composable () -> Unit> {
+                            add {
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .padding(16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                                ) {
+                                    MiniChatPreview(
+                                        ultraExpressive = appearance.ultraExpressive,
+                                        onTap = {
+                                            if (!showEasterEgg) {
+                                                previewTaps++
+                                                if (previewTaps >= 5) {
+                                                    easterEggUnlocked = true
+                                                    onAppearance(appearance.copy(ultraExpressive = true))
+                                                }
+                                            }
+                                        },
+                                    )
+                                    if (!showEasterEgg && previewTaps in 2..4) {
+                                        val left = 5 - previewTaps
+                                        Text(
+                                            "Tap $left more ${if (left == 1) "time" else "times"} to make the app 4x faster…",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.primary,
                                         )
                                     }
-                                },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
-                    }
-                    if (changed) {
-                        Row(
-                            Modifier.fillMaxWidth().padding(top = 16.dp),
-                            horizontalArrangement = Arrangement.End,
-                        ) {
-                            Button(
-                                onClick = { onSave(edited) },
-                                enabled = urlValid,
-                                shape = CircleShape,
-                            ) {
-                                Text("Save changes")
+                                    AccentSwatchPicker(
+                                        selected = appearance.accent,
+                                        enabled = !dynamicActive,
+                                        onSelect = { onAppearance(appearance.copy(accent = it)) },
+                                    )
+                                }
+                            }
+                            add {
+                                ListItem(
+                                    modifier = Modifier.clickable { pickTheme = true },
+                                    colors = transparentListItemColors,
+                                    leadingContent = { Icon(Icons.Outlined.DarkMode, null) },
+                                    headlineContent = { Text("Dark mode") },
+                                    supportingContent = { Text(appearance.themeMode.label) },
+                                )
+                            }
+                            add {
+                                ListItem(
+                                    modifier = Modifier.clickable {
+                                        onAppearance(appearance.copy(tintedBackground = !appearance.tintedBackground))
+                                    },
+                                    colors = transparentListItemColors,
+                                    leadingContent = { Icon(Icons.Outlined.FormatColorFill, null) },
+                                    headlineContent = { Text("Tinted chat background") },
+                                    supportingContent = { Text("Subtle accent wash behind messages") },
+                                    trailingContent = {
+                                        Switch(
+                                            checked = appearance.tintedBackground,
+                                            onCheckedChange = { onAppearance(appearance.copy(tintedBackground = it)) },
+                                        )
+                                    },
+                                )
+                            }
+                            add {
+                                ListItem(
+                                    modifier = Modifier.clickable {
+                                        onAppearance(appearance.copy(amoledBlack = !appearance.amoledBlack))
+                                    },
+                                    colors = transparentListItemColors,
+                                    leadingContent = { Icon(Icons.Outlined.Contrast, null) },
+                                    headlineContent = { Text("Pure black (AMOLED)") },
+                                    supportingContent = { Text("True black in dark mode, easier on OLED") },
+                                    trailingContent = {
+                                        Switch(
+                                            checked = appearance.amoledBlack,
+                                            onCheckedChange = { onAppearance(appearance.copy(amoledBlack = it)) },
+                                        )
+                                    },
+                                )
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                add {
+                                    ListItem(
+                                        modifier = Modifier.clickable {
+                                            onAppearance(appearance.copy(dynamicColor = !appearance.dynamicColor))
+                                        },
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.Palette, null) },
+                                        headlineContent = { Text("Wallpaper colors") },
+                                        supportingContent = { Text("Use colors from your wallpaper instead of Color") },
+                                        trailingContent = {
+                                            Switch(
+                                                checked = appearance.dynamicColor,
+                                                onCheckedChange = { onAppearance(appearance.copy(dynamicColor = it)) },
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            add {
+                                ListItem(
+                                    modifier = Modifier.clickable { onReducedMotion(!reducedMotion) },
+                                    colors = transparentListItemColors,
+                                    leadingContent = { Icon(Icons.Outlined.MotionPhotosOff, null) },
+                                    headlineContent = { Text("Reduced motion") },
+                                    supportingContent = { Text("Simpler transitions, no blur or waves") },
+                                    trailingContent = {
+                                        Switch(
+                                            checked = reducedMotion,
+                                            onCheckedChange = onReducedMotion,
+                                        )
+                                    },
+                                )
+                            }
+                            if (showEasterEgg) {
+                                add {
+                                    ListItem(
+                                        modifier = Modifier.clickable {
+                                            onAppearance(appearance.copy(ultraExpressive = !appearance.ultraExpressive))
+                                        },
+                                        colors = transparentListItemColors,
+                                        leadingContent = { FourXBadge(size = 36.dp, compact = true) },
+                                        headlineContent = { Text("4x faster mode") },
+                                        supportingContent = {
+                                            Text("Easter egg · Spot key buttons up to 4x faster")
+                                        },
+                                        trailingContent = {
+                                            Switch(
+                                                checked = appearance.ultraExpressive,
+                                                onCheckedChange = { onAppearance(appearance.copy(ultraExpressive = it)) },
+                                            )
+                                        },
+                                    )
+                                }
                             }
                         }
+                        ExpressiveSettingsGroup(items = appearanceItems)
                     }
-                }
-            }
-
-            if (current.onDevice) IncomingCallSettings()
-
-            SectionHeader("Chats")
-            ExpressiveSettingsGroup(
-                items = listOf<@Composable () -> Unit>(
-                    {
-                        ListItem(
-                            modifier = Modifier.clickable { onHideOfficialAccounts(!hideOfficialAccounts) },
-                            colors = transparentListItemColors,
-                            leadingContent = { Icon(Icons.Outlined.Campaign, null) },
-                            headlineContent = { Text("Hide official accounts") },
-                            supportingContent = {
-                                Text("News, shops and ZNS notifications won't show in your chat list or notify you")
-                            },
-                            trailingContent = {
-                                Switch(
-                                    checked = hideOfficialAccounts,
-                                    onCheckedChange = onHideOfficialAccounts,
+                    SettingsPage.PRIVACY -> PrivacySecuritySettings()
+                    SettingsPage.CONNECTION -> {
+                        SectionHeader("Zalo runs on")
+                        Surface(
+                            shape = RoundedCornerShape(24.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp),
+                        ) {
+                            Column(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                            ) {
+                                val serverToggleColors = ToggleButtonDefaults.tonalToggleButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    checkedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    checkedContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                                 )
-                            },
-                        )
-                    },
-                ),
-            )
-
-            // How long Zalo stays connected (only the on-phone core has this choice), and codes from Zalo's notifications.
-            StayConnectedSettings(showModes = current.onDevice)
-
-            if (current.onDevice || loggedIn) {
-                SectionHeader("Account")
-                val accountItems = buildList<@Composable () -> Unit> {
-                    if (current.onDevice) {
-                        add {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onRestartServer),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.RestartAlt, null) },
-                                headlineContent = { Text("Restart Zalo service") },
-                                supportingContent = { Text("If messages stop arriving") },
-                            )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
+                                ) {
+                                    ToggleButton(
+                                        checked = onDevice,
+                                        onCheckedChange = { if (it) onDevice = true },
+                                        shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
+                                        colors = serverToggleColors,
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Icon(
+                                            Icons.Outlined.PhoneAndroid,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(ToggleButtonDefaults.IconSize),
+                                        )
+                                        Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
+                                        Text("This phone")
+                                    }
+                                    ToggleButton(
+                                        checked = !onDevice,
+                                        onCheckedChange = { if (it) onDevice = false },
+                                        shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
+                                        colors = serverToggleColors,
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Icon(
+                                            Icons.Outlined.Cloud,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(ToggleButtonDefaults.IconSize),
+                                        )
+                                        Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
+                                        Text("Remote server")
+                                    }
+                                }
+                                Text(
+                                    if (onDevice) {
+                                        "Zalo runs inside this app, in the background."
+                                    } else {
+                                        "Connect to a Zalỏ server running on another computer or VPS."
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 12.dp),
+                                )
+                                if (!onDevice) {
+                                    Spacer(Modifier.height(14.dp))
+                                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        OutlinedTextField(
+                                            value = serverUrl,
+                                            onValueChange = { serverUrl = it },
+                                            label = { Text("Server address") },
+                                            placeholder = { Text("https://zalo.example.com") },
+                                            singleLine = true,
+                                            isError = serverUrl.isNotBlank() && !urlValid,
+                                            supportingText = if (serverUrl.isNotBlank() && !urlValid) ({ Text("Not a valid address") }) else null,
+                                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                                            shape = RoundedCornerShape(16.dp),
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                        OutlinedTextField(
+                                            value = token,
+                                            onValueChange = { token = it },
+                                            label = { Text("Access token") },
+                                            singleLine = true,
+                                            visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                                            trailingIcon = {
+                                                IconButton(onClick = { showToken = !showToken }) {
+                                                    Icon(
+                                                        if (showToken) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                                        contentDescription = if (showToken) "Hide token" else "Show token",
+                                                    )
+                                                }
+                                            },
+                                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                            shape = RoundedCornerShape(16.dp),
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                    }
+                                }
+                                if (changed) {
+                                    Row(
+                                        Modifier.fillMaxWidth().padding(top = 16.dp),
+                                        horizontalArrangement = Arrangement.End,
+                                    ) {
+                                        Button(
+                                            onClick = { onSave(edited) },
+                                            enabled = urlValid,
+                                            shape = CircleShape,
+                                        ) {
+                                            Text("Save changes")
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        StayConnectedSettings(showModes = current.onDevice, showCodes = false)
                     }
-                    if (loggedIn) {
-                        add {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onSyncHistory),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.Sync, null) },
-                                headlineContent = { Text("Sync messages from phone") },
-                                supportingContent = {
-                                    Text("Copy your chat history from Zalo on your phone (the phone asks you to confirm)")
+                    SettingsPage.NOTIFICATIONS -> {
+                        if (current.onDevice) IncomingCallSettings()
+                        StayConnectedSettings(showModes = false, showCodes = true)
+                    }
+                    SettingsPage.CHATS -> {
+                        ExpressiveSettingsGroup(
+                            items = listOf<@Composable () -> Unit>(
+                                {
+                                    ListItem(
+                                        modifier = Modifier.clickable { onHideOfficialAccounts(!hideOfficialAccounts) },
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.Campaign, null) },
+                                        headlineContent = { Text("Hide official accounts") },
+                                        supportingContent = {
+                                            Text("No news, shops or ZNS in chats or notifications")
+                                        },
+                                        trailingContent = {
+                                            Switch(
+                                                checked = hideOfficialAccounts,
+                                                onCheckedChange = onHideOfficialAccounts,
+                                            )
+                                        },
+                                    )
                                 },
-                            )
+                            ),
+                        )
+                    }
+                    SettingsPage.ACCOUNT -> {
+                        val accountItems = buildList<@Composable () -> Unit> {
+                            if (current.onDevice) {
+                                add {
+                                    ListItem(
+                                        modifier = Modifier.clickable(onClick = onRestartServer),
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.RestartAlt, null) },
+                                        headlineContent = { Text("Restart Zalo service") },
+                                        supportingContent = { Text("If messages stop arriving") },
+                                    )
+                                }
+                            }
+                            if (loggedIn) {
+                                add {
+                                    ListItem(
+                                        modifier = Modifier.clickable(onClick = onSyncHistory),
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.Sync, null) },
+                                        headlineContent = { Text("Sync messages from phone") },
+                                        supportingContent = {
+                                            Text("Copy history from Zalo on your phone (it asks to confirm)")
+                                        },
+                                    )
+                                }
+                                add {
+                                    ListItem(
+                                        modifier = Modifier.clickable { confirmLogout = true },
+                                        colors = transparentListItemColors,
+                                        leadingContent = {
+                                            Icon(Icons.AutoMirrored.Outlined.Logout, null, tint = MaterialTheme.colorScheme.error)
+                                        },
+                                        headlineContent = {
+                                            Text("Log out of Zalo", color = MaterialTheme.colorScheme.error)
+                                        },
+                                        supportingContent = {
+                                            Text("Removes your session and history from this device")
+                                        },
+                                    )
+                                }
+                            }
                         }
-                        add {
-                            ListItem(
-                                modifier = Modifier.clickable { confirmLogout = true },
-                                colors = transparentListItemColors,
-                                leadingContent = {
-                                    Icon(Icons.AutoMirrored.Outlined.Logout, null, tint = MaterialTheme.colorScheme.error)
+                        ExpressiveSettingsGroup(items = accountItems)
+                    }
+                    SettingsPage.DEVELOPER -> {
+                        ExpressiveSettingsGroup(
+                            items = listOf<@Composable () -> Unit>(
+                                {
+                                    ListItem(
+                                        modifier = Modifier.clickable(onClick = onShareStartupLog),
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.Share, null) },
+                                        headlineContent = { Text("Share startup log") },
+                                        supportingContent = {
+                                            Text("App start times and the core's startup output")
+                                        },
+                                    )
                                 },
-                                headlineContent = {
-                                    Text("Log out of Zalo", color = MaterialTheme.colorScheme.error)
+                                {
+                                    ListItem(
+                                        modifier = Modifier.clickable(onClick = onShareCallLog),
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.Share, null) },
+                                        headlineContent = { Text("Share call log") },
+                                        supportingContent = {
+                                            Text("Call events Zalo sent, to debug calls (no messages)")
+                                        },
+                                    )
                                 },
-                                supportingContent = {
-                                    Text("Removes the session and message history from this device")
+                                {
+                                    ListItem(
+                                        modifier = Modifier.clickable(onClick = onClearCallLog),
+                                        colors = transparentListItemColors,
+                                        leadingContent = { Icon(Icons.Outlined.DeleteSweep, null) },
+                                        headlineContent = { Text("Clear call log") },
+                                    )
                                 },
-                            )
-                        }
+                            ) + replayDebugItems() + socketLogItems(),
+                        )
                     }
                 }
-                ExpressiveSettingsGroup(items = accountItems)
+                Spacer(Modifier.height(28.dp))
             }
-
-            if (current.onDevice && loggedIn) {
-                SectionHeader("Developer")
-                ExpressiveSettingsGroup(
-                    items = listOf<@Composable () -> Unit>(
-                        {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onShareStartupLog),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.Share, null) },
-                                headlineContent = { Text("Share startup log") },
-                                supportingContent = {
-                                    Text("How long the app took to start (one line per cold start), and the core's startup output")
-                                },
-                            )
-                        },
-                        {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onShareCallLog),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.Share, null) },
-                                headlineContent = { Text("Share call log") },
-                                supportingContent = {
-                                    Text("Call events Zalo sent (call ids, server addresses; no messages), to help debug calls")
-                                },
-                            )
-                        },
-                        {
-                            ListItem(
-                                modifier = Modifier.clickable(onClick = onClearCallLog),
-                                colors = transparentListItemColors,
-                                leadingContent = { Icon(Icons.Outlined.DeleteSweep, null) },
-                                headlineContent = { Text("Clear call log") },
-                            )
-                        },
-                    ) + replayDebugItems() + socketLogItems(),
-                )
-            }
-            Spacer(Modifier.height(28.dp))
         }
     }
 
@@ -656,7 +780,6 @@ private fun PrivacySecuritySettings() {
         activity?.let { AppLock.applyScreenSecurity(it, secure) }
     }
 
-    SectionHeader("Privacy & security")
     val privacyItems = buildList<@Composable () -> Unit> {
         add {
             ListItem(
@@ -669,9 +792,9 @@ private fun PrivacySecuritySettings() {
                 supportingContent = {
                     Text(
                         if (canAuth || appLockEnabled) {
-                            "Require biometrics or device PIN to unlock Zalỏ"
+                            "Unlock with biometrics or device PIN"
                         } else {
-                            "Set up a screen lock in device settings to enable"
+                            "Set up a device screen lock first"
                         },
                     )
                 },
@@ -701,7 +824,7 @@ private fun PrivacySecuritySettings() {
                 colors = transparentListItemColors,
                 leadingContent = { Icon(Icons.Outlined.Security, null) },
                 headlineContent = { Text("Screen security") },
-                supportingContent = { Text("Block screenshots & hide app preview in Recents") },
+                supportingContent = { Text("Block screenshots and hide Recents preview") },
                 trailingContent = {
                     Switch(
                         checked = screenSecurity,

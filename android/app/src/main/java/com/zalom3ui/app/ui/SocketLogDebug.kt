@@ -62,7 +62,7 @@ private fun SocketLogRow() {
         leadingContent = { Icon(Icons.Outlined.Cable, null) },
         headlineContent = { Text("Socket log") },
         supportingContent = {
-            Text(error ?: "What Zalo sent over the connection, frame by frame, and what Zalỏ did with it (no message text)")
+            Text(error ?: "Frames Zalo sent and what Zalỏ did with them (no text)")
         },
     )
     log?.let { text ->
