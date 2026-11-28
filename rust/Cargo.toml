@@ -65,35 +65,12 @@ zalo-media = { path = "zalo-media" }
 zalo-server = { path = "zalo-server", default-features = false }
 
 [profile.release]
-opt-level = "z"
+# Built for speed: storage is cheap next to a slow watch CPU. (opt-level "z" was 2.5 MB compressed
+# vs 3.5 MB here; the APK grows by about 1 MB.)
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 # Unwind (not abort): the core runs inside the app process, so a panic must stay catchable at the JNI
 # boundary (catch_unwind) and inside one tokio task, instead of killing the whole app.
 panic = "unwind"
 strip = "symbols"
-
-# The rest of the core is built for size ("z" above). The few crates that run per byte or per packet
-# (message crypto, call SRTP and media, decompression, JSON) are built for speed instead.
-[profile.release.package.zalo-media]
-opt-level = 3
-[profile.release.package.aes]
-opt-level = 3
-[profile.release.package.aes-gcm]
-opt-level = 3
-[profile.release.package.ghash]
-opt-level = 3
-[profile.release.package.polyval]
-opt-level = 3
-[profile.release.package.ctr]
-opt-level = 3
-[profile.release.package.cbc]
-opt-level = 3
-[profile.release.package.hmac]
-opt-level = 3
-[profile.release.package.sha1]
-opt-level = 3
-[profile.release.package.miniz_oxide]
-opt-level = 3
-[profile.release.package.serde_json]
-opt-level = 3
