@@ -145,6 +145,39 @@ class PerfMathTest {
         assertEquals(0, acc.drain().count)
     }
 
+    @Test
+    fun perFrameDeadlineOverridesBudgetWhenPositive() {
+        val acc = FrameAccumulator(frameBudgetNs(120f)) // 8.33 ms display budget
+        // LTPO 30 Hz idle frame: 20 ms total within a 33.3 ms deadline is NOT slow.
+        acc.add(ms(20.0), deadlineNs = ms(33.3))
+        // Exactly on its per-frame deadline is NOT slow.
+        acc.add(ms(33.3), deadlineNs = ms(33.3))
+        // Exceeding its per-frame deadline IS slow.
+        acc.add(ms(33.3) + 1L, deadlineNs = ms(33.3))
+        val totals = acc.drain()
+        assertEquals(3, totals.count)
+        assertEquals(1, totals.slow)
+    }
+
+    @Test
+    fun perFrameDeadlineStricterThanBudgetCountsAsSlow() {
+        val acc = FrameAccumulator(budget60) // 16.67 ms display budget
+        // 10 ms frame against an 8.33 ms deadline IS slow even though under 16.67 ms budget.
+        acc.add(ms(10.0), deadlineNs = frameBudgetNs(120f))
+        assertEquals(1, acc.drain().slow)
+    }
+
+    @Test
+    fun missingOrNonPositiveDeadlineFallsBackToBudget() {
+        val acc = FrameAccumulator(budget60)
+        acc.add(ms(10.0), deadlineNs = 0L)
+        acc.add(ms(20.0), deadlineNs = 0L)
+        acc.add(ms(20.0), deadlineNs = -1L)
+        val totals = acc.drain()
+        assertEquals(3, totals.count)
+        assertEquals(2, totals.slow)
+    }
+
     // ---- ring buffer ----
 
     @Test

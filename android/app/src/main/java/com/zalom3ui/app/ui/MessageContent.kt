@@ -102,6 +102,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -143,6 +144,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -335,15 +339,16 @@ fun AttachmentContent(
 fun StickerImage(url: String?, modifier: Modifier = Modifier) {
     Box(modifier.size(128.dp), contentAlignment = Alignment.Center) {
         if (url != null) {
-            // Placeholder under the sticker while it loads or if it fails; stickers are transparent, so it hides once in.
-            var loaded by remember(url) { mutableStateOf(false) }
-            if (!loaded) StickerPlaceholder()
+            // Placeholder under the sticker while it loads or if it fails; hidden in the draw phase once in so
+            // transparent stickers don't show it through and RAM cache hits don't trigger a 2nd composition.
+            val loaded = remember(url) { mutableStateOf(false) }
+            StickerPlaceholder(Modifier.drawWithContent { if (!loaded.value) drawContent() })
             AsyncImage(
                 model = url,
                 contentDescription = "Sticker",
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize(),
-                onState = { loaded = it is AsyncImagePainter.State.Success },
+                onState = { loaded.value = it is AsyncImagePainter.State.Success },
             )
         } else {
             StickerPlaceholder()
@@ -352,8 +357,8 @@ fun StickerImage(url: String?, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun StickerPlaceholder() {
-    Box(Modifier.fillMaxSize().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh))
+private fun StickerPlaceholder(modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxSize().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh))
 }
 
 @Composable
@@ -414,9 +419,9 @@ private fun MediaFrame(
             attempt += 1
         }
     }
-    // Placeholder under the photo (no subcomposition per bubble): the loading one, or "unavailable" once retries
-    // are spent. Hidden once the photo is in.
-    var loadState by remember(activeUrl, attempt) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+    // Placeholder under the photo (no subcomposition per bubble): hidden in the draw phase once loaded so
+    // RAM cache hits and Loading->Success transitions don't recompose MediaFrame.
+    val loaded = remember(activeUrl, attempt) { mutableStateOf(false) }
     val clickMod = Modifier.clickable {
         if (failed) {
             // Tap to try again now.
@@ -427,22 +432,21 @@ private fun MediaFrame(
         }
     }
     Box(frameMod.then(clickMod)) {
-        when {
-            loadState is AsyncImagePainter.State.Success -> {}
-            failed && !retriesLeft -> MediaUnavailablePlaceholder()
-            else -> MediaPlaceholder()
+        if (failed && !retriesLeft) {
+            MediaUnavailablePlaceholder()
+        } else {
+            MediaPlaceholder(Modifier.drawWithContent { if (!loaded.value) drawContent() })
         }
-        // Software bitmaps: a tall HD photo decoded to fill the frame can exceed the GPU texture limit as a hardware bitmap.
         val context = LocalContext.current
         val request = remember(activeUrl, attempt) {
-            ImageRequest.Builder(context).data(activeUrl).allowHardware(false).build()
+            ImageRequest.Builder(context).data(activeUrl).build()
         }
         AsyncImage(
             model = request,
             contentDescription = "Photo",
             contentScale = ContentScale.Crop,
             onState = { state ->
-                loadState = state
+                loaded.value = state is AsyncImagePainter.State.Success
                 if (state is AsyncImagePainter.State.Error) {
                     if (fallbackUrl != null && activeUrl != fallbackUrl) {
                         activeUrl = fallbackUrl
@@ -475,9 +479,9 @@ internal fun imageUrlExtension(url: String?): String =
         .take(8).lowercase().ifEmpty { "none" }
 
 @Composable
-private fun MediaPlaceholder() {
+private fun MediaPlaceholder(modifier: Modifier = Modifier) {
     Box(
-        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) { Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
 }
@@ -875,7 +879,9 @@ object VoicePlayback {
     private const val POSITION_POLL_MS = 60L
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var workerInitialized = false
     private val workerHandler: Handler by lazy {
+        workerInitialized = true
         val thread = HandlerThread("voice-playback").apply { start() }
         Handler(thread.looper)
     }
@@ -924,11 +930,13 @@ object VoicePlayback {
 
     /** Refreshes [state] with the underlying player's live position and duration on the worker thread. */
     fun refreshPosition() {
+        if (!workerInitialized) return
         workerHandler.post(pollRunnable)
     }
 
     /** Seeks [url] to [fraction] (`0f..1f`) when it is the active clip. */
     fun seekTo(url: String, fraction: Float) {
+        if (!workerInitialized) return
         val clamped = fraction.coerceIn(0f, 1f)
         workerHandler.post { seekToOnWorker(url, clamped) }
     }
@@ -942,17 +950,22 @@ object VoicePlayback {
             if (_state.compareAndSet(cur, cur.copy(speed = next))) break
         }
         val target = next
-        workerHandler.post {
-            player?.takeIf { prepared }?.let { applySpeedOnWorker(it, target) }
+        if (workerInitialized) {
+            workerHandler.post {
+                player?.takeIf { prepared }?.let { applySpeedOnWorker(it, target) }
+            }
         }
         return target
     }
 
     fun stop() {
+        if (!workerInitialized && _playing.value == null && _state.value.url == null) return
         stopSeq.incrementAndGet()
         _playing.value = null
         _state.value = VoicePlaybackState()
-        workerHandler.post { stopOnWorker() }
+        if (workerInitialized) {
+            workerHandler.post { stopOnWorker() }
+        }
     }
 
     private fun toggleOnWorker(appContext: Context, url: String) {
@@ -1084,12 +1097,25 @@ object VoicePlayback {
     }
 }
 
+private val IDLE_VOICE_STATE = VoicePlaybackState()
+
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun VoiceClip(a: Attachment, onOutgoing: Boolean) {
     val context = LocalContext.current
-    val playback by VoicePlayback.state.collectAsStateWithLifecycle()
     val href = a.href
+    // Scope collection to this clip's URL so inactive voice clips skip recomposition on 60ms position ticks.
+    val playback by remember(href) {
+        if (href == null) {
+            flowOf(IDLE_VOICE_STATE)
+        } else {
+            VoicePlayback.state
+                .map { if (it.url == href) it else IDLE_VOICE_STATE }
+                .distinctUntilChanged()
+        }
+    }.collectAsStateWithLifecycle(
+        initialValue = VoicePlayback.state.value.takeIf { href != null && it.url == href } ?: IDLE_VOICE_STATE,
+    )
     val isActiveClip = href != null && playback.url == href
     val isPlaying = isActiveClip && playback.isPlaying
 

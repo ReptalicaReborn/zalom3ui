@@ -50,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -59,6 +60,8 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -99,17 +102,24 @@ fun Avatar(name: String, url: String, key: String, isGroup: Boolean, size: Dp = 
     if (url.isBlank()) {
         Box(modifier) { fallback() }
     } else {
-        // Plain AsyncImage over the initials (no subcomposition per chat row). The initials hide once the picture
-        // is in, so transparent pictures don't show them through.
-        var loaded by remember(url) { mutableStateOf(false) }
+        // Plain AsyncImage over the initials (no subcomposition per chat row). The initials hide in the draw phase
+        // once the picture is in, so transparent pictures don't show them through and RAM cache hits don't recompose.
+        val loaded = remember(url) { mutableStateOf(false) }
         Box(modifier.size(size).clip(shape)) {
-            if (!loaded) fallback()
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .clearAndSetSemantics {}
+                    .drawWithContent { if (!loaded.value) drawContent() },
+            ) {
+                fallback()
+            }
             AsyncImage(
                 model = url,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.matchParentSize(),
-                onState = { loaded = it is AsyncImagePainter.State.Success },
+                onState = { loaded.value = it is AsyncImagePainter.State.Success },
             )
         }
     }
@@ -134,34 +144,52 @@ fun deliveryState(msg: ChatMessage): Delivery? = when {
 fun DeliveryIcon(state: Delivery?, tint: Color, background: Color, modifier: Modifier = Modifier) {
     if (state == null) return
     val double = state != Delivery.SENT
+    val stroke = with(LocalDensity.current) { 1.2.dp.toPx() }
+    val ringStroke = remember(stroke) { Stroke(stroke) }
+    val checkStroke = remember(stroke) { Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round) }
+    val checkPath = remember { Path() }
     Canvas(modifier.size(width = if (double) 18.dp else 12.dp, height = 12.dp)) {
-        val stroke = 1.2.dp.toPx()
         val outer = size.height / 2
         val r = outer - stroke / 2
         val cy = size.height / 2
-        val centers = if (double) listOf(outer, size.width - outer) else listOf(size.width / 2)
-        for (cx in centers) {
-            val center = Offset(cx, cy)
-            if (state == Delivery.READ) {
-                drawCircle(background, radius = outer + stroke, center = center)
-                drawCircle(tint, radius = outer, center = center)
-                drawCheck(center, r, background, stroke)
-            } else {
-                drawCircle(background, radius = outer + stroke * 0.5f, center = center)
-                drawCircle(tint, radius = r, center = center, style = Stroke(stroke))
-                drawCheck(center, r, tint, stroke)
-            }
+        if (double) {
+            drawDeliveryCircle(Offset(outer, cy), outer, r, stroke, state, tint, background, ringStroke, checkStroke, checkPath)
+            drawDeliveryCircle(Offset(size.width - outer, cy), outer, r, stroke, state, tint, background, ringStroke, checkStroke, checkPath)
+        } else {
+            drawDeliveryCircle(Offset(size.width / 2, cy), outer, r, stroke, state, tint, background, ringStroke, checkStroke, checkPath)
         }
     }
 }
 
-private fun DrawScope.drawCheck(center: Offset, r: Float, color: Color, stroke: Float) {
-    val path = Path().apply {
-        moveTo(center.x - r * 0.45f, center.y + r * 0.02f)
-        lineTo(center.x - r * 0.12f, center.y + r * 0.36f)
-        lineTo(center.x + r * 0.46f, center.y - r * 0.30f)
+private fun DrawScope.drawDeliveryCircle(
+    center: Offset,
+    outer: Float,
+    r: Float,
+    stroke: Float,
+    state: Delivery,
+    tint: Color,
+    background: Color,
+    ringStroke: Stroke,
+    checkStroke: Stroke,
+    checkPath: Path,
+) {
+    if (state == Delivery.READ) {
+        drawCircle(background, radius = outer + stroke, center = center)
+        drawCircle(tint, radius = outer, center = center)
+        drawCheck(center, r, background, checkStroke, checkPath)
+    } else {
+        drawCircle(background, radius = outer + stroke * 0.5f, center = center)
+        drawCircle(tint, radius = r, center = center, style = ringStroke)
+        drawCheck(center, r, tint, checkStroke, checkPath)
     }
-    drawPath(path, color, style = Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round))
+}
+
+private fun DrawScope.drawCheck(center: Offset, r: Float, color: Color, checkStroke: Stroke, path: Path) {
+    path.rewind()
+    path.moveTo(center.x - r * 0.45f, center.y + r * 0.02f)
+    path.lineTo(center.x - r * 0.12f, center.y + r * 0.36f)
+    path.lineTo(center.x + r * 0.46f, center.y - r * 0.30f)
+    drawPath(path, color, style = checkStroke)
 }
 
 /** Pill with a number (or "@"), as on unread chats. */
