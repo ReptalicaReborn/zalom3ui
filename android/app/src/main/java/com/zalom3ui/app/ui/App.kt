@@ -285,6 +285,8 @@ private fun AppNav(vm: AppViewModel) {
                     onMarkRead = { vm.markThreadRead(it.ref) },
                     onMarkUnread = { vm.markUnread(it.ref) },
                     onHideOfficialAccounts = { vm.setHideOfficialAccounts(true) },
+                    onHideChat = { vm.setChatHidden(it.ref, true) },
+                    onUnhideChat = { vm.setChatHidden(it.ref, false, official = it.isOfficialAccount) },
                     onDelete = { vm.deleteConversation(it.ref) },
                     onSearchMessages = vm::searchAllMessages,
                     onOpenSearchHit = { hit ->
@@ -361,8 +363,10 @@ private fun AppNav(vm: AppViewModel) {
                 ) { selectedKey ->
                     // The fields go in as they are (no copies), so the list skips when none of them changed.
                     val hideOfficialAccounts by vm.hideOfficialAccounts.collectAsStateWithLifecycle()
+                    val hiddenChats by vm.hiddenChats.collectAsStateWithLifecycle()
                     ThreadListScreen(
                         hideOfficialAccounts = hideOfficialAccounts,
+                        hiddenChats = hiddenChats,
                         threads = state.threads,
                         drafts = state.drafts,
                         typing = state.typing,

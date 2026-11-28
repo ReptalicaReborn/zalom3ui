@@ -37,6 +37,8 @@ import com.zalom3ui.app.data.IncomingCall
 import com.zalom3ui.app.data.ServerEvent
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.data.isManuallyHidden
+import com.zalom3ui.app.data.isOfficialShownOverride
 import com.zalom3ui.app.ui.call.CallActivity
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -129,11 +131,13 @@ class MessageNotifier(
 
     /** With "Hide official accounts" on, an Official Account's message posts no notification. */
     private fun showUnlessOfficial(msg: ChatMessage, threadName: String) {
-        if (msg.threadKind != "user" || !settings.hideOfficialAccounts) {
+        val key = ThreadRef(msg.threadKind, msg.threadId).key
+        val hidden = settings.hiddenChats
+        if (isManuallyHidden(hidden, key)) return
+        if (msg.threadKind != "user" || !settings.hideOfficialAccounts || isOfficialShownOverride(hidden, key)) {
             show(msg, threadName)
             return
         }
-        val key = ThreadRef(msg.threadKind, msg.threadId).key
         val targetScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
         targetScope.launch(Dispatchers.IO) {
             // The core flags the chat before it announces the message, so a fresh list already knows a new OA.

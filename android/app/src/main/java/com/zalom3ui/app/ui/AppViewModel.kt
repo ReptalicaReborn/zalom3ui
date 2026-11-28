@@ -33,6 +33,7 @@ import com.zalom3ui.app.data.SessionStatus
 import com.zalom3ui.app.data.SettingsStore
 import com.zalom3ui.app.data.StickerInfo
 import com.zalom3ui.app.data.ThreadRef
+import com.zalom3ui.app.data.shownOfficialOverrideKey
 import com.zalom3ui.app.data.ThreadSummary
 import com.zalom3ui.app.data.UserThreadInfo
 import com.zalom3ui.app.data.readPickedFile
@@ -163,6 +164,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** "Hide official accounts": the chat list hides OA chats behind an "Official accounts (N)" row. */
     val hideOfficialAccounts: StateFlow<Boolean> = _hideOfficialAccounts.asStateFlow()
 
+    private val _hiddenChats = MutableStateFlow(settingsStore.hiddenChats)
+    /** Thread keys hidden by hand from the chat list ("Hide chat"). */
+    val hiddenChats: StateFlow<Set<String>> = _hiddenChats.asStateFlow()
+
     private val _reducedMotion = MutableStateFlow(settingsStore.reducedMotion)
     /** User preference for reduced motion (combined with system setting at the theme root). */
     val reducedMotion: StateFlow<Boolean> = _reducedMotion.asStateFlow()
@@ -263,6 +268,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setHideOfficialAccounts(hide: Boolean) {
         settingsStore.hideOfficialAccounts = hide
         _hideOfficialAccounts.value = hide
+    }
+
+    /** Hides or unhides a chat. Unhiding an Official Account also overrides "Hide official accounts" for it. */
+    fun setChatHidden(thread: ThreadRef, hidden: Boolean, official: Boolean = false) {
+        val override = shownOfficialOverrideKey(thread.key)
+        val next = if (hidden) {
+            _hiddenChats.value + thread.key - override
+        } else {
+            _hiddenChats.value - thread.key + (if (official) setOf(override) else emptySet())
+        }
+        settingsStore.hiddenChats = next
+        _hiddenChats.value = next
     }
 
     fun setReducedMotion(enabled: Boolean) {
